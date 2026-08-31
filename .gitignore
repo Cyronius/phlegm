@@ -1,0 +1,41 @@
+# Rust / C++ build
+npu-engine/target/
+**/*.obj
+**/*.exe
+**/*.lib
+**/*.exp
+**/*.dll
+**/*.pdb
+
+# Python
+__pycache__/
+*.pyc
+
+# Model weights, NPU pools, captured buffers, scratch data (never commit)
+*.q4nx
+*.gguf
+*.bin
+*.npy
+*.npz
+*.f32
+*.i64
+*.safetensors
+m3out/
+out/
+tools/kernel-interp/hf_ref/
+tools/kernel-interp/*.npy
+caps/
+
+# Vendored reference converter (clone it yourself; see tools/q4nx-convert/README.md)
+tools/q4nx-convert/reference/
+
+# Editor / tooling / index artifacts
+.claude/
+lancedb/
+.codegraph/
+.DS_Store
+
+# Keep small golden test fixtures that ARE committed:
+!tools/kernel-interp/rust_ref/
+!tools/kernel-interp/rust_ref/*.f32
+!tools/kernel-interp/rust_ref/*.i64

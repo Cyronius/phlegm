@@ -1,0 +1,17 @@
+[package]
+name = "phlegm"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# NPU decode driver: compiles + links the extern "C" xrt-shim over XRT.
+# Requires MSVC (cl.exe reachable via vcvars64) and the XRT import lib. Off by
+# default so the CPU engine builds without XRT present.
+npu = []
+
+[dependencies]
+memmap2 = "0.9"
+serde_json = "1"
+
+[profile.release]
+debug = true

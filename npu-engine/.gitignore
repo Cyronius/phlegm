@@ -1,0 +1,7 @@
+target/
+m3out/
+out/
+*.bin
+*.exe
+*.obj
+*.lib
