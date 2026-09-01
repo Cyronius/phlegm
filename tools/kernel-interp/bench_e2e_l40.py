@@ -227,7 +227,14 @@ def main():
     print(f"tokens: {NTOK} (first {warm} dropped as warmup)")
     print(f"per-token: mean {avg*1000:.1f} ms  => {1/avg:.2f} tok/s")
     print(f"          min {min(steady)*1000:.1f}  max {max(steady)*1000:.1f} ms")
-    print(f"FLM measured baseline (same 40L model, end-to-end serve): 7.05 tok/s")
+    # Re-measured 2026-09-01 against real flm.exe 1.0.2 /v1/chat/completions
+    # (decoding_speed_tps field, 3 requests, real xrt_coreutil.dll i.e. capture
+    # proxy swapped out): 6.68 / 6.92 / 6.88 tok/s -> ~6.8 tok/s avg. Same run
+    # also clocked the current all-Rust engine (`open-qwen-npu l40-run`, no
+    # subprocess/file round-trip) at ~9.1 tok/s decode, ~10.5 tok/s prefill --
+    # the number this script's own (older, Python-glued C++ driver) path
+    # should be measured against going forward.
+    print(f"FLM measured baseline (same 40L model, end-to-end serve): 6.8 tok/s")
 
     print(f"\n=== PHASE BREAKDOWN (mean over {len(steady)} steady-state steps) ===")
     total_ms = avg * 1000.0
