@@ -6,6 +6,7 @@
 //! whole point: interval-3 models run with the same code path as interval-4.
 
 use crate::q4nx::Q4nx;
+use std::path::Path;
 
 pub const HIDDEN: usize = 2048;
 pub const VOCAB: usize = 248320;
@@ -66,9 +67,68 @@ pub struct KvState {
     pub v: Vec<f64>,
 }
 
+/// One layer's decode-ready state, tagged by layer kind. Carries the layer
+/// index it belongs to so a caller building per-layer buffers (e.g. serializing
+/// `state_L{l}.bin` files) doesn't need separate bookkeeping to line a state
+/// back up with its layer.
+pub enum LayerState {
+    Linear(LinearState),
+    Full(KvState),
+}
+
 pub struct Model {
     pub file: Q4nx,
     pub layer_types: Vec<String>,
+}
+
+/// Open a `.q4nx` model file and derive its layer schedule from tensor names
+/// (linear-attention vs full-attention, per layer).
+pub fn open_model(model_path: &Path) -> Model {
+    let file = Q4nx::open(model_path).unwrap();
+    let mut n = 0;
+    while file.tensors.contains_key(&format!("model.layer.{n}.input_layernorm.weight")) {
+        n += 1;
+    }
+    let layer_types: Vec<String> = (0..n)
+        .map(|l| {
+            if file.tensors.contains_key(&format!("model.layer.{l}.linear_attn.qkv_proj.weight")) {
+                "linear_attention".to_string()
+            } else {
+                "full_attention".to_string()
+            }
+        })
+        .collect();
+    eprintln!("model format: {}", file.fmt);
+    eprintln!("model: {} layers, schedule {:?}", n, layer_types);
+    Model { file, layer_types }
+}
+
+/// CPU prefill over `ids`: returns the residual stream (`[T*HIDDEN]`, f64) and
+/// each layer's decode-ready state, in layer order.
+pub fn run_prefill(m: &Model, ids: &[i64]) -> (Vec<f64>, Vec<LayerState>) {
+    let t = ids.len();
+    let mut x = vec![0f64; t * HIDDEN];
+    for (i, id) in ids.iter().enumerate() {
+        let e = m.embed(*id as usize);
+        x[i * HIDDEN..(i + 1) * HIDDEN].copy_from_slice(&e);
+    }
+    let mut states = Vec::with_capacity(m.layer_types.len());
+    for (l, lt) in m.layer_types.clone().iter().enumerate() {
+        if lt == "linear_attention" {
+            states.push(LayerState::Linear(m.linear_attn_prefill(l, &mut x, t)));
+        } else {
+            states.push(LayerState::Full(m.full_attn_prefill(l, &mut x, t)));
+        }
+        m.moe(l, &mut x, t);
+        eprintln!("  layer {l} ({lt}) done");
+    }
+    (x, states)
+}
+
+/// Final-norm hidden state (pre-lm_head) for one residual-stream row.
+pub fn final_hidden(m: &Model, x_last: &[f64]) -> Vec<f32> {
+    let nw = m.file.bf16("model.norm.weight");
+    rms_norm(x_last, &nw, HIDDEN).iter().map(|v| *v as f32).collect()
 }
 
 impl Model {

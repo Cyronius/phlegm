@@ -119,7 +119,7 @@ The open engine also **reads** q4nx files emitted by the newer FLM 1.0.3 convert
 writes. That read path lives in the engine, not here — `tools/kernel-interp/
 q4nx_v103.py` (Q4_K dequant + reorder-undo) and `q4nx.py::Q4NX` (auto-detects
 4736 B Q4_K vs 5120 B q4_1 and dispatches). See
-`.claude/plans/qwen36-1.0.3-format-support.md` for the byte-exact spec.
+`docs/qwen36-1.0.3-format-support.md` for the byte-exact spec.
 
 1.0.3 differs from 1.0.2 three ways: Q4_K-refit quant (4736 B chunk, per-group
 uint8 scales/mins over a bf16 super-scale, min subtracted), plain column-major

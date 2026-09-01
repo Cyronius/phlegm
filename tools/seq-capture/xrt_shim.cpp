@@ -81,6 +81,7 @@ std::atomic<bo_dtor_t> g_real_bo_dtor{nullptr};
 
 std::string           g_bo_dir;                 // FLM_BO_CAPTURE_DIR ("" = off)
 uint64_t              g_bo_dump_max = 0;         // FLM_BO_DUMP_MAX bytes/sync
+uint64_t              g_bo_runarg_max = ~0ULL;   // FLM_BO_RUNARG_MAX: hash/dump run args only up to this size (hashing 512MB pools per submit stalls prefill ~100x)
 std::atomic<uint32_t> g_bo_index{0};
 std::mutex            g_bo_trace_mtx;
 std::mutex            g_bo_map_mtx;
@@ -193,6 +194,7 @@ void init() {
     if (!g_bo_dir.empty()) {
         CreateDirectoryA(g_bo_dir.c_str(), NULL);
         if (const char* m = getenv("FLM_BO_DUMP_MAX")) g_bo_dump_max = strtoull(m, nullptr, 10);
+        if (const char* m = getenv("FLM_BO_RUNARG_MAX")) g_bo_runarg_max = strtoull(m, nullptr, 10);
         OutputDebugStringA("[xrt-shim] tensor-data capture armed");
     }
     g_init.store(true);
@@ -338,9 +340,9 @@ extern "C" void flmcap_run_start(void* run) {
               auto h = g_bo_hostptr.find(a.second);
               if (h != g_bo_hostptr.end()) host = h->second; }
             uint64_t sz = bosize ? bosize(a.second) : 0;
-            uint64_t hash = (host && sz) ? fnv1a(host, (size_t)sz) : 0;
+            uint64_t hash = (host && sz && sz <= g_bo_runarg_max) ? fnv1a(host, (size_t)sz) : 0;
             int dumped = 0;
-            if (host && sz && g_bo_dump_max && sz <= g_bo_dump_max) {
+            if (host && sz && sz <= g_bo_runarg_max && g_bo_dump_max && sz <= g_bo_dump_max) {
                 uint64_t key = sz ^ (hash * 1099511628211ULL);
                 bool need;
                 { std::lock_guard<std::mutex> lk(g_blob_mtx); need = g_blob_done.emplace(key, 1).second; }

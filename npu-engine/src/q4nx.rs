@@ -1,7 +1,7 @@
 //! q4nx container access: safetensors header parse + verified dequantization.
 //!
 //! Byte-level formats verified against HF reference weights and FLM's live
-//! NPU buffers (see .claude/plans/npu-open-engine.md "Step 3 STATUS"):
+//! NPU buffers (see docs/npu-open-engine.md "Step 3 STATUS"):
 //!
 //! q4 tensor (I8, [A, B, 5120]): chunks of 5120 B, each covering 32 rows x
 //! 256 cols of the logical [out, in] matrix in plain raster order
@@ -44,6 +44,14 @@ const N_HEADS: usize = 16; // g: KV heads across the paired halves
 #[inline]
 pub fn bf16_to_f32(u: u16) -> f32 {
     f32::from_bits((u as u32) << 16)
+}
+
+/// Round-to-nearest-even bf16 encode (mirror of q4nx.py's `f32_to_bf16`).
+#[inline]
+pub fn f32_to_bf16(f: f32) -> u16 {
+    let u = f.to_bits();
+    let rounded = u.wrapping_add(0x7FFF + ((u >> 16) & 1));
+    (rounded >> 16) as u16
 }
 
 impl Q4nx {

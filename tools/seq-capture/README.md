@@ -3,7 +3,7 @@
 Capture the *live* per-op control sequences the closed FLM engines submit to the
 NPU, in submission order, **without recompiling the engine and without Ghidra** —
 then diff an interval-4 run against an interval-3 run to locate the interval-3
-scheduling defect (see `.claude/plans/rust-engine-replacement-feasibility.md`).
+scheduling defect (see `docs/rust-engine-replacement-feasibility.md`).
 
 ## Why this works
 

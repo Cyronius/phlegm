@@ -6,7 +6,7 @@ current closed FLM engine mis-executes. It reuses AMD's NPU kernels and makes th
 host-side orchestration open, correct, and extensible.
 
 > Status: **proof-of-concept, in development.** Not usable yet — see
-> [`.claude/plans/npu-open-engine.md`](../docs/npu-open-engine.md) for
+> [`docs/npu-open-engine.md`](../docs/npu-open-engine.md) for
 > the plan and current milestone. Reuses FLM's closed xclbin kernels for now
 > (open kernels are a later goal).
 

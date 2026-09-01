@@ -14,7 +14,7 @@ DIFFERENT file:
 
 Byte layout read straight from the reference converter's `_pack_q4k`
 (q4nx/model_converter.py) and `unpack_q4_k`/`_refit_one_side`
-(q4nx/gguf_tensor.py); see .claude/plans/qwen36-1.0.3-format-support.md.
+(q4nx/gguf_tensor.py); see docs/qwen36-1.0.3-format-support.md.
 
 The container (safetensors header + raster [out//32, in//256, CHUNK] I8 tensors)
 is unchanged from 1.0.2, so this module only supplies the per-chunk dequant and

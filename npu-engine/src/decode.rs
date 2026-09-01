@@ -24,7 +24,7 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 
 /// Interpreter state, mirroring decode_driver.cpp's locals.
-struct Driver {
+pub struct Driver {
     dev: Option<Device>,
     ctxs: HashMap<String, Context>,
     kernels: HashMap<String, Kernel>,
@@ -252,10 +252,103 @@ impl Driver {
         Ok(())
     }
 
-    /// Resident decode loop. `prog` is the fixed per-token layer program (read
-    /// from the config between `serve` and `endserve`). Reads stdin lines:
+    /// One resident decode step, entirely in-process: write `act_bytes` into
+    /// the resident `act` buffer, run the fixed per-token layer program
+    /// (`prog`, the lines between `serve`/`endserve`), and return the
+    /// resulting 8192-byte hidden dump. No subprocess, no temp files — this is
+    /// what [`serve`](Driver::serve) is built on, and what a real generate
+    /// loop should call directly instead of spawning this binary as a
+    /// subprocess and shuttling activations through disk.
+    ///
+    /// `prog` may also contain `load <buf> <file>` lines (same as the
+    /// immediate-mode `load` directive in [`exec_line`](Driver::exec_line)):
+    /// this is what a pool-STREAMING per-token program needs — e.g. the l30
+    /// schedule's 30 layers can't all stay resident as 512MB pools, so its
+    /// program reloads a small set of pool buffers from disk before each
+    /// group of layers, exactly as `l30_run_npu.py`'s `gen_stream_cfg` does.
+    /// A resident schedule (e.g. 5li3) simply never emits a `load` line.
+    pub fn step_bytes(&mut self, prog: &[String], act_bytes: &[u8]) -> Result<[u8; 8192], String> {
+        {
+            let entry = self.bufs.get_mut("act").ok_or("no buf act")?;
+            let n = act_bytes.len().min(entry.1);
+            entry.0.write(&act_bytes[..n], 0)?;
+            entry.0.sync_to_device()?;
+        }
+        // run the fixed program (runlist chunks + cross-context barriers)
+        let mut prl: Option<Runlist> = None;
+        let mut prl_runs: Vec<crate::xrt::Run> = Vec::new();
+        for p in prog {
+            let mut ls = p.split_whitespace();
+            let c = match ls.next() {
+                Some(c) => c,
+                None => continue,
+            };
+            match c {
+                "load" => {
+                    let name = ls.next().ok_or("load: name")?.to_string();
+                    let initf = ls.next().ok_or("load: file")?;
+                    let d = read_file(initf)?;
+                    let entry = self.bufs.get_mut(&name).ok_or(format!("no buf {name}"))?;
+                    let n = d.len().min(entry.1);
+                    entry.0.write(&d[..n], 0)?;
+                    entry.0.sync_to_device()?;
+                }
+                "runlist" => {
+                    let xn = ls.next().ok_or("runlist: xclbin")?;
+                    let ctx = self.ctxs.get(xn).ok_or(format!("no xclbin {xn}"))?;
+                    prl = Some(ctx.runlist()?);
+                    prl_runs.clear();
+                }
+                "layer" => {
+                    let kn = ls.next().ok_or("layer: kernel")?.to_string();
+                    let pool = ls.next().ok_or("layer: pool")?.to_string();
+                    let act = ls.next().ok_or("layer: act")?.to_string();
+                    let pack = ls.next().ok_or("layer: pack")?.to_string();
+                    let side = ls.next().ok_or("layer: side")?.to_string();
+                    let state = ls.next().ok_or("layer: state")?.to_string();
+                    let args = [
+                        (3, pool.as_str()),
+                        (4, act.as_str()),
+                        (5, pack.as_str()),
+                        (6, side.as_str()),
+                        (7, state.as_str()),
+                    ];
+                    let r = self.make_run(&kn, &args)?;
+                    prl_runs.push(r);
+                    prl.as_mut().ok_or("layer without runlist")?.add(prl_runs.last().unwrap())?;
+                }
+                "submit" => {
+                    let r = prl.as_mut().ok_or("submit without runlist")?;
+                    r.execute()?;
+                    r.wait().map_err(|e| format!("STEP FAILED: {e}"))?;
+                    prl = None;
+                    prl_runs.clear();
+                }
+                "barrier" => {
+                    let kn = ls.next().ok_or("barrier: kernel")?.to_string();
+                    let logits = ls.next().ok_or("barrier: logits")?.to_string();
+                    let lmpool = ls.next().ok_or("barrier: lmpool")?.to_string();
+                    let act = ls.next().ok_or("barrier: act")?.to_string();
+                    self.submit_single(&kn, &[(3, logits.as_str()), (4, lmpool.as_str()), (5, act.as_str())])?;
+                }
+                _ => {}
+            }
+        }
+        // dump hidden (act, first 8192 bytes)
+        let entry = self.bufs.get("act").ok_or("no buf act")?;
+        entry.0.sync_from_device()?;
+        let mut hidden = [0u8; 8192];
+        entry.0.read(&mut hidden, 0)?;
+        Ok(hidden)
+    }
+
+    /// Resident decode loop over stdin (subprocess mode, as spawned by
+    /// generate_npu.py / tools/server's NpuBackend today). Reads lines:
     ///   step <act_in> <hidden_out>   -> load act, run program, dump 8192 B hidden
     ///   quit                          -> exit
+    /// Thin file-I/O wrapper around [`step_bytes`](Driver::step_bytes); kept
+    /// for the standalone `npu <config>` CLI subcommand and for driving this
+    /// binary as a subprocess from another process/language.
     fn serve(&mut self, prog: &[String]) -> Result<(), String> {
         println!("SERVE READY");
         std::io::stdout().flush().ok();
@@ -275,92 +368,63 @@ impl Driver {
             }
             let actin = rs.next().ok_or("step: act_in")?.to_string();
             let hidout = rs.next().ok_or("step: hidden_out")?.to_string();
-            // load act
-            {
-                let d = read_file(&actin)?;
-                let entry = self.bufs.get_mut("act").ok_or("no buf act")?;
-                let n = d.len().min(entry.1);
-                entry.0.write(&d[..n], 0)?;
-                entry.0.sync_to_device()?;
-            }
-            // run the fixed program (runlist chunks + cross-context barriers)
-            let mut ok = true;
-            let mut prl: Option<Runlist> = None;
-            let mut prl_runs: Vec<crate::xrt::Run> = Vec::new();
-            for p in prog {
-                let mut ls = p.split_whitespace();
-                let c = match ls.next() {
-                    Some(c) => c,
-                    None => continue,
-                };
-                match c {
-                    "runlist" => {
-                        let xn = ls.next().ok_or("runlist: xclbin")?;
-                        let ctx = self.ctxs.get(xn).ok_or(format!("no xclbin {xn}"))?;
-                        prl = Some(ctx.runlist()?);
-                        prl_runs.clear();
-                    }
-                    "layer" => {
-                        let kn = ls.next().ok_or("layer: kernel")?.to_string();
-                        let pool = ls.next().ok_or("layer: pool")?.to_string();
-                        let act = ls.next().ok_or("layer: act")?.to_string();
-                        let pack = ls.next().ok_or("layer: pack")?.to_string();
-                        let side = ls.next().ok_or("layer: side")?.to_string();
-                        let state = ls.next().ok_or("layer: state")?.to_string();
-                        let args = [
-                            (3, pool.as_str()),
-                            (4, act.as_str()),
-                            (5, pack.as_str()),
-                            (6, side.as_str()),
-                            (7, state.as_str()),
-                        ];
-                        let r = self.make_run(&kn, &args)?;
-                        prl_runs.push(r);
-                        prl.as_mut().ok_or("layer without runlist")?.add(prl_runs.last().unwrap())?;
-                    }
-                    "submit" => {
-                        let r = prl.as_mut().ok_or("submit without runlist")?;
-                        r.execute()?;
-                        if let Err(e) = r.wait() {
-                            println!("STEP FAILED: {e}");
-                            ok = false;
-                            break;
-                        }
-                        prl = None;
-                        prl_runs.clear();
-                    }
-                    "barrier" => {
-                        let kn = ls.next().ok_or("barrier: kernel")?.to_string();
-                        let logits = ls.next().ok_or("barrier: logits")?.to_string();
-                        let lmpool = ls.next().ok_or("barrier: lmpool")?.to_string();
-                        let act = ls.next().ok_or("barrier: act")?.to_string();
-                        self.submit_single(
-                            &kn,
-                            &[(3, logits.as_str()), (4, lmpool.as_str()), (5, act.as_str())],
-                        )?;
-                    }
-                    _ => {}
+            let act_bytes = read_file(&actin)?;
+            match self.step_bytes(prog, &act_bytes) {
+                Ok(hidden) => {
+                    std::fs::write(&hidout, hidden).map_err(|e| format!("write {hidout}: {e}"))?;
+                    println!("STEP OK");
                 }
+                Err(e) => println!("STEP ERR: {e}"),
             }
-            if !ok {
-                println!("STEP ERR");
-                std::io::stdout().flush().ok();
-                continue;
-            }
-            // dump hidden (act, first 8192 bytes)
-            {
-                let entry = self.bufs.get("act").ok_or("no buf act")?;
-                entry.0.sync_from_device()?;
-                let mut v = vec![0u8; 8192];
-                entry.0.read(&mut v, 0)?;
-                std::fs::write(&hidout, &v).map_err(|e| format!("write {hidout}: {e}"))?;
-            }
-            println!("STEP OK");
             std::io::stdout().flush().ok();
         }
         println!("SERVE DONE");
         Ok(())
     }
+}
+
+/// Parse a decode-driver config file and run every directive up to (but not
+/// including) `serve`, leaving kernels/contexts/buffers resident. Returns the
+/// live `Driver` plus the fixed per-token layer program (the lines between
+/// `serve` and `endserve`) — this is the in-process counterpart to
+/// [`run_config`]'s subprocess-oriented parsing, for a real generate loop to
+/// drive directly via repeated [`Driver::step_bytes`] calls with no
+/// subprocess and no per-token file I/O.
+pub fn load_resident(cfg_path: &Path) -> Result<(Driver, Vec<String>), String> {
+    let text = std::fs::read_to_string(cfg_path)
+        .map_err(|e| format!("cannot open config {}: {e}", cfg_path.display()))?;
+    let lines: Vec<&str> = text.lines().collect();
+
+    let mut drv = Driver::new();
+    let mut rl: Option<Runlist> = None;
+    let mut rl_runs: Vec<crate::xrt::Run> = Vec::new();
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim_end();
+        i += 1;
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.split_whitespace().next() == Some("serve") {
+            let mut prog = Vec::new();
+            while i < lines.len() {
+                let pl = lines[i].trim_end().to_string();
+                i += 1;
+                if pl == "endserve" {
+                    break;
+                }
+                if !pl.is_empty() && !pl.starts_with('#') {
+                    prog.push(pl);
+                }
+            }
+            return Ok((drv, prog));
+        }
+        if let Err(e) = drv.exec_line(line, &mut rl, &mut rl_runs) {
+            return Err(format!("on '{line}': {e}"));
+        }
+    }
+    Err("config has no `serve` block".to_string())
 }
 
 /// Interpret a decode-driver config file.

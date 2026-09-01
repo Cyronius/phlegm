@@ -5,3 +5,6 @@ out/
 *.exe
 *.obj
 *.lib
+.npu.lock
+deps/
+m0/*_log.txt
