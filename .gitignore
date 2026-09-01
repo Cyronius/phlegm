@@ -39,3 +39,4 @@ lancedb/
 !tools/kernel-interp/rust_ref/
 !tools/kernel-interp/rust_ref/*.f32
 !tools/kernel-interp/rust_ref/*.i64
+kernels/

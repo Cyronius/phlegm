@@ -134,20 +134,38 @@ This runs the model on the actual NPU by driving FLM's kernels from phlegm's ope
 host. High level (details and exact buffer layouts in
 [`docs/npu-open-engine.md`](docs/npu-open-engine.md) and `npu-engine/README.md`):
 
-1. **Build the C++/XRT drivers + shim** (Windows + MSVC + XRT):
+1. **Fetch the NPU kernels.** The `.xclbin` kernels are proprietary
+   (patent-pending, free to use under FLM's revenue-capped
+   [TERMS](https://github.com/ROCm/FastFlowLM/blob/main/TERMS.md)) and are
+   **not in this repo** — but they sit in FastFlowLM's public repo, so fetch
+   them from there:
+   ```pwsh
+   pwsh -File tools/get-kernels.ps1          # layer + lm_head (the decode/serve path)
+   pwsh -File tools/get-kernels.ps1 -All     # + the op-level prefill kernels
+   $env:FLM_XCLBIN_DIR = "$PWD\kernels\Qwen3.6-35B-A3B-NPU2"
+   ```
+   (Equivalent by hand: `wget https://raw.githubusercontent.com/ROCm/FastFlowLM/v1.0.2/src/xclbins/Qwen3.6-35B-A3B-NPU2/layer.xclbin`
+   etc. A FastFlowLM checkout or install also works — the engine's default
+   path points at one. The script pins FLM **v1.0.2**: the captured kernel
+   ELFs pair with that release's kernels, and upstream `main` already ships
+   different bytes.) The per-op kernel *ELFs* (`elf_*.bin`) are a separate
+   matter: FLM's engine generates them at runtime, so they must be captured
+   locally with `tools/seq-capture` — they are neither downloadable nor
+   redistributable.
+2. **Build the C++/XRT drivers + shim** (Windows + MSVC + XRT):
    ```sh
    cd npu-engine/xrt-shim && ./build_shim.cmd
    cd ../m0 && ./build_nobarrier.cmd     # ping-pong context decode driver
    cd ..    && cargo build --release --features npu
    ```
-2. **Build the per-layer NPU weight pools** from the q4nx file + serialize the
+3. **Build the per-layer NPU weight pools** from the q4nx file + serialize the
    CPU-computed prefill state:
    ```sh
    cd tools/kernel-interp
    python run_5li3_npu.py     # interval-3 slice, or:
    python l30_build.py        # full 30-layer model
    ```
-3. **Generate** (autoregressive, NPU runs the layers, host samples):
+4. **Generate** (autoregressive, NPU runs the layers, host samples):
    ```sh
    python generate_npu.py --prompt "why is the sky blue?"
    ```

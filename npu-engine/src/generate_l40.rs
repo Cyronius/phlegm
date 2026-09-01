@@ -43,9 +43,15 @@ pub struct L40Config {
 
 impl Default for L40Config {
     fn default() -> L40Config {
+        // FLM_XCLBIN_DIR overrides where the closed .xclbin kernels are found
+        // (they are NOT in this repo — see NOTICE.md / tools/get-kernels.ps1);
+        // the fallback is a FastFlowLM checkout's copy.
+        let xclbin_dir = std::env::var("FLM_XCLBIN_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("C:/code/FastFlowLM/src/xclbins/Qwen3.6-35B-A3B-NPU2"));
         L40Config {
             model_path: PathBuf::from("C:/Users/josha/.flm/models/Qwen3.6-35B-A3B-NPU2/model.q4nx"),
-            xclbin_dir: PathBuf::from("C:/code/FastFlowLM/src/xclbins/Qwen3.6-35B-A3B-NPU2"),
+            xclbin_dir,
             elf_dir: PathBuf::from("C:/caps/m0c"),
             buf_dir: PathBuf::from("C:/code/FastFlowLM/npu-engine/m3out/l40"),
             num_layers: 40,
