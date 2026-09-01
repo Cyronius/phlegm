@@ -6,5 +6,5 @@ out/
 *.obj
 *.lib
 .npu.lock
-deps/
 m0/*_log.txt
+deps/XRT/.git-not-a-repo/
