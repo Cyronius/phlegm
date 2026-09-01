@@ -54,9 +54,9 @@ wrong ⇒ ~0.3–0.6.
 ### Quantized (I8, q4_1 5120B) — experts stored **contiguous per expert**
 | GGUF name | q4nx name | shape | transform |
 |---|---|---|---|
-| `blk.N.attn_qkv.weight` | `…linear_attn.qkv_proj.weight` | [8192,2048] | identity |
-| `blk.N.attn_gate.weight` | `…self_attn.gate_proj.weight` (z-gate) | [4096,2048] | identity |
-| `blk.N.ssm_out.weight` | `…linear_attn.ssm_out_proj.weight` | [2048,4096] | identity |
+| `blk.N.attn_qkv.weight` | `…linear_attn.qkv_proj.weight` | [8192,2048] | **v rows regrouped** (g q)→(q g), q/k rows identity |
+| `blk.N.attn_gate.weight` | `…self_attn.gate_proj.weight` (z-gate) | [4096,2048] | **rows regrouped** (g q)→(q g) |
+| `blk.N.ssm_out.weight` | `…linear_attn.ssm_out_proj.weight` | [2048,4096] | **cols regrouped** (g q)→(q g) |
 | `blk.N.attn_q.weight` (full-attn) | `…self_attn.q_proj.weight` | [8192,2048] | **deinterleave** `(g16 p2 h256)→(p g h)` → planar `[q4096 | gate4096]` |
 | `blk.N.attn_k/v.weight` | `…self_attn.k/v_proj.weight` | [512,2048] | identity |
 | `blk.N.attn_output.weight` | `…self_attn.o_proj.weight` | [2048,4096] | identity |
@@ -64,8 +64,37 @@ wrong ⇒ ~0.3–0.6.
 | `blk.N.ffn_down_exps.weight` | `…mlp.down_exps_proj.weight` | [256×2048,512] | per-expert pack |
 | `blk.N.ffn_{gate,up,down}_shexp.weight` | `…mlp.share_{gate,up,down}_exps_proj.weight` | — | identity |
 
-The **only** non-identity weight reorder is the full-attn `q_proj` deinterleave
-(the `attn_output_gate` q/gate are stored interleaved per head in HF/GGUF, planar in FLM).
+Non-identity reorders: the full-attn `q_proj` deinterleave (the `attn_output_gate`
+q/gate are stored interleaved per head in HF/GGUF, planar in FLM), and — for every
+**linear-attention** tensor with a v-head axis — the **(g q)→(q g) head regroup**
+below.
+
+### Linear-attention v-head regroup (found on the real 27B GGUF, 2026-09-01)
+Gated DeltaNet here has 16 k-heads and 32 v-heads (2 v-heads per k-head, head dim
+128). llama.cpp's HF→GGUF writes every v-head-indexed axis **group-major** `(g q)`
+(g=2 groups outer, q=16 k-heads inner); HF and FLM 1.0.2 are **head-major** `(q g)`.
+Affected: `attn_qkv` v-rows, `attn_gate` (z) rows, `ssm_out` cols, `ssm_alpha/beta`
+head cols, `ssm_a`, `ssm_dt.bias`, `ssm_conv1d` v-cols. `convert.py::regroup_vheads_axis`
+does GGUF→HF. Evidence (`compare_vs_base.py`, Cyrus's converted 27B vs base 35B
+`model.q4nx.orig`, LoRA-healed weights still ~0.99 vs their source layer): with the
+identity mapping those tensors read cos 0.06–0.6 while every other tensor read
+0.99–1.00; with the regroup all read 0.9935–1.0000. The reference converter's
+"reorder_linear" touches the same tensor set (in the other direction, for the 1.0.3
+layout). `ssm_a` additionally was being exponentiated twice — the GGUF already
+carries −exp(A_log) (`log(−converted)` regrouped matched base at cos 1.0000).
+
+### MTP / nextn layers
+llama.cpp appends the MTP head as an extra `blk.<n_layer>` carrying a full
+attention+MoE sub-layer set plus `blk.N.nextn.*`, and counts it in `block_count`
+(`qwen35moe.nextn_predict_layers` = 1). FLM drops MTP entirely; `convert.py`
+excludes any block with `nextn.*` tensors (Cyrus's file: 31 blocks → 30 decoder
+layers) instead of emitting it as a bogus 31st decoder layer.
+
+### Validating a conversion
+`python compare_vs_base.py CONVERTED.q4nx BASE.q4nx` — per-tensor cosine of a
+converted file against a known-good q4nx of the same architecture, across the
+layer mapping (default: the 27B prune keeps base layers 0,2,3 / 4,6,7 / …).
+Anything under ~0.95 on a non-expert tensor is a mapping/permutation bug.
 
 ### q8 (8704B) and passthrough (BF16 / F32)
 | GGUF name | q4nx name | transform / dtype |
@@ -74,10 +103,10 @@ The **only** non-identity weight reorder is the full-attn `q_proj` deinterleave
 | `token_embd.weight` | `model.embed_tokens.weight` | BF16 |
 | `output_norm.weight` | `model.norm.weight` | BF16 |
 | `blk.N.ffn_gate_inp.weight` | `…moe_router.weight` | **.T** → [2048,256] BF16 |
-| `blk.N.ssm_alpha/beta.weight` | `…linear_attn.ssm_{alpha,beta}_proj.weight` | **.T** → [2048,32] BF16 |
-| `blk.N.ssm_conv1d.weight` | `…linear_attn.ssm_conv1d.weight` | squeeze **.T** → [4,8192] BF16 |
-| `blk.N.ssm_a` | `…linear_attn.ssm_a` | **−exp(A_log)** (pre-baked) F32 |
-| `blk.N.ssm_dt.bias` | `…linear_attn.ssm_dt.bias` | identity F32 |
+| `blk.N.ssm_alpha/beta.weight` | `…linear_attn.ssm_{alpha,beta}_proj.weight` | **.T** → [2048,32] BF16, then **head cols regrouped** (g q)→(q g) |
+| `blk.N.ssm_conv1d.weight` | `…linear_attn.ssm_conv1d.weight` | squeeze **.T** → [4,8192] BF16, then **v cols regrouped** |
+| `blk.N.ssm_a` | `…linear_attn.ssm_a` | **passthrough** (GGUF already stores −exp(A_log), all-negative) + **regrouped** F32 |
+| `blk.N.ssm_dt.bias` | `…linear_attn.ssm_dt.bias` | **regrouped** (g q)→(q g) F32 |
 | `blk.N.ssm_norm.weight` | `…linear_attn.ssm_norm.weight` | identity BF16 (**no +1**) |
 | `blk.N.attn_norm.weight` | `…input_layernorm.weight` | BF16 (see norm +1) |
 | `blk.N.post_attention_norm.weight` | `…post_attention_layernorm.weight` | BF16 |
@@ -101,16 +130,13 @@ and concatenates in expert order 0…255 (gate/up separate, not gpt-oss-interlea
 this arch keeps them as distinct tensors). Verified: converted expert 7 matches
 Cyrus's FILE expert 7 (contiguous placement, quant bound).
 
-## Assumption that needs the real GGUF to lock down
-The mapping was derived against HF-original weights. It is correct for a GGUF that
-(a) preserves HF row order and (b) bakes norm +1 — both **standard llama.cpp
-behavior** for NEOX-rope Qwen (no q/k permute), and consistent with the reference
-converter. The reference converter additionally applies ssm/qkv/z head-pairing
-reorders; those were **not** needed vs HF here (they belong to the newer FLM
-format). Before trusting a full 27B run, confirm on the **base 35B GGUF** against
-`model.q4nx.orig` (same per-layer structure) that each tensor decodes at the quant
-bound — if any projection lands at ~0.3, that GGUF applies llama.cpp's extra
-permutation and the reference converter's reorderings must be re-enabled.
+## Status of the "real GGUF" assumption (resolved 2026-09-01)
+The mapping was originally derived against HF-original weights and assumed a GGUF
+preserves HF order. It does for full-attention, MoE, norms and globals (all
+0.99–1.00 vs base), but **not** for the linear-attention v-head axes — see the
+regroup section above. Norm +1 baking is confirmed (no zero-centered norm
+warnings on the real file). Converting Cyrus's 27B with the fixed mapping is the
+first real-GGUF end-to-end run; the resulting NPU generation is the next check.
 
 ## Reading FLM 1.0.3 (Q4_K) files — separate from the GGUF converter above
 

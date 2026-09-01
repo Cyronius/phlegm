@@ -1,5 +1,15 @@
-//! The base-model (40-layer, resident-pool) generate loop: `L40Backend`, the
-//! first `backend::Backend` with NO CPU forward math on the request path.
+//! The resident-pool generate loop: `L40Backend`, the first
+//! `backend::Backend` with NO CPU forward math on the request path.
+//!
+//! Named for the base 40-layer model it shipped against, but layer-count
+//! agnostic: `L40Config::num_layers` + `buf_dir` select the schedule. The
+//! fused layer kernel is config-agnostic (pack/side/pool encode whether a
+//! layer is linear- or full-attention), so the 30-layer interval-3 pruned
+//! model runs on this exact code path too — `L40Config::l30()`. 30 x 512MB
+//! pools = 15GB resident, comfortably under the 20GB the 40L config already
+//! holds the same way (the earlier "l30 must stream pools" assumption in
+//! `generate_l30.rs` predates the resident 40L result and was never
+//! measured).
 //!
 //! Phase 1 of `docs/npu-prefill.md`: prompt tokens are prefilled by
 //! SEQUENTIAL DECODE from zeroed states ("decode-as-prefill" — the decode
@@ -56,6 +66,47 @@ impl Default for L40Config {
             buf_dir: PathBuf::from("C:/code/FastFlowLM/npu-engine/m3out/l40"),
             num_layers: 40,
         }
+    }
+}
+
+impl L40Config {
+    /// The 30-layer pruned/interval-3 schedule, resident. Same xclbins/ELFs;
+    /// buffers come from `l30_buffers::build` (Rust builders — same layouts
+    /// `pools_only_l40.py` produces for the 40L dir) in
+    /// `generate_l30::DEFAULT_OUT_DIR`. `num_layers` is read off the model
+    /// file so a differently-sliced `.q4nx` at that path just works.
+    ///
+    /// Env overrides (so a converted model can be pointed at without a code
+    /// edit): `OPEN_QWEN_L30_MODEL` (path to the `.q4nx`; its directory must
+    /// also hold `tokenizer.json`) and `OPEN_QWEN_L30_BUF_DIR` (where
+    /// `l30_buffers::build` writes / `Resident::open` reads the buffers).
+    pub fn l30() -> L40Config {
+        let model_path = std::env::var("OPEN_QWEN_L30_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(crate::generate_l30::DEFAULT_MODEL));
+        let buf_dir = std::env::var("OPEN_QWEN_L30_BUF_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(crate::generate_l30::DEFAULT_OUT_DIR));
+        let num_layers = crate::forward::open_model(&model_path).layer_types.len();
+        L40Config { model_path, buf_dir, num_layers, ..L40Config::default() }
+    }
+
+    /// The prompt-independent buffer files `Resident::open` will load, in
+    /// load order. Used to fail early with a useful message (and by the l30
+    /// CLI to decide whether to run `l30_buffers::build` first).
+    pub fn required_files(&self) -> Vec<PathBuf> {
+        let mut v = Vec::new();
+        for l in 0..self.num_layers {
+            v.push(self.buf_dir.join(format!("pool_L{l}.bin")));
+            v.push(self.buf_dir.join(format!("pack_L{l}.bin")));
+            v.push(self.buf_dir.join(format!("side_L{l}.bin")));
+        }
+        v.push(self.buf_dir.join("pool_lmhead.bin"));
+        v
+    }
+
+    pub fn missing_files(&self) -> Vec<PathBuf> {
+        self.required_files().into_iter().filter(|p| !p.exists()).collect()
     }
 }
 
@@ -129,6 +180,15 @@ mod npu_impl {
 
     impl Resident {
         fn open(cfg: &L40Config) -> Result<Resident, String> {
+            let missing = cfg.missing_files();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "resident backend: {} buffer file(s) missing under {} (first: {}) — build them first (l30: `open-qwen-npu l30-build`; l40: tools/kernel-interp/pools_only_l40.py)",
+                    missing.len(),
+                    cfg.buf_dir.display(),
+                    missing[0].display()
+                ));
+            }
             let lock = NpuLock::acquire("l40")?;
             let t0 = Instant::now();
             let dev = Device::open(0)?;

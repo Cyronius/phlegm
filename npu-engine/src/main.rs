@@ -219,6 +219,24 @@ fn main() {
         }
         #[cfg(feature = "npu")]
         Some("l30-run") => {
+            // Resident path (NPU prefill + decode + lm_head, pools loaded once).
+            let prompt = args.get(2).cloned().unwrap_or_else(|| "What is the capital of France?".to_string());
+            let max_tokens: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(32);
+            let cfg = l30_resident_config_ensuring_buffers();
+            let model_dir = cfg.model_path.parent().unwrap().to_path_buf();
+            run_backend_cli(&model_dir, &prompt, max_tokens, generate_l40::L40Backend::new(cfg));
+        }
+        Some("l30-build") => {
+            // (Re)build the prompt-independent l30 buffers (pools/packs/sides,
+            // zeroed states, lm_head pool). Pure CPU + disk; ~16GB written.
+            let cfg = generate_l40::L40Config::l30(); // honors OPEN_QWEN_L30_MODEL / _BUF_DIR
+            let model = forward::open_model(&cfg.model_path);
+            let b = l30_buffers::build(&model, &cfg.buf_dir).expect("l30_buffers::build");
+            eprintln!("l30-build: {} layers written to {}", b.layer_types.len(), b.out_dir.display());
+        }
+        #[cfg(feature = "npu")]
+        Some("l30-stream-run") => {
+            // Legacy pool-streaming path (reloads 15GB per token); see generate_l30.rs.
             let prompt = args.get(2).cloned().unwrap_or_else(|| "What is the capital of France?".to_string());
             let max_tokens: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(32);
             let model_dir = Path::new(generate_l30::DEFAULT_MODEL).parent().unwrap().to_path_buf();
@@ -247,12 +265,19 @@ fn main() {
                 }
                 #[cfg(feature = "npu")]
                 "l30" => {
-                    cfg.model_dir = Some(Path::new(generate_l30::DEFAULT_MODEL).parent().unwrap().to_path_buf());
+                    let l30cfg = l30_resident_config_ensuring_buffers();
+                    cfg.model_dir = Some(l30cfg.model_path.parent().unwrap().to_path_buf());
                     cfg.backend_name = "l30".to_string();
+                    Box::new(generate_l40::L40Backend::new(l30cfg))
+                }
+                #[cfg(feature = "npu")]
+                "l30-stream" => {
+                    cfg.model_dir = Some(Path::new(generate_l30::DEFAULT_MODEL).parent().unwrap().to_path_buf());
+                    cfg.backend_name = "l30-stream".to_string();
                     Box::new(generate_l30::L30Backend::open_default())
                 }
                 other => {
-                    eprintln!("unknown --backend {other} (mock{})", if cfg!(feature = "npu") { ", li3, l30, l40" } else { " — build with --features npu for li3/l30/l40" });
+                    eprintln!("unknown --backend {other} (mock{})", if cfg!(feature = "npu") { ", li3, l30, l30-stream, l40" } else { " — build with --features npu for li3/l30/l40" });
                     std::process::exit(2);
                 }
             };
@@ -267,17 +292,33 @@ fn main() {
             eprintln!("       open-qwen-npu run          <model.q4nx> <ids,csv>");
             eprintln!("       open-qwen-npu tokenize     <model_dir> <text>");
             eprintln!("       open-qwen-npu chattemplate <model_dir> <user_msg> [--no-think]");
-            eprintln!("       open-qwen-npu serve        [--backend mock|li3|l30]   (OpenAI-compatible HTTP server)");
+            eprintln!("       open-qwen-npu serve        [--backend mock|li3|l30|l30-stream|l40]   (OpenAI-compatible HTTP server)");
+            eprintln!("       open-qwen-npu l30-build                            (write the l30 resident buffers, ~16GB)");
             #[cfg(feature = "npu")]
             {
                 eprintln!("       open-qwen-npu npu          <driver-config>   (NPU decode driver)");
                 eprintln!("       open-qwen-npu li3-run      [prompt] [max_tokens]   (5li3 resident generate loop)");
-                eprintln!("       open-qwen-npu l30-run      [prompt] [max_tokens]   (l30 streamed generate loop)");
+                eprintln!("       open-qwen-npu l30-run      [prompt] [max_tokens]   (30L pruned model, resident, NPU prefill)");
+                eprintln!("       open-qwen-npu l30-stream-run [prompt] [max_tokens] (30L legacy pool-streaming loop)");
                 eprintln!("       open-qwen-npu l40-run      [prompt] [max_tokens]   (base 40L resident loop, NPU prefill)");
             }
             std::process::exit(2);
         }
     }
+}
+
+/// Resident l30 config, building the prompt-independent buffers first if any
+/// are missing (one-time, ~16GB to disk; later runs skip straight to load).
+#[cfg(feature = "npu")]
+fn l30_resident_config_ensuring_buffers() -> generate_l40::L40Config {
+    let cfg = generate_l40::L40Config::l30();
+    let missing = cfg.missing_files();
+    if !missing.is_empty() {
+        eprintln!("l30: {} buffer file(s) missing under {} — building", missing.len(), cfg.buf_dir.display());
+        let model = forward::open_model(&cfg.model_path);
+        l30_buffers::build(&model, &cfg.buf_dir).expect("l30_buffers::build");
+    }
+    cfg
 }
 
 /// Shared CLI driver for any `Backend`: render the chat template, generate,

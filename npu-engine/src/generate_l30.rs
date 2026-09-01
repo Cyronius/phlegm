@@ -1,17 +1,33 @@
 //! The l30 (30-layer, pool-STREAMING) generate loop: `L30Backend`, a
-//! `backend::Backend` for the schedule that can't keep its weight pools
-//! resident (30 x 512MB pools = 15GB), unlike the 5li3 schedule.
+//! `backend::Backend` that reloads its weight pools from disk every step.
+//!
+//! **Superseded for real use by the resident path**: `L40Config::l30()` +
+//! `L40Backend` (`generate_l40.rs`) hold all 30 pools on-device across
+//! requests, run NPU prefill + NPU decode + NPU lm_head, and are what
+//! `l30-run` / `serve --backend l30` use. This streamed loop was built on the
+//! assumption that 15GB of pools could not stay resident; the 40L backend
+//! holding 20GB resident disproved that. Kept as `l30-stream-run` /
+//! `--backend l30-stream` as a low-memory fallback and as a second
+//! implementation for cross-checking.
 //!
 //! Ported from `tools/kernel-interp/l30_run_npu.py`'s `gen_stream_cfg` (config
 //! generation) and `gen` mode (the decode loop), but restructured around the
-//! in-process, no-subprocess driver: [`l30_buffers::build`] does the
-//! per-request CPU prefill + buffer write (mirrors `l30_build.py`),
+//! in-process, no-subprocess driver: [`l30_buffers::build`] writes the
+//! prompt-independent pool/pack/side buffers plus zeroed per-layer state,
 //! [`decode::load_resident`] opens the device/xclbins/kernels and the
 //! resident buffers ONCE, and the decode loop calls
 //! [`decode::Driver::step_bytes`] repeatedly instead of `l30_run_npu.py`'s
 //! `run_driver` (which re-spawns `decode_driver.exe` as a fresh subprocess
 //! for every single token — the very overhead this whole rewrite exists to
 //! remove).
+//!
+//! Prefill is decode-as-prefill (see `generate_l40.rs` / `docs/npu-prefill.md`
+//! Phase 0): the prompt is fed through the same streamed decode step one
+//! token at a time from zeroed state, since the layer kernel self-tracks its
+//! own KV/state position on-device. This replaced an earlier CPU-forward
+//! prefill (`forward::run_prefill`) that was found to be numerically
+//! divergent from verified NPU behavior — see `.claude/plans/
+//! l30-npu-prefill.md` and the `flm-capture-oracle` memory.
 //!
 //! Every streamed decode step still has to reload 30 x 512MB = 15GB off disk
 //! (only 3 pool BOs — poolA/B/C — stay resident, reloaded 3-layers-at-a-time
@@ -34,17 +50,26 @@ use crate::sampler;
 #[cfg(feature = "npu")]
 use crate::state_io;
 
-pub const DEFAULT_MODEL: &str = "C:/Users/josha/.flm/models/Qwen3.6-35B-A3B-NPU2/model_30L.q4nx";
+/// Default 30-layer model: Cyrus's pruned + LoRA-healed Qwen3.6-27B-A2.8B,
+/// converted from its Q4_K_M GGUF by `tools/q4nx-convert/convert.py`
+/// (2026-09-01). The dir also holds `tokenizer.json`, `tokenizer_config.json`
+/// and `chat_template.jinja` (copied from the HF repo's `raw/`). The earlier
+/// default, `model_30L.q4nx`, was an UNHEALED raw slice of the base 35B made
+/// for the closed-engine structure test — it generates garbage in any engine
+/// and was deleted in the 2026-09-01 cleanup. Override with `OPEN_QWEN_L30_MODEL`.
+pub const DEFAULT_MODEL: &str = "C:/Users/josha/.flm/models/Qwen3.6-27B-A2.8B-open/model.q4nx";
 pub const DEFAULT_XCLBIN_DIR: &str = "C:/code/FastFlowLM/src/xclbins/Qwen3.6-35B-A3B-NPU2";
 pub const DEFAULT_CAP_DIR: &str = "C:/caps/m0c";
-pub const DEFAULT_OUT_DIR: &str = "C:/code/FastFlowLM/npu-engine/m3out/l30_gen";
+/// Resident buffers for `DEFAULT_MODEL` (built by `l30-build`). Override with
+/// `OPEN_QWEN_L30_BUF_DIR`.
+pub const DEFAULT_OUT_DIR: &str = "C:/code/FastFlowLM/npu-engine/m3out/l30_27b";
 
 /// A `Backend` for the streamed 30-layer schedule. Holds the open model (for
-/// CPU prefill + CPU lm_head — the NPU only ever computes the raw per-layer
-/// residual update, never the final logits) and the paths a request's config
-/// text is built from. No NPU/XRT state is held between calls: each
-/// `generate` call builds a fresh buffer set for its prompt, opens the
-/// device, and tears it down when the call returns (dropping the driver and
+/// embedding-row reads and CPU lm_head — the NPU only ever computes the raw
+/// per-layer residual update, never the final logits) and the paths a
+/// request's config text is built from. No NPU/XRT state is held between
+/// calls: each `generate` call builds a fresh buffer set, opens the device,
+/// and tears it down when the call returns (dropping the driver and
 /// releasing the NPU lock).
 pub struct L30Backend {
     pub model: Model,
@@ -148,19 +173,30 @@ fn hidden_to_residual_f64(hidden: &[u8; 8192]) -> Vec<f64> {
 #[cfg(feature = "npu")]
 use crate::npu_lock::NpuLock;
 
+/// KV capacity of the 3MB per-layer state buffer (same format L40 uses) —
+/// prompt length + generated tokens must fit under this.
+#[cfg(feature = "npu")]
+const MAX_POSITIONS: usize = 1024;
+
 #[cfg(feature = "npu")]
 impl Backend for L30Backend {
-    /// Build this request's buffers (per-request real prefill, not a fixed
-    /// offline one — closes the "known functional gap" noted in the rewrite
-    /// plan), open the device once, then decode-step token by token,
-    /// streaming 15GB off disk per step.
+    /// Build this request's prompt-independent buffers (zeroed state — no
+    /// CPU forward), open the device once, run the prompt through the
+    /// streamed decode step as decode-as-prefill, then continue decode-
+    /// stepping token by token, streaming 15GB off disk per step.
     fn generate(&mut self, prompt_ids: &[u32], params: &mut GenParams, on_token: &mut dyn FnMut(u32)) -> Result<(), String> {
         if prompt_ids.is_empty() {
             return Err("L30Backend::generate: empty prompt".to_string());
         }
-        let ids: Vec<i64> = prompt_ids.iter().map(|&x| x as i64).collect();
+        if prompt_ids.len() + params.max_tokens > MAX_POSITIONS {
+            return Err(format!(
+                "prompt ({}) + max_tokens ({}) exceeds the {MAX_POSITIONS}-position KV capacity",
+                prompt_ids.len(),
+                params.max_tokens
+            ));
+        }
 
-        let build = l30_buffers::build(&self.model, &ids, &self.out_dir)?;
+        let build = l30_buffers::build(&self.model, &self.out_dir)?;
 
         let cfg_text = build_stream_config(&build.out_dir, &self.xclbin_dir, &self.cap_dir, build.layer_types.len());
         let cfg_path = build.out_dir.join("cfg_gen_stream.txt");
@@ -172,9 +208,25 @@ impl Backend for L30Backend {
         let (mut driver, prog) = decode::load_resident(&cfg_path)?;
 
         let norm_weight = self.model.file.bf16("model.norm.weight");
-        let mut history: Vec<i64> = ids;
+        let mut history: Vec<i64> = prompt_ids.iter().map(|&t| t as i64).collect();
 
-        let mut tok = build.first_token;
+        // ---- NPU prefill: decode-as-prefill from zeroed state ------------
+        // Mathematically exact prefill (see generate_l40.rs / docs/
+        // npu-prefill.md Phase 0): the layer kernel self-tracks its own
+        // KV/state position on-device, so feeding the prompt one token at a
+        // time from zeroed state reproduces batch prefill exactly. This is
+        // the SAME per-token streamed step the decode loop below uses.
+        let mut hidden = [0u8; 8192];
+        for &tok in prompt_ids {
+            let embed = self.model.embed(tok as usize);
+            let act = state_io::write_act(&embed, &norm_weight);
+            hidden = driver.step_bytes(&prog, &act)?;
+        }
+        let x_last = hidden_to_residual_f64(&hidden);
+        let lg0 = self.model.logits(&x_last);
+        let mut tok = params.sampler.sample(&lg0, &history) as u32;
+
+        // ---- sample + decode loop -----------------------------------------
         for i in 0..params.max_tokens {
             if params.stop_ids.contains(&tok) {
                 break;
@@ -265,8 +317,9 @@ mod tests {
 
     /// For the real 30-layer model: `l30_buffers::build` writes every
     /// pool/pack/side/state file plus the lm_head pool, at the exact sizes
-    /// the driver config declares. No NPU/hardware needed (pure CPU + disk),
-    /// but writing ~15.75GB from a real model is minutes of wall-clock —
+    /// the driver config declares (state files zero-filled — no prompt
+    /// needed any more). No NPU/hardware needed (pure CPU + disk), but
+    /// writing ~15.75GB from a real model is minutes of wall-clock —
     /// `#[ignore]`d, invoke with a generous bounded timeout.
     #[test]
     #[ignore]
@@ -276,12 +329,8 @@ mod tests {
         let nlayers = model.layer_types.len();
         assert!(nlayers > 0, "model has no layers");
 
-        let model_dir = model_path.parent().unwrap();
-        let tok = crate::tokenizer::Tokenizer::load(model_dir).expect("load tokenizer");
-        let ids: Vec<i64> = tok.encode("The capital of France is").expect("encode").iter().map(|&x| x as i64).collect();
-
         let out_dir = Path::new("C:/code/FastFlowLM/npu-engine/m3out/l30_gen_bufcheck");
-        let build = l30_buffers::build(&model, &ids, out_dir).expect("l30_buffers::build");
+        let build = l30_buffers::build(&model, out_dir).expect("l30_buffers::build");
 
         assert_eq!(build.layer_types.len(), nlayers);
         assert_eq!(build.out_dir, out_dir);
@@ -293,13 +342,14 @@ mod tests {
             assert_eq!(pack_len, 2_097_152, "pack_L{l}.bin size");
             let side_len = std::fs::metadata(out_dir.join(format!("side_L{l}.bin"))).unwrap().len();
             assert_eq!(side_len, 6_291_456, "side_L{l}.bin size");
-            let state_len = std::fs::metadata(out_dir.join(format!("state_L{l}.bin"))).unwrap().len();
-            assert_eq!(state_len, 3_145_728, "state_L{l}.bin size");
+            let state_bytes = std::fs::read(out_dir.join(format!("state_L{l}.bin"))).unwrap();
+            assert_eq!(state_bytes.len(), 3_145_728, "state_L{l}.bin size");
+            assert!(state_bytes.iter().all(|&b| b == 0), "state_L{l}.bin should be zero-filled");
         }
         let lm_len = std::fs::metadata(out_dir.join("pool_lmhead.bin")).unwrap().len();
         assert_eq!(lm_len, 542_113_792, "pool_lmhead.bin size");
 
-        println!("l30_buffers: wrote {nlayers} layers + lm_head pool to {} (first_token={})", out_dir.display(), build.first_token);
+        println!("l30_buffers: wrote {nlayers} layers + lm_head pool to {}", out_dir.display());
     }
 
     /// Real end-to-end: build buffers for a short prompt, open the device,

@@ -58,6 +58,55 @@ def deinterleave_qgate(W):
     return W.reshape(g, 2, HEAD_DIM, W.shape[1]).transpose(1, 0, 2, 3).reshape(rows, W.shape[1])
 
 
+# Linear-attention (gated DeltaNet) head geometry: 16 k-heads x 128, 32 v-heads
+# x 128 (2 v-heads per k-head). llama.cpp's HF->GGUF stores every v-head-indexed
+# axis GROUP-major, (g q) with g=2, q=16 — HF/FLM order is HEAD-major (q g).
+# Established 2026-09-01 by cosine-matching Cyrus's converted 27B against the
+# base 35B q4nx (LoRA-healed weights still ~0.99 vs their source layer): the
+# identity mapping left qkv's v-half, z-gate, ssm_out cols, alpha/beta, dt.bias
+# and conv1d's v-cols at cos 0.06-0.6; regrouping (g q)->(q g) brings all of
+# them to 0.99-1.00.  (These are the same tensors the reference converter
+# calls "reorder_linear"; its rearrange goes the other way because it targets
+# the newer FLM 1.0.3 layout.)
+LIN_K_HEADS = 16
+LIN_V_HEADS = 32
+LIN_HEAD_DIM = 128
+LIN_G = LIN_V_HEADS // LIN_K_HEADS   # 2
+
+
+def regroup_vheads_axis(W, axis):
+    """(g q) -> (q g) on an axis of length LIN_V_HEADS*LIN_HEAD_DIM (per-head
+    128-blocks) or LIN_V_HEADS (per-head scalars)."""
+    W = np.asarray(W)
+    n = W.shape[axis]
+    W = np.moveaxis(W, axis, 0)
+    rest = W.shape[1:]
+    if n == LIN_V_HEADS * LIN_HEAD_DIM:
+        W = W.reshape(LIN_G, LIN_K_HEADS, LIN_HEAD_DIM, *rest).transpose(1, 0, 2, *range(3, 3 + len(rest)))
+    elif n == LIN_V_HEADS:
+        W = W.reshape(LIN_G, LIN_K_HEADS, *rest).transpose(1, 0, *range(2, 2 + len(rest)))
+    else:
+        raise ValueError(f"regroup_vheads_axis: axis len {n} is not a v-head axis")
+    W = W.reshape(n, *rest)
+    return np.ascontiguousarray(np.moveaxis(W, 0, axis))
+
+
+def regroup_qkv_rows(W):
+    """attn_qkv [q(2048) | k(2048) | v(4096), in]: only the v rows are v-head indexed."""
+    qk = LIN_K_HEADS * LIN_HEAD_DIM * 2
+    out = np.array(W, np.float32, copy=True)
+    out[qk:] = regroup_vheads_axis(W[qk:], 0)
+    return out
+
+
+def regroup_conv_vcols(W_kd):
+    """conv1d after the [k, dim] transpose: dim = [q 2048 | k 2048 | v 4096]."""
+    qk = LIN_K_HEADS * LIN_HEAD_DIM * 2
+    out = np.array(W_kd, np.float32, copy=True)
+    out[:, qk:] = regroup_vheads_axis(W_kd[:, qk:], 1)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 #  name mapping (GGUF llama.cpp name -> q4nx name) + how to emit
 # --------------------------------------------------------------------------- #
@@ -71,14 +120,15 @@ GLOBAL_MAP = {
 # per-layer: gguf suffix -> (q4nx suffix, emit, transform)
 LAYER_MAP = {
     # linear-attn block
-    "attn_qkv.weight":  ("linear_attn.qkv_proj.weight",         "q4",   None),
-    "attn_gate.weight": ("self_attn.gate_proj.weight",          "q4",   None),   # z-gate on linear layers
-    "ssm_out.weight":   ("linear_attn.ssm_out_proj.weight",     "q4",   None),
-    "ssm_a":            ("linear_attn.ssm_a",                   "f32",  "neg_exp"),
-    "ssm_dt.bias":      ("linear_attn.ssm_dt.bias",            "f32",  None),
-    "ssm_alpha.weight": ("linear_attn.ssm_alpha_proj.weight",   "bf16", "T"),
-    "ssm_beta.weight":  ("linear_attn.ssm_beta_proj.weight",    "bf16", "T"),
-    "ssm_conv1d.weight":("linear_attn.ssm_conv1d.weight",       "bf16", "conv"),
+    "attn_qkv.weight":  ("linear_attn.qkv_proj.weight",         "q4",   "qkv_vheads"),
+    "attn_gate.weight": ("self_attn.gate_proj.weight",          "q4",   "rows_vheads"),   # z-gate on linear layers
+    "ssm_out.weight":   ("linear_attn.ssm_out_proj.weight",     "q4",   "cols_vheads"),
+    # GGUF already carries -exp(A_log) (all-negative); do NOT exponentiate again.
+    "ssm_a":            ("linear_attn.ssm_a",                   "f32",  "vec_vheads"),
+    "ssm_dt.bias":      ("linear_attn.ssm_dt.bias",            "f32",  "vec_vheads"),
+    "ssm_alpha.weight": ("linear_attn.ssm_alpha_proj.weight",   "bf16", "T_cols_vheads"),
+    "ssm_beta.weight":  ("linear_attn.ssm_beta_proj.weight",    "bf16", "T_cols_vheads"),
+    "ssm_conv1d.weight":("linear_attn.ssm_conv1d.weight",       "bf16", "conv_vheads"),
     "ssm_norm.weight":  ("linear_attn.ssm_norm.weight",         "bf16", None),
     # full-attn block
     "attn_q.weight":    ("self_attn.q_proj.weight",             "q4",   "deint_q"),
@@ -118,6 +168,18 @@ def apply_transform(W, kind):
         return np.asarray(W, np.float32).reshape(-1)
     if kind == "deint_q":
         return deinterleave_qgate(W)
+    if kind == "qkv_vheads":
+        return regroup_qkv_rows(np.asarray(W, np.float32))
+    if kind == "rows_vheads":
+        return regroup_vheads_axis(np.asarray(W, np.float32), 0)
+    if kind == "cols_vheads":
+        return regroup_vheads_axis(np.asarray(W, np.float32), 1)
+    if kind == "vec_vheads":
+        return regroup_vheads_axis(np.asarray(W, np.float32).reshape(-1), 0)
+    if kind == "T_cols_vheads":
+        return regroup_vheads_axis(np.ascontiguousarray(np.asarray(W, np.float32).T), 1)
+    if kind == "conv_vheads":
+        return regroup_conv_vcols(apply_transform(W, "conv"))
     raise ValueError(kind)
 
 
@@ -192,6 +254,18 @@ def convert(gguf_path, out_dir, max_layers=None, warn_norms=True):
             except ValueError:
                 pass
     n_layers = max(layer_ids) + 1 if layer_ids else 0
+    # MTP ("nextn") layers: llama.cpp appends them as extra blk.N entries that
+    # carry a full attention+MoE sub-layer set plus blk.N.nextn.* tensors, and
+    # counts them in block_count. FLM drops MTP entirely, so exclude them here —
+    # otherwise the last (MTP) block would be emitted as a real decoder layer.
+    nextn = int(meta.get("qwen35moe.nextn_predict_layers", 0) or 0)
+    nextn_blocks = sorted({int(k.split(".")[1]) for k in gt if k.startswith("blk.") and ".nextn." in k})
+    if nextn_blocks:
+        n_layers = min(n_layers, min(nextn_blocks))
+    elif nextn:
+        n_layers -= nextn
+    if nextn or nextn_blocks:
+        print(f"[INFO] MTP/nextn layers excluded: {nextn_blocks or nextn}; decoder layers = {n_layers}")
     if max_layers:
         n_layers = min(n_layers, max_layers)
     print(f"[INFO] Converting {n_layers} layers")
