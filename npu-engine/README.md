@@ -46,7 +46,7 @@ starting from raw MLIR-AIE examples:
 
 **What none of them have:** a gated-DeltaNet / linear-attention recurrence
 kernel, or MoE expert-routing kernel, for AIE. Every project above targets
-the generic dense-decoder case (matmul, standard softmax attention). Josh's
+the generic dense-decoder case (matmul, standard softmax attention). Cyrus's
 model's hybrid linear-attn + full-attn + MoE architecture, fused the way
 FLM's `layer.xclbin` does it, isn't published anywhere — that piece stays
 novel work regardless of what we borrow.

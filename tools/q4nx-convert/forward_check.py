@@ -1,4 +1,4 @@
-"""End-to-end forward sanity: re-quantize Josh's real model_3LiF.q4nx through THIS
+"""End-to-end forward sanity: re-quantize Cyrus's real model_3LiF.q4nx through THIS
 converter's packer (dequant every tensor -> pack_q4_1/pack_q8_0 / passthrough ->
 new safetensors), then run tools/kernel-interp/full_forward.py on the result and
 confirm FINITE logits that track the original file's forward.

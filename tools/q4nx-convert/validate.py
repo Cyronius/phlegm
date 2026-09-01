@@ -5,7 +5,7 @@ Checks:
     (tools/kernel-interp/q4nx.py layout), matches the GGUF source dequant to the
     q4_1/q8 quantization bound.
  B. Ground-truth (when --file given): tensors converted from the synthetic GGUF
-    (built out of hf_ref/ originals) match Josh's real model_3LiF.q4nx at the
+    (built out of hf_ref/ originals) match Cyrus's real model_3LiF.q4nx at the
     quant bound -- proving the whole read->transform->pack->save pipeline.
  C. Structural: names / shapes / dtypes match the q4nx schema.
 
@@ -98,8 +98,8 @@ def check_roundtrip(q4nx_path, gguf_path):
 
 def check_vs_file(q4nx_path):
     """Compare synthetic-converted layer 0 (HF L0 linear) and layer 1 (HF L3 full-attn)
-    against Josh's real model_3LiF.q4nx layer 0 and layer 2 (= orig layer 3)."""
-    print("=== B. Ground-truth vs Josh's model_3LiF.q4nx ===")
+    against Cyrus's real model_3LiF.q4nx layer 0 and layer 2 (= orig layer 3)."""
+    print("=== B. Ground-truth vs Cyrus's model_3LiF.q4nx ===")
     FILE = "C:/Users/josha/.flm/models/Qwen3.6-35B-A3B-NPU2/model_3LiF.q4nx"
     if not os.path.exists(FILE):
         print("  (skipped: model_3LiF.q4nx not found)\n"); return
@@ -162,7 +162,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--q4nx", required=True)
     ap.add_argument("--gguf", default=None)
-    ap.add_argument("--file", action="store_true", help="compare vs Josh's model_3LiF.q4nx")
+    ap.add_argument("--file", action="store_true", help="compare vs Cyrus's model_3LiF.q4nx")
     args = ap.parse_args()
     check_schema(args.q4nx)
     if args.gguf:

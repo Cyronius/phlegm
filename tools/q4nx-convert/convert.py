@@ -7,7 +7,7 @@ Pipeline per tensor:  GGUF k-quant block  --ggml.dequantize-->  f32
                       safetensors tensor (I8 / BF16 / F32)
 
 The tensor-name map, shapes, dtypes and the single non-identity weight reorder
-(full-attn q_proj deinterleave) were all verified byte-for-byte against Josh's
+(full-attn q_proj deinterleave) were all verified byte-for-byte against Cyrus's
 installed model_3LiF.q4nx (see README.md "Verified mapping").
 
 Usage:

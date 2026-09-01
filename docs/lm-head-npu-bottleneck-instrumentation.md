@@ -268,7 +268,7 @@ target on its own merits.
 
 ## Research: how FLM's closed engine lives with the same 3-layer budget (2026-08-31)
 
-Question from Josh: does FLM avoid the per-context layer budget, and if not,
+Question from Cyrus: does FLM avoid the per-context layer budget, and if not,
 why is it 2x faster? Sources: the closed engine's PE import table
 (`dumpbin /imports qwen3_6_moe_npu.dll`), the m0c full-event capture
 (RUN/SETARG/START/sync stream, 3-layer model, 6 decode tokens), and the
@@ -331,7 +331,7 @@ relevant freedom for the Rust port's position patching.
 ~120ms compute + ~10ms lm_head + small overlapped submission overhead ≈
 **140ms/token = 7.1 tok/s ≈ FLM's measured 7.05.** The books balance: FLM
 is not doing less work — it hides the overhead we currently pay serially.
-Josh's instinct ("no real reason we can't match FLM") is confirmed: every
+Cyrus's instinct ("no real reason we can't match FLM") is confirmed: every
 distinguishing mechanism is available to open code.
 
 **Proposed next experiments (in leverage order, driver-only, no new
@@ -514,6 +514,6 @@ but the numbers are not a demo of prompt-conditioned generation; that wiring
 
 - Not touching `decode.rs` (the Rust port) — that's tracked in
   [rust-only-open-engine.md](rust-only-open-engine.md) and proceeds in
-  parallel per Josh's direction.
+  parallel per Cyrus's direction.
 - Not fixing anything yet — this is measurement only, to make the next
   optimization pick evidence-based instead of a guess.

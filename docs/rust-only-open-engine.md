@@ -1,6 +1,6 @@
 # Rewrite the open NPU engine in Rust, remove Python from the runtime path
 
-## Decisions made (confirmed with Josh)
+## Decisions made (confirmed with Cyrus)
 
 | Question | Decision |
 |---|---|

@@ -43,7 +43,7 @@ builders and kernels. Nothing downstream of dequant changes.
 ## Why this is needed
 
 The public reference converter has moved to the 1.0.3 format. Any model FLM
-publishes going forward ships in 1.0.3. Josh's own 27B will be distributed this
+publishes going forward ships in 1.0.3. Cyrus's own 27B will be distributed this
 way. The open engine must consume those files directly, not only the 1.0.2 files
 that happen to be on disk today.
 
@@ -186,7 +186,7 @@ reference `_pack_q4k` logic → read back with the new reader → round-trips to
 same weights. Proves the reader inverts the packer exactly.
 
 **Final lock (when a real 1.0.3 file exists):** run the new reader on a real FLM
-1.0.3 model (Josh's 27B, or the base-35B), confirm every tensor decodes at the
+1.0.3 model (Cyrus's 27B, or the base-35B), confirm every tensor decodes at the
 quant bound, and resolve the two *inferred* facts (`state_size`, `ssm_a`
 `−exp` vs raw). Then run it end-to-end on the open engine — which already runs
 interval-3 to finite logits where FLM 1.0.2 NaN-collapses.
@@ -195,7 +195,7 @@ interval-3 to finite logits where FLM 1.0.2 NaN-collapses.
 
 ## Real-file validation (2026-08-30) — both inferred constants RESOLVED
 Converted `FastFlowLM/Qwen3.5-0.8B-q4_k.gguf` (a real published GGUF, arch
-`qwen35`, the same DeltaNet family as Josh's `qwen35moe`) through the reference
+`qwen35`, the same DeltaNet family as Cyrus's `qwen35moe`) through the reference
 converter -> a genuine 1.0.3 file (150 Q4_K + 37 q8 tensors). Two results:
 - **Q4_K byte layout confirmed vs INDEPENDENT ground truth**: our
   `dequant_q4k_file` vs `gguf.dequantize` on 126 non-reordered Q4_K matmuls, ALL
@@ -209,11 +209,11 @@ converter -> a genuine 1.0.3 file (150 Q4_K + 37 q8 tensors). Two results:
 Caveat: the 0.8B is small (`ffn=3584 ≤ 6144` → `reorder_linear_required=False`),
 so it does NOT exercise the A3B linear reorders (only the passthrough `q_proj`).
 Those remain validated against the reference packer only; a real A3B (qwen35moe)
-1.0.3 file — Josh's 27B — is the one remaining item to exercise them end-to-end.
+1.0.3 file — Cyrus's 27B — is the one remaining item to exercise them end-to-end.
 
 ## Risks / open items
 - **A3B linear reorders** validated against the reference packer + a transcode,
-  not yet against a real qwen35moe 1.0.3 file (none published; needs Josh's 27B).
+  not yet against a real qwen35moe 1.0.3 file (none published; needs Cyrus's 27B).
   state_size=128 and ssm_a=−exp are now confirmed for the qwen35 family and
   near-certainly identical for qwen35moe (same DeltaNet), but not independently
   reconfirmed on an A3B file.

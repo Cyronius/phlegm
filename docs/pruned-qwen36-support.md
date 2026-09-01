@@ -174,7 +174,7 @@ touching quantization:
 | Engine requires vision weights present | Medium | Reuse official vision_weight.q4nx |
 | Double-quantization quality loss (Q4_K_M→Q4_1) | Medium | Use healed BF16 safetensors as source if available |
 
-## Inputs needed from Josh
+## Inputs needed from Cyrus
 1. Was the layer removal uniform (exactly one DeltaNet layer per `[L,L,L,F]`
    block)? Which indices were dropped?
 2. Do the healed BF16 safetensors still exist locally? (Better conversion source

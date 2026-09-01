@@ -1,5 +1,5 @@
 """Build a small qwen35moe GGUF from real HF reference tensors (hf_ref/) so the
-full converter pipeline can be exercised + byte-compared against Josh's
+full converter pipeline can be exercised + byte-compared against Cyrus's
 model_3LiF.q4nx.  Emulates llama.cpp conventions: zero-centered RMSNorms carry a
 baked +1, tensors in HF row order, weights stored F32/Q4_K.
 
@@ -8,7 +8,7 @@ so both code paths (linear + full q_proj deinterleave) run.  Experts: 8-expert
 stub placing the 5 available real experts at their true indices.
 
 Not a faithful full model -- a pipeline+layout test harness.  For a real run,
-use Josh's published GGUF directly with convert.py.
+use Cyrus's published GGUF directly with convert.py.
 """
 import sys, numpy as np
 from gguf import GGUFWriter

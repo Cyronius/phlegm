@@ -1,6 +1,6 @@
 # GGUF → q4nx converter (Qwen3.6-MoE, open NPU engine)
 
-Converts a **Qwen3.6-MoE GGUF** (llama.cpp `qwen35moe` arch, e.g. Josh's
+Converts a **Qwen3.6-MoE GGUF** (llama.cpp `qwen35moe` arch, e.g. Cyrus's
 [Cyronius/Qwen3.6-27B-A2.8B](https://huggingface.co/Cyronius/Qwen3.6-27B-A2.8B)
 `Q4_K_M`) into the **q4nx FILE format** that the open NPU engine (`npu-engine/`)
 and the reference forward (`tools/kernel-interp/full_forward.py`) read.
@@ -8,7 +8,7 @@ and the reference forward (`tools/kernel-interp/full_forward.py`) read.
 It exists because the official converter
 ([FastFlowLM/FLM_Q4NX_Converter](https://github.com/FastFlowLM/FLM_Q4NX_Converter))
 now targets a **newer** FLM format (Q4_K super-blocks, 4736-byte chunks, plain
-column-major within-chunk nibbles). Josh's installed engine (flm 1.0.2) — the one
+column-major within-chunk nibbles). Cyrus's installed engine (flm 1.0.2) — the one
 the open engine was reverse-engineered from — reads the **older q4_1 format**
 (5120-byte chunks, bf16 scale+min, a 16-lane nibble interleave) plus a q8 lm_head.
 This converter emits exactly that verified layout.
@@ -28,7 +28,7 @@ identical block scale/min choice to llama.cpp); `q4nx_format.py` only performs t
 FLM byte re-layout, and stores the block scale/min as **bf16** (FLM's format) — the
 only lossy step beyond the requant, ≈0.001 per weight.
 
-### q4nx FILE byte layout (verified against Josh's model_3LiF.q4nx + HF weights)
+### q4nx FILE byte layout (verified against Cyrus's model_3LiF.q4nx + HF weights)
 
 A quantized `[out, in]` weight → I8 safetensors tensor `[out//32, in//256, CHUNK]`,
 one CHUNK per 32-row × 256-col tile, tiles in **plain raster order**
@@ -46,7 +46,7 @@ loader applies the exotic pool tilings at model-load time; the FILE is raster.
 
 ## Verified tensor mapping (GGUF/HF → q4nx)
 
-Every transform below was checked byte-for-byte: FLM-dequant of Josh's
+Every transform below was checked byte-for-byte: FLM-dequant of Cyrus's
 `model_3LiF.q4nx` vs the candidate transform of the HF-original weight
 (`tools/kernel-interp/hf_ref/`). Correct transform ⇒ **quant bound** (~0.01–0.03);
 wrong ⇒ ~0.3–0.6.
@@ -99,7 +99,7 @@ The q4nx FILE lays experts **contiguously**: expert `e` occupies chunks
 `e*(out//32) … (e+1)*(out//32)`. `convert.py` packs each expert with `pack_q4_1`
 and concatenates in expert order 0…255 (gate/up separate, not gpt-oss-interleaved —
 this arch keeps them as distinct tensors). Verified: converted expert 7 matches
-Josh's FILE expert 7 (contiguous placement, quant bound).
+Cyrus's FILE expert 7 (contiguous placement, quant bound).
 
 ## Assumption that needs the real GGUF to lock down
 The mapping was derived against HF-original weights. It is correct for a GGUF that
@@ -150,7 +150,7 @@ Two facts remain INFERRED until a real 1.0.3 file is available: `ssm.state_size`
 ## Validation results (this build)
 - **Round-trip** (converted tensor ↔ GGUF source): worst q4_1 maxerr **0.039**,
   mean ~0.001; lm_head q8 maxerr **0.001**.
-- **Ground truth** (synthetic-from-HF conversion ↔ Josh's `model_3LiF.q4nx`):
+- **Ground truth** (synthetic-from-HF conversion ↔ Cyrus's `model_3LiF.q4nx`):
   every tensor at the quant bound, mean ~0.001 (qkv 0.024, z 0.018, out 0.029,
   full-attn q_proj deinterleave 0.024, o_proj 0.072 worst-single-outlier,
   expert7 contiguous 0.005). Two independent q4_1 quantizations of the same

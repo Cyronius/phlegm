@@ -3,7 +3,7 @@
 ## Goal
 
 An **open-source execution engine** that runs the Qwen3.6-MoE family on the
-Ryzen AI XDNA2 NPU, including Josh's pruned **interval-3** model *as published*
+Ryzen AI XDNA2 NPU, including Cyrus's pruned **interval-3** model *as published*
 (no re-pruning). It reuses AMD/FLM's closed **xclbin kernels** for the actual
 NPU compute; everything above them — weight loading, per-op orchestration, the
 DeltaNet/MoE/attention scheduling, the interval handling that FLM gets wrong — is
@@ -331,7 +331,7 @@ implementation skeleton.
   construction in the open host.** Commands: `open-qwen-npu prefill|decode`
   (parity vs tools/kernel-interp/rust_ref + C:/caps/m0c states),
   `open-qwen-npu run <model.q4nx> <ids,csv>`.
-  Remaining M2 polish: tokenizer + sampler + generate loop; run Josh's real
+  Remaining M2 polish: tokenizer + sampler + generate loop; run Cyrus's real
   30-layer model (needs GGUF→q4nx conversion — separate track); perf
   (parallelize matmuls / cache dequant).
 - **M3 — full interval-3 forward on NPU. LARGELY DONE (2026-08-30).**
@@ -422,7 +422,7 @@ implementation skeleton.
     model (pool builder already general); resolve the ERT queue-depth cap so
     all layers fit one runlist (removes the barrier hack + its wasted lm_head
     passes); port the driver to the Rust core via the C-ABI xrt-shim;
-    FLM-compatible HTTP server; GGUF→q4nx converter for Josh's published 27B.
+    FLM-compatible HTTP server; GGUF→q4nx converter for Cyrus's published 27B.
 
 ## Decisions
 
@@ -443,7 +443,7 @@ implementation skeleton.
   reimplement it in Rust, wrap FLM's already-working `npu_utils` in a small
   `extern "C"` shim and FFI to that from Rust. Reuses the open wrapper verbatim;
   keeps engine logic in Rust.
-- **Platform:** on **Windows** (Josh's box) NPU access must go through XRT
+- **Platform:** on **Windows** (Cyrus's box) NPU access must go through XRT
   (`xrt_coreutil.dll`); `amdxdna_accel.h` is a **Linux** DRM-ioctl UAPI, so a
   driver-direct (XRT-free) backend is a *Linux-only* future option, not the
   Windows path.
