@@ -285,3 +285,37 @@ engineering, not research: the q4_1 GEMV with in-kernel dequant, the DeltaNet
 step, attention, and wiring per-layer kernels behind phlegm's resident
 driver, each checkable against the C:/caps oracle. Phase 1 (open + correct
 decode) is the next milestone.
+
+
+## Phase 1 progress (2026-09-02)
+
+Goal: every decode op as an open kernel, correct against the oracle; speed is
+phase 2. Order chosen by "most bytes first" (the GEMVs are ~95 % of per-token
+traffic), then the ops with no prior art.
+
+| op | status | design | note |
+|---|---|---|---|
+| q4_1 projections (qkv, z, share_up/gate/down, full-attn q/k/v/o) | **DONE, exact** | `designs/gemv_q4` | pool-order chunks, band law half=c%2 kt=c/2; qkv 1.09 ms |
+| lm_head q8 (248320×2048) | **DONE, exact** | `designs/lm_head_q8` | supertile order quarter=c%4 kt=c/4; 21.4 ms vs FLM 15.4 |
+| routed experts (gate/up stripes + down, per-expert base from ctrlpkt fetch) | next | — | GEMV is the same kernel; stripe/down perms from pools.rs; combine with 0b fetch |
+| router 2048×256 bf16 + top-8 + sigmoid/softmax weights | todo | — | tiny; needs an on-core sort |
+| RMSNorm, residual, gates (SiLU/sigmoid) | todo | — | standard IRON elementwise |
+| gated DeltaNet step (conv1d shift, S update 32×128×128 fp32, gate/norm) | todo | — | oracle: captured state BOs + forward.rs |
+| full attention (KV append, softmax over ≤1024) | todo | — | every 3rd layer |
+| per-layer fusion behind L40Backend | phase 2 | — | one dispatch per layer, no host round-trip |
+
+**What the two GEMVs established beyond correctness.** (1) vegah's kernels port
+unchanged: FLM's chunk layout is bit-for-bit the one his kernels read, so the
+only new code per projection is the pool-order band law. (2) A runtime `group`
+argument (passed from a `range_` loop) works, so one entry point serves every
+chunk group — no per-group translation units. (3) Uneven per-core slices via
+hand-built `TensorAccessPattern`s work (1940 bands over 8 cores). (4) The
+driver's `run` directive + `make_test.py`/`compare.py` per design is a
+sufficient harness: pool bytes in, fp64 reference from the same bytes, PASS
+at cos 1.0 / maxrel ~1e-5 (fp32 accumulation order).
+
+**Speed observations (not optimised).** lm_head 80 bands: 33 GB/s; full 540
+MB: 25 GB/s; qkv 10.5 MB: 1.09 ms ≈ 9.6 GB/s incl. ~0.18 ms dispatch. The q4
+kernel does ~2× the vector work per byte of the q8 one (nibble unpack + zip +
+two half-products); whether it is compute- or DMA-bound is a phase-2 question
+(memtile staging, 16 cores via memtile split, `--null` DMA probe like vegah's).

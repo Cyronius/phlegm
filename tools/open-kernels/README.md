@@ -68,4 +68,32 @@ ELF; output == ROT13(input) byte-exact for both.
   (device pin, floor rounding, no fp32 vector multiply on AIE2P, 2-in/2-out
   DMA streams per core, 128-byte shim transfers deliver zeros, ...).
 
-Next: phase 0b, the routed-expert fetch spike (see the plan).
+- `designs/expert_fetch/` — phase 0b spike (PASSED 2026-09-02): a shim DMA
+  descriptor into a DDR pool retargeted to a runtime-chosen slab by control
+  packets bounced through DDR, no host round-trip. `ddr_bounce_fetch.mlir` is
+  the proof; the rest is the bisection ladder. See the plan's 0b section.
+- `designs/gemv_q4/` — **phase 1**: q4_1 GEMV with in-kernel dequant, consuming
+  chunks in the LAYER-POOL order FLM's kernel uses (`pools.rs std_perm`: 64-row
+  bands of `K/128` chunks, half = c%2, k-tile = c/2). Tile arithmetic ported from
+  vegah's `granite_gemv.h` (same chunk layout). 8 cores, x broadcast, 4 chunks
+  per DMA element. Shape via env `GEMV_N/GEMV_K/GEMV_CORES`; `make_test.py
+  --region qkv|z|share_up|share_gate|share_down` slices the region out of the
+  captured L0 pool, writes an fp64 reference from the same bytes and a
+  `run_<region>.cfg`; `compare.py <region>` checks. Results (random bf16 x):
+
+  | region | shape | PASS | steady-state |
+  |---|---|---|---|
+  | qkv | 8192×2048 (10.5 MB) | cos 1.0, maxrel 1.2e-5 | 1.09 ms |
+  | share_down | 2048×512 | cos 1.0, maxrel 7.6e-6 | 0.24 ms |
+  | share_up | 512×2048 | cos 1.0, maxrel 1.1e-5 | 0.24 ms |
+
+- `designs/lm_head_q8/` — **phase 1**: q8 lm_head GEMV from the captured
+  lm_head pool (`C:/caps/m0d/000127.bo`, its own 128-row supertile order:
+  32-chunk bands, quarter = c%4, k-tile = c/4). One entry point with a runtime
+  `group` argument; 1940 bands split 243/242 over 8 cores with hand-built taps.
+  `make_test.py [--bands B]` + `compare.py <tag>`. Full 248320 logits: **PASS
+  cos 1.0, maxrel 2.9e-6, 21.4 ms** (540 MB, ~25 GB/s; FLM's closed lm_head:
+  15.4 ms). 80-band subset: 0.67 ms at 33 GB/s.
+
+Phase-1 status and what's next: `.claude/plans/open-kernels-feasibility.md`,
+"Phase 1 progress".
