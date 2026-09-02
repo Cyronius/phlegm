@@ -356,6 +356,7 @@ over 19 xclbin contexts (~0.3 s). Phase 2 turns it into an engine:
 
 Each step keeps the phase-1 chain as its regression oracle (the kernels
 already match the faithful replica at 1.00000).
+| **Josh's pruned 27B (30L, interval 3), whole decode step** | **DONE — matches the replica** | `designs/decode_chain/make_27b.py` | 1622 dispatches; logits corr 0.999998, same argmax/top-5; all 30 residuals ≥ 0.999998. The model FLM cannot run correctly runs correctly here |
 | per-layer fusion behind L40Backend | phase 2 | — | one dispatch per layer, no host round-trip |
 
 **What the two GEMVs established beyond correctness.** (1) vegah's kernels port

@@ -268,8 +268,18 @@ step now run on open kernels and match the CPU replica.**
   corr 1.00000, and FLM's captures are the wrong oracle for interval-3 models.
   **Control (done): on the base 40-layer interval-4 model the same replica's
   prefill logits match FLM's capture (`C:/caps/pf_t11_full/008566.bo`) at
-  corr 0.955 with the same top token (9419)** — FLM does compute attention
+  corr 0.955 with the same top token (9419)** ï¿½ FLM does compute attention
   there. The skip is specific to the interval-3 configuration.
+
+- **Josh's pruned Qwen3.6-27B-A2.8B (30 layers, interval 3) on open kernels
+  (2026-09-02):** `make_27b.py` builds every layer's pool/pack/side with
+  `build_pools.py` from `~/.flm/models/Qwen3.6-27B-A2.8B-open/model.q4nx`,
+  slices the kernels' inputs, and runs one decode step at position 0 (zero
+  states, empty cache) through all 30 layers + final norm + lm_head as one
+  config: **1622 dispatches, logits corr 0.999998 vs the CPU replica, same
+  argmax (846) and top-5, every layer's residual â‰¥ 0.999998** (`compare_27b.py`).
+  ~4 s of NPU time host-driven. This is the model FLM mis-executes; the open
+  kernels run it correctly.
 
 Phase-1 status and what's next: `.claude/plans/open-kernels-feasibility.md`,
 "Phase 1 progress".
