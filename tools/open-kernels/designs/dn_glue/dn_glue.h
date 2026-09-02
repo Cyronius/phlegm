@@ -47,35 +47,7 @@ static inline void glue_ab_tile(const bfloat16 *__restrict W, const bfloat16 *__
   aie::store_v(acc, a.template to_vector<float>());
 }
 
-// ---- scalar transcendental helpers (32 values per layer: scalar float is slow
-// but this is 64 evaluations). Own implementations: no libm dependency.
-static inline float sexp(float x) {
-  if (x > 88.f) x = 88.f;
-  if (x < -87.f) x = -87.f;
-  // 2^(x*log2e): n = round, f in [-0.5, 0.5]
-  const float t = x * 1.44269504f;
-  const int n = (int)(t + (t >= 0.f ? 0.5f : -0.5f));
-  const float f = (t - (float)n) * 0.69314718f;      // ln2 * frac -> exp(f), |f| <= 0.347
-  // exp(f) by degree-6 Taylor (error < 1e-7 on this range)
-  float p = 1.f + f * (1.f + f * (0.5f + f * (0.166666667f + f * (0.0416666667f + f * (0.00833333333f + f * 0.00138888889f)))));
-  union { float f; uint32_t u; } s;
-  s.u = (uint32_t)(n + 127) << 23;
-  return p * s.f;
-}
-static inline float slog(float x) {                 // natural log, x > 0
-  union { float f; uint32_t u; } s;
-  s.f = x;
-  int e = (int)((s.u >> 23) & 0xFF) - 127;
-  s.u = (s.u & 0x007FFFFFu) | 0x3F800000u;           // mantissa in [1, 2)
-  float m = s.f;
-  if (m > 1.41421356f) { m *= 0.5f; e += 1; }        // m in [0.707, 1.414]
-  const float y = (m - 1.f) / (m + 1.f);             // atanh series: ln m = 2(y + y^3/3 + y^5/5 + ...)
-  const float y2 = y * y;
-  const float l = 2.f * y * (1.f + y2 * (0.333333333f + y2 * (0.2f + y2 * (0.142857143f + y2 * 0.111111111f))));
-  return l + (float)e * 0.69314718f;
-}
-static inline float ssoftplus(float u) { return u > 20.f ? u : slog(1.f + sexp(u)); }
-static inline float ssigmoid(float u) { return 1.f / (1.f + sexp(-u)); }
+// (scalar sexp/slog/ssoftplus/ssigmoid live in vecmath.h)
 
 // ---- decay/beta from the two projections
 static inline void glue_small(const float *__restrict small /* A[32] @0, dt_bias[32] @32 */,

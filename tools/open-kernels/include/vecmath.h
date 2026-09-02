@@ -139,6 +139,34 @@ static inline vfN<N> vsigmoidN(const vfN<N> &x) {
 template <unsigned N>
 static inline vfN<N> vsiluN(const vfN<N> &x) { return fmulN<N>(x, vsigmoidN<N>(x)); }
 
+// ---- scalar transcendentals (software float on the scalar unit: slow, use
+// for a few dozen values per call). No libm dependency.
+static inline float sexp(float x) {
+  if (x > 88.f) x = 88.f;
+  if (x < -87.f) x = -87.f;
+  const float t = x * 1.44269504f;
+  const int n = (int)(t + (t >= 0.f ? 0.5f : -0.5f));
+  const float f = (t - (float)n) * 0.69314718f;      // |f| <= 0.347
+  float p = 1.f + f * (1.f + f * (0.5f + f * (0.166666667f + f * (0.0416666667f + f * (0.00833333333f + f * 0.00138888889f)))));
+  union { float f; uint32_t u; } s;
+  s.u = (uint32_t)(n + 127) << 23;
+  return p * s.f;
+}
+static inline float slog(float x) {                 // natural log, x > 0
+  union { float f; uint32_t u; } s;
+  s.f = x;
+  int e = (int)((s.u >> 23) & 0xFF) - 127;
+  s.u = (s.u & 0x007FFFFFu) | 0x3F800000u;           // mantissa in [1, 2)
+  float m = s.f;
+  if (m > 1.41421356f) { m *= 0.5f; e += 1; }
+  const float y = (m - 1.f) / (m + 1.f);
+  const float y2 = y * y;
+  const float l = 2.f * y * (1.f + y2 * (0.333333333f + y2 * (0.2f + y2 * (0.142857143f + y2 * 0.111111111f))));
+  return l + (float)e * 0.69314718f;
+}
+static inline float ssoftplus(float u) { return u > 20.f ? u : slog(1.f + sexp(u)); }
+static inline float ssigmoid(float u) { return 1.f / (1.f + sexp(-u)); }
+
 // scalar 1/sqrt(x) to fp32: hardware seed + two Newton steps
 static inline float srsqrt(float x) {
   float inv = aie::invsqrt(x);
