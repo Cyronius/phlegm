@@ -320,8 +320,10 @@ decode logits (0.998, same argmax). This matches the earlier note that FLM
 "mis-executes interval-3" models — Josh's pruned 27B is interval-3. Implication:
 FLM's fused kernels cannot be the oracle (or the engine) for interval-3 models;
 the open kernels, which reproduce the HF-faithful replica exactly, are the
-correct path. Control check pending: the 40-layer base model (interval 4)
-replica prefill vs `C:/caps/pf_t11_full`'s captured logits.
+correct path. Control (done): the 40-layer base model (interval 4), replica prefill
+logits vs `C:/caps/pf_t11_full`'s captured logits: corr 0.955, same top
+token. FLM computes attention on interval-4 models; the skip is interval-3
+specific (`tools/kernel-interp/bisect/control_40l.py`).
 
 ## Phase 2 plan (open + fast, resident)
 

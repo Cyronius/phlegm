@@ -266,8 +266,10 @@ step now run on open kernels and match the CPU replica.**
   mis-executes interval-3 models (Josh's pruned 27B is interval-3). So:
   the CPU replica is the faithful (HF) math, the open kernels match it to
   corr 1.00000, and FLM's captures are the wrong oracle for interval-3 models.
-  Whether FLM computes attention correctly on the base interval-4 model is
-  being checked against `C:/caps/pf_t11_full` (40-layer replica prefill).
+  **Control (done): on the base 40-layer interval-4 model the same replica's
+  prefill logits match FLM's capture (`C:/caps/pf_t11_full/008566.bo`) at
+  corr 0.955 with the same top token (9419)** — FLM does compute attention
+  there. The skip is specific to the interval-3 configuration.
 
 Phase-1 status and what's next: `.claude/plans/open-kernels-feasibility.md`,
 "Phase 1 progress".
