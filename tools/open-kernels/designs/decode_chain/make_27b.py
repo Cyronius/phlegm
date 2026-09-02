@@ -36,6 +36,7 @@ from q4nx import bf16_to_f32  # noqa: E402
 
 D = "C:/code/phlegm/tools/open-kernels/designs"
 OUT = f"{D}/decode_chain/w27"
+POOLS = "C:/code/FastFlowLM/npu-engine/m3out/l30_27b"      # `open-qwen-npu l30-build` output (pools.rs layout)
 WDIR = HERE / "w27"
 S = 163_840
 NE = 8
@@ -69,6 +70,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--layers", type=int, default=None, help="only the first N layers (+ final norm/lm_head)")
     ap.add_argument("--token", type=int, default=248045)
+    ap.add_argument("--cfg-only", action="store_true", help="only rewrite run_27b.cfg (weights/refs from a previous run)")
     a = ap.parse_args()
     WDIR.mkdir(exist_ok=True)
     cfgj = json.load(open(f"{MODEL_DIR}/config.json"))
@@ -93,7 +95,7 @@ def main() -> int:
     cs = np.zeros((3, 8192)); S0 = np.zeros((32, 128, 128))
     top = {}
     xr = x.copy()
-    for l in range(NL):
+    for l in range(NL if not a.cfg_only else 0):
         if full[l]:
             xa, _, _ = DS.attn_decode(l, xr.copy(), np.zeros((0, 2, 256)), np.zeros((0, 2, 256)), 0)
         else:
@@ -106,18 +108,8 @@ def main() -> int:
         side = np.frombuffer(BP.build_side(m, l, full[l]), np.uint8)
         wr(f"lnw{l}.bin", pack[0:4096]); wr(f"postln{l}.bin", pack[4096:8192])
         wr(f"sgw{l}.bin", pack[8192:12288]); wr(f"rw{l}.bin", pack[12288:12288 + 1048576])
-        # the routed experts, in routing order, as moe_experts streams them:
-        # per expert [up 4 stripes | gate 4 stripes | down 16 bands]
-        parts = []
-        for e in top[l]:
-            e = int(e)
-            parts.append(b"".join(bytes(pool[(8 * e + 2 * s) * S:(8 * e + 2 * s + 1) * S]) for s in range(4)))
-            parts.append(b"".join(bytes(pool[(8 * e + 2 * s + 1) * S:(8 * e + 2 * s + 2) * S]) for s in range(4)))
-            parts.append(bytes(pool[335_544_320 + e * 655_360:335_544_320 + (e + 1) * 655_360]))
-        # then the shared expert [up | gate | down] as the 9th (RS=2 layout)
-        parts += [bytes(pool[503_316_480:503_316_480 + 655_360]), bytes(pool[503_971_840:503_971_840 + 655_360]),
-                  bytes(pool[504_627_200:504_627_200 + 655_360])]
-        (WDIR / f"wexp{l}.bin").write_bytes(b"".join(parts))
+        # (the experts stream straight out of the resident layer pool: the
+        # driver's `moeroute` points the kernel's fills at the router's choice)
         if not full[l]:
             wr(f"wqkv{l}.bin", pool[505_282_560:505_282_560 + 10_485_760])
             wr(f"wz{l}.bin", pool[515_768_320:515_768_320 + 5_242_880])
@@ -144,11 +136,13 @@ def main() -> int:
             meta[1536:1792] = meta_cs.view(np.uint8)
             wr(f"meta{l}.bin", meta)
         print(f"layer {l} {'FULL' if full[l] else 'lin '} top8={top[l].tolist()}", flush=True)
-    hn = (DS.F.rms(xr) * normw).astype(np.float32)
-    logits_ref = m.lmhead_logits(hn)
-    wr("ref_logits.bin", logits_ref.astype(np.float32))
-    if not (WDIR / "lm27.bin").is_file():
-        (WDIR / "lm27.bin").write_bytes(BP.build_lmhead_pool(m))
+    if not a.cfg_only:
+        hn = (DS.F.rms(xr) * normw).astype(np.float32)
+        logits_ref = m.lmhead_logits(hn)
+        wr("ref_logits.bin", logits_ref.astype(np.float32))
+        if not (WDIR / "lm27.bin").is_file():
+            (WDIR / "lm27.bin").write_bytes(BP.build_lmhead_pool(m))
+    ref_argmax = int(np.fromfile(WDIR / "ref_logits.bin", np.float32).argmax())
 
     # ---- config
     X = [("L", "ln", "ln/build"), ("Q", "gqkv", "gemv_q4/build_qkv"), ("Z", "gz", "gemv_q4/build_z"),
@@ -170,7 +164,7 @@ def main() -> int:
                 f"buf sgw{l} 4096 {OUT}/sgw{l}.bin", f"buf rw{l} 1048576 {OUT}/rw{l}.bin",
                 f"buf xa{l} 8192", f"buf xn{l} 4096", f"buf out{l} 8192", f"buf xb{l} 8192", f"buf xm{l} 4096",
                 f"buf rout{l} 4096", f"buf xc{l} 8192",
-                f"buf wexp{l} {(NE + 1) * 1_966_080} {OUT}/wexp{l}.bin", f"buf hdr{l} 20480"]
+                f"buf pool{l} 536870912 {POOLS}/pool_L{l}.bin", f"buf hdr{l} 20480"]
         xin = "xres0" if l == 0 else f"xc{l - 1}"
         if not full[l]:
             cfg += [f"buf wqkv{l} 10485760 {OUT}/wqkv{l}.bin", f"buf wz{l} 5242880 {OUT}/wz{l}.bin",
@@ -198,14 +192,14 @@ def main() -> int:
                      f"run ln xa{l} out{l} postln{l} xb{l} xm{l}"]
         # router -> header [xm | rout | sgw | xres] (host copies until the fused
         # layer writes it in place) -> the whole MoE block as one dispatch
-        runs += [f"run rt xm{l} rw{l} rout{l}",
+        runs += [f"run rt xm{l} rw{l} rout{l}", f"moeroute me rout{l}",
                  f"copy hdr{l} 0 xm{l} 0 4096", f"copy hdr{l} 4096 rout{l} 0 4096",
                  f"copy hdr{l} 8192 sgw{l} 0 4096", f"copy hdr{l} 12288 xb{l} 0 8192",
-                 f"run me wexp{l} hdr{l} xc{l}",
+                 f"run me pool{l} hdr{l} xc{l}",
                  f"dump rout{l} {OUT}/y_rout{l}.bin 4096", f"dump xc{l} {OUT}/y_res{l}.bin 8192"]
     runs += [f"run ln xc{NL - 1} zero normw xresf hn", "run lm lmpool hn logits", f"dump logits {OUT}/y_logits.bin 993280", ""]
     (HERE / "run_27b.cfg").write_text("\n".join(cfg + runs), newline="\n")
-    print(f"{NL} layers, {len([r for r in runs if r.startswith('run ')])} runs; ref argmax {int(logits_ref.argmax())}")
+    print(f"{NL} layers, {len([r for r in runs if r.startswith('run ')])} runs; ref argmax {ref_argmax}")
     return 0
 
 

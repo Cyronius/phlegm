@@ -350,3 +350,21 @@ expert, 1350 dispatches in all), hence MoE first.
   (2.9 tok/s), logits corr 0.999998, same argmax/top-5**
   (`run_27b_fused.log`). Per layer the MoE block is now `rt` + 4 host copies
   + `me` (3.2 ms); the linear-attention chain is the remaining ~190 ms.
+
+  **Step 2a — experts straight from the resident layer pool, no host slice.**
+  The kernel's instruction stream has one DDR-patch op per weight fill (144
+  on arg 0: opcode 0x81, 12 words, register at +6, arg index at +8, byte
+  offset at +10). Built for the host-concatenated `wexp`, each fill's static
+  offset names its (expert slot, core, up/gate/down); the driver's new
+  `moeroute <kernel> <rout-buf>` reads the router's 8 indices (int32 at byte
+  1024 of its output) and rewrites those 144 offsets as offsets into the
+  512 MB layer pool (`pools.rs` layout: stripes `(8e + 2c [+1])·163840`,
+  down `335544320 + e·655360 + c·81920`, shared fixed), then syncs the
+  instruction BO. **0.04 ms per layer.** `make_27b.py` now binds
+  `pool_L{l}.bin` from `l30-build`'s output (verified byte-identical to
+  `build_pools.py`'s) and no longer writes `wexp{l}.bin`: **the 27B step
+  runs with all 30 pools resident (15 GB of BOs, 20 s to load), 302
+  dispatches, logits corr 0.999998, same argmax/top-5**; 350–400 ms depending
+  on the box's other load (two llama-servers were running; the slowdown was
+  uniform across every kernel). The on-device 0b mechanism stays unused: the
+  host patch costs 1.2 ms/token, which is the whole difference.

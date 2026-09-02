@@ -32,10 +32,28 @@ pub struct Driver {
     /// instruction-stream BO and its 32-bit word count, bound at args 1/2 of
     /// every run. ELF-flow kernels carry instructions in the module (args 1/2 = 0).
     instr: HashMap<String, (Bo, usize)>,
+    /// The instruction bytes as loaded (before any `moeroute` patching).
+    instr_src: HashMap<String, Vec<u8>>,
+    /// `moeroute` patch table per kernel: (word index, expert slot 0..8, core, kind 0/1/2).
+    moe_patches: HashMap<String, Vec<(usize, usize, u64, u8)>>,
     /// name -> (bo, logical size). The Bo's own size is padded up to 1 MB.
     bufs: HashMap<String, (Bo, usize)>,
     layeridx: i32,
 }
+
+// moe_experts (tools/open-kernels/designs/moe_experts/moe_experts.py) weight
+// stream layout: per expert [up 4 stripes | gate 4 stripes | down 16 bands],
+// core c reads up/gate stripe c (128 rows) and down bands 2c, 2c+1 (256 rows).
+const MOE_STRIPE: u64 = 163_840;
+const MOE_UP_BYTES: u64 = 4 * MOE_STRIPE;
+const MOE_EXPERT_BYTES: u64 = 3 * MOE_UP_BYTES;
+const MOE_DOWN_CORE: u64 = 81_920;
+// Layer pool regions (pools.rs): routed gate/up stripes interleaved
+// [up0 gate0 up1 gate1 ...] from 0, down experts, shared up/gate/down.
+const MOE_POOL_DOWN: u64 = 335_544_320;
+const MOE_POOL_SHARE_UP: u64 = 503_316_480;
+const MOE_POOL_SHARE_GATE: u64 = 503_971_840;
+const MOE_POOL_SHARE_DOWN: u64 = 504_627_200;
 
 fn read_file(p: &str) -> Result<Vec<u8>, String> {
     std::fs::read(p).map_err(|e| format!("cannot open {p}: {e}"))
@@ -48,6 +66,8 @@ impl Driver {
             ctxs: HashMap::new(),
             kernels: HashMap::new(),
             instr: HashMap::new(),
+            instr_src: HashMap::new(),
+            moe_patches: HashMap::new(),
             bufs: HashMap::new(),
             layeridx: 0,
         }
@@ -82,6 +102,50 @@ impl Driver {
             r.set_arg_bo(*idx, bo)?;
         }
         Ok(r)
+    }
+
+    /// The `moeroute` patch table for a moe_experts kernel, built once from the
+    /// instruction stream as loaded: every DDR-patch op (0x81, 12 words:
+    /// reg addr at +6, arg index at +8, byte offset at +10) on arg 0 is one
+    /// weight fill whose static offset into the host-built `wexp` names its
+    /// expert slot, core and kind.
+    fn moe_patch_table(&mut self, kn: &str) -> Result<Vec<(usize, usize, u64, u8)>, String> {
+        if let Some(t) = self.moe_patches.get(kn) {
+            return Ok(t.clone());
+        }
+        let src = self.instr_src.get(kn).ok_or(format!("no kernelx {kn}"))?;
+        let w: Vec<u32> = src.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let mut t = Vec::new();
+        let mut i = 4;
+        while i < w.len() {
+            let len = match w[i] {
+                0 => 6,
+                1 => 12,
+                3 => 7,
+                0x80 => 4,
+                0x81 => 12,
+                _ => 1,
+            };
+            if w[i] == 0x81 && i + 11 < w.len() && w[i + 8] == 0 {
+                let off = w[i + 10] as u64;
+                let slot = (off / MOE_EXPERT_BYTES) as usize;
+                let rem = off % MOE_EXPERT_BYTES;
+                let (kind, core) = if rem < MOE_UP_BYTES {
+                    (0u8, rem / MOE_STRIPE)
+                } else if rem < 2 * MOE_UP_BYTES {
+                    (1u8, (rem - MOE_UP_BYTES) / MOE_STRIPE)
+                } else {
+                    (2u8, (rem - 2 * MOE_UP_BYTES) / MOE_DOWN_CORE)
+                };
+                t.push((i + 10, slot, core, kind));
+            }
+            i += len;
+        }
+        if t.len() != 144 {
+            return Err(format!("moeroute: {kn} has {} weight fills, expected 144", t.len()));
+        }
+        self.moe_patches.insert(kn.to_string(), t.clone());
+        Ok(t)
     }
 
     /// Single-shot submit (its own runlist implied) for lm_head / standalone ops.
@@ -140,6 +204,7 @@ impl Driver {
                 ibo.sync_to_device()?;
                 println!("kernelx {name} ({instp}, {} words)", insts.len() / 4);
                 self.instr.insert(name.clone(), (ibo, insts.len() / 4));
+                self.instr_src.insert(name.clone(), insts);
                 self.kernels.insert(name, k);
             }
             "buf" => {
@@ -235,6 +300,47 @@ impl Driver {
                 let d = self.bufs.get_mut(&dst).ok_or(format!("no buf {dst}"))?;
                 d.0.write(&tmp, doff)?;
                 d.0.sync_to_device()?;
+            }
+            "moeroute" => {
+                // moeroute <kernel> <rout-buf>: point the moe_experts kernel's
+                // routed-expert fills at the experts the router just chose.
+                // The kernel's instruction stream carries one DDR-patch op per
+                // fill (arg 0 = the weight BO, byte offset into it); built for
+                // a host-concatenated `wexp`, those offsets identify (slot,
+                // core, up/gate/down), and are rewritten here as offsets into
+                // the resident layer pool (pools.rs layout). ~0.1 ms of host
+                // time per layer instead of a 15 MB host slice.
+                let kn = it.next().ok_or("moeroute: kernel")?.to_string();
+                let rb = it.next().ok_or("moeroute: rout buf")?;
+                let t0 = std::time::Instant::now();
+                let mut idx = [0u8; 32];
+                {
+                    let r = self.bufs.get(rb).ok_or(format!("no buf {rb}"))?;
+                    r.0.sync_from_device()?;
+                    r.0.read(&mut idx, 1024)?; // router output: int32 idx[8] at byte 1024
+                }
+                let idx: Vec<u32> = idx.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                let table = self.moe_patch_table(&kn)?;
+                let (ibo, _) = self.instr.get_mut(&kn).ok_or(format!("no kernelx {kn}"))?;
+                for &(word, slot, core, kind) in &table {
+                    let off: u64 = if slot < 8 {
+                        let e = idx[slot] as u64;
+                        match kind {
+                            0 => (8 * e + 2 * core) * MOE_STRIPE,
+                            1 => (8 * e + 2 * core + 1) * MOE_STRIPE,
+                            _ => MOE_POOL_DOWN + e * MOE_UP_BYTES + core * MOE_DOWN_CORE,
+                        }
+                    } else {
+                        match kind {
+                            0 => MOE_POOL_SHARE_UP + core * MOE_STRIPE,
+                            1 => MOE_POOL_SHARE_GATE + core * MOE_STRIPE,
+                            _ => MOE_POOL_SHARE_DOWN + core * MOE_DOWN_CORE,
+                        }
+                    };
+                    ibo.write(&(off as u32).to_le_bytes(), word * 4)?;
+                }
+                ibo.sync_to_device()?;
+                println!("moeroute {kn} idx {:?} ({:.3} ms)", idx, t0.elapsed().as_secs_f64() * 1e3);
             }
             "runx" => {
                 // `run`'s arg binding, but queued on the open `runlist` instead

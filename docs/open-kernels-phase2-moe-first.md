@@ -66,7 +66,12 @@ stands; the path there is removing dispatches, then bandwidth work (item 5).
   argmax/top-5.** Remaining: linear-attention chain ~190 ms over 10
   dispatches/layer (item 1), fused MoE 95 ms, lm_head 18 ms, attention
   layers ~40 ms, router 15 ms.
-- Next: step 2 — see the design note (2a vs 2b) below; then item 1.
+- **Step 2a done** (decision: 2a, 2b not worth 1.2 ms/token): driver
+  `moeroute` rewrites the 144 fill offsets in the MoE kernel's instruction
+  BO from the router's indices, 0.04 ms/layer; the 27B step binds the
+  resident `pool_L{l}.bin` directly (no host slice), same logits, 302
+  dispatches, 350–400 ms under shared load.
+- Next: item 1 (fused linear-attention layer, ~190 ms of the step).
 
 ## Steps
 
