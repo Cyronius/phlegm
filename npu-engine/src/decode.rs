@@ -286,18 +286,47 @@ impl Driver {
                     words.push((addr & 0xFFFF_FFFC) as u32);
                     words.push(((addr >> 32) & 0xFFFF) as u32);
                 }
-                // Enable the channel (controller id field), then push the BD to
-                // its task queue. FLM's stream does the same pair before every
-                // enqueue: maskwrite <queue-4> 0xf00 <- 0x1f00, then write queue.
-                words.push(hdr(q_reg - 4, 1));
-                words.push(0x1F00);
+                // Push the BD to its task queue: enable_token_issue | start_bd_id,
+                // the same value the compiler and FLM write.
                 words.push(hdr(q_reg, 1));
-                words.push(bd_id);
+                words.push(0x8000_0000 | bd_id);
                 println!("ctrlpkt {dst}: base={base:#x} bias={bias:#x} idx={idx} -> addr={addr:#x}, {} words", words.len());
                 let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
                 let entry = self.bufs.get_mut(&dst).ok_or(format!("no buf {dst}"))?;
                 entry.0.init(&[])?;
                 entry.0.write(&bytes, 0)?;
+                entry.0.sync_to_device()?;
+            }
+            "setwords" => {
+                // setwords <buf> <word-offset> <v> [<v> ...]  -- write u32 words (dec or 0x hex)
+                let name = it.next().ok_or("setwords: buf")?.to_string();
+                let off: usize = it.next().ok_or("setwords: offset")?.parse().map_err(|_| "setwords: bad offset")?;
+                let vals: Vec<u32> = it
+                    .map(|t| {
+                        let t2 = t.trim_start_matches("0x");
+                        if t2.len() != t.len() { u32::from_str_radix(t2, 16).unwrap_or(0) } else { t.parse().unwrap_or(0) }
+                    })
+                    .collect();
+                let bytes: Vec<u8> = vals.iter().flat_map(|w| w.to_le_bytes()).collect();
+                let entry = self.bufs.get_mut(&name).ok_or(format!("no buf {name}"))?;
+                entry.0.write(&bytes, off * 4)?;
+                entry.0.sync_to_device()?;
+            }
+            "boaddr" => {
+                // boaddr <buf> <word-offset> <target-buf> [bias]  -- write target's DDR
+                // address (+bias) as two u32 words (lo, hi) into buf at word-offset.
+                let name = it.next().ok_or("boaddr: buf")?.to_string();
+                let off: usize = it.next().ok_or("boaddr: offset")?.parse().map_err(|_| "boaddr: bad offset")?;
+                let tgt = it.next().ok_or("boaddr: target")?.to_string();
+                let bias: u64 = it.next().map(|t| {
+                    let t2 = t.trim_start_matches("0x");
+                    if t2.len() != t.len() { u64::from_str_radix(t2, 16).unwrap_or(0) } else { t.parse().unwrap_or(0) }
+                }).unwrap_or(0);
+                let addr = self.bufs.get(&tgt).ok_or(format!("no buf {tgt}"))?.0.address().wrapping_add(bias);
+                let bytes: Vec<u8> = [(addr & 0xFFFF_FFFF) as u32, (addr >> 32) as u32].iter().flat_map(|w| w.to_le_bytes()).collect();
+                println!("boaddr {name}[{off}] = {addr:#x} ({tgt}+{bias:#x})");
+                let entry = self.bufs.get_mut(&name).ok_or(format!("no buf {name}"))?;
+                entry.0.write(&bytes, off * 4)?;
                 entry.0.sync_to_device()?;
             }
             "dump" => {
