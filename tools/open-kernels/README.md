@@ -225,5 +225,30 @@ captured decode step now reproduces on open kernels.**
 **All three layer types (linear attention, MoE, full attention) of the decode
 step now run on open kernels and match the CPU replica.**
 
+- `designs/decode_chain/` — **the whole decode step as one driver config**:
+  L0 linear+MoE, L1 linear+MoE, L2 attention+MoE, final norm, lm_head — 164
+  dispatches over 19 xclbin contexts, ~all in ~0.3 s of kernel time
+  (lm_head 38 ms cold). `make_decode.py` slices every weight from the captured
+  pools/packs/sides, predicts each layer's routing with the mirrored math (and
+  adopts the NPU's own selection from a previous run if it differs);
+  `compare_decode.py` compares logits with FLM's capture (odd vocab rows) and
+  the replica. Result (2026-09-02):
+
+  | | corr | top token |
+  |---|---|---|
+  | open kernels vs CPU replica | **1.00000** (residuals 0.999999 per layer) | same |
+  | open kernels vs FLM capture | 0.671 | differs |
+  | CPU replica vs FLM capture | 0.671 | differs |
+
+  So the open kernels reproduce the replica's math exactly, and inherit its
+  **pre-existing divergence from FLM** (the repo already deposed the CPU model
+  as oracle for this reason: 0.57–0.68 vs both NPU paths, which agree at
+  0.9996). The divergence is a semantics difference in some op, not
+  accumulation; it must be found before the open engine is "correct". The
+  decode block in `C:/caps/m0c` is FLM's older many-ops-per-layer flow with
+  every op's buffers captured, so it can be bisected op by op against this
+  modular chain. (Process exit after 19 contexts segfaults in XRT teardown,
+  after all work and dumps are done — harmless, noted.)
+
 Phase-1 status and what's next: `.claude/plans/open-kernels-feasibility.md`,
 "Phase 1 progress".

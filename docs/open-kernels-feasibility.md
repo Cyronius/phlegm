@@ -305,7 +305,8 @@ traffic), then the ops with no prior art.
 | post: RMSNorm128(o)·ssm_norm · silu(z); layer RMSNorm + residual | **DONE, exact** | `designs/dn_post`, `designs/ln` | bf16 outputs match the fp64→bf16 reference (ln bit-identical) |
 | **whole linear-attention layer, chained** | **DONE — matches CPU replica** | `designs/layer_chain` | 7 dispatches on layer 0 of the captured decode step: residual cos 0.9999996, S 1.0000000, xm 0.9999975 |
 | full attention (head norm, partial RoPE, KV cache, online softmax, gate) | **DONE — matches** | `designs/attn`, `designs/attn_chain` | layer 2 of the captured decode step: residual cos 0.9999999; cached-row count is a CompileTime param |
-| **end-to-end decode step (3 layers + lm_head) vs FLM's captured logits** | next | `designs/decode_chain` | the phase-1 finish line |
+| **end-to-end decode step (3 layers + lm_head)** | **RUNS; = replica exactly (corr 1.00000); ≠ FLM capture (0.671)** | `designs/decode_chain` | 164 dispatches / 19 contexts; the 0.67 is the repo's known CPU-model divergence, now inherited by the kernels |
+| **find the divergent op vs FLM** (bisect the m0c per-op decode captures against this modular chain) | next | — | blocks "correct"; the CPU model was deposed for this, never diagnosed |
 | per-layer fusion behind L40Backend | phase 2 | — | one dispatch per layer, no host round-trip |
 
 **What the two GEMVs established beyond correctness.** (1) vegah's kernels port
