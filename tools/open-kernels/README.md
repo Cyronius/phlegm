@@ -250,5 +250,24 @@ step now run on open kernels and match the CPU replica.**
   modular chain. (Process exit after 19 contexts segfaults in XRT teardown,
   after all work and dumps are done — harmless, noted.)
 
+  **Diagnosed (2026-09-02): the "CPU-model divergence" is FLM skipping the
+  full-attention block.** Bisecting the m0c capture with the replica: the
+  normalized layer inputs match at layers 0→1 and 1→2 (0.996–0.9998 per
+  token), FLM's own captured q/gate/k/v projections and its CPU-built KV cache
+  match ours (0.9994–0.9999, which also pins RoPE to half-split, rotary 64,
+  θ=1e7 and the planar q|gate layout), yet layer 2's captured expert inputs
+  match our MoE input only at 0.53 — and at **0.995 when the attention
+  contribution is set to zero**. Same for the whole step: replica decode
+  logits vs FLM's captured logits go from 0.671 to **0.998 with the same top
+  token** when layer-2 attention is skipped; the prefill's final hidden from
+  0.72 to 0.995. FLM's captured execution of this 3-layer `[L,L,F]`
+  (`full_attention_interval=3`) test model contributes nothing from the
+  attention block — consistent with the repo's earlier note that FLM
+  mis-executes interval-3 models (Josh's pruned 27B is interval-3). So:
+  the CPU replica is the faithful (HF) math, the open kernels match it to
+  corr 1.00000, and FLM's captures are the wrong oracle for interval-3 models.
+  Whether FLM computes attention correctly on the base interval-4 model is
+  being checked against `C:/caps/pf_t11_full` (40-layer replica prefill).
+
 Phase-1 status and what's next: `.claude/plans/open-kernels-feasibility.md`,
 "Phase 1 progress".

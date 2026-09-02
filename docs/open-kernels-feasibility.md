@@ -306,7 +306,22 @@ traffic), then the ops with no prior art.
 | **whole linear-attention layer, chained** | **DONE — matches CPU replica** | `designs/layer_chain` | 7 dispatches on layer 0 of the captured decode step: residual cos 0.9999996, S 1.0000000, xm 0.9999975 |
 | full attention (head norm, partial RoPE, KV cache, online softmax, gate) | **DONE — matches** | `designs/attn`, `designs/attn_chain` | layer 2 of the captured decode step: residual cos 0.9999999; cached-row count is a CompileTime param |
 | **end-to-end decode step (3 layers + lm_head)** | **RUNS; = replica exactly (corr 1.00000); ≠ FLM capture (0.671)** | `designs/decode_chain` | 164 dispatches / 19 contexts; the 0.67 is the repo's known CPU-model divergence, now inherited by the kernels |
-| **find the divergent op vs FLM** (bisect the m0c per-op decode captures against this modular chain) | next | — | blocks "correct"; the CPU model was deposed for this, never diagnosed |
+| **find the divergent op vs FLM** | **DIAGNOSED: FLM skips the full-attention block on this interval-3 model** | bisection scripts (README) | replica logits vs FLM capture: 0.671 with attention, **0.998 with layer-2 attention zeroed** (same top token); prefill final hidden 0.72 → 0.995. The CPU replica is the faithful math; the open kernels match it at 1.00000 |
+
+**Finding (2026-09-02).** The repo's "known CPU-model divergence" (0.57–0.68
+vs FLM, CPU model deposed as oracle) is FLM contributing nothing from the
+full-attention block when it runs the 3-layer `[L,L,F]`
+(`full_attention_interval=3`) test model: every input to that block matches
+FLM's own captures (q/gate/k/v projections, its CPU-built KV cache — which
+also pins RoPE half-split/rotary 64/θ 1e7 and the planar q|gate layout), the
+layers before it match at 0.996–0.9998, and replicating a zero attention
+contribution reproduces FLM's expert inputs (0.995), final hidden (0.995) and
+decode logits (0.998, same argmax). This matches the earlier note that FLM
+"mis-executes interval-3" models — Josh's pruned 27B is interval-3. Implication:
+FLM's fused kernels cannot be the oracle (or the engine) for interval-3 models;
+the open kernels, which reproduce the HF-faithful replica exactly, are the
+correct path. Control check pending: the 40-layer base model (interval 4)
+replica prefill vs `C:/caps/pf_t11_full`'s captured logits.
 | per-layer fusion behind L40Backend | phase 2 | — | one dispatch per layer, no host round-trip |
 
 **What the two GEMVs established beyond correctness.** (1) vegah's kernels port
