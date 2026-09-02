@@ -116,5 +116,39 @@ ELF; output == ROT13(input) byte-exact for both.
     default; designs with several fills per core need `Worker(..., tile=Tile(c, 2))`
     to spread one core per column (the verifier catches this one).
 
+- `designs/dn_glue/` — **phase 1**: the linear-attention layer glue around the
+  DeltaNet step, one core: alpha/beta projections (2048×32 bf16) → decay =
+  exp(A·softplus(·+dt_bias)), beta = sigmoid; depthwise conv1d k=4 over
+  [state rows, qkv] + SiLU; per-head L2 norm of q/k; emits the fp32[512]
+  per-head records `designs/deltanet` consumes and the shifted conv state.
+  Inputs from the captured L0 side pool (`C:/caps/m0d/000119.bo`, repacked
+  into our 4 KB-element side blob by `make_test.py`) and the captured decode
+  conv state (`C:/caps/m0c/000898.bo`); xn/qkv random. **PASS: state
+  bit-exact, k/q/v maxrel ≤ 1.1e-5, decay/beta ≤ 1.4e-7, 0.71 ms.** Uses
+  `ironutil.Pipeline` (throttled fills/drains) and fp32 vector exp/reciprocal
+  helpers in `dn_glue.h` (`vexp32`, `vrecip32`, `vsigmoid32`).
+
+  Traps met here (each cost a build-run cycle; all silent):
+  - **`release(n)` frees the n OLDEST acquired elements.** You cannot hold one
+    element (x) across later acquire/release pairs on the same fifo; copy it
+    to a `Buffer` first (`glue_copy.cc`). Symptom: garbage that depends on x.
+  - **Python-unrolled loops overflow the 16 KB program memory** —
+    `XAie_LoadElf failed with XAIE_INVALID_ELF`. Use `range_` and pass indices
+    as runtime ints.
+  - **The objectfifo lowering allocates depth+1 buffers** when a side acquires
+    `depth` at once; the aie-opt `MemoryMap` in the error is the truth.
+  - **`aie::tanh` / `aie::invsqrt` / `aie::inv` are LUT approximations
+    (~1e-2).** A sigmoid via `(tanh+1)/2` gave 2.6 % error on normalised q/k.
+    Build fp32 transcendentals from bf16 MACs: `vexp32` (bit trick + degree-6
+    poly, 1e-7) and Newton-refine the hardware `inv`/`invsqrt` seeds.
+  - **Stack overflow hangs the core** (state 8): the fp32 exp path spills
+    many 128-B vectors; `stack_size=0xD00` was too small, `0x1800` works. The
+    stack sits at 0x0 with the fifo buffers right after it.
+  - **The build caches too much.** `iron.jit`'s design cache is keyed on the
+    Python source + CompileTime args, and aiecc keeps kernel sources/objects
+    in `final.prj` and skips recompiling them — header edits produced
+    bit-identical results three builds in a row. `build_design.py` now wipes
+    `final.prj` before every build.
+
 Phase-1 status and what's next: `.claude/plans/open-kernels-feasibility.md`,
 "Phase 1 progress".

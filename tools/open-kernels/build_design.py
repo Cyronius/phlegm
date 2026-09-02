@@ -15,6 +15,7 @@ The design module must expose DESIGN (an @iron.jit callable) and SPECIALIZE
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -26,6 +27,10 @@ from aie.iron.device import from_name
 def main() -> int:
     src = Path(sys.argv[1]).resolve()
     out = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else src.parent / "build"
+    # Always a fresh project: aiecc keeps copies of the kernel sources and their
+    # objects in final.prj and skips recompiling them (header edits in the
+    # design dir were silently ignored: identical results build after build).
+    shutil.rmtree(out / "final.prj", ignore_errors=True)
     out.mkdir(parents=True, exist_ok=True)
 
     # Trap 1 (LLMNpuTest): without this IRON silently targets aie2 / NPU1.

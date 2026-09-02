@@ -301,7 +301,8 @@ traffic), then the ops with no prior art.
 | router 2048×256 bf16 + top-8 + sigmoid/softmax weights | todo | — | tiny; needs an on-core sort |
 | RMSNorm, residual, gates (SiLU/sigmoid) | todo | — | standard IRON elementwise |
 | gated DeltaNet step (S update 32×128×128 fp32, o = S'^T q) | **DONE, exact** | `designs/deltanet` | two streamed passes over S, bf16 hi/lo splits; S from a real captured state; 0.44 ms/layer |
-| conv1d shift + SiLU + q/k L2-norm, decay/beta (softplus/sigmoid), ssm_norm·silu(z) gate | todo | — | elementwise around the step above |
+| conv1d + SiLU + q/k L2-norm, alpha/beta proj → decay/beta, DeltaNet records, state shift | **DONE, fp32-exact** | `designs/dn_glue` | one core, 0.71 ms; fp32 vector exp/recip helpers; captured side pool + state |
+| post: RMSNorm128(o)·ssm_norm · silu(z) → out_proj input; layer RMSNorm + residual | todo | — | then the whole linear layer chains: norm → gemv(qkv,z) → glue → dn_step → post → gemv(out) |
 | full attention (KV append, softmax over ≤1024) | todo | — | every 3rd layer |
 | per-layer fusion behind L40Backend | phase 2 | — | one dispatch per layer, no host round-trip |
 
@@ -321,6 +322,14 @@ and a column shim has **16 BDs total**, so designs with several fills per core
 must pin one worker per column (`Worker(tile=Tile(c, 2))`). (6) bf16 hi/lo
 splitting of fp32 operands (no fp32 vector multiply on AIE2P) keeps a 128×128
 fp32 state update at 6e-6 relative error — fp32 state precision is preserved.
+(7) From the glue kernel (README has the detail): `release(n)` frees the
+OLDEST n elements (copy a held element to a Buffer); Python-unrolled loops
+overflow the 16 KB program memory (`XAIE_INVALID_ELF`); objectfifo lowering
+allocates depth+1 buffers; the hardware tanh/inv/invsqrt are ~1e-2 LUT
+approximations, so transcendentals are built from bf16 MACs (`vexp32`,
+Newton-refined `inv`/`invsqrt`, 1e-7); a too-small worker stack hangs the
+core; and both the jit design cache and aiecc's `final.prj` reuse stale
+kernel objects — `build_design.py` now wipes the project dir per build.
 
 **Speed observations (not optimised).** lm_head 80 bands: 33 GB/s; full 540
 MB: 25 GB/s; qkv 10.5 MB: 1.09 ms ≈ 9.6 GB/s incl. ~0.18 ms dispatch. The q4
