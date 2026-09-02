@@ -150,5 +150,35 @@ ELF; output == ROT13(input) byte-exact for both.
     bit-identical results three builds in a row. `build_design.py` now wipes
     `final.prj` before every build.
 
+- `designs/ln/` — layer RMSNorm with fused residual add: y = x + add,
+  xn = bf16(rms(y)·w). PASS, xn bit-identical to the fp64→bf16 reference.
+- `designs/dn_post/` — DeltaNet post step: og = bf16(rms128(o)·ssm_norm ·
+  silu(z)). PASS (4 of 4096 one-ulp bf16 differences).
+- `include/vecmath.h` — the fp32-on-bf16-MAC toolkit every kernel above uses:
+  `splitN`, `fmulN/faddN/fsubN`, `vexpN` (1e-7), `vrecipN`/`srsqrt`
+  (Newton-refined hardware seeds), `vsigmoidN`/`vsiluN`.
+- `designs/layer_chain/` — **MILESTONE (2026-09-02): a whole linear-attention
+  layer runs on open kernels and matches the CPU replica.** Layer 0 of the
+  captured 3LiF decode block (token 248068 at position 11, states from
+  `C:/caps/m0c/000898.bo`, weights from the captured L0 pool/pack/side) as a
+  host-driven chain of seven dispatches: ln → gemv(qkv) → gemv(z) → glue →
+  dn_step → post → gemv(out) → ln(+residual, post-attn norm). Reference:
+  `tools/kernel-interp/decode_step.py linear_decode` in fp64.
+  `make_chain.py` (WSL, needs the 3LiF model) writes buffers + `run.cfg`;
+  `compare_chain.py` checks:
+
+  | output | cos | maxrel | note |
+  |---|---|---|---|
+  | xn (normed input) | 0.9999986 | 2.4e-3 | bf16 |
+  | residual after attention | 0.9999996 | 9.4e-4 | fp32; error = bf16 xn/og rounding, as FLM |
+  | MoE input xm | 0.9999975 | 2.7e-3 | bf16 |
+  | DeltaNet state S | 1.0000000 | 2.8e-4 | fp32 |
+  | conv state | 0.9999996 | 1.9e-3 | bf16 |
+
+  ~15 ms for the chain as run (7 xclbin contexts, cold; the fused single
+  dispatch is phase 2). Multiple `xclbin`/`kernelx` contexts in one driver
+  config work; the glue's xn slot is filled by `dump xn` + `load side` (host
+  round trip, test only).
+
 Phase-1 status and what's next: `.claude/plans/open-kernels-feasibility.md`,
 "Phase 1 progress".
