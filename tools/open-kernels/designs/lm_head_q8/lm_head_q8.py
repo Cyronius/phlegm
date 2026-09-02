@@ -11,6 +11,7 @@ Build (WSL):  [LMHEAD_N=<rows>] python build_design.py designs/lm_head_q8/lm_hea
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -18,13 +19,14 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 import aie.iron as iron
-from aie.iron import CompileTime, In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker
+from aie.iron import Buffer, CompileTime, In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker
 from aie.iron.controlflow import range_
 from aie.iron.kernel import ExternalFunction
 from aie.helpers.taplib import TensorAccessPattern
 from aie.utils import config
 
 HERE = Path(__file__).parent
+GEMV = HERE.parent / "gemv_q4"          # gemv_tab.h + the activation prep entry point
 
 TILE_BYTES = 8704
 K = 2048
@@ -44,6 +46,7 @@ def _include_dirs() -> list[str]:
     root = Path(config.cxx_header_path()) / "aie_kernels"
     inc.append(str(root))
     inc.append(str(root / _detect_arch()))
+    inc.append(str(GEMV))
     return inc
 
 
@@ -54,7 +57,7 @@ def split_bands(bands: int, n_cores: int) -> list[int]:
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
 def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
-               n_cores: CompileTime[int], per_call: CompileTime[int]):
+               n_cores: CompileTime[int], per_call: CompileTime[int], srchash: CompileTime[int] = 0):
     assert n % BAND_ROWS == 0 and PER_BAND % per_call == 0
     bands = n // BAND_ROWS
     n_groups = PER_BAND // per_call
@@ -63,6 +66,7 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
 
     elem_ty = np.ndarray[(call_bytes,), np.dtype[np.uint8]]
     x_ty = np.ndarray[(K,), np.dtype[bfloat16]]
+    tab_ty = np.ndarray[(2 * K + K // 4,), np.dtype[np.uint8]]      # gemv_q4_tab_bytes(2048)
     acc_ty = np.ndarray[(BAND_ROWS,), np.dtype[np.float32]]
     w_ty = np.ndarray[(bands * BAND_BYTES,), np.dtype[np.uint8]]
     y_ty = np.ndarray[(n,), np.dtype[np.float32]]
@@ -70,23 +74,26 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
     kernel = ExternalFunction(
         "lm_head_q8_group",
         source_file=str(HERE / "lm_head_q8.cc"),
-        arg_types=[elem_ty, x_ty, acc_ty, np.int32],
+        arg_types=[elem_ty, tab_ty, acc_ty, np.int32],
         include_dirs=_include_dirs(),
         compile_flags=[f"-DLMHEAD_PER_CALL={per_call}"],
     )
+    prep = ExternalFunction("gemv_q4_prep_k2048", source_file=str(GEMV / "gemv_q4_prep_k2048.cc"),
+                            arg_types=[x_ty, tab_ty], include_dirs=_include_dirs())
 
     of_w = [ObjectFifo(elem_ty, name=f"w{c}", depth=2) for c in range(n_cores)]
     of_y = [ObjectFifo(acc_ty, name=f"y{c}", depth=2) for c in range(n_cores)]
     of_x = ObjectFifo(x_ty, name="x", depth=1)
 
     def make_body(nb: int):
-        def core_body(win, xin, yout, fn):
+        def core_body(win, xin, yout, tab, fprep, fn):
             xe = xin.acquire(1)
+            fprep(xe, tab)                       # block-quantise x once (gemv_tab.h)
             for _ in range_(nb):
                 ye = yout.acquire(1)
                 for g in range_(n_groups):
                     we = win.acquire(1)
-                    fn(we, xe, ye, g)
+                    fn(we, tab, ye, g)
                     win.release(1)
                 yout.release(1)
             xin.release(1)
@@ -94,8 +101,8 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
 
     workers = [
         Worker(make_body(counts[c]),
-               fn_args=[of_w[c].cons(), of_x.cons(), of_y[c].prod(), kernel],
-               stack_size=0xD00)
+               fn_args=[of_w[c].cons(), of_x.cons(), of_y[c].prod(), Buffer(tab_ty, name=f"tab{c}"), prep, kernel],
+               stack_size=0x1000)
         for c in range(n_cores)
     ]
 
@@ -125,4 +132,5 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
 
 
 DESIGN = lm_head_q8
-SPECIALIZE = {"n": N, "n_cores": N_CORES, "per_call": PER_CALL}
+_src = b"".join((HERE / f).read_bytes() for f in ("lm_head_q8.h", "lm_head_q8.cc")) + (GEMV / "gemv_tab.h").read_bytes()
+SPECIALIZE = {"n": N, "n_cores": N_CORES, "per_call": PER_CALL, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

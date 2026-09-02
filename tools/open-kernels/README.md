@@ -459,7 +459,29 @@ expert, 1350 dispatches in all), hence MoE first.
   same load, logits corr 0.999998, same argmax (846) / top-5, all 30
   residuals ≥ 0.999998** (`run_27b_item5.log`). Per kernel: me 108 → 60 ms,
   la 58 → 39, lc 37 → 30, al 30 → 20, dn 32 → 29 (no GEMV), lm_head 22 (q8,
-  untouched), router 19. Of the 220 ms, ~60 are context switches (132
-  dispatches × ~0.45 ms): the router fold, design B and a whole-layer
-  context are now worth more than the rest of item 5 (MoE core balance
-  ~10–15 ms, lm_head mmul ~5 ms). Details and traps in the plan doc.
+  untouched), router 19. Details and traps in the plan doc.
+
+  **Item 5, second half (same day).** (a) `moe_experts` balanced: all 8
+  cores do up/gate (64 rows each: the 64-row half c%2 of stripe c//2 is the
+  chunk pairs {4kt + 2(c%2), +1}, a strided shim tap of 8 × 10240 B at
+  stride 20480 expressed as three real dims [8, 4, 2560] — the BD's highest
+  dim is a repeat count, its length covers only the lowest three, and the
+  innermost wrap is < 4096 B — which the RS=2 band law consumes as a plain
+  64-row band); odd cores hand their 64 h rows to the even neighbour through
+  shared L1 (an AIE2 core reads its west neighbour's memory; the memtile
+  join keeps 4 producers, it has 6 DMA inputs). The driver's `moeroute` keeps
+  each fill's byte position inside its stripe and accepts 144 or 216 weight
+  fills. Unit test PASS (maxrel 2.5e-5), **0.85 ms** for the block (was
+  1.36–1.57; 2.24–2.5 originally): 17.7 MB at ~25 GB/s. (b) `lm_head_q8`
+  on the same path (`mmul<4,8,8,int16,int8>`, an unzip at step 8 splits each
+  128 B into the two 8-row B operands; rows come out in order, no
+  permutation): **full 21.4 → 15.6 ms (34.7 GB/s), PASS maxrel 4.6e-6** —
+  level with FLM's closed lm_head (15.4). The activation table code is now
+  `gemv_tab.h`, shared by both kernels.
+  **27B decode step: 313 → 208 ms (4.8 tok/s), same load, logits corr
+  0.999998, same argmax / top-5** (`run_27b_item5c.log`): me 1.85 ms/layer
+  (the unit test's 0.85 + the context switch and a cold pool per layer), la
+  2.0, lc 1.4, dn 1.4, al 1.9, rt 0.6, lm 16.8. Of the 208 ms, ~60 are
+  context switches (132 dispatches × ~0.45 ms) and ~18 the router: the
+  router fold, design B and a whole-layer context are now worth more than
+  anything left in item 5.

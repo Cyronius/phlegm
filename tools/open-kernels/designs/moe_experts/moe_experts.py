@@ -10,20 +10,30 @@ contexts, 5 for the shared expert + combine) of moe_chain / decode_chain with
 one. Weights are the same pool-order chunks make_27b.py slices today,
 concatenated per expert `[up 4 stripes | gate 4 stripes | down 16 bands]` =
 1,966,080 B x 8, then the shared expert `[share_up | share_gate | share_down]`
-(the same 3 x 655,360 B, standard RS=2 layout) as a 9th. (Step 2 replaces the
-host slice with the on-device fetch.)
+(the same 3 x 655,360 B, standard RS=2 layout) as a 9th. (Step 2a streams the
+same bytes from the resident layer pool: the driver's `moeroute` rewrites each
+fill's offset, keeping its position inside the stripe.)
 
 Cores (one per column, Tile(c, 2)), each with exactly its 2 input DMA channels
-(w from the shim, h from the memtile) and <= 2 outputs (h part, acc):
-  c < 4 : per expert, up band c then gate band c (128 rows each: one 32-chunk
-          RS=4 band for the routed experts, two 16-chunk RS=2 bands for the
-          shared one) against xm -> h_c = bf16(silu(g)*u) -> joined on a
-          memtile into h[512] and broadcast to all 8 cores.
+(w from the shim, h from the memtile) and <= 2 outputs (h part, acc). Phase 2
+item 5 balance: ALL 8 cores do up/gate (64 rows each) as well as down:
+  all 8 : per routed expert, the 64-row half c%2 of up stripe c//2 then of gate
+          stripe c//2 -- the stripe is an RS=4 band (quarter = chunk%4, k-tile
+          = chunk/4), so one half is the chunk pairs {4kt + 2(c%2), +1}: a
+          strided DMA tap (8 x 10240 B, stride 20480) that the RS=2 band law
+          (half = chunk%2, k-tile = chunk/2) consumes as a plain 64-row band.
+          For the shared expert (RS=2 layout) it is simply band c. Against xm
+          -> h_c = bf16(silu(g)*u), 64 rows.
+  pairs : the odd core hands its 64 h rows to its even neighbour through
+          shared L1 (an AIE2 core reads its west neighbour's memory); the even
+          core emits hp = [own 64 | neighbour 64] = 128 rows of stripe c//2,
+          joined on a memtile (a memtile has 6 DMA inputs, so 4 producers)
+          into h[512] and broadcast to all 8 cores.
   all 8 : per expert, its 256 rows of the down projection (two 8-chunk RS=4
           bands / four 4-chunk RS=2 bands) against h; routed: acc += w[e]*y in
           the output element; shared: out = xres + acc + gate*y, drained once.
 The first element of every core's w stream is the header
-[xm | router output | sgw | xres] (see moe_hdr.cc), copied to local buffers.
+[xm | router output | sgw | xres] (see moe_hdr.cc).
 
 Activations go through gemv_q4's int16 block tables (gemv_q4_prep_k2048 on the
 header element for xm, gemv_q4_prep_k512 on each h element) -- phase 2 item 5.
@@ -61,26 +71,36 @@ TILE = 5120
 PER_CALL = 4
 CALL_BYTES = PER_CALL * TILE          # one w element (and the header)
 STRIPE = 32 * TILE                    # 128 rows x 2048: one up/gate band (RS=4) or two (RS=2)
+HALF = 16 * TILE                      # 64 rows x 2048 = 4 elements: one core's share of a stripe
+PAIR = 2 * TILE                       # the two chunks of one half at one k-tile
 DOWN_BAND = 8 * TILE                  # 128 rows x 512 (RS=4) or two 64-row bands (RS=2)
 UP_BYTES = 4 * STRIPE                 # 655360
 EXPERT_BYTES = 3 * UP_BYTES           # up | gate | down
 N_CORES = 8
-N_UP = 4                              # cores doing up/gate
+N_PAIRS = N_CORES // 2                # h parts joined on the memtile
 DOWN_PER_CORE = 2                     # 16 x 128-row down bands / 8 cores
 HDR_BYTES = 20480
+ROWS = 64                             # up/gate rows per core
 
 
 def tap(total: int, off: int, n: int) -> TensorAccessPattern:
     return TensorAccessPattern((1, total), off, [1, 1, 1, n], [0, 0, 0, 1])
 
 
+def half_tap(total: int, off: int) -> TensorAccessPattern:
+    """One 64-row half of an RS=4 stripe: chunk pairs at every k-tile (8 x 10240 B, stride 20480).
+    Three real dims (8 k-tiles x 4 x 2560 B): the shim BD's highest dim is a repeat count, its
+    length covers only the lowest three, and the innermost wrap is 10 bits (< 4096 B)."""
+    return TensorAccessPattern((1, total), off, [1, 8, 4, PAIR // 4], [0, 2 * PAIR, PAIR // 4, 1])
+
+
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
 def moe_experts(wexp: In, hdr: In, out: Out, *, srchash: CompileTime[int] = 0):
     w_ty = np.ndarray[(NX * EXPERT_BYTES,), np.dtype[np.uint8]]
     elem_ty = np.ndarray[(CALL_BYTES,), np.dtype[np.uint8]]
-    x_ty = np.ndarray[(HID,), np.dtype[bfloat16]]
     h_ty = np.ndarray[(FF,), np.dtype[bfloat16]]
-    hp_ty = np.ndarray[(FF // N_UP,), np.dtype[bfloat16]]
+    hp_ty = np.ndarray[(2 * ROWS,), np.dtype[bfloat16]]        # a pair's 128 rows of h
+    nb_ty = hp_ty                                              # the odd core's 64 rows (in a 128 element: one silu signature)
     r_ty = np.ndarray[(32,), np.dtype[np.float32]]     # router floats 256..287; [0] = shared gate
     band_ty = np.ndarray[(128,), np.dtype[np.float32]]
     accp_ty = np.ndarray[(DOWN_PER_CORE * 128,), np.dtype[np.float32]]
@@ -89,15 +109,14 @@ def moe_experts(wexp: In, hdr: In, out: Out, *, srchash: CompileTime[int] = 0):
     tabh_ty = np.ndarray[(2 * FF + FF // 4,), np.dtype[np.uint8]]     # gemv_q4_tab_bytes(512): h
 
     inc = include_dirs() + [str(GEMV)]
-    # routed: up/gate 32-chunk RS=4 bands (8 groups of 4), down 8-chunk RS=4 bands
-    # (2 groups) -- gemv_q4's own entry points. Shared: RS=2 wrappers with a
+    # up/gate: 64-row bands of 16 chunks, RS=2 band law (4 groups of 4) -- the
+    # routed halves through the strided tap, the shared bands as they lie.
+    # down: routed 8-chunk RS=4 bands (2 groups); shared RS=2 wrappers with a
     # runtime group + output offset (two 64-row bands per 128-float buffer).
-    k_up = [ExternalFunction(f"gemv_q4_p4b32r4_k{i}", source_file=str(GEMV / f"gemv_q4_p4b32r4_k{i}.cc"),
-                             arg_types=[elem_ty, tabx_ty, band_ty], include_dirs=inc) for i in range(8)]
+    k_up = [ExternalFunction(f"gemv_q4_p4b16r2_k{i}", source_file=str(GEMV / f"gemv_q4_p4b16r2_k{i}.cc"),
+                             arg_types=[elem_ty, tabx_ty, band_ty], include_dirs=inc) for i in range(4)]
     k_dn = [ExternalFunction(f"gemv_q4_p4b8r4_k{i}", source_file=str(GEMV / f"gemv_q4_p4b8r4_k{i}.cc"),
                              arg_types=[elem_ty, tabh_ty, band_ty], include_dirs=inc) for i in range(2)]
-    r2x = ExternalFunction("gemv_q4_r2x", source_file=str(HERE / "gemv_q4_r2x.cc"),
-                           arg_types=[elem_ty, tabx_ty, band_ty, np.int32, np.int32], include_dirs=inc)
     r2h = ExternalFunction("gemv_q4_r2h", source_file=str(HERE / "gemv_q4_r2h.cc"),
                            arg_types=[elem_ty, tabh_ty, band_ty, np.int32, np.int32], include_dirs=inc)
     # activation prep (gemv_q4.h): xm straight from the header element, h from its fifo element
@@ -108,7 +127,9 @@ def moe_experts(wexp: In, hdr: In, out: Out, *, srchash: CompileTime[int] = 0):
     hdrf = ExternalFunction("moe_hdr", source_file=str(HERE / "moe_hdr.cc"),
                             arg_types=[elem_ty, r_ty, accp_ty, np.int32], include_dirs=inc)
     silu = ExternalFunction("moe_silu", source_file=str(HERE / "moe_silu.cc"),
-                            arg_types=[band_ty, band_ty, hp_ty], include_dirs=inc)
+                            arg_types=[band_ty, band_ty, nb_ty], include_dirs=inc)
+    catf = ExternalFunction("moe_cat", source_file=str(HERE / "moe_cat.cc"),
+                            arg_types=[nb_ty, hp_ty], include_dirs=inc)
     accf = ExternalFunction("moe_acc", source_file=str(HERE / "moe_acc.cc"),
                             arg_types=[band_ty, band_ty, r_ty, accp_ty, np.int32], include_dirs=inc)
     finf = ExternalFunction("moe_fin", source_file=str(HERE / "moe_fin.cc"),
@@ -116,10 +137,18 @@ def moe_experts(wexp: In, hdr: In, out: Out, *, srchash: CompileTime[int] = 0):
 
     of_w = [ObjectFifo(elem_ty, name=f"w{c}", depth=2) for c in range(N_CORES)]
     of_h = ObjectFifo(h_ty, name="h", depth=2)
-    of_hp = of_h.prod().join([c * (FF // N_UP) for c in range(N_UP)],
-                             obj_types=[hp_ty] * N_UP, names=[f"hp{c}" for c in range(N_UP)],
-                             depths=[2] * N_UP)
+    of_hp = of_h.prod().join([p * 2 * ROWS for p in range(N_PAIRS)],
+                             obj_types=[hp_ty] * N_PAIRS, names=[f"hp{p}" for p in range(N_PAIRS)],
+                             depths=[2] * N_PAIRS)
+    of_nb = [ObjectFifo(nb_ty, name=f"nb{p}", depth=2) for p in range(N_PAIRS)]   # odd core -> even core, shared L1
     of_acc = [ObjectFifo(accp_ty, name=f"acc{c}", depth=1) for c in range(N_CORES)]
+
+    def up_gate(win, tabx, ub, gb, kup):
+        for dst in (ub, gb):
+            for fn in kup:
+                we = win.acquire(1)
+                fn(we, tabx, dst)
+                win.release(1)
 
     def routed_down(win, tabh, y0, y1, kdn):
         for yb in (y0, y1):
@@ -134,35 +163,61 @@ def moe_experts(wexp: In, hdr: In, out: Out, *, srchash: CompileTime[int] = 0):
             r2h(we, tabh, y0 if j < 2 else y1, 0, 64 * (j % 2))
             win.release(1)
 
-    def body_up(win, hout, hin, aout, tabx, tabh, rb, xr, ub, gb, y0, y1, c,
-                fhdr, fprepx, fpreph, fsilu, facc, ffin, fr2x, fr2h, *ks):
-        kup, kdn = ks[:8], ks[8:]
+    def body_even(win, hout, nbin, hin, aout, tabx, tabh, rb, xr, ub, gb, y0, y1, c,
+                  fhdr, fprepx, fpreph, fsilu, fcat, facc, ffin, fr2h, *ks):
+        kup, kdn = ks[:4], ks[4:]
         we = win.acquire(1)
         fhdr(we, rb, xr, c)
         fprepx(we, tabx)                          # xm -> GEMV table
         win.release(1)
         ae = aout.acquire(1)
         for e in range_(NE):
-            for dst in (ub, gb):
-                for fn in kup:
-                    we = win.acquire(1)
-                    fn(we, tabx, dst)
-                    win.release(1)
+            up_gate(win, tabx, ub, gb, kup)
             he = hout.acquire(1)
-            fsilu(gb, ub, he)
+            fsilu(gb, ub, he)                     # rows 0..63 of the pair's 128
+            nb = nbin.acquire(1)
+            fcat(nb, he)                          # rows 64..127 from the odd neighbour
+            nbin.release(1)
             hout.release(1)
             hh = hin.acquire(1)
             fpreph(hh, tabh)                      # h -> GEMV table
             routed_down(win, tabh, y0, y1, kdn)
             facc(y0, y1, rb, ae, e)
             hin.release(1)
-        # the shared expert: 64-row bands 2c, 2c+1 of up then gate (4 groups each)
-        for dst in (ub, gb):
-            for b in range(2):
-                for g in range(4):
-                    we = win.acquire(1)
-                    fr2x(we, tabx, dst, g, 64 * b)
-                    win.release(1)
+        # the shared expert: band c of up then gate, four RS=2 down bands, combine
+        up_gate(win, tabx, ub, gb, kup)
+        he = hout.acquire(1)
+        fsilu(gb, ub, he)
+        nb = nbin.acquire(1)
+        fcat(nb, he)
+        nbin.release(1)
+        hout.release(1)
+        hh = hin.acquire(1)
+        fpreph(hh, tabh)
+        shared_down(win, tabh, y0, y1)
+        ffin(y0, y1, rb, xr, ae)
+        hin.release(1)
+        aout.release(1)
+
+    def body_odd(win, hout, hin, aout, tabx, tabh, rb, xr, ub, gb, y0, y1, c,
+                 fhdr, fprepx, fpreph, fsilu, facc, ffin, fr2h, *ks):
+        kup, kdn = ks[:4], ks[4:]
+        we = win.acquire(1)
+        fhdr(we, rb, xr, c)
+        fprepx(we, tabx)
+        win.release(1)
+        ae = aout.acquire(1)
+        for e in range_(NE):
+            up_gate(win, tabx, ub, gb, kup)
+            he = hout.acquire(1)
+            fsilu(gb, ub, he)                     # the odd core's 64 rows, to the even neighbour
+            hout.release(1)
+            hh = hin.acquire(1)
+            fpreph(hh, tabh)
+            routed_down(win, tabh, y0, y1, kdn)
+            facc(y0, y1, rb, ae, e)
+            hin.release(1)
+        up_gate(win, tabx, ub, gb, kup)
         he = hout.acquire(1)
         fsilu(gb, ub, he)
         hout.release(1)
@@ -173,45 +228,30 @@ def moe_experts(wexp: In, hdr: In, out: Out, *, srchash: CompileTime[int] = 0):
         hin.release(1)
         aout.release(1)
 
-    def body_dn(win, hin, aout, tabh, rb, xr, y0, y1, c, fhdr, fpreph, facc, ffin, fr2h, *kdn):
-        we = win.acquire(1)
-        fhdr(we, rb, xr, c)
-        win.release(1)
-        ae = aout.acquire(1)
-        for e in range_(NE):
-            hh = hin.acquire(1)
-            fpreph(hh, tabh)
-            routed_down(win, tabh, y0, y1, kdn)
-            facc(y0, y1, rb, ae, e)
-            hin.release(1)
-        hh = hin.acquire(1)
-        fpreph(hh, tabh)
-        shared_down(win, tabh, y0, y1)
-        ffin(y0, y1, rb, xr, ae)
-        hin.release(1)
-        aout.release(1)
-
     workers = []
     for c in range(N_CORES):
+        p = c // 2
+        tabx = Buffer(tabx_ty, name=f"tabx{c}")
         tabh = Buffer(tabh_ty, name=f"tabh{c}")
         rb = Buffer(r_ty, name=f"r{c}")
         xr = Buffer(accp_ty, name=f"xr{c}")
         y0 = Buffer(band_ty, name=f"y0_{c}")
         y1 = Buffer(band_ty, name=f"y1_{c}")
-        if c < N_UP:
-            ub = Buffer(band_ty, name=f"u{c}")
-            gb = Buffer(band_ty, name=f"g{c}")
-            tabx = Buffer(tabx_ty, name=f"tabx{c}")
-            workers.append(Worker(body_up,
-                                  fn_args=[of_w[c].cons(), of_hp[c].prod(), of_h.cons(), of_acc[c].prod(),
+        ub = Buffer(band_ty, name=f"u{c}")
+        gb = Buffer(band_ty, name=f"g{c}")
+        if c % 2 == 0:
+            workers.append(Worker(body_even,
+                                  fn_args=[of_w[c].cons(), of_hp[p].prod(), of_nb[p].cons(), of_h.cons(), of_acc[c].prod(),
                                            tabx, tabh, rb, xr, ub, gb, y0, y1, c,
-                                           hdrf, prepx, preph, silu, accf, finf, r2x, r2h,
+                                           hdrf, prepx, preph, silu, catf, accf, finf, r2h,
                                            *k_up, *k_dn],
                                   tile=Tile(c, 2), stack_size=0x1800))
         else:
-            workers.append(Worker(body_dn,
-                                  fn_args=[of_w[c].cons(), of_h.cons(), of_acc[c].prod(),
-                                           tabh, rb, xr, y0, y1, c, hdrf, preph, accf, finf, r2h, *k_dn],
+            workers.append(Worker(body_odd,
+                                  fn_args=[of_w[c].cons(), of_nb[p].prod(), of_h.cons(), of_acc[c].prod(),
+                                           tabx, tabh, rb, xr, ub, gb, y0, y1, c,
+                                           hdrf, prepx, preph, silu, accf, finf, r2h,
+                                           *k_up, *k_dn],
                                   tile=Tile(c, 2), stack_size=0x1800))
 
     W_TOTAL = NX * EXPERT_BYTES
@@ -224,14 +264,17 @@ def moe_experts(wexp: In, hdr: In, out: Out, *, srchash: CompileTime[int] = 0):
         pipe = Pipeline(3)
         for c in range(N_CORES):
             pipe.fill(w_prods[c], a_hdr, tap(HDR_BYTES, 0, HDR_BYTES))
-        # The shared expert's byte layout per core is identical to a routed one's
-        # (128 rows of up, of gate, 256 rows of down); only the band law differs.
         for e in range(NX):
             base = e * EXPERT_BYTES
             for c in range(N_CORES):
-                if c < N_UP:
-                    pipe.fill(w_prods[c], a_w, tap(W_TOTAL, base + c * STRIPE, STRIPE))
-                    pipe.fill(w_prods[c], a_w, tap(W_TOTAL, base + UP_BYTES + c * STRIPE, STRIPE))
+                if e < NE:
+                    # half c%2 of up stripe c//2, then of gate stripe c//2 (strided)
+                    pipe.fill(w_prods[c], a_w, half_tap(W_TOTAL, base + (c // 2) * STRIPE + (c % 2) * PAIR))
+                    pipe.fill(w_prods[c], a_w, half_tap(W_TOTAL, base + UP_BYTES + (c // 2) * STRIPE + (c % 2) * PAIR))
+                else:
+                    # the shared expert's RS=2 layout: band c of up, of gate (contiguous)
+                    pipe.fill(w_prods[c], a_w, tap(W_TOTAL, base + c * HALF, HALF))
+                    pipe.fill(w_prods[c], a_w, tap(W_TOTAL, base + UP_BYTES + c * HALF, HALF))
                 pipe.fill(w_prods[c], a_w, tap(W_TOTAL, base + 2 * UP_BYTES + c * DOWN_PER_CORE * DOWN_BAND,
                                                 DOWN_PER_CORE * DOWN_BAND))
         pipe.finish()

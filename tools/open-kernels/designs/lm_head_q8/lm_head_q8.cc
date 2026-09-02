@@ -4,14 +4,14 @@
 #include "lm_head_q8.h"
 
 extern "C" {
-void lm_head_q8_group(const uint8_t *__restrict t, const bfloat16 *__restrict x,
+void lm_head_q8_group(const uint8_t *__restrict t, const uint8_t *__restrict tab,
                       float *__restrict y, int group) {
 #pragma clang loop unroll(disable)
   for (unsigned i = 0; i < kPerCall; ++i) {
     const unsigned c = (unsigned)group * kPerCall + i;   // index within the band
     const unsigned quarter = c % kRowSplit;
     const unsigned kt = c / kRowSplit;
-    gemv_q8_tile(t + i * kTileBytes, x, kt, kt == 0, y + quarter * kRows);
+    gemv_q8_tile(t + i * kTileBytes, tab, kt, kt == 0, y + quarter * kRows);
   }
 }
 }

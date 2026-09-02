@@ -43,6 +43,8 @@
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 
+#include "gemv_tab.h"   // the activation's int16 block table (shared with lm_head_q8)
+
 static constexpr unsigned kRows = 32;         // output rows per chunk
 static constexpr unsigned kBandRows = 64;     // output rows per pool band
 static constexpr unsigned kKBlocks = 8;       // 32-wide K blocks per chunk
@@ -103,77 +105,6 @@ static constexpr unsigned kRowSplit = GEMV_ROWSPLIT;
 // Table layout (gemv_q4_tab_bytes(K) = 2.25 K):
 //   int16 xi[K] | int32 s[K/32] | bf16 xs_hi[K/32] | bf16 xs_lo[K/32]
 // ---------------------------------------------------------------------------
-
-// Sum of 32 bf16 values -> fp32, returned as 32-lane bf16 hi/lo broadcast
-// vectors (hi + lo == sum to ~2^-16). Vector-only: accumulator adds fold
-// 32 -> 16 -> 8 lanes, rotate-adds finish 8 -> 1 (zero padding makes the
-// wrapped lanes harmless for lane 0), lane 0 is broadcast and split.
-static inline void block_sum_split(const bfloat16 *__restrict xb,
-                                   aie::vector<bfloat16, 32> &hi,
-                                   aie::vector<bfloat16, 32> &lo) {
-  aie::accum<accfloat, 32> xa;
-  xa.from_vector(aie::load_v<32>(xb));
-  const aie::vector<float, 32> v32 = xa.template to_vector<float>();
-  aie::accum<accfloat, 16> a16, b16;
-  a16.from_vector(v32.template extract<16>(0));
-  b16.from_vector(v32.template extract<16>(1));
-  const aie::vector<float, 16> v16 = aie::add(a16, b16).template to_vector<float>();
-  aie::accum<accfloat, 8> a8, b8;
-  a8.from_vector(v16.template extract<8>(0));
-  b8.from_vector(v16.template extract<8>(1));
-  aie::vector<float, 16> t = aie::concat(aie::add(a8, b8).template to_vector<float>(),
-                                         aie::zeros<float, 8>());
-#pragma clang loop unroll(full)
-  for (unsigned s = 4; s >= 1; s >>= 1) {
-    aie::accum<accfloat, 16> p, q;
-    p.from_vector(t);
-    q.from_vector(aie::shuffle_down_rotate(t, s));
-    t = aie::add(p, q).template to_vector<float>();
-  }
-  aie::accum<accfloat, 32> bc;
-  bc.from_vector(aie::broadcast<float, 32>(t[0]));
-  hi = bc.template to_vector<bfloat16>();
-  lo = aie::sub(bc, hi).template to_vector<bfloat16>();
-}
-
-static constexpr unsigned gemv_q4_tab_bytes(unsigned K) { return 2 * K + K / 8 + K / 8; }
-
-// Block-quantise x[K] (bf16) into the table. Integer scalar work only (the
-// scalar unit has no FPU); the float work is vector ops. The block sum is the
-// exact bf16 x's (fp32 tree), not the quantised one; the two agree to ~2^-15.
-// K is a runtime argument so every K shares ONE body (noinline + inline,
-// COMDAT): a design mixing K = 512 and 2048 overflowed the 16 KB program
-// memory with per-K copies.
-__attribute__((noinline)) inline void gemv_q4_prep(const bfloat16 *__restrict x, uint8_t *__restrict tab,
-                                                   unsigned K) {
-  const unsigned NB = K / 32;
-  aie::set_rounding(aie::rounding_mode::conv_even);
-  int16_t *__restrict xi = (int16_t *)tab;
-  int32_t *__restrict sh = (int32_t *)(tab + 2 * K);
-  bfloat16 *__restrict xsh = (bfloat16 *)(tab + 2 * K + 4 * NB);
-  bfloat16 *__restrict xsl = xsh + NB;
-  // |x| as int16 bit patterns: clear bit 15 (byte mask [0xFF, 0x7F] per lane)
-  const aie::vector<uint8_t, 64> absmask =
-      aie::interleave_zip(aie::broadcast<uint8_t, 64>(0xFF), aie::broadcast<uint8_t, 64>(0x7F), 1).first;
-#pragma clang loop unroll(disable)
-  for (unsigned kb = 0; kb < NB; ++kb) {
-    const aie::vector<bfloat16, 32> xv = aie::load_v<32>(x + kb * 32);
-    const aie::vector<int16_t, 32> ab =
-        aie::bit_and(xv.template cast_to<uint8_t>(), absmask).template cast_to<int16_t>();
-    const int mx = aie::reduce_max(ab);            // positive floats order as their bits
-    int s = 141 - (mx >> 7);                       // 14 - (e - 127)
-    if (s > 126) s = 126;                          // zero / tiny block: any scale works
-    sh[kb] = s;
-    const aie::vector<bfloat16, 32> sc =
-        aie::broadcast<int16_t, 32>((int16_t)((127 + s) << 7)).template cast_to<bfloat16>();
-    const aie::accum<accfloat, 32> a = aie::mul(xv, sc);
-    aie::store_v(xi + kb * 32, aie::to_fixed<int16_t>(a, 0));
-    aie::vector<bfloat16, 32> hi, lo;
-    block_sum_split(x + kb * 32, hi, lo);
-    xsh[kb] = hi[0];
-    xsl[kb] = lo[0];
-  }
-}
 
 // One chunk against the k-tile `kt` of the table. `first` starts the band
 // accumulator, `last` writes y back in row order (see the lane-order note).
@@ -304,11 +235,6 @@ static inline void gemv_q4_pool_group(const uint8_t *__restrict chunks,
                                        float *__restrict y) {               \
     gemv_q4_pool_group(t, tab, N, y);                                       \
   }
-// The activation prep entry point for one K: gemv_q4_prep_k<K>(x, tab).
-#define GEMV_Q4_PREP_ENTRY_(K)                                              \
-  void gemv_q4_prep_k##K(const bfloat16 *__restrict x, uint8_t *__restrict tab) { \
-    gemv_q4_prep(x, tab, K);                                                \
-  }
-#define GEMV_Q4_PREP_ENTRY(K) GEMV_Q4_PREP_ENTRY_(K)
+
 #define GEMV_Q4_ENTRY_(P, B, R, N) GEMV_Q4_ENTRY__(P, B, R, N)
 #define GEMV_Q4_ENTRY(N) GEMV_Q4_ENTRY_(GEMV_PER_CALL, GEMV_PER_BAND, GEMV_ROWSPLIT, N)

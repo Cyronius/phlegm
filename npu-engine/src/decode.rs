@@ -34,8 +34,9 @@ pub struct Driver {
     instr: HashMap<String, (Bo, usize)>,
     /// The instruction bytes as loaded (before any `moeroute` patching).
     instr_src: HashMap<String, Vec<u8>>,
-    /// `moeroute` patch table per kernel: (word index, expert slot 0..8, core, kind 0/1/2).
-    moe_patches: HashMap<String, Vec<(usize, usize, u64, u8)>>,
+    /// `moeroute` patch table per kernel: (word index, expert slot 0..8, stripe/core, kind 0/1/2,
+    /// byte offset inside the stripe / down slice).
+    moe_patches: HashMap<String, Vec<(usize, usize, u64, u8, u64)>>,
     /// name -> (bo, logical size). The Bo's own size is padded up to 1 MB.
     bufs: HashMap<String, (Bo, usize)>,
     layeridx: i32,
@@ -108,8 +109,11 @@ impl Driver {
     /// instruction stream as loaded: every DDR-patch op (0x81, 12 words:
     /// reg addr at +6, arg index at +8, byte offset at +10) on arg 0 is one
     /// weight fill whose static offset into the host-built `wexp` names its
-    /// expert slot, core and kind.
-    fn moe_patch_table(&mut self, kn: &str) -> Result<Vec<(usize, usize, u64, u8)>, String> {
+    /// expert slot, stripe (up/gate) or core (down), kind, and its byte
+    /// position inside that stripe / down slice (the balanced design streams
+    /// one 64-row half of a stripe per core: 4 cores x 3 fills, or 8 x 3, per
+    /// slot).
+    fn moe_patch_table(&mut self, kn: &str) -> Result<Vec<(usize, usize, u64, u8, u64)>, String> {
         if let Some(t) = self.moe_patches.get(kn) {
             return Ok(t.clone());
         }
@@ -130,19 +134,19 @@ impl Driver {
                 let off = w[i + 10] as u64;
                 let slot = (off / MOE_EXPERT_BYTES) as usize;
                 let rem = off % MOE_EXPERT_BYTES;
-                let (kind, core) = if rem < MOE_UP_BYTES {
-                    (0u8, rem / MOE_STRIPE)
+                let (kind, core, intra) = if rem < MOE_UP_BYTES {
+                    (0u8, rem / MOE_STRIPE, rem % MOE_STRIPE)
                 } else if rem < 2 * MOE_UP_BYTES {
-                    (1u8, (rem - MOE_UP_BYTES) / MOE_STRIPE)
+                    (1u8, (rem - MOE_UP_BYTES) / MOE_STRIPE, (rem - MOE_UP_BYTES) % MOE_STRIPE)
                 } else {
-                    (2u8, (rem - 2 * MOE_UP_BYTES) / MOE_DOWN_CORE)
+                    (2u8, (rem - 2 * MOE_UP_BYTES) / MOE_DOWN_CORE, (rem - 2 * MOE_UP_BYTES) % MOE_DOWN_CORE)
                 };
-                t.push((i + 10, slot, core, kind));
+                t.push((i + 10, slot, core, kind, intra));
             }
             i += len;
         }
-        if t.len() != 144 {
-            return Err(format!("moeroute: {kn} has {} weight fills, expected 144", t.len()));
+        if t.len() != 144 && t.len() != 216 {
+            return Err(format!("moeroute: {kn} has {} weight fills, expected 144 or 216", t.len()));
         }
         self.moe_patches.insert(kn.to_string(), t.clone());
         Ok(t)
@@ -322,8 +326,8 @@ impl Driver {
                 let idx: Vec<u32> = idx.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                 let table = self.moe_patch_table(&kn)?;
                 let (ibo, _) = self.instr.get_mut(&kn).ok_or(format!("no kernelx {kn}"))?;
-                for &(word, slot, core, kind) in &table {
-                    let off: u64 = if slot < 8 {
+                for &(word, slot, core, kind, intra) in &table {
+                    let off: u64 = intra + if slot < 8 {
                         let e = idx[slot] as u64;
                         match kind {
                             0 => (8 * e + 2 * core) * MOE_STRIPE,

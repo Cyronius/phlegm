@@ -102,3 +102,26 @@ Unit tests, all PASS with the same tolerances as before:
   next plan decisions; they are worth more than the rest of item 5 now.
 - The DMA side itself is near the ceiling: 8 streams reach ~32–34 GB/s of
   the ~40 GB/s per-agent figure; 16 streams (2 per column) are untested.
+
+## Progress, second half (2026-09-02)
+
+- **MoE core balance done** (`moe_experts.py`): all 8 cores do up/gate (64
+  rows each) via a strided half-stripe tap `[8, 4, 2560]` (three real dims:
+  the shim BD's highest dim is a repeat count, its length covers only the
+  lowest three, innermost wrap < 4096 B); odd → even neighbour hand-over of
+  the 64 h rows through shared L1 (`moe_cat.cc`), 4-producer memtile join
+  unchanged. Driver `moeroute` keeps the intra-stripe offset (216 fills).
+  Unit test PASS, **0.85 ms** (was 1.36–1.57): 17.7 MB at ~25 GB/s.
+- **lm_head on the mmul path** (`lm_head_q8.h`, `gemv_tab.h` shared):
+  **21.4 → 15.6 ms, 34.7 GB/s**, PASS maxrel 4.6e-6. Level with FLM's
+  closed lm_head (15.4 ms).
+- **27B decode step: 313 → 208 ms (4.8 tok/s)** at the same box load,
+  logits corr 0.999998, same argmax / top-5 (`run_27b_item5c.log`). In the
+  step `me` is 1.85 ms/layer, not 0.85: the context switch (~0.5) and a
+  different 512 MB pool BO every layer (cold IOMMU/DRAM state; the unit
+  kernel against a pool BO with `moeroute` runs 0.86–1.29 ms) — a
+  same-context / resident-driver matter, not bandwidth.
+- Left: ~60 ms of context switches (router fold −15, design B −18,
+  whole-layer context −54), then dynamic KV (item 3) before the resident
+  driver (item 4). DMA is at 25–35 GB/s per design against a ~40 GB/s
+  per-agent ceiling; 16 streams (2 per column) untested.
