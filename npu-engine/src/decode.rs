@@ -277,10 +277,15 @@ impl Driver {
                     h | (parity(h) << 31)
                 };
                 let mut words: Vec<u32> = Vec::new();
-                // BD word1 = base_address_low (bits [1:0] are zero), word2 = high 16 bits.
-                words.push(hdr(bd_reg + 4, 2));
-                words.push((addr & 0xFFFF_FFFC) as u32);
-                words.push(((addr >> 32) & 0xFFFF) as u32);
+                // slab_bytes == 0 => enqueue only, leaving whatever address the
+                // firmware already patched into the BD. That isolates the
+                // control-packet/enqueue mechanism from the address encoding.
+                if slab != 0 {
+                    // BD word1 = base_address_low (bits [1:0] are zero), word2 = high 16 bits.
+                    words.push(hdr(bd_reg + 4, 2));
+                    words.push((addr & 0xFFFF_FFFC) as u32);
+                    words.push(((addr >> 32) & 0xFFFF) as u32);
+                }
                 // Enable the channel (controller id field), then push the BD to
                 // its task queue. FLM's stream does the same pair before every
                 // enqueue: maskwrite <queue-4> 0xf00 <- 0x1f00, then write queue.

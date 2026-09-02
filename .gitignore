@@ -40,7 +40,8 @@ lancedb/
 !tools/kernel-interp/rust_ref/*.f32
 !tools/kernel-interp/rust_ref/*.i64
 kernels/
-tools/open-kernels/designs/*/build/
+tools/open-kernels/designs/*/build*/
 tools/open-kernels/designs/*/out*.bin
 tools/open-kernels/designs/*/in.bin
 tools/open-kernels/designs/*/run*.cfg
+tools/open-kernels/designs/*/big.bin
