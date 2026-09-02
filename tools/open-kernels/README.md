@@ -180,5 +180,28 @@ ELF; output == ROT13(input) byte-exact for both.
   config work; the glue's xn slot is filled by `dump xn` + `load side` (host
   round trip, test only).
 
+- `designs/router/` — MoE router: bf16 GEMV 2048×256, fp32 softmax, top-8 on
+  the core (positive floats compare as uint32 on the scalar unit), renormalised
+  weights. On the layer chain's real MoE input: same 8 experts, same order as
+  the fp64 reference; p maxrel 1.6e-5, w 2.9e-6.
+- `designs/silu_mul/` — h = bf16(silu(g)·u): bit-exact.
+- `designs/moe_combine/` — two designs: `moe_axpy` (acc += w[e]·y_e, one run
+  per expert, slot from a small buffer, accumulator ping-pongs between two BOs)
+  and `moe_fin` (out = xres + acc + sigmoid(xm·sgw)·shared). maxrel 6.9e-6.
+  **A run with 14 buffer arguments is rejected by the firmware (ERT state 6,
+  abort, and the driver stops)** — hence two designs; keep runs ≤ ~8 buffers.
+- `designs/moe_chain/` — **the MoE block of layer 0 on open kernels, 48
+  dispatches over 9 xclbin contexts**: ln → router → per expert (gemv up, gemv
+  gate, silu_mul, gemv down, moe_axpy) → shared expert (gemv up/gate, silu_mul,
+  gemv down) → moe_fin. Reference: fp64 from the replica's dequantised expert
+  weights with bf16 xm and bf16 h exactly as the kernels round. **PASS: router
+  idx identical, block output cos 1.0000000 maxrel 2.8e-5** (1.4e-4 vs the
+  replica's fp32-activation version). Expert weights are sliced by the host
+  from the reference's indices; the on-device fetch (phase 0b) replaces that
+  slicing in the fused kernel.
+
+Together with `layer_chain`, **all of layer 0 (attention + MoE) of the
+captured decode step now reproduces on open kernels.**
+
 Phase-1 status and what's next: `.claude/plans/open-kernels-feasibility.md`,
 "Phase 1 progress".

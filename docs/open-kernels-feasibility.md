@@ -297,9 +297,9 @@ traffic), then the ops with no prior art.
 |---|---|---|---|
 | q4_1 projections (qkv, z, share_up/gate/down, full-attn q/k/v/o) | **DONE, exact** | `designs/gemv_q4` | pool-order chunks, band law half=c%2 kt=c/2; qkv 1.09 ms |
 | lm_head q8 (248320×2048) | **DONE, exact** | `designs/lm_head_q8` | supertile order quarter=c%4 kt=c/4; 21.4 ms vs FLM 15.4 |
-| routed experts (gate/up stripes + down, per-expert base from ctrlpkt fetch) | next | — | GEMV is the same kernel; stripe/down perms from pools.rs; combine with 0b fetch |
-| router 2048×256 bf16 + top-8 + sigmoid/softmax weights | todo | — | tiny; needs an on-core sort |
-| RMSNorm, residual, gates (SiLU/sigmoid) | todo | — | standard IRON elementwise |
+| routed experts (gate/up stripes + down) + shared expert + weighted combine | **DONE — MoE block matches** | `designs/moe_chain` (gemv_q4 RS=4, `silu_mul`, `moe_combine`) | 48 dispatches / 9 contexts; block output cos 1.0000000, maxrel 2.8e-5; host slices experts by index (0b fetch = fused kernel, phase 2) |
+| router 2048×256 bf16 + softmax + top-8 + renorm | **DONE, exact** | `designs/router` | on-core top-8; identical selection to the reference |
+| RMSNorm, residual, gates (SiLU/sigmoid) | **DONE** | `designs/ln`, `include/vecmath.h` | fp32 exp/sigmoid built from bf16 MACs |
 | gated DeltaNet step (S update 32×128×128 fp32, o = S'^T q) | **DONE, exact** | `designs/deltanet` | two streamed passes over S, bf16 hi/lo splits; S from a real captured state; 0.44 ms/layer |
 | conv1d + SiLU + q/k L2-norm, alpha/beta proj → decay/beta, DeltaNet records, state shift | **DONE, fp32-exact** | `designs/dn_glue` | one core, 0.71 ms; fp32 vector exp/recip helpers; captured side pool + state |
 | post: RMSNorm128(o)·ssm_norm · silu(z); layer RMSNorm + residual | **DONE, exact** | `designs/dn_post`, `designs/ln` | bf16 outputs match the fp64→bf16 reference (ln bit-identical) |
