@@ -24,6 +24,7 @@ def include_dirs() -> list[str]:
     root = Path(config.cxx_header_path()) / "aie_kernels"
     inc.append(str(root))
     inc.append(str(root / _detect_arch()))
+    inc.append(str(Path(__file__).parent / "include"))      # vecmath.h
     return inc
 
 

@@ -28,102 +28,7 @@ static constexpr unsigned kHD = 128;
 static constexpr unsigned kTile = 1024;      // conv channels per tile
 static constexpr unsigned kV = 32;
 
-using v32f = aie::vector<float, kV>;
-using v32b = aie::vector<bfloat16, kV>;
-using accf32 = aie::accum<accfloat, kV>;
-
-static inline void split32(const v32f &v, v32b &h, v32b &l) {
-  accf32 a;
-  a.from_vector(v);
-  h = a.template to_vector<bfloat16>();
-  l = aie::sub(a, h).template to_vector<bfloat16>();
-}
-
-// acc += a(fp32 vec) * s(bf16 hi/lo scalar)
-static inline accf32 mac_vs(accf32 acc, const v32f &a, bfloat16 sh, bfloat16 sl) {
-  v32b ah, al;
-  split32(a, ah, al);
-  acc = aie::mac(acc, ah, sh);
-  acc = aie::mac(acc, ah, sl);
-  acc = aie::mac(acc, al, sh);
-  return acc;
-}
-
-// acc += a(fp32 vec) * b(bf16 vec)
-static inline accf32 mac_vv(accf32 acc, const v32f &a, const v32b &b) {
-  v32b ah, al;
-  split32(a, ah, al);
-  acc = aie::mac(acc, ah, b);
-  acc = aie::mac(acc, al, b);
-  return acc;
-}
-
-// ---- fp32 vector arithmetic on top of bf16 MACs (3 cross terms, ~2^-16 rel)
-static inline v32f fmul32(const v32f &a, const v32f &b) {
-  v32b ah, al, bh, bl;
-  split32(a, ah, al);
-  split32(b, bh, bl);
-  accf32 acc = aie::mul(ah, bh);
-  acc = aie::mac(acc, ah, bl);
-  acc = aie::mac(acc, al, bh);
-  return acc.template to_vector<float>();
-}
-static inline v32f fadd32(const v32f &a, const v32f &b) {
-  accf32 x, y;
-  x.from_vector(a);
-  y.from_vector(b);
-  return aie::add(x, y).template to_vector<float>();
-}
-static inline v32f fsub32(const v32f &a, const v32f &b) {
-  accf32 x, y;
-  x.from_vector(a);
-  y.from_vector(b);
-  return aie::sub(x, y).template to_vector<float>();
-}
-
-// exp(x) to ~1e-7 relative: 2^(x*log2e) = 2^n * 2^f, |f| <= 0.5, degree-6 poly.
-// The hardware tanh/exp2 are LUT linear approximations (~1e-2), unusable for a
-// sigmoid that feeds an L2-normalised q/k.
-static inline v32f vexp32(v32f x) {
-  x = aie::max(x, aie::broadcast<float, kV>(-87.0f));
-  x = aie::min(x, aie::broadcast<float, kV>(88.0f));
-  const v32f t = fmul32(x, aie::broadcast<float, kV>(1.44269504f));
-  const aie::vector<int32_t, kV> n = aie::to_fixed<int32_t>(t, 0);      // round (conv_even)
-  const v32f nf = aie::to_float<float>(n, 0);
-  const v32f f = fsub32(t, nf);                                         // [-0.5, 0.5]
-  v32f p = aie::broadcast<float, kV>(1.54035304e-4f);
-  p = fadd32(fmul32(p, f), aie::broadcast<float, kV>(1.33335581e-3f));
-  p = fadd32(fmul32(p, f), aie::broadcast<float, kV>(9.61812911e-3f));
-  p = fadd32(fmul32(p, f), aie::broadcast<float, kV>(5.55041087e-2f));
-  p = fadd32(fmul32(p, f), aie::broadcast<float, kV>(2.40226507e-1f));
-  p = fadd32(fmul32(p, f), aie::broadcast<float, kV>(6.93147181e-1f));
-  p = fadd32(fmul32(p, f), aie::broadcast<float, kV>(1.0f));
-  const aie::vector<int32_t, kV> bits =
-      aie::upshift(aie::add(n, aie::broadcast<int32_t, kV>(127)), 23);
-  const v32f scale = bits.template cast_to<float>();                    // exact power of two
-  accf32 s;
-  s.from_vector(scale);
-  const v32b sb = s.template to_vector<bfloat16>();                     // exact
-  v32b ph, pl;
-  split32(p, ph, pl);
-  accf32 r = aie::mul(ph, sb);
-  r = aie::mac(r, pl, sb);
-  return r.template to_vector<float>();
-}
-
-// 1/d to fp32: hardware inv seed + two Newton steps r = r (2 - d r).
-static inline v32f vrecip32(const v32f &d) {
-  v32f r = aie::inv(d);
-  const v32f two = aie::broadcast<float, kV>(2.0f);
-  r = fmul32(r, fsub32(two, fmul32(d, r)));
-  r = fmul32(r, fsub32(two, fmul32(d, r)));
-  return r;
-}
-
-static inline v32f vsigmoid32(const v32f &x) {
-  const v32f e = vexp32(aie::neg(x));
-  return vrecip32(fadd32(e, aie::broadcast<float, kV>(1.0f)));
-}
+#include "vecmath.h"   // fp32 vector math on bf16 MACs (split32, fmul32, vexp32, vsigmoid32, srsqrt)
 
 // ---- alpha/beta projection tile: W element = kAbRows rows x 32 bf16 (4 KB); acc[32] += x[rows] @ W
 static constexpr unsigned kAbRows = 64;
@@ -234,10 +139,7 @@ static inline void glue_conv_tile(const float *__restrict q0, const float *__res
       }
       // aie::invsqrt is a coarse hardware approximation (~2% observed);
       // two Newton steps bring it to fp32.
-      const float x = aie::reduce_add(ss.template to_vector<float>()) + 1e-6f;
-      float inv = aie::invsqrt(x);
-      inv = inv * (1.5f - 0.5f * x * inv * inv);
-      inv = inv * (1.5f - 0.5f * x * inv * inv);
+      const float inv = srsqrt(aie::reduce_add(ss.template to_vector<float>()) + 1e-6f);
       const bfloat16 ih = (bfloat16)inv;
       const bfloat16 il = (bfloat16)(inv - (float)ih);
 #pragma clang loop unroll(disable)
