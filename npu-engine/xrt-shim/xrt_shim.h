@@ -70,6 +70,12 @@ void xrtsh_bo_free(xrtsh_bo bo);
 xrtsh_run xrtsh_run_create(xrtsh_kernel k);
 int xrtsh_run_set_arg_int(xrtsh_run r, int idx, int val);
 int xrtsh_run_set_arg_bo(xrtsh_run r, int idx, xrtsh_bo bo);
+/* The run's XRT-allocated control scratchpad BO (ELF-flow kernels whose
+ * instruction stream contains create_scratchpad). NULL if absent/failure.
+ * The returned handle is a new ShimBo sharing the underlying xrt::bo. */
+xrtsh_bo xrtsh_run_scratchpad_bo(xrtsh_run r);
+/* Device address of a BO (xrt::bo::address()). 0 on failure. */
+unsigned long long xrtsh_bo_address(xrtsh_bo bo);
 int xrtsh_run_start(xrtsh_run r);
 /* Returns ert_cmd_state (4 == COMPLETED) or <0 on exception. */
 int xrtsh_run_wait(xrtsh_run r);

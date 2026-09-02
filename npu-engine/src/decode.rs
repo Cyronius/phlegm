@@ -244,6 +244,57 @@ impl Driver {
                     return Err("RUN FAILED".to_string());
                 }
             }
+            "ctrlpkt" => {
+                // Build AIE control-packet words that retarget a shim DMA BD at a
+                // slab of another buffer and push it to a task queue:
+                //   ctrlpkt <dst-buf> <target-buf> <bd_reg> <queue_reg> <bd_id> <slab_bytes> <idx> [addr_bias]
+                // Packet word layout (mlir-aie AIETargetNPU.cpp / add_one_ctrl_packet):
+                //   header = stream_id<<24 | opcode<<22 | (beats=n-1)<<20 | addr, parity in bit 31
+                // followed by `n` data words. opcode 0 = write.
+                let dst = it.next().ok_or("ctrlpkt: dst buf")?.to_string();
+                let tgt = it.next().ok_or("ctrlpkt: target buf")?.to_string();
+                let pnum = |s: Option<&str>, what: &str| -> Result<u64, String> {
+                    let s = s.ok_or(format!("ctrlpkt: {what}"))?;
+                    let s2 = s.trim_start_matches("0x");
+                    if s2.len() != s.len() { u64::from_str_radix(s2, 16) } else { s.parse::<u64>() }
+                        .map_err(|_| format!("ctrlpkt: bad {what}: {s}"))
+                };
+                let bd_reg = pnum(it.next(), "bd_reg")? as u32;
+                let q_reg = pnum(it.next(), "queue_reg")? as u32;
+                let bd_id = pnum(it.next(), "bd_id")? as u32;
+                let slab = pnum(it.next(), "slab_bytes")?;
+                let idx = pnum(it.next(), "idx")?;
+                let bias = it.next().map(|s| {
+                    let s2 = s.trim_start_matches("0x");
+                    if s2.len() != s.len() { u64::from_str_radix(s2, 16).unwrap_or(0) } else { s.parse().unwrap_or(0) }
+                }).unwrap_or(0);
+
+                let base = self.bufs.get(&tgt).ok_or(format!("no buf {tgt}"))?.0.address();
+                let addr = base.wrapping_add(bias).wrapping_add(idx * slab);
+                let parity = |n: u32| -> u32 { if (n.count_ones() % 2) == 0 { 1 } else { 0 } };
+                let hdr = |addr_reg: u32, n: u32| -> u32 {
+                    let h = ((n - 1) << 20) | (addr_reg & 0xFFFFF); // stream_id 0, opcode 0 (write)
+                    h | (parity(h) << 31)
+                };
+                let mut words: Vec<u32> = Vec::new();
+                // BD word1 = base_address_low (bits [1:0] are zero), word2 = high 16 bits.
+                words.push(hdr(bd_reg + 4, 2));
+                words.push((addr & 0xFFFF_FFFC) as u32);
+                words.push(((addr >> 32) & 0xFFFF) as u32);
+                // Enable the channel (controller id field), then push the BD to
+                // its task queue. FLM's stream does the same pair before every
+                // enqueue: maskwrite <queue-4> 0xf00 <- 0x1f00, then write queue.
+                words.push(hdr(q_reg - 4, 1));
+                words.push(0x1F00);
+                words.push(hdr(q_reg, 1));
+                words.push(bd_id);
+                println!("ctrlpkt {dst}: base={base:#x} bias={bias:#x} idx={idx} -> addr={addr:#x}, {} words", words.len());
+                let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                let entry = self.bufs.get_mut(&dst).ok_or(format!("no buf {dst}"))?;
+                entry.0.init(&[])?;
+                entry.0.write(&bytes, 0)?;
+                entry.0.sync_to_device()?;
+            }
             "dump" => {
                 let name = it.next().ok_or("dump: name")?;
                 let outf = it.next().ok_or("dump: file")?;

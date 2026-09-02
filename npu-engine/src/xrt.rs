@@ -37,6 +37,8 @@ extern "C" {
     fn xrtsh_run_set_arg_int(r: handle, idx: c_int, val: c_int) -> c_int;
     fn xrtsh_run_set_arg_bo(r: handle, idx: c_int, bo: handle) -> c_int;
     fn xrtsh_run_start(r: handle) -> c_int;
+    fn xrtsh_run_scratchpad_bo(r: handle) -> handle;
+    fn xrtsh_bo_address(bo: handle) -> u64;
     fn xrtsh_run_wait(r: handle) -> c_int;
     fn xrtsh_run_free(r: handle);
 
@@ -168,6 +170,11 @@ impl Bo {
         self.size
     }
 
+    /// Device (DDR) address of this BO.
+    pub fn address(&self) -> u64 {
+        unsafe { xrtsh_bo_address(self.h) }
+    }
+
     /// Zero the whole (padded) buffer, then copy `data` into the front.
     pub fn init(&mut self, data: &[u8]) -> Result<()> {
         // Zero via the mapped pointer.
@@ -237,6 +244,17 @@ impl Run {
             return Err(last_error());
         }
         Ok(())
+    }
+
+    /// The run's control scratchpad BO (XRT allocates it when the kernel's
+    /// ELF instruction stream contains `create_scratchpad`). `size` is the
+    /// logical StateTable size to expose (max 128 bytes per mlir-aie).
+    pub fn scratchpad_bo(&self, size: usize) -> Result<Bo> {
+        let h = unsafe { xrtsh_run_scratchpad_bo(self.0) };
+        if h.is_null() {
+            return Err(last_error());
+        }
+        Ok(Bo { h, size })
     }
 
     pub fn start(&mut self) -> Result<()> {

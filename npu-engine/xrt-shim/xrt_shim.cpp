@@ -210,6 +210,26 @@ int xrtsh_run_set_arg_bo(xrtsh_run r, int idx, xrtsh_bo bo) {
     })
 }
 
+xrtsh_bo xrtsh_run_scratchpad_bo(xrtsh_run r) {
+    GUARD_PTR({
+        auto *b = new ShimBo{static_cast<ShimRun *>(r)->run.get_ctrl_scratchpad_bo()};
+        return static_cast<xrtsh_bo>(b);
+    })
+}
+
+unsigned long long xrtsh_bo_address(xrtsh_bo bo) {
+    try {
+        clear_err();
+        return static_cast<unsigned long long>(static_cast<ShimBo *>(bo)->bo.address());
+    } catch (const std::exception &e) {
+        set_err(e.what());
+        return 0;
+    } catch (...) {
+        set_err("unknown C++ exception");
+        return 0;
+    }
+}
+
 int xrtsh_run_start(xrtsh_run r) {
     GUARD_INT({
         static_cast<ShimRun *>(r)->run.start();
