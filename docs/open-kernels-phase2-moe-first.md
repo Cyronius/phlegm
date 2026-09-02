@@ -59,8 +59,14 @@ stands; the path there is removing dispatches, then bandwidth work (item 5).
   context switch. Remaining: linear-attention chain ~190 ms (item 1), shared
   expert + combine ~100 ms (step 1b), fused MoE 92 ms, lm_head 23 ms, rest
   ~55 ms.
-- Next: step 1b (shared expert + `fin` into the same dispatch: 5 dispatches
-  and ~100 ms/step → ~0), then step 2 (0b fetch), then item 1.
+- **Step 1b done**: shared expert + combine folded in as a 9th expert
+  (identical DMA pattern, RS=2 band law; header `[xm | rout | sgw | xres]`).
+  Unit test PASS maxrel 2.75e-5, 2.49 ms for the whole block. **27B decode
+  step: 302 dispatches, 348 ms (2.9 tok/s), logits corr 0.999998, same
+  argmax/top-5.** Remaining: linear-attention chain ~190 ms over 10
+  dispatches/layer (item 1), fused MoE 95 ms, lm_head 18 ms, attention
+  layers ~40 ms, router 15 ms.
+- Next: step 2 — see the design note (2a vs 2b) below; then item 1.
 
 ## Steps
 
@@ -118,6 +124,38 @@ one dispatch reading the full expert pool BO directly. This is where the
 resident engine's expert traffic pattern is decided, so it also needs the
 pool layout `build_pools.py` emits to be the one the BDs address — check that
 before writing the kernel.
+
+#### Step 2 design note (2026-09-02, after reading the 0b proof)
+
+What the fused kernel needs at runtime is only *where each of its 24 routed
+fills per layer reads from* (8 experts × [up band, gate band] on cores 0–3,
+[down bands] on all 8). Today those are static offsets into the host-built
+`wexp`; the on-device version points them into the resident layer pool at
+`(8e + 2s [+1]) · 163840` and `335544320 + e · 655360`.
+
+Two ways to get the router's 8 indices into those descriptors:
+
+- **2a — instruction-stream patch (host, ~0.1 ms/layer).** IRON's `insts.bin`
+  holds each fill as a `blockwrite` of BD words + an `address_patch` that adds
+  the BO base at submit. The instruction BO is host-writable: after the router
+  dispatch, read its 32 bytes of indices, rewrite the 24 fills' offset words
+  in the MoE kernel's instruction BO, submit. Removes the 15 MB/layer host
+  slice (450 MB/token, the resident engine's real host cost) for ~3 ms/token
+  of host time. One day; no new hardware mechanism; the fused kernel is
+  unchanged except that `wexp` becomes the full pool BO.
+- **2b — the 0b mechanism (no host involvement).** The router core writes
+  control-packet words (BD addr lo/hi + queue push, per column) to a DDR
+  bounce buffer; the sequence waits on that drain and pushes each column's
+  ctrl BD, whose packets rewrite the expert BDs and enqueue them. Proven
+  (`ddr_bounce_fetch.mlir`), but IRON cannot express it: it means editing the
+  generated `aie.mlir` (add the router core, ctrl packet flows per column,
+  replace 24 fills with wait+push) or hand-writing the fused MoE in MLIR.
+  A week or more, for ~3 ms/token over 2a. It also fixes the MM2S channel
+  budget: ctrl packets take ch0 of every column shim, weights ch1.
+
+Recommendation: do 2a now (it is what makes the resident 27B engine
+practical), keep 2b for after items 1, 3, 4 when the per-token budget is
+tight enough for 3 ms to matter. Decision needed before starting step 2.
 
 ### Then plan items 1, 3, 4, 5 in the existing order
 

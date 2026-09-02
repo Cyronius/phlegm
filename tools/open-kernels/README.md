@@ -331,7 +331,22 @@ expert, 1350 dispatches in all), hence MoE first.
   wexp hdr acc` per layer, then the shared expert + `fin` as before):
   **1622 → 452 dispatches, 1239 → 460 ms (2.2 tok/s), logits corr 0.999998,
   same argmax (846) and top-5, all 30 residuals ≥ 0.999997**
-  (`run_27b_fused.log`, `compare_27b.py`). The fused MoE is 92 ms of the 460
-  (3.1 ms/layer including the context switch); the rest is the unfused
-  linear-attention chain (~190 ms over 10 dispatches/layer), the shared
-  expert (5 dispatches, ~100 ms), lm_head 23 ms.
+  (`compare_27b.py`). The fused MoE is 92 ms of the 460 (3.1 ms/layer
+  including the context switch); the rest is the unfused linear-attention
+  chain (~190 ms over 10 dispatches/layer), the shared expert (5 dispatches,
+  ~100 ms), lm_head 23 ms.
+
+  **Step 1b — the shared expert and the combine in the same dispatch.** The
+  shared expert is streamed as a 9th expert: its `[share_up | share_gate |
+  share_down]` are the same 3 × 655,360 B, so every core's DMA pattern is
+  identical to a routed expert's and only the band law differs (RS=2, 64-row
+  bands: `gemv_q4_r2x/r2h.cc` wrap `gemv_q4_pool_group` with a runtime group
+  and output offset). The header grows to `[xm | rout | sgw | xres]` (exactly
+  20480 B); `moe_hdr` computes the gate `sigmoid(xm·sgw)` on every core and
+  keeps its 256 rows of xres; `moe_fin` emits `xres + acc + gate·shared`, so
+  the kernel's output is the layer's residual. Unit test vs `moe_chain`'s
+  block reference: **PASS cos 1.0000000, maxrel 2.75e-5, 2.49 ms** (the
+  45-dispatch chain: ~30 ms). **27B decode step: 302 dispatches, 348 ms
+  (2.9 tok/s), logits corr 0.999998, same argmax/top-5**
+  (`run_27b_fused.log`). Per layer the MoE block is now `rt` + 4 host copies
+  + `me` (3.2 ms); the linear-attention chain is the remaining ~190 ms.

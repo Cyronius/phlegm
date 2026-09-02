@@ -2,10 +2,13 @@ r"""Test vectors for moe_experts from designs/moe_chain's layer-0 inputs (no mod
 needed; runs on Windows):
 
   wexp.bin  = per routed expert k: w_up{k} | w_gate{k} | w_down{k}   (8 x 1,966,080 B)
-  hdr.bin   = 20480 B: moe_chain/y_xm.bin (the ln kernel's bf16 xm) at 0, then
-              moe_chain/y_rout.bin (the router kernel's f32[1024], w[8] at 264) at 4096
-  ref_acc.bin = sum_k w[k] * down_k(bf16(silu(gate_k xm) * (up_k xm))), fp64 from
-                the same pool bytes (gemv_q4/make_test.reference), bf16 h as the kernel.
+              then the shared expert w_su | w_sg | w_sd (1,966,080 B)
+  hdr.bin   = 20480 B: [moe_chain/y_xm.bin (the ln kernel's bf16 xm) | moe_chain/y_rout.bin
+              (the router kernel's f32[1024], w[8] at 264) | sgw.bin | xres.bin]
+  ref_acc.bin = the routed sum alone, fp64 from the same pool bytes
+                (gemv_q4/make_test.reference), bf16 h as the kernel (diagnostic)
+  ref_out.bin = moe_chain/ref_out.bin: xres + acc + sigmoid(xm.sgw) * shared -- the
+                block output the kernel emits
 
     python make_test.py ; open-qwen-npu npu designs/moe_experts/run.cfg ; python compare.py
 """
@@ -34,7 +37,6 @@ def silu(x):
 
 def main() -> int:
     xm_b = np.fromfile(MC / "y_xm.bin", np.uint8)[:4096].view(bfloat16)
-    xm = xm_b.astype(np.float64)
     rout = np.fromfile(MC / "y_rout.bin", np.float32)
     w8 = rout[264:272].astype(np.float64)
     acc = np.zeros(2048, np.float64)
@@ -51,23 +53,27 @@ def main() -> int:
         acc += w8[k] * y
         parts += [up.tobytes(), gt.tobytes(), dn.tobytes()]
         print(f"expert slot {k}: w={w8[k]:.4f} |y|max={np.abs(y).max():.4g}", flush=True)
+    parts += [(MC / n).read_bytes() for n in ("w_su.bin", "w_sg.bin", "w_sd.bin")]
     (HERE / "wexp.bin").write_bytes(b"".join(parts))
     hdr = np.zeros(20480, np.uint8)
     hdr[:4096] = xm_b.view(np.uint8)
     hdr[4096:8192] = rout.view(np.uint8)
+    hdr[8192:12288] = np.fromfile(MC / "sgw.bin", np.uint8)[:4096]
+    hdr[12288:20480] = np.fromfile(MC / "xres.bin", np.uint8)[:8192]
     (HERE / "hdr.bin").write_bytes(hdr.tobytes())
     (HERE / "ref_acc.bin").write_bytes(acc.astype(np.float32).tobytes())
+    (HERE / "ref_out.bin").write_bytes((MC / "ref_out.bin").read_bytes())
     cfg = "\n".join([
         "device",
         f"xclbin E {D}/moe_experts/build/final.xclbin",
         f"kernelx me E {D}/moe_experts/build/insts.bin",
-        f"buf wexp {NE * 1_966_080} {D}/moe_experts/wexp.bin",
+        f"buf wexp {(NE + 1) * 1_966_080} {D}/moe_experts/wexp.bin",
         f"buf hdr 20480 {D}/moe_experts/hdr.bin",
-        "buf acc 8192",
-        "run me wexp hdr acc",
-        "run me wexp hdr acc",
-        "run me wexp hdr acc",
-        f"dump acc {D}/moe_experts/y_acc.bin 8192",
+        "buf out 8192",
+        "run me wexp hdr out",
+        "run me wexp hdr out",
+        "run me wexp hdr out",
+        f"dump out {D}/moe_experts/y_out.bin 8192",
         "",
     ])
     (HERE / "run.cfg").write_text(cfg, newline="\n")
