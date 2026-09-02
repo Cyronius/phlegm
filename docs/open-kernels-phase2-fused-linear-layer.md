@@ -120,3 +120,16 @@ alone is 65 ms at 25 GB/s.
 - Next: **A′** (full-attention layer: ln → q/gate/k/v GEMVs → attn → o GEMV
   → ln in one context, 8 → 1 dispatches, ~−35 ms), then measure and decide
   on B.
+- **A′ done** (`designs/attn_layer/attn_l.py`, README "designs/attn_layer"):
+  the full-attention layer as one dispatch, built first try for pos 11 and
+  pos 0. Unit test on attn_chain's vectors: PASS with attn_chain's numbers
+  (residual 0.9999999), **2.5 ms warm** vs ~8 ms as 8 dispatches. Both entry
+  point sets share the GEMV core; one x fifo (bf16[4096]) carries xn then og.
+  `ironutil.Pipeline.finish(*eps)` added for per-channel stage waits.
+- **27B step with A + A′: 132 dispatches, 8 contexts, 311–315 ms (3.2 tok/s)
+  under the same load as the 378 ms run; logits corr 0.999998, same argmax /
+  top-5.** Estimate for A + A′ was ≈ 260 ms on a quieter box; like for like
+  (me 3.3 → 3.6 ms drift ≈ 10 %) we are at ~285. Remaining: MoE 108 ms
+  (item 5), linear layer's 3 switches ~30 ms (B), router 22 ms (fold into
+  the fused layer or `me`), lm_head 22 ms, dynamic KV (item 3) before the
+  resident driver (item 4).

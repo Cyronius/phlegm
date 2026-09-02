@@ -400,7 +400,36 @@ expert, 1350 dispatches in all), hence MoE first.
   loaded than for the 348 ms run — `me` 3.6 vs 3.3 ms, `lm` 23 vs 20 — so the
   like-for-like saving is the ~2.3 ms × 20 ≈ 45–65 ms the per-kernel times
   show, not the totals). Remaining per linear layer: 3 context switches
-  (~1.5 ms) — design B territory. Next: A′ (the full-attention layer as one
-  dispatch, 8 → 1).
+  (~1.5 ms) — design B territory.
+
+- `designs/attn_layer/` — **design A′: the full-attention layer as ONE
+  dispatch** (2026-09-02): `attn_l` = ln → q | gate | k | v GEMVs → attn →
+  o GEMV → ln (+residual), 10 cores in one xclbin (11 fills, 10 drains). One
+  ln core runs both norms (`ln_nr` then `ln`); the 8 GEMV cores stream q (8
+  bands) | gate (8) | k (1) | v (1) against xn and then o (4 bands of K=4096)
+  against og — two elements of one bf16[4096] x fifo, xn's fill being 8 KB
+  from `act[0]` with an unread tail — with both entry-point sets (`p4b16r2`,
+  `p4b32r2`) on the core; the attention core is `attn.py`'s verbatim. Five
+  weight fills and five y drains per column are throttled by
+  `ironutil.Pipeline` (which gained per-endpoint `finish(*eps)` so a stage
+  can wait for just the drains it needs). Args `pool xres consts kv act
+  hdr`: q/k/v/gate/o at their pool offsets, `consts` = [lnw | postln |
+  meta], the new cache rows land in `act` (the host still appends them to
+  the cache: plan item 3), the MoE header is written directly. `pos` (cached
+  rows) is still a CompileTime parameter: `build_pos11` for the unit test,
+  `build_pos0` for the 27B step.
+  `make_test.py` / `compare.py` on attn_chain's layer-2 vectors (position
+  11, the captured layer-2 pool as the weight BO): **PASS first run — knew /
+  vnew 1.0000000, og 0.9999996, residual 0.9999999 (maxrel 4.0e-5), xm
+  0.9999984; 2.5 ms warm** vs ~8 ms as 8 dispatches over 6 contexts.
+
+  **27B decode step with both fused layers: 1622 → 132 dispatches, 8
+  contexts, 311–315 ms (3.2 tok/s) under the same shared load as the 378 ms
+  run, logits corr 0.999998, same argmax (846) / top-5, all 30 residuals
+  ≥ 0.999997** (`run_27b_attn2.log`). Per layer now: linear 2.9 (la) + 1.6
+  (dn) + 1.9 (lc) + 0.75 (rt) + 3.6 (me) ≈ 10.8 ms; attention 3.0 (al) +
+  0.75 + 3.6 ≈ 7.4 ms; lm_head 22 ms. What is left is the MoE dispatch
+  (108 ms, 7 GB/s — item 5), the linear layer's three context switches
+  (design B, ~30 ms), the router (22 ms: fold into `me` or `lc`), lm_head.
   Trap: two designs in one process each pinning `Tile(c, 0)` shim handles
   is fine; a run with 6 buffer args is fine (9 is not).

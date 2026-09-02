@@ -52,7 +52,9 @@ class Pipeline:
     def drain(self, cons, tensor, tap):
         self._issue(cons, lambda tg: cons.drain(tensor, tap=tap, wait=True, group=tg))
 
-    def finish(self):
-        for q in self.queues.values():
+    def finish(self, *eps):
+        """Await everything issued (or, with endpoints given, only their queues)."""
+        qs = [self._q(ep) for ep in eps] if eps else list(self.queues.values())
+        for q in qs:
             while q:
                 q.popleft().finish()

@@ -33,8 +33,18 @@ os.chdir(KI)
 import decode_step as DS  # noqa: E402
 import build_pools as BP  # noqa: E402
 from q4nx import bf16_to_f32  # noqa: E402
-sys.path.insert(0, str(HERE.parent / "lin_layer"))
-import layout as LL  # noqa: E402  (lin_a / lin_c byte layouts)
+import importlib.util as _ilu  # noqa: E402
+
+
+def _load(name, path):
+    spec = _ilu.spec_from_file_location(name, path)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+LL = _load("lin_layout", HERE.parent / "lin_layer" / "layout.py")      # lin_a / lin_c byte layouts
+AL = _load("attn_layout", HERE.parent / "attn_layer" / "layout.py")    # attn_l byte layouts
 
 D = "C:/code/phlegm/tools/open-kernels/designs"
 OUT = f"{D}/decode_chain/w27"
@@ -158,13 +168,18 @@ def main() -> int:
             consts[LL.C_NW:LL.C_NW + 4096] = np.fromfile(WDIR / f"nw{l}.bin", np.uint8)[:4096]
             consts[LL.C_POSTLN:LL.C_POSTLN + 4096] = np.fromfile(WDIR / f"postln{l}.bin", np.uint8)[:4096]
             wr(f"consts{l}.bin", consts)
+        else:                                       # attn_layer/layout.py: [lnw | postln | meta]
+            consts = np.zeros(AL.CA_BYTES, np.uint8)
+            consts[AL.CA_LNW:AL.CA_LNW + 4096] = np.fromfile(WDIR / f"lnw{l}.bin", np.uint8)[:4096]
+            consts[AL.CA_POSTLN:AL.CA_POSTLN + 4096] = np.fromfile(WDIR / f"postln{l}.bin", np.uint8)[:4096]
+            consts[AL.CA_META:AL.CA_META + 2048] = np.fromfile(WDIR / f"meta{l}.bin", np.uint8)[:2048]
+            wr(f"constsa{l}.bin", consts)
 
     # ---- config
-    X = [("L", "ln", "ln/build"), ("Z", "gz", "gemv_q4/build_z"),
+    X = [("L", "ln", "ln/build"),
          ("A", "la", "lin_layer/build_a"), ("N", "dn", "deltanet/build"), ("C", "lc", "lin_layer/build_c"),
-         ("O", "gout", "gemv_q4/build_out"), ("R", "rt", "router/build"), ("E", "me", "moe_experts/build"),
-         ("S", "gsu", "gemv_q4/build_share_up"),
-         ("H", "g4kh", "gemv_q4/build_z_hi"), ("I", "g512h", "gemv_q4/build_512_hi"), ("X", "at", "attn/build_pos0"),
+         ("T", "al", "attn_layer/build_pos0"),
+         ("R", "rt", "router/build"), ("E", "me", "moe_experts/build"),
          ("K", "lm", "lm_head_q8/build_full")]
     cfg = ["device"]
     for tag, kn, path in X:
@@ -188,20 +203,10 @@ def main() -> int:
                      f"run dn zS vec{l} sout{l} o{l}",
                      f"run lc wout{l} o{l} consts{l} act{l} {xin} hdr{l}"]
         else:
-            cfg += [f"buf lnw{l} 4096 {OUT}/lnw{l}.bin", f"buf postln{l} 4096 {OUT}/postln{l}.bin",
-                    f"buf xa{l} 8192", f"buf xn{l} 4096", f"buf out{l} 8192", f"buf xb{l} 8192", f"buf xm{l} 4096",
-                    f"buf wq{l} 5242880 {OUT}/wq{l}.bin", f"buf wgate{l} 5242880 {OUT}/wgate{l}.bin",
-                    f"buf wk{l} 655360 {OUT}/wk{l}.bin", f"buf wv{l} 655360 {OUT}/wv{l}.bin", f"buf wo{l} 5242880 {OUT}/wo{l}.bin",
-                    f"buf qg{l} 32768", f"buf kvn{l} 4096", f"buf meta{l} 2048 {OUT}/meta{l}.bin",
-                    f"buf kvnew{l} 2048", f"buf og{l} 8192"]
-            runs += [f"run ln {xin} zero lnw{l} xa{l} xn{l}",
-                     f"run gz wq{l} xn{l} qg{l}", f"run g4kh wgate{l} xn{l} qg{l}",
-                     f"run gsu wk{l} xn{l} kvn{l}", f"run g512h wv{l} xn{l} kvn{l}",
-                     f"run at meta{l} qg{l} kvn{l} zkv kvnew{l} og{l}",
-                     f"run gout wo{l} og{l} out{l}",
-                     f"run ln xa{l} out{l} postln{l} xb{l} xm{l}",
-                     # header [xm | rout | sgw | xres]: host copies until the fused attention layer (A') writes it
-                     f"copy hdr{l} 0 xm{l} 0 4096", f"copy hdr{l} 12288 xb{l} 0 8192"]
+            # fused full-attention layer (ln -> q|gate|k|v -> attn -> o -> ln+res) as one dispatch;
+            # q/k/v/gate/o stream from the pool, the new cache rows land in act (host appends them: item 3)
+            cfg += [f"buf constsa{l} {AL.CA_BYTES} {OUT}/constsa{l}.bin", f"buf acta{l} {AL.AA_BYTES}"]
+            runs += [f"run al pool{l} {xin} constsa{l} zkv acta{l} hdr{l}"]
         # router (reads xm at hdr+0) -> the whole MoE block as one dispatch
         runs += [f"run rt hdr{l} rw{l} rout{l}", f"moeroute me rout{l}",
                  f"copy hdr{l} 4096 rout{l} 0 4096",
