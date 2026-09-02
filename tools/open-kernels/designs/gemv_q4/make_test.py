@@ -1,10 +1,15 @@
 r"""Test vectors for gemv_q4: slice a projection out of a captured layer pool,
 make an activation, compute the fp64 reference from the SAME pool bytes.
 
-    python make_test.py [--region qkv|z|share_up|share_gate|share_down] [--x random|ones|onehot:K|act:FILE]
+    python make_test.py [--region R] [--expert E] [--x random|ones|onehot:K|act:FILE]
 
-Writes w.bin (pool-order chunks), x.bin (bf16[K]), ref.bin (f32[N]) next to
-this file. Pool offsets: npu-engine/src/pools.rs. The pool blob is FLM's own
+Regions (npu-engine/src/pools.rs offsets; RS = band row split, see gemv_q4.h):
+    qkv, z, share_up, share_gate, share_down          standard layout, RS=2
+    exp_up, exp_gate     expert E's 4 stripes (128 rows x 2048 each), RS=4
+    exp_down             expert E's down [2048, 512], RS=4
+
+Writes w_<tag>.bin (pool-order chunks), x_<tag>.bin (bf16[K]), ref_<tag>.bin
+(f32[N]) and run_<tag>.cfg next to this file. The pool blob is FLM's own
 layer-0 pool as captured (verified byte-exact by pools.rs tests).
 """
 from __future__ import annotations
@@ -19,14 +24,38 @@ from ml_dtypes import bfloat16
 HERE = Path(__file__).parent
 POOL = Path("/mnt/c/caps/m0d/blob_536870912_836fd8e49f35a0b6.bin")
 CH = 5120
+S = 32 * CH                       # one expert stripe (128 rows x 2048)
 
-REGIONS = {                       # name: (offset, N, K)
-    "qkv":        (505_282_560, 8192, 2048),
-    "z":          (515_768_320, 4096, 2048),
-    "share_up":   (503_316_480, 512, 2048),
-    "share_gate": (503_971_840, 512, 2048),
-    "share_down": (504_627_200, 2048, 512),
+REGIONS = {                       # name: (offset, N, K, RS)
+    "qkv":        (505_282_560, 8192, 2048, 2),
+    "z":          (515_768_320, 4096, 2048, 2),
+    "share_up":   (503_316_480, 512, 2048, 2),
+    "share_gate": (503_971_840, 512, 2048, 2),
+    "share_down": (504_627_200, 2048, 512, 2),
 }
+
+
+def region_bytes(f, region: str, expert: int, bands_cap: int | None):
+    """-> (w_bytes, N, K, RS). Expert up/gate stripes are interleaved
+    [up0 gate0 up1 gate1 ...] in the pool; concatenate the 4 of one kind."""
+    if region in ("exp_up", "exp_gate"):
+        parts = []
+        for k in range(4):
+            f.seek((8 * expert + 2 * k + (1 if region == "exp_gate" else 0)) * S)
+            parts.append(f.read(S))
+        w = np.frombuffer(b"".join(parts), np.uint8)
+        return w, 512, 2048, 4
+    if region == "exp_down":
+        f.seek(335_544_320 + expert * 655_360)
+        return np.frombuffer(f.read(655_360), np.uint8), 2048, 512, 4
+    off, n, k, rs = REGIONS[region]
+    if bands_cap:
+        n = bands_cap * 32 * rs
+    nbytes = n * k * CH // (32 * 256)
+    f.seek(off)
+    w = np.frombuffer(f.read(nbytes), np.uint8)
+    assert len(w) == nbytes
+    return w, n, k, rs
 
 
 def dequant_chunk(b: np.ndarray) -> np.ndarray:
@@ -50,15 +79,15 @@ def dequant_chunk(b: np.ndarray) -> np.ndarray:
     return w
 
 
-def reference(w_bytes: np.ndarray, x: np.ndarray, n: int, k: int) -> np.ndarray:
-    per_band = k // 128
+def reference(w_bytes: np.ndarray, x: np.ndarray, n: int, k: int, rs: int) -> np.ndarray:
+    per_band = rs * k // 256
     y = np.zeros(n, np.float64)
     xf = x.astype(np.float64)
     nch = len(w_bytes) // CH
     for c in range(nch):
         band, ci = divmod(c, per_band)
-        rows0 = 64 * band + 32 * (ci % 2)
-        cols0 = 256 * (ci // 2)
+        rows0 = 32 * rs * band + 32 * (ci % rs)
+        cols0 = 256 * (ci // rs)
         w = dequant_chunk(w_bytes[c * CH:(c + 1) * CH]).astype(np.float64)
         y[rows0:rows0 + 32] += w @ xf[cols0:cols0 + 256]
     return y.astype(np.float32)
@@ -67,17 +96,13 @@ def reference(w_bytes: np.ndarray, x: np.ndarray, n: int, k: int) -> np.ndarray:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--region", default="qkv")
+    ap.add_argument("--expert", type=int, default=0)
     ap.add_argument("--x", default="random")
-    ap.add_argument("--bands", type=int, default=None, help="cap bands (64 rows each)")
+    ap.add_argument("--bands", type=int, default=None, help="cap bands (standard regions)")
     a = ap.parse_args()
-    off, n, k = REGIONS[a.region]
-    if a.bands:
-        n = a.bands * 64
-    nbytes = n * k * CH // (32 * 256)
     with POOL.open("rb") as f:
-        f.seek(off)
-        w = np.frombuffer(f.read(nbytes), np.uint8)
-    assert len(w) == nbytes
+        w, n, k, rs = region_bytes(f, a.region, a.expert, a.bands)
+    nbytes = len(w)
 
     if a.x == "ones":
         x = np.ones(k, np.float32).astype(bfloat16)
@@ -90,34 +115,32 @@ def main() -> int:
     else:
         x = np.random.default_rng(0).standard_normal(k).astype(np.float32).astype(bfloat16)
 
-    ref = reference(w, x, n, k)
-    r = a.region
-    (HERE / f"w_{r}.bin").write_bytes(w.tobytes())
-    (HERE / f"x_{r}.bin").write_bytes(x.tobytes())
-    (HERE / f"ref_{r}.bin").write_bytes(ref.tobytes())
-    # Driver config for this region (Windows paths). Two runs: the second is
-    # the steady-state timing (first includes nothing extra on this driver, but
-    # keeps the comparison honest).
+    ref = reference(w, x, n, k, rs)
+    tag = a.region if not a.region.startswith("exp_") else f"{a.region}{a.expert}"
+    (HERE / f"w_{tag}.bin").write_bytes(w.tobytes())
+    (HERE / f"x_{tag}.bin").write_bytes(x.tobytes())
+    (HERE / f"ref_{tag}.bin").write_bytes(ref.tobytes())
     d = "C:/code/phlegm/tools/open-kernels/designs/gemv_q4"
+    build = a.region  # builds are per shape, shared across experts
     cfg = "\n".join([
         "device",
-        f"xclbin G {d}/build_{r}/final.xclbin",
-        f"kernelx k G {d}/build_{r}/insts.bin",
-        f"buf w {nbytes} {d}/w_{r}.bin",
-        f"buf x {x.nbytes} {d}/x_{r}.bin",
+        f"xclbin G {d}/build_{build}/final.xclbin",
+        f"kernelx k G {d}/build_{build}/insts.bin",
+        f"buf w {nbytes} {d}/w_{tag}.bin",
+        f"buf x {x.nbytes} {d}/x_{tag}.bin",
         f"buf y {ref.nbytes}",
         "run k w x y",
         "run k w x y",
-        f"dump y {d}/y_{r}.bin {ref.nbytes}",
+        f"dump y {d}/y_{tag}.bin {ref.nbytes}",
         "",
     ])
-    (HERE / f"run_{r}.cfg").write_text(cfg, newline="\n")
-    cores = min(8, n // 64)
-    print(f"{r}: N={n} K={k} w={nbytes} B x={x.nbytes} B ref={ref.nbytes} B "
+    (HERE / f"run_{tag}.cfg").write_text(cfg, newline="\n")
+    cores = min(8, n // (32 * rs))
+    print(f"{tag}: N={n} K={k} RS={rs} w={nbytes} B x={x.nbytes} B ref={ref.nbytes} B "
           f"ref[:4]={ref[:4]} absmax={np.abs(ref).max():.4g}")
-    print(f"build: GEMV_N={n} GEMV_K={k} GEMV_CORES={cores} python build_design.py "
-          f"designs/gemv_q4/gemv_q4.py designs/gemv_q4/build_{r}")
-    print(f"run:   open-qwen-npu npu designs/gemv_q4/run_{r}.cfg ; python compare.py {r}")
+    print(f"build: GEMV_N={n} GEMV_K={k} GEMV_RS={rs} GEMV_CORES={cores} python build_design.py "
+          f"designs/gemv_q4/gemv_q4.py designs/gemv_q4/build_{build}")
+    print(f"run:   open-qwen-npu npu designs/gemv_q4/run_{tag}.cfg ; python compare.py {tag}")
     return 0
 
 

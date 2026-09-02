@@ -55,15 +55,22 @@ static constexpr unsigned kMetaBytes = 1024;
 static constexpr unsigned kTileBytes = 5120;
 
 // Chunks per entry-point call (one ObjectFifo element = kPerCall * 5120 B,
-// double-buffered in L1) and chunks per pool band (= K/128).
+// double-buffered in L1), chunks per pool band (= ROWSPLIT * K/256), and the
+// band's row split: 2 for the standard layout (std_perm: 64-row bands,
+// half = c%2, kt = c/2), 4 for the expert stripes / down experts (128-row
+// bands, quarter = c%4, kt = c/4 -- pools.rs stripe_transpose / down_perm).
 #ifndef GEMV_PER_CALL
 #define GEMV_PER_CALL 4
 #endif
 #ifndef GEMV_PER_BAND
 #define GEMV_PER_BAND 16
 #endif
+#ifndef GEMV_ROWSPLIT
+#define GEMV_ROWSPLIT 2
+#endif
 static constexpr unsigned kPerCall = GEMV_PER_CALL;
 static constexpr unsigned kPerBand = GEMV_PER_BAND;
+static constexpr unsigned kRowSplit = GEMV_ROWSPLIT;
 
 // `kt` selects the 256-wide slice of x; `first` starts the accumulator instead
 // of adding to y (so the K tiles chain without a zeroing pass). Runtime args +
@@ -156,17 +163,17 @@ static inline void gemv_q4_pool_group(const uint8_t *__restrict chunks,
 #pragma clang loop unroll(disable)
   for (unsigned i = 0; i < kPerCall; ++i) {
     const unsigned c = group * kPerCall + i;   // index within the band
-    const unsigned half = c % 2;
-    const unsigned kt = c / 2;
-    gemv_q4_tile(chunks + i * kTileBytes, x, kt, kt == 0, y + half * kRows);
+    const unsigned part = c % kRowSplit;       // which 32-row slice of the band
+    const unsigned kt = c / kRowSplit;
+    gemv_q4_tile(chunks + i * kTileBytes, x, kt, kt == 0, y + part * kRows);
   }
 }
 
-#define GEMV_Q4_ENTRY__(P, B, N)                                            \
-  void gemv_q4_p##P##b##B##_k##N(const uint8_t *__restrict t,               \
-                                 const bfloat16 *__restrict x,              \
-                                 float *__restrict y) {                     \
+#define GEMV_Q4_ENTRY__(P, B, R, N)                                         \
+  void gemv_q4_p##P##b##B##r##R##_k##N(const uint8_t *__restrict t,         \
+                                       const bfloat16 *__restrict x,        \
+                                       float *__restrict y) {               \
     gemv_q4_pool_group(t, x, N, y);                                         \
   }
-#define GEMV_Q4_ENTRY_(P, B, N) GEMV_Q4_ENTRY__(P, B, N)
-#define GEMV_Q4_ENTRY(N) GEMV_Q4_ENTRY_(GEMV_PER_CALL, GEMV_PER_BAND, N)
+#define GEMV_Q4_ENTRY_(P, B, R, N) GEMV_Q4_ENTRY__(P, B, R, N)
+#define GEMV_Q4_ENTRY(N) GEMV_Q4_ENTRY_(GEMV_PER_CALL, GEMV_PER_BAND, GEMV_ROWSPLIT, N)
