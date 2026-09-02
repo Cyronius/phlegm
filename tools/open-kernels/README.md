@@ -95,5 +95,26 @@ ELF; output == ROT13(input) byte-exact for both.
   cos 1.0, maxrel 2.9e-6, 21.4 ms** (540 MB, ~25 GB/s; FLM's closed lm_head:
   15.4 ms). 80-band subset: 0.67 ms at 33 GB/s.
 
+- `designs/deltanet/` — **phase 1**: gated DeltaNet decode step, 32 v-heads,
+  S[32,128,128] fp32 in/out + per-head (k, q, v, decay, beta) in, o[32,128]
+  out. S does not fit L1, so it streams through each core (one per column,
+  4 heads each) in 16-row slices, twice per head: pass 1 forms S^T k, pass 2
+  writes S' = decay·S + k⊗delta and forms o = S'^T q/√128. Every fp32 product
+  is a bf16 hi/lo split (AIE2P has no fp32 vector multiply). `make_test.py`
+  takes S from a real captured boundary state (`C:/caps/pf_t11_full`) and
+  random k/q/v/decay/beta; `compare.py` checks S_out and o. **PASS: S_out
+  maxrel 6.2e-6, o maxrel 6.3e-6, 0.44 ms** (2 MB state read twice + written
+  once).
+
+  Two hardware facts learned here, both silent hangs (ERT state 8) otherwise:
+  - **A shim DMA channel's start queue holds 4 BDs.** Queue more fills on one
+    channel without awaiting and the extra ones are dropped; the core waits
+    forever. Fix: `fill(..., wait=True, group=tg)` per head and `tg.finish()`
+    before issuing more than 2 heads (4 BDs) ahead — the sequence in
+    `dn_step.py`. Drains are issued first so cores never block on output.
+  - **A column shim has 16 BDs total** and IRON packs 4 workers per column by
+    default; designs with several fills per core need `Worker(..., tile=Tile(c, 2))`
+    to spread one core per column (the verifier catches this one).
+
 Phase-1 status and what's next: `.claude/plans/open-kernels-feasibility.md`,
 "Phase 1 progress".

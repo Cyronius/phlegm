@@ -300,7 +300,8 @@ traffic), then the ops with no prior art.
 | routed experts (gate/up stripes + down, per-expert base from ctrlpkt fetch) | next | — | GEMV is the same kernel; stripe/down perms from pools.rs; combine with 0b fetch |
 | router 2048×256 bf16 + top-8 + sigmoid/softmax weights | todo | — | tiny; needs an on-core sort |
 | RMSNorm, residual, gates (SiLU/sigmoid) | todo | — | standard IRON elementwise |
-| gated DeltaNet step (conv1d shift, S update 32×128×128 fp32, gate/norm) | todo | — | oracle: captured state BOs + forward.rs |
+| gated DeltaNet step (S update 32×128×128 fp32, o = S'^T q) | **DONE, exact** | `designs/deltanet` | two streamed passes over S, bf16 hi/lo splits; S from a real captured state; 0.44 ms/layer |
+| conv1d shift + SiLU + q/k L2-norm, decay/beta (softplus/sigmoid), ssm_norm·silu(z) gate | todo | — | elementwise around the step above |
 | full attention (KV append, softmax over ≤1024) | todo | — | every 3rd layer |
 | per-layer fusion behind L40Backend | phase 2 | — | one dispatch per layer, no host round-trip |
 
@@ -312,7 +313,14 @@ chunk group — no per-group translation units. (3) Uneven per-core slices via
 hand-built `TensorAccessPattern`s work (1940 bands over 8 cores). (4) The
 driver's `run` directive + `make_test.py`/`compare.py` per design is a
 sufficient harness: pool bytes in, fp64 reference from the same bytes, PASS
-at cos 1.0 / maxrel ~1e-5 (fp32 accumulation order).
+at cos 1.0 / maxrel ~1e-5 (fp32 accumulation order). (5) From the DeltaNet
+step, two hardware limits that hang silently (ERT state 8): a shim DMA
+channel's **start queue is 4 BDs deep** — more un-awaited fills on one channel
+are dropped, so per-head `fill(wait=True, group)` + `finish()` ≤ 2 heads ahead;
+and a column shim has **16 BDs total**, so designs with several fills per core
+must pin one worker per column (`Worker(tile=Tile(c, 2))`). (6) bf16 hi/lo
+splitting of fp32 operands (no fp32 vector multiply on AIE2P) keeps a 128×128
+fp32 state update at 6e-6 relative error — fp32 state precision is preserved.
 
 **Speed observations (not optimised).** lm_head 80 bands: 33 GB/s; full 540
 MB: 25 GB/s; qkv 10.5 MB: 1.09 ms ≈ 9.6 GB/s incl. ~0.18 ms dispatch. The q4
