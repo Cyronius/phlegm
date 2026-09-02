@@ -92,7 +92,7 @@ static inline vfN<N> fscaleN(const vfN<N> &a, float s) {
 
 // exp(x) to ~1e-7 relative: 2^(x*log2e) = 2^n * 2^f, |f| <= 0.5, degree-6 poly.
 template <unsigned N>
-static inline vfN<N> vexpN(vfN<N> x) {
+__attribute__((noinline)) inline vfN<N> vexpN(vfN<N> x) {
   x = aie::max(x, aie::broadcast<float, N>(-87.0f));
   x = aie::min(x, aie::broadcast<float, N>(88.0f));
   const vfN<N> t = fmulN<N>(x, aie::broadcast<float, N>(1.44269504f));
@@ -121,7 +121,7 @@ static inline vfN<N> vexpN(vfN<N> x) {
 
 // 1/d to fp32: hardware inv seed + two Newton steps r = r (2 - d r).
 template <unsigned N>
-static inline vfN<N> vrecipN(const vfN<N> &d) {
+__attribute__((noinline)) inline vfN<N> vrecipN(const vfN<N> &d) {
   vfN<N> r = aie::inv(d);
   const vfN<N> two = aie::broadcast<float, N>(2.0f);
   r = fmulN<N>(r, fsubN<N>(two, fmulN<N>(d, r)));
@@ -130,7 +130,7 @@ static inline vfN<N> vrecipN(const vfN<N> &d) {
 }
 
 template <unsigned N>
-static inline vfN<N> vsigmoidN(const vfN<N> &x) {
+__attribute__((noinline)) inline vfN<N> vsigmoidN(const vfN<N> &x) {
   // (aie::neg on a float vector fails to legalize (G_FNEG) in some kernels;
   // 0 - x through the accumulator is exact.)
   const vfN<N> e = vexpN<N>(fsubN<N>(aie::zeros<float, N>(), x));

@@ -29,7 +29,7 @@ import aie.iron as iron
 from aie.iron import CompileTime, In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker
 from aie.iron.controlflow import range_
 from aie.iron.kernel import ExternalFunction
-from aie.helpers.taplib import TensorTiler2D
+from aie.helpers.taplib import TensorAccessPattern, TensorTiler2D
 from aie.utils import config
 
 HERE = Path(__file__).parent
@@ -42,6 +42,11 @@ N = int(os.environ.get("GEMV_N", 8192))
 K = int(os.environ.get("GEMV_K", 2048))
 RS = int(os.environ.get("GEMV_RS", 2))
 N_CORES = int(os.environ.get("GEMV_CORES", 8))
+# Output placement: y is written at element offset YOFF of a YTOT-long buffer
+# (so two GEMVs can share one output BO -- the firmware rejects runs with
+# many buffer args). Default: YOFF = 0, YTOT = N.
+YOFF = int(os.environ.get("GEMV_YOFF", 0))
+YTOT = int(os.environ.get("GEMV_YTOT", 0)) or (N + YOFF)
 PER_CALL = 4          # 4 x 5120 = 20480 B per element, x2 buffered -> 40 KB of L1
 
 
@@ -81,7 +86,8 @@ def ensure_entry_points(n_entry: int, per_call: int, per_band: int, rs: int) -> 
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
 def gemv_q4(w: In, x: In, y: Out, *, n: CompileTime[int], k: CompileTime[int],
-            rs: CompileTime[int], n_cores: CompileTime[int], per_call: CompileTime[int]):
+            rs: CompileTime[int], n_cores: CompileTime[int], per_call: CompileTime[int],
+            yoff: CompileTime[int] = 0, ytot: CompileTime[int] = 0):
     band_rows = 32 * rs
     per_band = rs * k // 256                # chunks per band
     n_entry = per_band // per_call
@@ -97,7 +103,8 @@ def gemv_q4(w: In, x: In, y: Out, *, n: CompileTime[int], k: CompileTime[int],
     x_ty = np.ndarray[(k,), np.dtype[bfloat16]]
     acc_ty = np.ndarray[(band_rows,), np.dtype[np.float32]]
     w_ty = np.ndarray[(bands * band_bytes,), np.dtype[np.uint8]]
-    y_ty = np.ndarray[(n,), np.dtype[np.float32]]
+    y_total = ytot or (n + yoff)
+    y_ty = np.ndarray[(y_total,), np.dtype[np.float32]]
 
     kernels = [
         ExternalFunction(
@@ -132,7 +139,8 @@ def gemv_q4(w: In, x: In, y: Out, *, n: CompileTime[int], k: CompileTime[int],
     ]
 
     w_taps = TensorTiler2D.simple_tiler((1, bands * band_bytes), (1, bands_per_core * band_bytes))
-    y_taps = TensorTiler2D.simple_tiler((1, n), (1, bands_per_core * band_rows))
+    y_taps = [TensorAccessPattern((1, y_total), yoff + c * bands_per_core * band_rows,
+                                  [1, 1, 1, bands_per_core * band_rows], [0, 0, 0, 1]) for c in range(n_cores)]
 
     def sequence(a_w, a_x, c_y, w_prods, x_prod, y_conss):
         tg = TaskGroup()
@@ -148,4 +156,4 @@ def gemv_q4(w: In, x: In, y: Out, *, n: CompileTime[int], k: CompileTime[int],
 
 
 DESIGN = gemv_q4
-SPECIALIZE = {"n": N, "k": K, "rs": RS, "n_cores": N_CORES, "per_call": PER_CALL}
+SPECIALIZE = {"n": N, "k": K, "rs": RS, "n_cores": N_CORES, "per_call": PER_CALL, "yoff": YOFF, "ytot": YTOT}
