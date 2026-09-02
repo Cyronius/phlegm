@@ -28,6 +28,10 @@ pub struct Driver {
     dev: Option<Device>,
     ctxs: HashMap<String, Context>,
     kernels: HashMap<String, Kernel>,
+    /// Classic-flow kernels (`kernelx`, mlir-aie xclbin + insts.bin): their
+    /// instruction-stream BO and its 32-bit word count, bound at args 1/2 of
+    /// every run. ELF-flow kernels carry instructions in the module (args 1/2 = 0).
+    instr: HashMap<String, (Bo, usize)>,
     /// name -> (bo, logical size). The Bo's own size is padded up to 1 MB.
     bufs: HashMap<String, (Bo, usize)>,
     layeridx: i32,
@@ -43,6 +47,7 @@ impl Driver {
             dev: None,
             ctxs: HashMap::new(),
             kernels: HashMap::new(),
+            instr: HashMap::new(),
             bufs: HashMap::new(),
             layeridx: 0,
         }
@@ -61,8 +66,13 @@ impl Driver {
         let k: &Kernel = self.kernels.get(kn).ok_or(format!("no kernel {kn}"))?;
         let mut r = k.run()?;
         r.set_arg_int(0, 3)?;
-        r.set_arg_int(1, 0)?;
-        r.set_arg_int(2, 0)?;
+        if let Some((ibo, nwords)) = self.instr.get(kn) {
+            r.set_arg_bo(1, ibo)?;
+            r.set_arg_int(2, *nwords as i32)?;
+        } else {
+            r.set_arg_int(1, 0)?;
+            r.set_arg_int(2, 0)?;
+        }
         for (idx, bufname) in args {
             let bo: &Bo = &self
                 .bufs
@@ -115,6 +125,22 @@ impl Driver {
                 let k = ctx.kernel(Path::new(elfp))?;
                 self.kernels.insert(name.clone(), k);
                 println!("kernel {name} ({elfp})");
+            }
+            "kernelx" => {
+                // Classic mlir-aie flow: `kernelx <name> <xclbin-ctx> <insts.bin>`
+                // -> xrt::kernel(ctx, "MLIR_AIE") + a cacheable instruction BO.
+                let name = it.next().ok_or("kernelx: name")?.to_string();
+                let xn = it.next().ok_or("kernelx: xclbin")?;
+                let instp = it.next().ok_or("kernelx: insts.bin")?;
+                let ctx = self.ctxs.get(xn).ok_or(format!("no xclbin {xn}"))?;
+                let k = ctx.kernel_xclbin("MLIR_AIE")?;
+                let insts = read_file(instp)?;
+                let mut ibo = self.dev().bo_instr(&k, insts.len())?;
+                ibo.write(&insts, 0)?;
+                ibo.sync_to_device()?;
+                println!("kernelx {name} ({instp}, {} words)", insts.len() / 4);
+                self.instr.insert(name.clone(), (ibo, insts.len() / 4));
+                self.kernels.insert(name, k);
             }
             "buf" => {
                 let name = it.next().ok_or("buf: name")?.to_string();
@@ -197,6 +223,25 @@ impl Driver {
                 println!("lmhead {kn} -> state {st}");
                 if st != STATE_COMPLETED {
                     return Err("LMHEAD FAILED".to_string());
+                }
+            }
+            "run" => {
+                // Generic immediate submit: `run <kernel> <buf> [<buf> ...]` binds
+                // the buffers at args 3.. (after opcode/instr/ninstr) and waits.
+                // For open (IRON-built) designs whose arg list isn't the fused
+                // layer / lm_head shape.
+                let kn = it.next().ok_or("run: kernel")?.to_string();
+                let names: Vec<String> = it.map(|s| s.to_string()).collect();
+                if names.is_empty() {
+                    return Err("run: needs at least one buffer".to_string());
+                }
+                let args: Vec<(i32, &str)> =
+                    names.iter().enumerate().map(|(i, n)| (3 + i as i32, n.as_str())).collect();
+                let t0 = std::time::Instant::now();
+                let st = self.submit_single(&kn, &args)?;
+                println!("run {kn} [{} bufs] -> state {st} ({:.3} ms)", names.len(), t0.elapsed().as_secs_f64() * 1e3);
+                if st != STATE_COMPLETED {
+                    return Err("RUN FAILED".to_string());
                 }
             }
             "dump" => {

@@ -12,6 +12,7 @@
 #include "xrt/experimental/xrt_ext.h"
 
 #include <cstring>
+#include <stdexcept>
 #include <memory>
 #include <string>
 
@@ -30,12 +31,17 @@ struct ShimCtx {
     xrt::hw_context ctx;
 };
 struct ShimKernel {
+    // ELF flow (FLM's captured kernels): elf -> module -> ext::kernel.
     std::shared_ptr<xrt::elf> elf;
     std::shared_ptr<xrt::module> mod;
     std::shared_ptr<xrt::ext::kernel> kern;
+    // Classic flow (mlir-aie xclbin + insts.bin): plain xrt::kernel.
+    std::shared_ptr<xrt::kernel> classic;
 };
 struct ShimBo {
-    xrt::ext::bo bo;
+    // xrt::ext::bo is-a xrt::bo; holding the base lets instruction BOs
+    // (plain xrt::bo with a kernel group id) share the same handle type.
+    xrt::bo bo;
 };
 struct ShimRun {
     xrt::run run;
@@ -116,6 +122,25 @@ xrtsh_kernel xrtsh_kernel_create(xrtsh_ctx ctx, const char *elf_path) {
     })
 }
 
+xrtsh_kernel xrtsh_kernel_create_xclbin(xrtsh_ctx ctx, const char *kernel_name) {
+    GUARD_PTR({
+        auto *c = static_cast<ShimCtx *>(ctx);
+        auto *k = new ShimKernel();
+        k->classic = std::make_shared<xrt::kernel>(c->ctx, std::string(kernel_name));
+        return static_cast<xrtsh_kernel>(k);
+    })
+}
+
+xrtsh_bo xrtsh_bo_create_instr(xrtsh_dev dev, xrtsh_kernel k, size_t size) {
+    GUARD_PTR({
+        auto *d = static_cast<ShimDevice *>(dev);
+        auto *kern = static_cast<ShimKernel *>(k);
+        if (!kern->classic) throw std::runtime_error("instr bo needs a classic (xclbin) kernel");
+        auto *b = new ShimBo{xrt::bo(d->dev, size, xrt::bo::flags::cacheable, kern->classic->group_id(1))};
+        return static_cast<xrtsh_bo>(b);
+    })
+}
+
 void xrtsh_kernel_free(xrtsh_kernel k) { delete static_cast<ShimKernel *>(k); }
 
 xrtsh_bo xrtsh_bo_create(xrtsh_dev dev, size_t size) {
@@ -165,7 +190,8 @@ void xrtsh_bo_free(xrtsh_bo bo) { delete static_cast<ShimBo *>(bo); }
 xrtsh_run xrtsh_run_create(xrtsh_kernel k) {
     GUARD_PTR({
         auto *kern = static_cast<ShimKernel *>(k);
-        auto *r = new ShimRun{xrt::run(*kern->kern)};
+        auto *r = kern->classic ? new ShimRun{xrt::run(*kern->classic)}
+                                : new ShimRun{xrt::run(*kern->kern)};
         return static_cast<xrtsh_run>(r);
     })
 }

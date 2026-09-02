@@ -22,6 +22,8 @@ extern "C" {
     fn xrtsh_hwctx_free(ctx: handle);
 
     fn xrtsh_kernel_create(ctx: handle, elf_path: *const c_char) -> handle;
+    fn xrtsh_kernel_create_xclbin(ctx: handle, kernel_name: *const c_char) -> handle;
+    fn xrtsh_bo_create_instr(dev: handle, k: handle, size: usize) -> handle;
     fn xrtsh_kernel_free(k: handle);
 
     fn xrtsh_bo_create(dev: handle, size: usize) -> handle;
@@ -110,6 +112,16 @@ impl Device {
     }
 
     /// Allocate an `xrt::ext::bo`. `size` is padded up to 1 MB.
+    /// Instruction-stream BO for a classic (xclbin) kernel: cacheable, bound
+    /// to the kernel's arg-1 memory group. Fill with `write` + `sync_to_device`.
+    pub fn bo_instr(&self, k: &Kernel, size: usize) -> Result<Bo> {
+        let h = unsafe { xrtsh_bo_create_instr(self.0, k.0, size) };
+        if h.is_null() {
+            return Err(last_error());
+        }
+        Ok(Bo { h, size })
+    }
+
     pub fn bo(&self, size: usize) -> Result<Bo> {
         let padded = padup(size);
         let h = unsafe { xrtsh_bo_create(self.0, padded) };
@@ -121,6 +133,17 @@ impl Device {
 }
 
 impl Context {
+    /// Classic flow for mlir-aie/IRON designs: `xrt::kernel(ctx, name)`; the
+    /// instruction stream travels per run (arg 1 = instr BO, arg 2 = words).
+    pub fn kernel_xclbin(&self, kernel_name: &str) -> Result<Kernel> {
+        let p = cpath(kernel_name)?;
+        let h = unsafe { xrtsh_kernel_create_xclbin(self.0, p.as_ptr()) };
+        if h.is_null() {
+            return Err(last_error());
+        }
+        Ok(Kernel(h))
+    }
+
     /// elf(path) -> module -> ext::kernel(ctx, module, "MLIR_AIE").
     pub fn kernel(&self, elf_path: &Path) -> Result<Kernel> {
         let p = cpath(&elf_path.to_string_lossy())?;

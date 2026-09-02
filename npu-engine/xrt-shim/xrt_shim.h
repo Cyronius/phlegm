@@ -45,6 +45,13 @@ void xrtsh_hwctx_free(xrtsh_ctx ctx);
 /* xrt::elf(path) -> module -> ext::kernel(ctx, module, "MLIR_AIE").
  * NULL on failure. */
 xrtsh_kernel xrtsh_kernel_create(xrtsh_ctx ctx, const char *elf_path);
+/* Classic flow (IRON/mlir-aie designs): xrt::kernel(ctx, name) with the NPU
+ * instruction stream passed per run as a cacheable BO at arg 1 and its
+ * 32-bit word count at arg 2. NULL on failure. */
+xrtsh_kernel xrtsh_kernel_create_xclbin(xrtsh_ctx ctx, const char *kernel_name);
+/* Instruction-stream BO for a classic kernel (cacheable, group_id(1)); the
+ * caller fills it via xrtsh_bo_write + xrtsh_bo_sync like any other BO. */
+xrtsh_bo xrtsh_bo_create_instr(xrtsh_dev dev, xrtsh_kernel k, size_t size);
 void xrtsh_kernel_free(xrtsh_kernel k);
 
 /* xrt::ext::bo(dev, size). Caller passes the already-padded size. NULL on
