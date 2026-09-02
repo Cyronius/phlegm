@@ -368,3 +368,39 @@ expert, 1350 dispatches in all), hence MoE first.
   on the box's other load (two llama-servers were running; the slowdown was
   uniform across every kernel). The on-device 0b mechanism stays unused: the
   host patch costs 1.2 ms/token, which is the whole difference.
+
+- `designs/lin_layer/` — **phase 2 item 1, design A: the linear-attention
+  layer as three dispatches instead of ten** (2026-09-02). The DeltaNet step
+  alone uses the whole shim budget (16 fills + 16 drains), so it stays its own
+  context; everything around it regroups by shim column into two multi-worker
+  xclbins whose stages hand over through a DDR scratch BO (`act`), each
+  dependent fill issued after `dma_wait` on the drain that wrote it:
+  - `lin_a` = ln (no residual, `ln_nr.cc`) → qkv | z GEMV (8 cores stream
+    qkv's 16 bands then z's 8 per core, x broadcast once) → glue. Args
+    `pool xres consts state act vec`; qkv/z are read at their **layer-pool
+    offsets**, the conv state is updated **in place**, the glue's xn element
+    comes from `act` (no more `dump xn` / `load side`). 10 cores, 12 fills,
+    10 drains: `Tile(c, 0)` pins on the runtime handles put ln in shim column
+    0, x in 1, the glue's side/out in 2 and act in 3, next to the GEMV streams.
+  - `lin_c` = post → out GEMV → ln (+residual). Args `wout o consts act xres
+    hdr`; it writes the MoE header record directly (xm at 0, the new residual
+    at 12288; sgw is preloaded, the router's slot is one host `copy`).
+  - `layout.py` holds the byte layouts (per-layer `consts` = [lnw | glue side
+    | nw | postln], `act`, `hdr`); `make_test.py` (Windows) chains `la → dn →
+    lc` on layer_chain's vectors with the captured pool as the weight BO;
+    `compare.py` reuses layer_chain's references and tolerances.
+
+  **PASS with the unfused chain's numbers** (xn 0.9999986, residual
+  0.9999996, xm 0.9999975, S 1.0000000, conv state 0.9999996; qkv bit-exact
+  vs the unfused GEMV). Warm: la 2.4–2.9 ms, dn 1.5–1.7, lc 1.8 ≈ **6.2 ms
+  per layer** vs ~8.5 ms + a host round trip as 10 dispatches (same log
+  conditions: run_27b_fused.log). **27B decode step: 302 → 202 dispatches,
+  13 contexts, logits corr 0.999998, same argmax (846) / top-5, all residuals
+  ≥ 0.999997** (`run_27b_lin2.log`: 378 ms, but the box was ~10–15 % more
+  loaded than for the 348 ms run — `me` 3.6 vs 3.3 ms, `lm` 23 vs 20 — so the
+  like-for-like saving is the ~2.3 ms × 20 ≈ 45–65 ms the per-kernel times
+  show, not the totals). Remaining per linear layer: 3 context switches
+  (~1.5 ms) — design B territory. Next: A′ (the full-attention layer as one
+  dispatch, 8 → 1).
+  Trap: two designs in one process each pinning `Tile(c, 0)` shim handles
+  is fine; a run with 6 buffer args is fine (9 is not).

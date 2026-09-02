@@ -33,6 +33,8 @@ os.chdir(KI)
 import decode_step as DS  # noqa: E402
 import build_pools as BP  # noqa: E402
 from q4nx import bf16_to_f32  # noqa: E402
+sys.path.insert(0, str(HERE.parent / "lin_layer"))
+import layout as LL  # noqa: E402  (lin_a / lin_c byte layouts)
 
 D = "C:/code/phlegm/tools/open-kernels/designs"
 OUT = f"{D}/decode_chain/w27"
@@ -111,8 +113,7 @@ def main() -> int:
         # (the experts stream straight out of the resident layer pool: the
         # driver's `moeroute` points the kernel's fills at the router's choice)
         if not full[l]:
-            wr(f"wqkv{l}.bin", pool[505_282_560:505_282_560 + 10_485_760])
-            wr(f"wz{l}.bin", pool[515_768_320:515_768_320 + 5_242_880])
+            # (qkv / z stream straight out of the resident pool: lin_a reads them at their pool offsets)
             wr(f"wout{l}.bin", side[328_192:328_192 + 10_485_760])
             nwp = np.zeros(2048, bfloat16); nwp[:128] = side[65536:65536 + 256].view(bfloat16)
             wr(f"nw{l}.bin", nwp)
@@ -144,9 +145,23 @@ def main() -> int:
             (WDIR / "lm27.bin").write_bytes(BP.build_lmhead_pool(m))
     ref_argmax = int(np.fromfile(WDIR / "ref_logits.bin", np.float32).argmax())
 
+    # ---- per-layer records for the fused linear layer (lin_layer/layout.py), from the files above:
+    # consts = [lnw | glue side minus its xn slot | nw | postln]; hdr = the MoE header with sgw preloaded
+    for l in range(NL):
+        hdr = np.zeros(LL.H_BYTES, np.uint8)
+        hdr[LL.H_SGW:LL.H_SGW + 4096] = np.fromfile(WDIR / f"sgw{l}.bin", np.uint8)[:4096]
+        wr(f"hdr{l}.bin", hdr)
+        if not full[l]:
+            consts = np.zeros(LL.C_BYTES, np.uint8)
+            consts[LL.C_LNW:LL.C_LNW + 4096] = np.fromfile(WDIR / f"lnw{l}.bin", np.uint8)[:4096]
+            consts[LL.C_WA:LL.C_NW] = np.fromfile(WDIR / f"side{l}.bin", np.uint8)[4096:]
+            consts[LL.C_NW:LL.C_NW + 4096] = np.fromfile(WDIR / f"nw{l}.bin", np.uint8)[:4096]
+            consts[LL.C_POSTLN:LL.C_POSTLN + 4096] = np.fromfile(WDIR / f"postln{l}.bin", np.uint8)[:4096]
+            wr(f"consts{l}.bin", consts)
+
     # ---- config
-    X = [("L", "ln", "ln/build"), ("Q", "gqkv", "gemv_q4/build_qkv"), ("Z", "gz", "gemv_q4/build_z"),
-         ("G", "glue", "dn_glue/build"), ("N", "dn", "deltanet/build"), ("P", "post", "dn_post/build"),
+    X = [("L", "ln", "ln/build"), ("Z", "gz", "gemv_q4/build_z"),
+         ("A", "la", "lin_layer/build_a"), ("N", "dn", "deltanet/build"), ("C", "lc", "lin_layer/build_c"),
          ("O", "gout", "gemv_q4/build_out"), ("R", "rt", "router/build"), ("E", "me", "moe_experts/build"),
          ("S", "gsu", "gemv_q4/build_share_up"),
          ("H", "g4kh", "gemv_q4/build_z_hi"), ("I", "g512h", "gemv_q4/build_512_hi"), ("X", "at", "attn/build_pos0"),
@@ -160,41 +175,36 @@ def main() -> int:
             f"buf zstate 49152 {OUT}/zstate.bin", f"buf zS 2097152 {OUT}/zS.bin", f"buf zkv 3145728 {OUT}/zkv.bin"]
     runs = []
     for l in range(NL):
-        cfg += [f"buf lnw{l} 4096 {OUT}/lnw{l}.bin", f"buf postln{l} 4096 {OUT}/postln{l}.bin",
-                f"buf sgw{l} 4096 {OUT}/sgw{l}.bin", f"buf rw{l} 1048576 {OUT}/rw{l}.bin",
-                f"buf xa{l} 8192", f"buf xn{l} 4096", f"buf out{l} 8192", f"buf xb{l} 8192", f"buf xm{l} 4096",
-                f"buf rout{l} 4096", f"buf xc{l} 8192",
-                f"buf pool{l} 536870912 {POOLS}/pool_L{l}.bin", f"buf hdr{l} 20480"]
+        cfg += [f"buf rw{l} 1048576 {OUT}/rw{l}.bin", f"buf rout{l} 4096", f"buf xc{l} 8192",
+                f"buf pool{l} 536870912 {POOLS}/pool_L{l}.bin", f"buf hdr{l} 20480 {OUT}/hdr{l}.bin"]
         xin = "xres0" if l == 0 else f"xc{l - 1}"
         if not full[l]:
-            cfg += [f"buf wqkv{l} 10485760 {OUT}/wqkv{l}.bin", f"buf wz{l} 5242880 {OUT}/wz{l}.bin",
-                    f"buf wout{l} 10485760 {OUT}/wout{l}.bin", f"buf side{l} 335872 {OUT}/side{l}.bin",
-                    f"buf nstate{l} 49152", f"buf vec{l} 65536", f"buf sout{l} 2097152", f"buf o{l} 16384",
-                    f"buf nw{l} 4096 {OUT}/nw{l}.bin", f"buf qkv{l} 32768", f"buf z{l} 16384", f"buf og{l} 8192"]
-            runs += [f"run ln {xin} zero lnw{l} xa{l} xn{l}",
-                     f"run gqkv wqkv{l} xn{l} qkv{l}", f"run gz wz{l} xn{l} z{l}",
-                     f"dump xn{l} {OUT}/y_xn{l}.bin 4096", f"load side{l} {OUT}/y_xn{l}.bin",
-                     f"run glue side{l} qkv{l} zstate nstate{l} vec{l}",
+            # fused linear layer: lin_a (ln -> qkv|z -> glue) / dn / lin_c (post -> out -> ln+res),
+            # the conv state per layer updated in place, lin_c writing the MoE header
+            cfg += [f"buf consts{l} {LL.C_BYTES} {OUT}/consts{l}.bin", f"buf state{l} 49152 {OUT}/zstate.bin",
+                    f"buf act{l} {LL.A_BYTES}", f"buf vec{l} 65536", f"buf sout{l} 2097152", f"buf o{l} 16384",
+                    f"buf wout{l} 10485760 {OUT}/wout{l}.bin"]
+            runs += [f"run la pool{l} {xin} consts{l} state{l} act{l} vec{l}",
                      f"run dn zS vec{l} sout{l} o{l}",
-                     f"run post o{l} z{l} nw{l} og{l}",
-                     f"run gout wout{l} og{l} out{l}",
-                     f"run ln xa{l} out{l} postln{l} xb{l} xm{l}"]
+                     f"run lc wout{l} o{l} consts{l} act{l} {xin} hdr{l}"]
         else:
-            cfg += [f"buf wq{l} 5242880 {OUT}/wq{l}.bin", f"buf wgate{l} 5242880 {OUT}/wgate{l}.bin",
+            cfg += [f"buf lnw{l} 4096 {OUT}/lnw{l}.bin", f"buf postln{l} 4096 {OUT}/postln{l}.bin",
+                    f"buf xa{l} 8192", f"buf xn{l} 4096", f"buf out{l} 8192", f"buf xb{l} 8192", f"buf xm{l} 4096",
+                    f"buf wq{l} 5242880 {OUT}/wq{l}.bin", f"buf wgate{l} 5242880 {OUT}/wgate{l}.bin",
                     f"buf wk{l} 655360 {OUT}/wk{l}.bin", f"buf wv{l} 655360 {OUT}/wv{l}.bin", f"buf wo{l} 5242880 {OUT}/wo{l}.bin",
                     f"buf qg{l} 32768", f"buf kvn{l} 4096", f"buf meta{l} 2048 {OUT}/meta{l}.bin",
-                    f"buf kvnew{l} 2048", f"buf og{l} 8192", f"buf out{l} 8192"]
+                    f"buf kvnew{l} 2048", f"buf og{l} 8192"]
             runs += [f"run ln {xin} zero lnw{l} xa{l} xn{l}",
                      f"run gz wq{l} xn{l} qg{l}", f"run g4kh wgate{l} xn{l} qg{l}",
                      f"run gsu wk{l} xn{l} kvn{l}", f"run g512h wv{l} xn{l} kvn{l}",
                      f"run at meta{l} qg{l} kvn{l} zkv kvnew{l} og{l}",
                      f"run gout wo{l} og{l} out{l}",
-                     f"run ln xa{l} out{l} postln{l} xb{l} xm{l}"]
-        # router -> header [xm | rout | sgw | xres] (host copies until the fused
-        # layer writes it in place) -> the whole MoE block as one dispatch
-        runs += [f"run rt xm{l} rw{l} rout{l}", f"moeroute me rout{l}",
-                 f"copy hdr{l} 0 xm{l} 0 4096", f"copy hdr{l} 4096 rout{l} 0 4096",
-                 f"copy hdr{l} 8192 sgw{l} 0 4096", f"copy hdr{l} 12288 xb{l} 0 8192",
+                     f"run ln xa{l} out{l} postln{l} xb{l} xm{l}",
+                     # header [xm | rout | sgw | xres]: host copies until the fused attention layer (A') writes it
+                     f"copy hdr{l} 0 xm{l} 0 4096", f"copy hdr{l} 12288 xb{l} 0 8192"]
+        # router (reads xm at hdr+0) -> the whole MoE block as one dispatch
+        runs += [f"run rt hdr{l} rw{l} rout{l}", f"moeroute me rout{l}",
+                 f"copy hdr{l} 4096 rout{l} 0 4096",
                  f"run me pool{l} hdr{l} xc{l}",
                  f"dump rout{l} {OUT}/y_rout{l}.bin 4096", f"dump xc{l} {OUT}/y_res{l}.bin 8192"]
     runs += [f"run ln xc{NL - 1} zero normw xresf hn", "run lm lmpool hn logits", f"dump logits {OUT}/y_logits.bin 993280", ""]
