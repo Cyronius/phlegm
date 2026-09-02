@@ -304,7 +304,8 @@ traffic), then the ops with no prior art.
 | conv1d + SiLU + q/k L2-norm, alpha/beta proj → decay/beta, DeltaNet records, state shift | **DONE, fp32-exact** | `designs/dn_glue` | one core, 0.71 ms; fp32 vector exp/recip helpers; captured side pool + state |
 | post: RMSNorm128(o)·ssm_norm · silu(z); layer RMSNorm + residual | **DONE, exact** | `designs/dn_post`, `designs/ln` | bf16 outputs match the fp64→bf16 reference (ln bit-identical) |
 | **whole linear-attention layer, chained** | **DONE — matches CPU replica** | `designs/layer_chain` | 7 dispatches on layer 0 of the captured decode step: residual cos 0.9999996, S 1.0000000, xm 0.9999975 |
-| full attention (KV append, softmax over ≤1024) | todo | — | every 3rd layer |
+| full attention (head norm, partial RoPE, KV cache, online softmax, gate) | **DONE — matches** | `designs/attn`, `designs/attn_chain` | layer 2 of the captured decode step: residual cos 0.9999999; cached-row count is a CompileTime param |
+| **end-to-end decode step (3 layers + lm_head) vs FLM's captured logits** | next | `designs/decode_chain` | the phase-1 finish line |
 | per-layer fusion behind L40Backend | phase 2 | — | one dispatch per layer, no host round-trip |
 
 **What the two GEMVs established beyond correctness.** (1) vegah's kernels port

@@ -203,5 +203,27 @@ ELF; output == ROT13(input) byte-exact for both.
 Together with `layer_chain`, **all of layer 0 (attention + MoE) of the
 captured decode step now reproduces on open kernels.**
 
+- `designs/attn/` — full-attention decode step, one core: head RMSNorm ×
+  effective q/k norm weights, partial RoPE (rotary 64 of 256, half-split,
+  cos/sin for the position supplied by the host in a 2 KB meta record),
+  online-softmax attention over the cached K/V rows (streamed 1 KB per row,
+  two fills per position) plus the new position, sigmoid gate; emits the new
+  bf16 cache rows. The number of cached rows is a CompileTime parameter
+  (`ATTN_POS`): the runtime sequence is a static instruction stream.
+- `designs/attn_chain/` — **layer 2 (full attention) of the captured decode
+  step on open kernels**: ln → gemv q/gate/k/v → attn → gemv o → ln. PASS:
+  residual cos 0.9999999 (maxrel 4.0e-5), new cache rows and gated output
+  within bf16 rounding, 0.95 ms for the attention kernel at 11 positions.
+
+  Two more traps: **a run with 9 buffer arguments aborts (ERT state 6); 6
+  works** — so the GEMV gained `GEMV_YOFF`/`GEMV_YTOT` (write y at an offset
+  of a shared output BO: `build_z_hi` puts gate after q, `build_512_hi` puts v
+  after k). And **shared kernel bodies must be `inline` (vague linkage) +
+  `noinline`**: `static` copies per translation unit overflowed the 16 KB
+  program memory (`_XAie_LoadProgMemSection: Overflow of program memory`).
+
+**All three layer types (linear attention, MoE, full attention) of the decode
+step now run on open kernels and match the CPU replica.**
+
 Phase-1 status and what's next: `.claude/plans/open-kernels-feasibility.md`,
 "Phase 1 progress".
