@@ -133,3 +133,9 @@ alone is 65 ms at 25 GB/s.
   (item 5), linear layer's 3 switches ~30 ms (B), router 22 ms (fold into
   the fused layer or `me`), lm_head 22 ms, dynamic KV (item 3) before the
   resident driver (item 4).
+- **Item 5 (GEMV bandwidth) done first, 2026-09-02** — see
+  `open-kernels-phase2-item5-bandwidth.md`: the q4 GEMV moved to the integer
+  matrix unit (int16 block-quantised activations), every fused design
+  rebuilt; **27B step 313 → 220 ms (4.5 tok/s), same logits.** Remaining:
+  ~60 ms of context switches (router fold, design B, whole-layer context),
+  MoE core balance ~10–15 ms, lm_head mmul ~5 ms.

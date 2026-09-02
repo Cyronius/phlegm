@@ -25,6 +25,9 @@ Cores (one per column, Tile(c, 2)), each with exactly its 2 input DMA channels
 The first element of every core's w stream is the header
 [xm | router output | sgw | xres] (see moe_hdr.cc), copied to local buffers.
 
+Activations go through gemv_q4's int16 block tables (gemv_q4_prep_k2048 on the
+header element for xm, gemv_q4_prep_k512 on each h element) -- phase 2 item 5.
+
 Args: wexp u8[9 * 1966080], hdr u8[20480], out f32[2048].
 Build (WSL): python build_design.py designs/moe_experts/moe_experts.py
 """
@@ -82,21 +85,28 @@ def moe_experts(wexp: In, hdr: In, out: Out, *, srchash: CompileTime[int] = 0):
     band_ty = np.ndarray[(128,), np.dtype[np.float32]]
     accp_ty = np.ndarray[(DOWN_PER_CORE * 128,), np.dtype[np.float32]]
     acc_ty = np.ndarray[(HID,), np.dtype[np.float32]]
+    tabx_ty = np.ndarray[(2 * HID + HID // 4,), np.dtype[np.uint8]]   # gemv_q4_tab_bytes(2048): xm
+    tabh_ty = np.ndarray[(2 * FF + FF // 4,), np.dtype[np.uint8]]     # gemv_q4_tab_bytes(512): h
 
     inc = include_dirs() + [str(GEMV)]
     # routed: up/gate 32-chunk RS=4 bands (8 groups of 4), down 8-chunk RS=4 bands
     # (2 groups) -- gemv_q4's own entry points. Shared: RS=2 wrappers with a
     # runtime group + output offset (two 64-row bands per 128-float buffer).
     k_up = [ExternalFunction(f"gemv_q4_p4b32r4_k{i}", source_file=str(GEMV / f"gemv_q4_p4b32r4_k{i}.cc"),
-                             arg_types=[elem_ty, x_ty, band_ty], include_dirs=inc) for i in range(8)]
+                             arg_types=[elem_ty, tabx_ty, band_ty], include_dirs=inc) for i in range(8)]
     k_dn = [ExternalFunction(f"gemv_q4_p4b8r4_k{i}", source_file=str(GEMV / f"gemv_q4_p4b8r4_k{i}.cc"),
-                             arg_types=[elem_ty, h_ty, band_ty], include_dirs=inc) for i in range(2)]
+                             arg_types=[elem_ty, tabh_ty, band_ty], include_dirs=inc) for i in range(2)]
     r2x = ExternalFunction("gemv_q4_r2x", source_file=str(HERE / "gemv_q4_r2x.cc"),
-                           arg_types=[elem_ty, x_ty, band_ty, np.int32, np.int32], include_dirs=inc)
+                           arg_types=[elem_ty, tabx_ty, band_ty, np.int32, np.int32], include_dirs=inc)
     r2h = ExternalFunction("gemv_q4_r2h", source_file=str(HERE / "gemv_q4_r2h.cc"),
-                           arg_types=[elem_ty, h_ty, band_ty, np.int32, np.int32], include_dirs=inc)
+                           arg_types=[elem_ty, tabh_ty, band_ty, np.int32, np.int32], include_dirs=inc)
+    # activation prep (gemv_q4.h): xm straight from the header element, h from its fifo element
+    prepx = ExternalFunction("gemv_q4_prep_k2048", source_file=str(GEMV / "gemv_q4_prep_k2048.cc"),
+                             arg_types=[elem_ty, tabx_ty], include_dirs=inc)
+    preph = ExternalFunction("gemv_q4_prep_k512", source_file=str(GEMV / "gemv_q4_prep_k512.cc"),
+                             arg_types=[h_ty, tabh_ty], include_dirs=inc)
     hdrf = ExternalFunction("moe_hdr", source_file=str(HERE / "moe_hdr.cc"),
-                            arg_types=[elem_ty, x_ty, r_ty, accp_ty, np.int32], include_dirs=inc)
+                            arg_types=[elem_ty, r_ty, accp_ty, np.int32], include_dirs=inc)
     silu = ExternalFunction("moe_silu", source_file=str(HERE / "moe_silu.cc"),
                             arg_types=[band_ty, band_ty, hp_ty], include_dirs=inc)
     accf = ExternalFunction("moe_acc", source_file=str(HERE / "moe_acc.cc"),
@@ -111,36 +121,39 @@ def moe_experts(wexp: In, hdr: In, out: Out, *, srchash: CompileTime[int] = 0):
                              depths=[2] * N_UP)
     of_acc = [ObjectFifo(accp_ty, name=f"acc{c}", depth=1) for c in range(N_CORES)]
 
-    def routed_down(win, hh, y0, y1, kdn):
+    def routed_down(win, tabh, y0, y1, kdn):
         for yb in (y0, y1):
             for fn in kdn:
                 we = win.acquire(1)
-                fn(we, hh, yb)
+                fn(we, tabh, yb)
                 win.release(1)
 
-    def shared_down(win, hh, y0, y1):
+    def shared_down(win, tabh, y0, y1):
         for j in range(4):                       # 64-row bands 4c..4c+3 -> [y0 | y1]
             we = win.acquire(1)
-            r2h(we, hh, y0 if j < 2 else y1, 0, 64 * (j % 2))
+            r2h(we, tabh, y0 if j < 2 else y1, 0, 64 * (j % 2))
             win.release(1)
 
-    def body_up(win, hout, hin, aout, xb, rb, xr, ub, gb, y0, y1, c, fhdr, fsilu, facc, ffin, fr2x, fr2h, *ks):
+    def body_up(win, hout, hin, aout, tabx, tabh, rb, xr, ub, gb, y0, y1, c,
+                fhdr, fprepx, fpreph, fsilu, facc, ffin, fr2x, fr2h, *ks):
         kup, kdn = ks[:8], ks[8:]
         we = win.acquire(1)
-        fhdr(we, xb, rb, xr, c)
+        fhdr(we, rb, xr, c)
+        fprepx(we, tabx)                          # xm -> GEMV table
         win.release(1)
         ae = aout.acquire(1)
         for e in range_(NE):
             for dst in (ub, gb):
                 for fn in kup:
                     we = win.acquire(1)
-                    fn(we, xb, dst)
+                    fn(we, tabx, dst)
                     win.release(1)
             he = hout.acquire(1)
             fsilu(gb, ub, he)
             hout.release(1)
             hh = hin.acquire(1)
-            routed_down(win, hh, y0, y1, kdn)
+            fpreph(hh, tabh)                      # h -> GEMV table
+            routed_down(win, tabh, y0, y1, kdn)
             facc(y0, y1, rb, ae, e)
             hin.release(1)
         # the shared expert: 64-row bands 2c, 2c+1 of up then gate (4 groups each)
@@ -148,36 +161,39 @@ def moe_experts(wexp: In, hdr: In, out: Out, *, srchash: CompileTime[int] = 0):
             for b in range(2):
                 for g in range(4):
                     we = win.acquire(1)
-                    fr2x(we, xb, dst, g, 64 * b)
+                    fr2x(we, tabx, dst, g, 64 * b)
                     win.release(1)
         he = hout.acquire(1)
         fsilu(gb, ub, he)
         hout.release(1)
         hh = hin.acquire(1)
-        shared_down(win, hh, y0, y1)
+        fpreph(hh, tabh)
+        shared_down(win, tabh, y0, y1)
         ffin(y0, y1, rb, xr, ae)
         hin.release(1)
         aout.release(1)
 
-    def body_dn(win, hin, aout, xb, rb, xr, y0, y1, c, fhdr, facc, ffin, fr2h, *kdn):
+    def body_dn(win, hin, aout, tabh, rb, xr, y0, y1, c, fhdr, fpreph, facc, ffin, fr2h, *kdn):
         we = win.acquire(1)
-        fhdr(we, xb, rb, xr, c)
+        fhdr(we, rb, xr, c)
         win.release(1)
         ae = aout.acquire(1)
         for e in range_(NE):
             hh = hin.acquire(1)
-            routed_down(win, hh, y0, y1, kdn)
+            fpreph(hh, tabh)
+            routed_down(win, tabh, y0, y1, kdn)
             facc(y0, y1, rb, ae, e)
             hin.release(1)
         hh = hin.acquire(1)
-        shared_down(win, hh, y0, y1)
+        fpreph(hh, tabh)
+        shared_down(win, tabh, y0, y1)
         ffin(y0, y1, rb, xr, ae)
         hin.release(1)
         aout.release(1)
 
     workers = []
     for c in range(N_CORES):
-        xb = Buffer(x_ty, name=f"x{c}")
+        tabh = Buffer(tabh_ty, name=f"tabh{c}")
         rb = Buffer(r_ty, name=f"r{c}")
         xr = Buffer(accp_ty, name=f"xr{c}")
         y0 = Buffer(band_ty, name=f"y0_{c}")
@@ -185,15 +201,17 @@ def moe_experts(wexp: In, hdr: In, out: Out, *, srchash: CompileTime[int] = 0):
         if c < N_UP:
             ub = Buffer(band_ty, name=f"u{c}")
             gb = Buffer(band_ty, name=f"g{c}")
+            tabx = Buffer(tabx_ty, name=f"tabx{c}")
             workers.append(Worker(body_up,
                                   fn_args=[of_w[c].cons(), of_hp[c].prod(), of_h.cons(), of_acc[c].prod(),
-                                           xb, rb, xr, ub, gb, y0, y1, c, hdrf, silu, accf, finf, r2x, r2h,
+                                           tabx, tabh, rb, xr, ub, gb, y0, y1, c,
+                                           hdrf, prepx, preph, silu, accf, finf, r2x, r2h,
                                            *k_up, *k_dn],
                                   tile=Tile(c, 2), stack_size=0x1800))
         else:
             workers.append(Worker(body_dn,
                                   fn_args=[of_w[c].cons(), of_h.cons(), of_acc[c].prod(),
-                                           xb, rb, xr, y0, y1, c, hdrf, accf, finf, r2h, *k_dn],
+                                           tabh, rb, xr, y0, y1, c, hdrf, preph, accf, finf, r2h, *k_dn],
                                   tile=Tile(c, 2), stack_size=0x1800))
 
     W_TOTAL = NX * EXPERT_BYTES

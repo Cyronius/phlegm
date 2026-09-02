@@ -8,8 +8,8 @@
 #include "gemv_q4.h"
 
 extern "C" {
-void gemv_q4_r2x(const uint8_t *__restrict t, const bfloat16 *__restrict x, float *__restrict y,
+void gemv_q4_r2x(const uint8_t *__restrict t, const uint8_t *__restrict tab, float *__restrict y,
                  int32_t group, int32_t off) {
-  gemv_q4_pool_group(t, x, group, y + off);
+  gemv_q4_pool_group(t, tab, group, y + off);
 }
 }

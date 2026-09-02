@@ -81,11 +81,28 @@ ELF; output == ROT13(input) byte-exact for both.
   captured L0 pool, writes an fp64 reference from the same bytes and a
   `run_<region>.cfg`; `compare.py <region>` checks. Results (random bf16 x):
 
-  | region | shape | PASS | steady-state |
+  | region | shape | PASS | steady-state (bf16 kernel → mmul kernel, item 5) |
   |---|---|---|---|
-  | qkv | 8192×2048 (10.5 MB) | cos 1.0, maxrel 1.2e-5 | 1.09 ms |
-  | share_down | 2048×512 | cos 1.0, maxrel 7.6e-6 | 0.24 ms |
-  | share_up | 512×2048 | cos 1.0, maxrel 1.1e-5 | 0.24 ms |
+  | qkv | 8192×2048 (10.5 MB) | cos 1.0, maxrel 1.6e-5 | 1.09 → **0.50–0.55 ms** (DMA-only floor 0.45) |
+  | share_down | 2048×512 | cos 1.0, maxrel 9.8e-6 | 0.24 → 0.17 ms |
+  | share_up | 512×2048 | cos 1.0, maxrel 1.2e-5 | 0.24 → 0.16 ms |
+
+  **Phase 2 item 5 (2026-09-02): the inner product moved to the integer
+  matrix unit** (`gemv_q4.h`, plan `open-kernels-phase2-item5-bandwidth.md`).
+  vegah's bf16 form was compute-bound at 1.4 GB/s per core — its nibble → bf16
+  conversion is 4 accumulator ops per 32 lanes and spilled — while the DMA
+  stream feeds ~4 GB/s per core (`GEMV_NULL=1` builds the DMA-only probe).
+  Now `mmul<4,8,8,int16,uint8>` consumes each 64 B nibble block as it lies in
+  the pool (B = [8 k][8 row pairs]), low and high nibbles masked separately
+  (the odd rows' factor 16 folds into d), against the activation
+  block-quantised to int16 once per x per core (`gemv_q4_prep_k{K}`: per
+  32-wide block, power-of-two scale, exact for bf16 values within 2^7 of the
+  block max). Entry points take the table instead of x: `(chunks, tab, y)`,
+  `Buffer` of 2.25 K bytes per core, `gemv_q4_prep_k{K}(x, tab)` after each
+  x acquire. K is a runtime argument of the one shared tile body (per-K
+  template copies overflowed the 16 KB program memory in moe_experts).
+  `GEMV_TABDUMP` writes table windows into y for debugging (a `static`
+  counter in core code is NOT zero-initialised — .bss is not cleared).
 
 - `designs/lm_head_q8/` — **phase 1**: q8 lm_head GEMV from the captured
   lm_head pool (`C:/caps/m0d/000127.bo`, its own 128-row supertile order:
@@ -433,3 +450,16 @@ expert, 1350 dispatches in all), hence MoE first.
   (design B, ~30 ms), the router (22 ms: fold into `me` or `lc`), lm_head.
   Trap: two designs in one process each pinning `Tile(c, 0)` shim handles
   is fine; a run with 6 buffer args is fine (9 is not).
+
+- **Phase 2 item 5 — GEMV bandwidth (2026-09-02).** With the mmul GEMV
+  (above) in every design — `moe_experts`, `lin_a`, `lin_c`, `attn_l`
+  rebuilt, unit tests PASS at the previous tolerances: me 2.24–2.5 →
+  **1.36–1.57 ms**, la 2.4–2.9 → **1.9–2.0**, lc 1.8 → **1.4–1.5**, al 2.5 →
+  **1.3–1.5** — the **27B decode step is 313 → 220 ms (4.5 tok/s) under the
+  same load, logits corr 0.999998, same argmax (846) / top-5, all 30
+  residuals ≥ 0.999998** (`run_27b_item5.log`). Per kernel: me 108 → 60 ms,
+  la 58 → 39, lc 37 → 30, al 30 → 20, dn 32 → 29 (no GEMV), lm_head 22 (q8,
+  untouched), router 19. Of the 220 ms, ~60 are context switches (132
+  dispatches × ~0.45 ms): the router fold, design B and a whole-layer
+  context are now worth more than the rest of item 5 (MoE core balance
+  ~10–15 ms, lm_head mmul ~5 ms). Details and traps in the plan doc.
