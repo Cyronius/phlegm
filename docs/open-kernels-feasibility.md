@@ -322,6 +322,38 @@ FLM's fused kernels cannot be the oracle (or the engine) for interval-3 models;
 the open kernels, which reproduce the HF-faithful replica exactly, are the
 correct path. Control check pending: the 40-layer base model (interval 4)
 replica prefill vs `C:/caps/pf_t11_full`'s captured logits.
+
+## Phase 2 plan (open + fast, resident)
+
+Phase 1's deliverable is a *correct* decode step as 164 host-driven dispatches
+over 19 xclbin contexts (~0.3 s). Phase 2 turns it into an engine:
+
+1. **Fused linear-attention layer kernel** — one xclbin, one dispatch: the
+   ln → qkv/z GEMVs (8 cores) → glue → DeltaNet step (8 cores, one per
+   column) → post → out GEMV → ln chain as one dataflow with the activations
+   staying in memtiles/L1. Removes 9 dispatches and 8 context switches per
+   layer. Design question: core allocation between the GEMV band streams and
+   the DeltaNet heads (32 cores, 8 columns).
+2. **Fused MoE kernel with the 0b expert fetch** — router on one core, its
+   8 indices drive the DDR-bounced control packets that retarget the 32
+   expert-stripe BDs (exactly FLM's mechanism), experts stream through the
+   GEMV cores, combine on device. Removes ~45 dispatches per layer and the
+   host-side expert slicing.
+3. **Attention with a dynamic KV length** — the runtime sequence is static, so
+   either per-length instruction streams (FLM's approach: DDR-patched BD
+   lengths) or a max-length read with an in-kernel mask; the KV cache append
+   becomes an in-place drain at row `pos`.
+4. **Behind the resident driver** — `L40Backend`/`generate_l30` get an
+   "open" kernel set: per-layer xclbins loaded once, states resident, the
+   same HTTP/sampler path. First target: **Josh's pruned 27B (30L, interval
+   3)** end to end, which FLM cannot run correctly (see Finding).
+5. **Performance** — the GEMVs are at 10–25 GB/s of the ~40 GB/s per-agent
+   ceiling: memtile staging + 16–24 cores via memtile split (vegah: 2.24×),
+   larger DMA elements, and the fused layer removing the ~0.18 ms/dispatch
+   floor. Target from the feasibility analysis: 20–30 tok/s on the 27B.
+
+Each step keeps the phase-1 chain as its regression oracle (the kernels
+already match the faithful replica at 1.00000).
 | per-layer fusion behind L40Backend | phase 2 | — | one dispatch per layer, no host round-trip |
 
 **What the two GEMVs established beyond correctness.** (1) vegah's kernels port
