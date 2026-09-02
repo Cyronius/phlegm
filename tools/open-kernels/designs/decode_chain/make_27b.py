@@ -84,9 +84,6 @@ def main() -> int:
     wr("zstate.bin", np.zeros(3 * 8192, bfloat16))
     wr("zS.bin", np.zeros(32 * 128 * 128, np.float32))
     wr("zkv.bin", np.zeros(3145728, np.uint8))
-    for k in range(NE):
-        eb = np.zeros(1024, np.int32); eb[0] = k
-        wr(f"e{k}.bin", eb)
     normw = m.bf16("model.norm.weight")
     wr("normw.bin", normw.astype(np.float32).astype(bfloat16))
     freqs = (1e7) ** (-np.arange(32) / 32)
@@ -109,11 +106,15 @@ def main() -> int:
         side = np.frombuffer(BP.build_side(m, l, full[l]), np.uint8)
         wr(f"lnw{l}.bin", pack[0:4096]); wr(f"postln{l}.bin", pack[4096:8192])
         wr(f"sgw{l}.bin", pack[8192:12288]); wr(f"rw{l}.bin", pack[12288:12288 + 1048576])
-        for k, e in enumerate(top[l]):
+        # the routed experts, in routing order, as moe_experts streams them:
+        # per expert [up 4 stripes | gate 4 stripes | down 16 bands]
+        parts = []
+        for e in top[l]:
             e = int(e)
-            (WDIR / f"wu{l}{k}.bin").write_bytes(b"".join(bytes(pool[(8 * e + 2 * s) * S:(8 * e + 2 * s + 1) * S]) for s in range(4)))
-            (WDIR / f"wg{l}{k}.bin").write_bytes(b"".join(bytes(pool[(8 * e + 2 * s + 1) * S:(8 * e + 2 * s + 2) * S]) for s in range(4)))
-            wr(f"wd{l}{k}.bin", pool[335_544_320 + e * 655_360:335_544_320 + (e + 1) * 655_360])
+            parts.append(b"".join(bytes(pool[(8 * e + 2 * s) * S:(8 * e + 2 * s + 1) * S]) for s in range(4)))
+            parts.append(b"".join(bytes(pool[(8 * e + 2 * s + 1) * S:(8 * e + 2 * s + 2) * S]) for s in range(4)))
+            parts.append(bytes(pool[335_544_320 + e * 655_360:335_544_320 + (e + 1) * 655_360]))
+        (WDIR / f"wexp{l}.bin").write_bytes(b"".join(parts))
         wr(f"wsu{l}.bin", pool[503_316_480:503_316_480 + 655_360])
         wr(f"wsg{l}.bin", pool[503_971_840:503_971_840 + 655_360])
         wr(f"wsd{l}.bin", pool[504_627_200:504_627_200 + 655_360])
@@ -152,19 +153,18 @@ def main() -> int:
     # ---- config
     X = [("L", "ln", "ln/build"), ("Q", "gqkv", "gemv_q4/build_qkv"), ("Z", "gz", "gemv_q4/build_z"),
          ("G", "glue", "dn_glue/build"), ("N", "dn", "deltanet/build"), ("P", "post", "dn_post/build"),
-         ("O", "gout", "gemv_q4/build_out"), ("R", "rt", "router/build"), ("U", "gexp", "gemv_q4/build_exp_up"),
-         ("W", "gdown", "gemv_q4/build_exp_down"), ("M", "sm", "silu_mul/build"), ("S", "gsu", "gemv_q4/build_share_up"),
-         ("T", "gsd", "gemv_q4/build_share_down"), ("A", "ax", "moe_combine/build_axpy"), ("F", "fin", "moe_combine/build_fin"),
+         ("O", "gout", "gemv_q4/build_out"), ("R", "rt", "router/build"), ("E", "me", "moe_experts/build"),
+         ("M", "sm", "silu_mul/build"), ("S", "gsu", "gemv_q4/build_share_up"),
+         ("T", "gsd", "gemv_q4/build_share_down"), ("F", "fin", "moe_combine/build_fin"),
          ("H", "g4kh", "gemv_q4/build_z_hi"), ("I", "g512h", "gemv_q4/build_512_hi"), ("X", "at", "attn/build_pos0"),
          ("K", "lm", "lm_head_q8/build_full")]
     cfg = ["device"]
     for tag, kn, path in X:
         cfg += [f"xclbin {tag} {D}/{path}/final.xclbin", f"kernelx {kn} {tag} {D}/{path}/insts.bin"]
     cfg += [f"buf xres0 8192 {OUT}/xres0.bin", f"buf zero 8192 {OUT}/zero.bin", f"buf normw 4096 {OUT}/normw.bin",
-            "buf accA 8192", "buf accB 8192", f"buf lmpool 542113792 {OUT}/lm27.bin",
+            "buf acc 8192", f"buf lmpool 542113792 {OUT}/lm27.bin",
             "buf xresf 8192", "buf hn 4096", "buf logits 993280",
             f"buf zstate 49152 {OUT}/zstate.bin", f"buf zS 2097152 {OUT}/zS.bin", f"buf zkv 3145728 {OUT}/zkv.bin"]
-    cfg += [f"buf e{k} 4096 {OUT}/e{k}.bin" for k in range(NE)]
     runs = []
     for l in range(NL):
         cfg += [f"buf lnw{l} 4096 {OUT}/lnw{l}.bin", f"buf postln{l} 4096 {OUT}/postln{l}.bin",
@@ -172,11 +172,8 @@ def main() -> int:
                 f"buf xa{l} 8192", f"buf xn{l} 4096", f"buf out{l} 8192", f"buf xb{l} 8192", f"buf xm{l} 4096",
                 f"buf rout{l} 4096", f"buf xc{l} 8192",
                 f"buf wsu{l} 655360 {OUT}/wsu{l}.bin", f"buf wsg{l} 655360 {OUT}/wsg{l}.bin", f"buf wsd{l} 655360 {OUT}/wsd{l}.bin",
-                f"buf su{l} 2048", f"buf sgv{l} 2048", f"buf hs{l} 1024", f"buf sh{l} 8192"]
-        for k in range(NE):
-            cfg += [f"buf wu{l}{k} 655360 {OUT}/wu{l}{k}.bin", f"buf wg{l}{k} 655360 {OUT}/wg{l}{k}.bin",
-                    f"buf wd{l}{k} 655360 {OUT}/wd{l}{k}.bin", f"buf u{l}{k} 2048", f"buf g{l}{k} 2048",
-                    f"buf h{l}{k} 1024", f"buf y{l}{k} 8192"]
+                f"buf su{l} 2048", f"buf sgv{l} 2048", f"buf hs{l} 1024", f"buf sh{l} 8192",
+                f"buf wexp{l} {NE * 1_966_080} {OUT}/wexp{l}.bin", f"buf hdr{l} 20480"]
         xin = "xres0" if l == 0 else f"xc{l - 1}"
         if not full[l]:
             cfg += [f"buf wqkv{l} 10485760 {OUT}/wqkv{l}.bin", f"buf wz{l} 5242880 {OUT}/wz{l}.bin",
@@ -202,14 +199,13 @@ def main() -> int:
                      f"run at meta{l} qg{l} kvn{l} zkv kvnew{l} og{l}",
                      f"run gout wo{l} og{l} out{l}",
                      f"run ln xa{l} out{l} postln{l} xb{l} xm{l}"]
-        runs += [f"run rt xm{l} rw{l} rout{l}"]
-        for k in range(NE):
-            src, dst = ("accA", "accB") if k % 2 == 0 else ("accB", "accA")
-            runs += [f"run gexp wu{l}{k} xm{l} u{l}{k}", f"run gexp wg{l}{k} xm{l} g{l}{k}", f"run sm g{l}{k} u{l}{k} h{l}{k}",
-                     f"run gdown wd{l}{k} h{l}{k} y{l}{k}", f"run ax rout{l} y{l}{k} {src} e{k} {dst}"]
-        last = "accB" if (NE - 1) % 2 == 0 else "accA"
-        runs += [f"run gsu wsu{l} xm{l} su{l}", f"run gsu wsg{l} xm{l} sgv{l}", f"run sm sgv{l} su{l} hs{l}",
-                 f"run gsd wsd{l} hs{l} sh{l}", f"run fin {last} xb{l} sh{l} xm{l} sgw{l} xc{l}",
+        # router -> header [xm | rout] (host copy until the fused layer writes it
+        # in place) -> the 8 routed experts as one dispatch -> shared expert -> combine
+        runs += [f"run rt xm{l} rw{l} rout{l}",
+                 f"copy hdr{l} 0 xm{l} 0 4096", f"copy hdr{l} 4096 rout{l} 0 4096",
+                 f"run me wexp{l} hdr{l} acc",
+                 f"run gsu wsu{l} xm{l} su{l}", f"run gsu wsg{l} xm{l} sgv{l}", f"run sm sgv{l} su{l} hs{l}",
+                 f"run gsd wsd{l} hs{l} sh{l}", f"run fin acc xb{l} sh{l} xm{l} sgw{l} xc{l}",
                  f"dump rout{l} {OUT}/y_rout{l}.bin 4096", f"dump xc{l} {OUT}/y_res{l}.bin 8192"]
     runs += [f"run ln xc{NL - 1} zero normw xresf hn", "run lm lmpool hn logits", f"dump logits {OUT}/y_logits.bin 993280", ""]
     (HERE / "run_27b.cfg").write_text("\n".join(cfg + runs), newline="\n")

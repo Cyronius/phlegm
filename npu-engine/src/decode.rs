@@ -204,12 +204,50 @@ impl Driver {
             }
             "submit" => {
                 let r = rl.as_mut().ok_or("submit without runlist")?;
+                let t0 = std::time::Instant::now();
                 r.execute()?;
                 r.wait().map_err(|e| format!("RUNLIST FAILED: {e}"))?;
-                println!("runlist[{} layers] -> completed", rl_runs.len());
+                println!(
+                    "runlist[{} runs] -> completed ({:.3} ms)",
+                    rl_runs.len(),
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
                 self.layeridx += rl_runs.len() as i32;
                 *rl = None;
                 rl_runs.clear();
+            }
+            "copy" => {
+                // copy <dst> <dst_off> <src> <src_off> <nbytes>: BO -> BO through
+                // host memory (a host round trip; assembles one kernel's input
+                // from other kernels' outputs until the fused designs write it
+                // in place).
+                let dst = it.next().ok_or("copy: dst")?.to_string();
+                let doff: usize = it.next().ok_or("copy: dst_off")?.parse().map_err(|_| "copy: bad dst_off")?;
+                let src = it.next().ok_or("copy: src")?.to_string();
+                let soff: usize = it.next().ok_or("copy: src_off")?.parse().map_err(|_| "copy: bad src_off")?;
+                let n: usize = it.next().ok_or("copy: nbytes")?.parse().map_err(|_| "copy: bad nbytes")?;
+                let mut tmp = vec![0u8; n];
+                {
+                    let s = self.bufs.get(&src).ok_or(format!("no buf {src}"))?;
+                    s.0.sync_from_device()?;
+                    s.0.read(&mut tmp, soff)?;
+                }
+                let d = self.bufs.get_mut(&dst).ok_or(format!("no buf {dst}"))?;
+                d.0.write(&tmp, doff)?;
+                d.0.sync_to_device()?;
+            }
+            "runx" => {
+                // `run`'s arg binding, but queued on the open `runlist` instead
+                // of submitted alone (all runs of one runlist share its xclbin
+                // context). Measures what a same-context sequence costs
+                // without the per-run submit/wait floor.
+                let kn = it.next().ok_or("runx: kernel")?.to_string();
+                let names: Vec<String> = it.map(|s| s.to_string()).collect();
+                let args: Vec<(i32, &str)> =
+                    names.iter().enumerate().map(|(i, n)| (3 + i as i32, n.as_str())).collect();
+                let r = self.make_run(&kn, &args)?;
+                rl_runs.push(r);
+                rl.as_mut().ok_or("runx without runlist")?.add(rl_runs.last().unwrap())?;
             }
             "lmhead" => {
                 let kn = it.next().ok_or("lmhead: kernel")?.to_string();

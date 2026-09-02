@@ -283,3 +283,55 @@ step now run on open kernels and match the CPU replica.**
 
 Phase-1 status and what's next: `.claude/plans/open-kernels-feasibility.md`,
 "Phase 1 progress".
+
+## Phase 2 (fast): where the 27B step's 1.24 s went, and the fused MoE
+
+`decode_chain/floor.cfg` (2026-09-02) measured the per-dispatch cost in
+isolation, with the driver's new `runlist` + `runx` (a generic `run` queued on
+the open runlist) and `copy` (BO→BO through the host) directives:
+
+| pattern | per dispatch |
+|---|---|
+| gexp (655 KB expert stripe set) alone, same context back to back | 0.23–0.25 ms |
+| silu_mul (512 elements) alone | 0.13 ms — the submit/wait floor |
+| gexp with the previous dispatch in another xclbin context | **0.65–0.79 ms** |
+| silu_mul after a context switch | 0.29–0.37 ms |
+| 16 gexp in one runlist | 2.5–2.8 ms (0.16 ms each) |
+| 8 silu_mul in one runlist | 0.5–0.6 ms (0.07 ms each) |
+
+So the decode chain's 0.4–0.6 ms average per dispatch is mostly **context
+switching** (~0.4–0.5 ms every time consecutive dispatches use different
+xclbins, which in the chain is nearly always); runlists halve the floor but
+only within one context. Fusion into one xclbin removes both. The 27B step's
+1622 dispatches were 61 % routed experts (5 dispatches over 4 contexts per
+expert, 1350 dispatches in all), hence MoE first.
+
+- `designs/moe_experts/` — **the 8 routed experts of a MoE block as ONE
+  dispatch** (2026-09-02): cores 0–3 stream up band c and gate band c of each
+  expert (the gemv_q4 RS=4 entry points unchanged) against xm and emit
+  h_c = bf16(silu(g)·u); the four h parts are **joined on a memtile**
+  (`of_h.prod().join(...)`) into h[512] and **broadcast to all 8 cores**, which
+  each stream two down bands and keep `acc += w[e]·y` for their 256 rows in
+  the output element across the 8 experts; one drain at the end. Weights are
+  the host-sliced experts concatenated per expert `[up | gate | down]`
+  (15.7 MB); the first element of every core's weight stream is the header
+  `[xm bf16 | router output f32[1024]]`, because **a core has only 2 input DMA
+  channels** (the build error names it: "requires 4 input/2 output DMA
+  channels, but only 2 input/2 output available") — w and h take both.
+  `make_test.py` (Windows, from `moe_chain`'s layer-0 vectors) + `compare.py`:
+  **PASS cos 1.0000000, maxrel 8.4e-5, 2.24–2.4 ms warm** (3.7–3.9 ms cold)
+  for all 8 experts, vs ~25 ms as 40 dispatches. 15.7 MB / 2.3 ms ≈ 7 GB/s;
+  the per-expert bubble is the h join/broadcast round trip and the 4 idle
+  cores during up/gate — item 5 territory.
+  Trap: one `extern "C"` entry point per `.cc` (IRON compiles each
+  ExternalFunction's source file separately; two entries in one file link as
+  duplicate symbols).
+
+  **In the 27B decode step** (`make_27b.py`: `copy hdr ← xm, rout; run me
+  wexp hdr acc` per layer, then the shared expert + `fin` as before):
+  **1622 → 452 dispatches, 1239 → 460 ms (2.2 tok/s), logits corr 0.999998,
+  same argmax (846) and top-5, all 30 residuals ≥ 0.999997**
+  (`run_27b_fused.log`, `compare_27b.py`). The fused MoE is 92 ms of the 460
+  (3.1 ms/layer including the context switch); the rest is the unfused
+  linear-attention chain (~190 ms over 10 dispatches/layer), the shared
+  expert (5 dispatches, ~100 ms), lm_head 23 ms.
