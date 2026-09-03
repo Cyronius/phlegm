@@ -10,10 +10,17 @@ MIT-licensed parts of this repository that derive from it retain that notice.
 (The name is a joke: it *derives from FLM*, and it was built while its author had
 a cold.)
 
-## The NPU kernels are NOT in this repository
+## Two kinds of kernels: ours (MIT, in tree) and FastFlowLM's (closed, not in tree)
+`tools/open-kernels/` contains phlegm's **own** NPU kernels, written from
+scratch with the open IRON / mlir-aie toolchain. They are MIT like the rest of
+the repo. The `rot13` smoke test and the q4 GEMV tile arithmetic started from
+**vegah/LLMNpuTest** (https://github.com/vegah/LLMNpuTest), Apache-2.0; its
+license is kept at `tools/open-kernels/designs/rot13/LICENSE.LLMNpuTest`.
+
 phlegm does **not** contain, and does **not** redistribute, AMD's NPU kernel
-binaries (the `.xclbin` compute kernels and `q4_npu_eXpress` / `qwen3_6_moe_npu`
-runtime). Those binaries are **proprietary and patent-pending** and are governed
+binaries (FastFlowLM's `.xclbin` compute kernels and `q4_npu_eXpress` /
+`qwen3_6_moe_npu` runtime). Only the closed-kernel backends (`l30`/`l40`/`li3`)
+use them; the open-kernel path does not. Those binaries are **proprietary and patent-pending** and are governed
 by FastFlowLM's own terms (paraphrased):
 
 > Free for non-commercial, academic, or personal use, and for commercial use by
@@ -24,9 +31,9 @@ by FastFlowLM's own terms (paraphrased):
 See FastFlowLM's `TERMS.md` for the authoritative text, and contact
 info@fastflowlm.com for commercial licensing.
 
-**To run phlegm on the NPU you must have FastFlowLM installed** (it provides the
-kernels and, conveniently, the model files). phlegm supplies only the open host
-orchestration — everything in this repo is MIT. What you do with the AMD kernels
+**To run the closed-kernel backends you must have FastFlowLM installed** (it
+provides those kernels and, conveniently, the model files). The open-kernel
+path has no such dependency. Everything in this repo is MIT. What you do with the AMD kernels
 is between you and FastFlowLM's terms above.
 
 ## Other bundled third-party code

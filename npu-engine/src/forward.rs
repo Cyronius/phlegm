@@ -370,8 +370,15 @@ impl Model {
         }
         let wo = self.dq(layer, "self_attn.o_proj.weight", 2048, 4096);
         let proj = matmul(&og, &wo, t, 4096, 2048);
-        for i in 0..t * 2048 {
-            x_res[i] += proj[i] as f64;
+        // Diagnostic: OPEN_QWEN_ZERO_FULL_ATTN=1 keeps the KV cache but drops the
+        // block's contribution to the residual stream — the "FLM contributes
+        // nothing from the full-attention block on interval-3" hypothesis, so a
+        // suspect NPU token stream can be checked against it (see
+        // [[flm-capture-oracle]]).
+        if std::env::var("OPEN_QWEN_ZERO_FULL_ATTN").is_err() {
+            for i in 0..t * 2048 {
+                x_res[i] += proj[i] as f64;
+            }
         }
         kv
     }

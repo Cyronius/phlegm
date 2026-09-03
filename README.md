@@ -1,36 +1,89 @@
 # phlegm
 
-**An open replacement for the software AMD's NPU chip needs to run Qwen3.6-MoE
-models — built to fix a bug in the official one.**
+**An open runtime and open NPU kernels for running Qwen3.6-MoE models on
+AMD Ryzen AI (XDNA2) — started to fix a bug in the official one, now running
+the whole model on kernels we wrote ourselves.**
 
 Cyrus pruned Qwen3.6 down to a smaller model (fewer layers, still strong) to
-run on AMD's Ryzen AI NPU. The official app for that NPU, FastFlowLM, crashes
-on it — not with an error, but silently: it outputs `NaN` (not-a-number)
-instead of real predictions, so the model looks broken. It isn't. The bug is
-in how FastFlowLM schedules work for the NPU chip, not in the chip or its
-compute kernels. phlegm is a different driver for those same kernels that
-schedules them correctly and gets real output.
+run on AMD's Ryzen AI NPU. The official app for that NPU, FastFlowLM, fails
+on it silently: it skips the full-attention block on this model's layout and
+outputs `NaN` or garbage. The model isn't broken. phlegm began as a
+different host driver for FastFlowLM's closed kernels that schedules them
+correctly, and has since replaced the kernels themselves with open ones.
 
 > The name comes from **FLM** (FastFlowLM) — written while its author had a cold.
 
-> **Status: proof-of-concept.** It works — proven on real hardware — but the
-> NPU setup has rough edges (see below), and you need specific AMD hardware to
-> use it. A slower CPU-only mode works on any machine and is the easiest way
-> to see the fix for yourself.
+> **Status (2026-09-03):** two working paths on real hardware.
+> 1. **Open kernels** (`tools/open-kernels/`): a full decode step for the
+>    30-layer pruned Qwen3.6-27B-A2.8B runs entirely on kernels in this repo,
+>    no FastFlowLM binary involved: **~155 ms/token (about 6 tok/s)**, 62
+>    dispatches, greedy output matching the CPU reference at every position.
+>    Driven by the config harness today; the resident backend that serves it
+>    over HTTP is the next item.
+> 2. **Closed-kernel host** (`npu-engine/` backends `l30`/`l40`/`li3`): runs
+>    FastFlowLM's own kernels correctly on the model FastFlowLM mis-executes.
+>    This is what the HTTP server uses right now.
+>
+> Both have rough edges (hardcoded paths, WSL build for the kernels). A
+> slower CPU-only mode works on any machine.
+
+---
+
+## Open kernels: the whole decode step, no closed binaries
+
+`tools/open-kernels/` holds our own AIE kernels for XDNA2, written with the
+open IRON / mlir-aie toolchain (75 core kernels, ~8.7k lines, MIT). Together
+they cover every op in a Qwen3.6-MoE decode step:
+
+- q4 GEMV with dequant fused into the integer matrix unit (weights stay
+  4-bit in memory; nothing is unpacked on the host or in DDR)
+- gated DeltaNet state update, conv1d / SiLU / q-k norm glue, post-norm
+- full attention with a dynamic KV length (RoPE, online softmax, gated output)
+- MoE router with on-device top-8, and the 8 routed experts plus the shared
+  expert and combine as **one dispatch**, reading experts straight from the
+  resident weight pool by runtime index (no host round trip, no host slicing)
+- RMSNorm + residual, silu*mul, q8 lm_head
+
+Measured on Cyrus's pruned 27B (30 layers, full-attention interval 3), one
+xclbin context for the whole layer:
+
+| milestone | ms / token | notes |
+|---|---|---|
+| phase 1, one dispatch per op | 1239 | 1622 dispatches, correct logits |
+| routed experts as one dispatch | 460 | |
+| MoE block (routed + shared + combine) fused | 348 | |
+| linear-attention layer as 3 dispatches | 202 | |
+| full-attention layer as 1 dispatch | 313 | 132 dispatches; measured under heavier box load |
+| q4 GEMV moved to the integer matrix unit | 208 | same load as the row above; bandwidth-bound now |
+| whole layer in one xclbin context | 165 | 62 dispatches |
+| dynamic KV, 3-token greedy decode | **157 / 154 / 155** | argmax matches the reference at every position |
+
+Every kernel has a `make_test.py` / `compare.py` pair against a byte-exact
+CPU reference, and the README there records the XDNA2 traps met along the
+way (a context switch resets the cores, `.bss` isn't zeroed, buffer args
+≥ 5 carry a hidden offset bit, and so on). Status, per-kernel results, and
+the build recipe: [`tools/open-kernels/README.md`](tools/open-kernels/README.md).
+Plans and numbers per step: `docs/open-kernels-*.md`.
+
+The GEMV tile arithmetic started from
+[vegah/LLMNpuTest](https://github.com/vegah/LLMNpuTest) (Apache-2.0).
 
 ---
 
 ## What it is (and isn't)
 
-- **Is:** an MIT-licensed program — mostly Rust, some Python — that runs
-  Cyrus's pruned Qwen3.6 model correctly on the NPU. It also includes a
-  converter (turns a model file into the format phlegm reads) and a small web
-  server (so it behaves like a normal chat API).
-- **Isn't:** a copy of AMD's NPU code. The actual compute kernels (`.xclbin`
-  files) that run on the chip are proprietary and **not included in this
-  repo** — they ship with FastFlowLM. You still need FastFlowLM installed to
-  get them; phlegm only replaces the part of FastFlowLM that decides how and
-  when to run them. See [`NOTICE.md`](NOTICE.md) for the license terms on that.
+- **Is:** an MIT-licensed program — mostly Rust, some Python, plus C++ AIE
+  kernels — that runs Cyrus's pruned Qwen3.6 model correctly on the NPU. It
+  includes our own open NPU kernels for the whole decode step, a converter
+  (turns a model file into the format phlegm reads), and a small web server
+  (so it behaves like a normal chat API).
+- **Isn't:** a copy of AMD's NPU code. FastFlowLM's closed kernels
+  (`.xclbin` files and the `q4_npu_eXpress` runtime) are **not included in
+  this repo** and never were. The closed-kernel backends (`l30`/`l40`/`li3`)
+  still need a FastFlowLM install to get them; the open-kernel path does not.
+  See [`NOTICE.md`](NOTICE.md) for the license terms.
+- **Scope today:** one model family (Qwen3.6-MoE), decode on the open
+  kernels, prefill as sequential decode. Not a multi-model product shell.
 
 ### The bug, in plain terms
 Qwen3.6 models mix two kinds of attention layers in a repeating pattern —
@@ -77,7 +130,9 @@ proves the fix):
 **To run it for real, on the NPU:**
 - An AMD Ryzen AI **XDNA2** NPU (Strix / Strix Halo / Kraken / Gorgon Point) and its driver
 - The **XRT** runtime, and MSVC (Windows) to build the driver code
-- **FastFlowLM installed** — this is where the NPU kernel files come from
+- **FastFlowLM installed** — only for the closed-kernel backends; that is
+  where their kernel files come from. The open-kernel path needs the
+  mlir-aie toolchain instead (see `tools/open-kernels/README.md`)
 
 ---
 
@@ -95,6 +150,10 @@ npu-engine/        The Rust program: reads model files, builds NPU work,
   xrt-shim/        glue between Rust and AMD's XRT runtime (C++)
   deps/XRT/        vendored XRT headers (Apache-2.0)
 tools/
+  open-kernels/    OUR OWN NPU kernels (IRON / mlir-aie): designs/<op>/ with
+                   the C++ core kernel, the IRON dataflow, a make_test.py that
+                   slices real inputs, and a compare.py against a CPU oracle.
+                   designs/decode_chain/make_27b.py runs the whole 27B step.
   kernel-interp/   Python originals the Rust program above was ported from —
                    still used for one setup step (see "Running on the NPU"),
                    and for CPU-only diagnostics
@@ -155,7 +214,14 @@ Full byte-format details: [`docs/qwen36-1.0.3-format-support.md`](docs/qwen36-1.
 
 ---
 
-## Running on the NPU (supported hardware + FastFlowLM install)
+## Running on the NPU with FastFlowLM's closed kernels (needs a FastFlowLM install)
+
+This is the closed-kernel host: phlegm's own driver running FastFlowLM's
+kernels correctly. It is the path the HTTP server uses today. (To run the
+**open** kernels instead, see
+[`tools/open-kernels/README.md`](tools/open-kernels/README.md):
+`designs/decode_chain/make_27b.py --whole-layer --tokens N` builds the
+config and `open-qwen-npu npu <cfg>` runs it. No FastFlowLM files needed.)
 
 phlegm can run three versions of the model. Pick the one that matches what
 you're trying to do:
@@ -169,9 +235,10 @@ you're trying to do:
 (The names come from layer counts: `l30` = 30 layers, `l40` = 40 layers,
 `li3` = a 5-layer slice around the interval-3 boundary where the bug hits.)
 
-### 1. Get the NPU kernel files
-These are AMD's proprietary compute kernels — not included here, but public
-in FastFlowLM's repo, so fetch them from there:
+### 1. Get FastFlowLM's kernel files
+These are AMD's proprietary compute kernels — not included here (only the
+open-kernel path is self-contained), but public in FastFlowLM's repo, so
+fetch them from there:
 ```pwsh
 pwsh -File tools/get-kernels.ps1          # what you need for running/serving
 pwsh -File tools/get-kernels.ps1 -All     # + extra kernels only needed for some setup steps
@@ -261,7 +328,9 @@ phlegm's output is correct. Neither is needed just to run phlegm.
 
 ## License
 
-phlegm's code is **MIT** — see [`LICENSE`](LICENSE). It derives from
-FastFlowLM (also MIT). The AMD NPU **kernels are not included** and are
-governed by FastFlowLM's own terms — see [`NOTICE.md`](NOTICE.md). Everything
-you need to run on the NPU comes from your own FastFlowLM install.
+phlegm's code is **MIT** — see [`LICENSE`](LICENSE), including the open
+kernels under `tools/open-kernels/`. The host derives from FastFlowLM (also
+MIT). FastFlowLM's own NPU **kernels are not included** and are governed by
+its terms — see [`NOTICE.md`](NOTICE.md); only the closed-kernel backends
+need them. One kernel's tile arithmetic derives from vegah/LLMNpuTest
+(Apache-2.0, notice kept alongside).

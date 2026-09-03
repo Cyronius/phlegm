@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NPU Chat</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #1e1f22; --panel: #2b2d31; --border: #3d3f44;
+    --text: #dcddde; --muted: #8e9297; --accent: #5865f2;
+    --user-bubble: #313338; --assistant-bubble: #2b2d31;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+    background: var(--panel); flex-wrap: wrap;
+  }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0 12px 0 0; white-space: nowrap; }
+  header input, header select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px; font-size: 12px;
+  }
+  header input#baseUrl { width: 220px; }
+  header input#apiKey { width: 120px; }
+  header input#maxTokens { width: 64px; }
+  header label { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
+  header button {
+    background: var(--accent); color: white; border: none; border-radius: 6px;
+    padding: 5px 10px; font-size: 12px; cursor: pointer;
+  }
+  header button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  header .status { font-size: 11px; color: var(--muted); margin-left: auto; }
+  #log { flex: 1; overflow-y: auto; padding: 16px; }
+  .msg { max-width: 780px; margin: 0 auto 14px; display: flex; gap: 10px; }
+  .msg .role {
+    flex: 0 0 60px; font-size: 11px; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; padding-top: 4px;
+  }
+  .msg.user .role { color: #7a9eff; }
+  .msg.assistant .role { color: #6fd6a0; }
+  .bubble {
+    flex: 1; white-space: pre-wrap; word-wrap: break-word;
+    line-height: 1.5; font-size: 14px; padding: 2px 0;
+  }
+  .bubble.error { color: #f38ba8; }
+  footer { border-top: 1px solid var(--border); padding: 12px 16px; background: var(--panel); }
+  #composer { max-width: 780px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+  #input {
+    flex: 1; resize: none; min-height: 40px; max-height: 200px;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px; font-size: 14px; font-family: inherit;
+  }
+  #composer button {
+    background: var(--accent); color: white; border: none; border-radius: 8px;
+    padding: 10px 16px; font-size: 13px; cursor: pointer; white-space: nowrap;
+  }
+  #composer button:disabled { opacity: .5; cursor: default; }
+  .hint { max-width: 780px; margin: 6px auto 0; font-size: 11px; color: var(--muted); }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; }
+  .dot.ok { background: #6fd6a0; }
+  .dot.bad { background: #f38ba8; }
+  .dot.unknown { background: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>NPU Chat</h1>
+  <label>Base URL <input id="baseUrl" value="http://127.0.0.1:52625"></label>
+  <label>Model <select id="model"><option value="">(auto)</option></select></label>
+  <label>API key <input id="apiKey" placeholder="optional"></label>
+  <label>Max tokens <input id="maxTokens" value="512"></label>
+  <label><input type="checkbox" id="stream" checked style="width:auto"> stream</label>
+  <button id="refresh" class="secondary">Refresh models</button>
+  <button id="clear" class="secondary">Clear chat</button>
+  <span class="status"><span id="statusDot" class="dot unknown"></span><span id="statusText">not checked</span></span>
+</header>
+
+<div id="log"></div>
+
+<footer>
+  <div id="composer">
+    <textarea id="input" placeholder="Message... (Enter to send, Shift+Enter for newline)"></textarea>
+    <button id="send">Send</button>
+  </div>
+  <div class="hint">Talks directly to the OpenAI-compatible endpoint above via fetch(). Nothing leaves your machine.</div>
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const log = $('log'), input = $('input'), sendBtn = $('send');
+const baseUrlEl = $('baseUrl'), modelEl = $('model'), apiKeyEl = $('apiKey'), maxTokensEl = $('maxTokens'), streamEl = $('stream');
+const statusDot = $('statusDot'), statusText = $('statusText');
+
+let messages = [];
+let busy = false;
+
+function persist() {
+  try {
+    localStorage.setItem('npu-chat-cfg', JSON.stringify({
+      baseUrl: baseUrlEl.value, model: modelEl.value, apiKey: apiKeyEl.value,
+      maxTokens: maxTokensEl.value, stream: streamEl.checked,
+    }));
+  } catch (e) {}
+}
+function restore() {
+  try {
+    const raw = localStorage.getItem('npu-chat-cfg');
+    if (!raw) return;
+    const cfg = JSON.parse(raw);
+    if (cfg.baseUrl) baseUrlEl.value = cfg.baseUrl;
+    if (cfg.apiKey) apiKeyEl.value = cfg.apiKey;
+    if (cfg.maxTokens) maxTokensEl.value = cfg.maxTokens;
+    if (typeof cfg.stream === 'boolean') streamEl.checked = cfg.stream;
+    if (cfg._model) modelEl.dataset.pending = cfg._model;
+  } catch (e) {}
+}
+restore();
+[baseUrlEl, apiKeyEl, maxTokensEl].forEach(el => el.addEventListener('change', persist));
+streamEl.addEventListener('change', persist);
+modelEl.addEventListener('change', persist);
+
+function headers() {
+  const h = { 'Content-Type': 'application/json' };
+  if (apiKeyEl.value.trim()) h['Authorization'] = 'Bearer ' + apiKeyEl.value.trim();
+  return h;
+}
+
+function renderMessage(role, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.innerHTML = `<div class="role">${role}</div><div class="bubble"></div>`;
+  div.querySelector('.bubble').textContent = text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  return div.querySelector('.bubble');
+}
+
+async function checkHealth() {
+  const base = baseUrlEl.value.replace(/\/+$/, '');
+  try {
+    const res = await fetch(base + '/health', { headers: headers() });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    statusDot.className = 'dot ok';
+    statusText.textContent = 'connected';
+  } catch (e) {
+    statusDot.className = 'dot bad';
+    statusText.textContent = 'unreachable';
+  }
+}
+
+async function loadModels() {
+  const base = baseUrlEl.value.replace(/\/+$/, '');
+  try {
+    const res = await fetch(base + '/v1/models', { headers: headers() });
+    const data = await res.json();
+    const current = modelEl.value || modelEl.dataset.pending;
+    modelEl.innerHTML = '<option value="">(auto)</option>';
+    (data.data || []).forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.id; opt.textContent = m.id;
+      modelEl.appendChild(opt);
+    });
+    if (current) modelEl.value = current;
+    await checkHealth();
+  } catch (e) {
+    statusDot.className = 'dot bad';
+    statusText.textContent = 'model list failed';
+  }
+}
+
+async function sendMessage() {
+  const text = input.value.trim();
+  if (!text || busy) return;
+  input.value = '';
+  input.style.height = 'auto';
+  messages.push({ role: 'user', content: text });
+  renderMessage('user', text);
+
+  busy = true; sendBtn.disabled = true;
+  const bubble = renderMessage('assistant', '');
+  let acc = '';
+
+  const base = baseUrlEl.value.replace(/\/+$/, '');
+  const body = {
+    messages,
+    model: modelEl.value || undefined,
+    max_tokens: parseInt(maxTokensEl.value, 10) || 512,
+    stream: streamEl.checked,
+  };
+
+  try {
+    const res = await fetch(base + '/v1/chat/completions', {
+      method: 'POST', headers: headers(), body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error('HTTP ' + res.status + ': ' + errText);
+    }
+
+    if (streamEl.checked) {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const payload = trimmed.slice(5).trim();
+          if (payload === '[DONE]') continue;
+          try {
+            const chunk = JSON.parse(payload);
+            const delta = chunk.choices?.[0]?.delta?.content;
+            if (delta) {
+              acc += delta;
+              bubble.textContent = acc;
+              log.scrollTop = log.scrollHeight;
+            }
+          } catch (e) { /* ignore partial/non-JSON frames */ }
+        }
+      }
+    } else {
+      const data = await res.json();
+      acc = data.choices?.[0]?.message?.content ?? '';
+      bubble.textContent = acc;
+    }
+    messages.push({ role: 'assistant', content: acc });
+  } catch (e) {
+    bubble.textContent = 'Error: ' + e.message;
+    bubble.classList.add('error');
+    messages.pop(); // drop the failed user turn's pairing expectation
+    messages.push({ role: 'assistant', content: '' });
+  } finally {
+    busy = false; sendBtn.disabled = false;
+    input.focus();
+  }
+}
+
+sendBtn.addEventListener('click', sendMessage);
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 200) + 'px';
+});
+
+$('refresh').addEventListener('click', loadModels);
+$('clear').addEventListener('click', () => {
+  messages = [];
+  log.innerHTML = '';
+});
+baseUrlEl.addEventListener('change', () => { loadModels(); });
+
+loadModels();
+</script>
+</body>
+</html>
