@@ -451,6 +451,33 @@ expert, 1350 dispatches in all), hence MoE first.
   Trap: two designs in one process each pinning `Tile(c, 0)` shim handles
   is fine; a run with 6 buffer args is fine (9 is not).
 
+- `designs/layer_x/` — **the whole layer in ONE xclbin context** (2026-09-02,
+  plan `open-kernels-phase2-whole-layer.md`): `lx` = ln → qkv|z → glue →
+  DeltaNet → post → out → ln(+res) → router → MoE for a linear-attention
+  layer, `ax` = ln → q|gate|k|v → attn → o → ln(+res) → router → MoE for a
+  full-attention layer. Eight main cores (Tile(c, 2)) run every GEMV, the
+  DeltaNet step (`dnx.h`: S in 20-row slices through the weight stream, heads
+  padded to 140 rows in the state BO and updated in place, S' rows out through
+  the 256 B result elements) and the MoE block in one core program over three
+  streams (w 10 KB, x 4 KB broadcast, y 256 B); helpers: norm + router, post,
+  glue / attention. Two instruction streams per layer on one xclbin (part 0
+  through the router, `moeroute2`, part 1 = the MoE): **a context switch does
+  NOT preserve the array state — the cores restart** — so a layer must be one
+  context, and multi-part sequences only work back to back. Program memory
+  (16 KB) forced: one runtime-parameterised GEMV entry per destination type
+  (`gemv_q4_pool_group_rt`), one scratch buffer per kernel family (`ms`, `ds`),
+  one 9-iteration expert loop, `-Os`, shared (`inline` noinline) transcendentals
+  in `vecmath.h`, no scalar float ops anywhere (the soft-float library is 2.6 KB).
+  Unit test (`make_test.py`, layer 0): PASS with layer_chain's numbers, S pad
+  rows zero, routing = moe_chain's, block output cos 0.9999992; lx0 3.4 ms +
+  lx1 0.9 ms warm. **27B decode step (`run_27b_x.cfg`, `make_27b.py
+  --whole-layer`): 132 → 62 dispatches, 8 → 4 contexts, 208 → 165 ms
+  (6.1 tok/s) on a busier box, logits corr 0.999998, same argmax (846) /
+  top-5.** Per layer: linear lx0 4.35 + lx1 1.12, attention ax0 2.34 + ax1
+  1.10, lm_head 18.9. Driver: `moeroute2 <kernel> <buf> <idx offset>` (pool-
+  layout placeholders), `dump <buf> <file> [size [offset]]`, `NPU_KEEP_GOING=1`
+  (continue after a timed-out run so dumps show how far the cores got).
+
 - **Phase 2 item 5 — GEMV bandwidth (2026-09-02).** With the mmul GEMV
   (above) in every design — `moe_experts`, `lin_a`, `lin_c`, `attn_l`
   rebuilt, unit tests PASS at the previous tolerances: me 2.24–2.5 →

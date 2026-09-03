@@ -37,6 +37,10 @@ pub struct Driver {
     /// `moeroute` patch table per kernel: (word index, expert slot 0..8, stripe/core, kind 0/1/2,
     /// byte offset inside the stripe / down slice).
     moe_patches: HashMap<String, Vec<(usize, usize, u64, u8, u64)>>,
+    /// `moeroute2` patch table per kernel: (word index, slot 0..7, byte offset relative to the
+    /// expert's stripe set / down slice in the pool). Kernels whose fills already use the pool
+    /// layout with expert j standing in for routed slot j (designs/layer_x).
+    moe2_patches: HashMap<String, Vec<(usize, usize, u64)>>,
     /// name -> (bo, logical size). The Bo's own size is padded up to 1 MB.
     bufs: HashMap<String, (Bo, usize)>,
     layeridx: i32,
@@ -69,6 +73,7 @@ impl Driver {
             instr: HashMap::new(),
             instr_src: HashMap::new(),
             moe_patches: HashMap::new(),
+            moe2_patches: HashMap::new(),
             bufs: HashMap::new(),
             layeridx: 0,
         }
@@ -149,6 +154,50 @@ impl Driver {
             return Err(format!("moeroute: {kn} has {} weight fills, expected 144 or 216", t.len()));
         }
         self.moe_patches.insert(kn.to_string(), t.clone());
+        Ok(t)
+    }
+
+    /// The `moeroute2` patch table: every DDR-patch op on arg 0 (the layer pool) whose offset
+    /// lies in a routed expert's stripe set (expert e < 8: `(8e + ..)·STRIPE + ..`) or down slice
+    /// (`POOL_DOWN + e·655360 + ..`) is a placeholder for slot e; the shared expert, qkv, z, ...
+    /// are real offsets and stay. The remainder inside the expert's region is kept.
+    fn moe2_patch_table(&mut self, kn: &str) -> Result<Vec<(usize, usize, u64)>, String> {
+        if let Some(t) = self.moe2_patches.get(kn) {
+            return Ok(t.clone());
+        }
+        let src = self.instr_src.get(kn).ok_or(format!("no kernelx {kn}"))?;
+        let w: Vec<u32> = src.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let mut t = Vec::new();
+        let mut i = 4;
+        while i < w.len() {
+            let len = match w[i] {
+                0 => 6,
+                1 => 12,
+                3 => 7,
+                0x80 => 4,
+                0x81 => 12,
+                _ => 1,
+            };
+            if w[i] == 0x81 && i + 11 < w.len() && w[i + 8] == 0 {
+                let off = w[i + 10] as u64;
+                if off < MOE_POOL_DOWN {
+                    let e = (off / (8 * MOE_STRIPE)) as usize;
+                    if e < 8 {
+                        t.push((i + 10, e, off % (8 * MOE_STRIPE)));
+                    }
+                } else if off < MOE_POOL_SHARE_UP {
+                    let e = ((off - MOE_POOL_DOWN) / MOE_UP_BYTES) as usize;
+                    if e < 8 {
+                        t.push((i + 10, e | 0x100, (off - MOE_POOL_DOWN) % MOE_UP_BYTES));
+                    }
+                }
+            }
+            i += len;
+        }
+        if t.is_empty() {
+            return Err(format!("moeroute2: {kn} has no routed-expert fills"));
+        }
+        self.moe2_patches.insert(kn.to_string(), t.clone());
         Ok(t)
     }
 
@@ -346,6 +395,31 @@ impl Driver {
                 ibo.sync_to_device()?;
                 println!("moeroute {kn} idx {:?} ({:.3} ms)", idx, t0.elapsed().as_secs_f64() * 1e3);
             }
+            "moeroute2" => {
+                // moeroute2 <kernel> <buf> <idx byte offset>: like moeroute for kernels whose
+                // expert fills are pool-layout placeholders (routed slot j = expert j); the
+                // router's int32 idx[8] are read at the given byte offset of <buf>.
+                let kn = it.next().ok_or("moeroute2: kernel")?.to_string();
+                let rb = it.next().ok_or("moeroute2: rout buf")?;
+                let ioff: u64 = it.next().ok_or("moeroute2: idx offset")?.parse().map_err(|_| "moeroute2: idx offset")?;
+                let t0 = std::time::Instant::now();
+                let mut idx = [0u8; 32];
+                {
+                    let r = self.bufs.get(rb).ok_or(format!("no buf {rb}"))?;
+                    r.0.sync_from_device()?;
+                    r.0.read(&mut idx, ioff as usize)?;
+                }
+                let idx: Vec<u32> = idx.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                let table = self.moe2_patch_table(&kn)?;
+                let (ibo, _) = self.instr.get_mut(&kn).ok_or(format!("no kernelx {kn}"))?;
+                for &(word, slot, rem) in &table {
+                    let e = idx[slot & 0xff] as u64;
+                    let off = if (slot & 0x100) == 0 { 8 * e * MOE_STRIPE + rem } else { MOE_POOL_DOWN + e * MOE_UP_BYTES + rem };
+                    ibo.write(&(off as u32).to_le_bytes(), word * 4)?;
+                }
+                ibo.sync_to_device()?;
+                println!("moeroute2 {kn} idx {:?} ({:.3} ms)", idx, t0.elapsed().as_secs_f64() * 1e3);
+            }
             "runx" => {
                 // `run`'s arg binding, but queued on the open `runlist` instead
                 // of submitted alone (all runs of one runlist share its xclbin
@@ -389,7 +463,12 @@ impl Driver {
                 let st = self.submit_single(&kn, &args)?;
                 println!("run {kn} [{} bufs] -> state {st} ({:.3} ms)", names.len(), t0.elapsed().as_secs_f64() * 1e3);
                 if st != STATE_COMPLETED {
-                    return Err("RUN FAILED".to_string());
+                    // NPU_KEEP_GOING=1: carry on (so later `dump`s show how far the cores got)
+                    if std::env::var("NPU_KEEP_GOING").map(|v| v == "1").unwrap_or(false) {
+                        println!("run {kn} FAILED (state {st}); continuing (NPU_KEEP_GOING)");
+                    } else {
+                        return Err("RUN FAILED".to_string());
+                    }
                 }
             }
             "ctrlpkt" => {
@@ -481,11 +560,12 @@ impl Driver {
                 let name = it.next().ok_or("dump: name")?;
                 let outf = it.next().ok_or("dump: file")?;
                 let size: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let off: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);   // dump <buf> <file> [size [byte offset]]
                 let entry = self.bufs.get(name).ok_or(format!("no buf {name}"))?;
                 let n = if size != 0 { size } else { entry.1 };
                 entry.0.sync_from_device()?;
                 let mut v = vec![0u8; n];
-                entry.0.read(&mut v, 0)?;
+                entry.0.read(&mut v, off)?;
                 std::fs::write(outf, &v).map_err(|e| format!("write {outf}: {e}"))?;
             }
             "loglogits" => {

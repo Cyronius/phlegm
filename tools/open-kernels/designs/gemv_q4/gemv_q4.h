@@ -229,6 +229,23 @@ static inline void gemv_q4_pool_group(const uint8_t *__restrict chunks,
   }
 }
 
+// The same with the band law (chunks per band, row split) as RUNTIME arguments:
+// one entry point serves every shape of a design (16 KB program memory).
+static inline void gemv_q4_pool_group_rt(const uint8_t *__restrict chunks,
+                                         const uint8_t *__restrict tab,
+                                         unsigned group, float *__restrict y,
+                                         unsigned per_band, unsigned rs) {
+  const unsigned K = kTileK * per_band / rs;
+  const unsigned kt_last = per_band / rs - 1;
+#pragma clang loop unroll(disable)
+  for (unsigned i = 0; i < kPerCall; ++i) {
+    const unsigned c = group * kPerCall + i;
+    const unsigned part = c % rs;
+    const unsigned kt = c / rs;
+    gemv_q4_tile(chunks + i * kTileBytes, tab, K, kt, kt == 0, kt == kt_last, y + part * kRows);
+  }
+}
+
 #define GEMV_Q4_ENTRY__(P, B, R, N)                                         \
   void gemv_q4_p##P##b##B##r##R##_k##N(const uint8_t *__restrict t,         \
                                        const uint8_t *__restrict tab,       \
@@ -238,3 +255,15 @@ static inline void gemv_q4_pool_group(const uint8_t *__restrict chunks,
 
 #define GEMV_Q4_ENTRY_(P, B, R, N) GEMV_Q4_ENTRY__(P, B, R, N)
 #define GEMV_Q4_ENTRY(N) GEMV_Q4_ENTRY_(GEMV_PER_CALL, GEMV_PER_BAND, GEMV_ROWSPLIT, N)
+// One entry point per (PER_CALL, PER_BAND, ROWSPLIT) with the group AND the
+// band (y + band * band_rows) as RUNTIME arguments (from range_ loops):
+// gemv_q4_p<P>b<B>r<R>_g. Keeps the core program compact (16 KB).
+#define GEMV_Q4_GROUP_ENTRY__(P, B, R)                                       \
+  void gemv_q4_p##P##b##B##r##R##_g(const uint8_t *__restrict t,            \
+                                    const uint8_t *__restrict tab,          \
+                                    float *__restrict y, int32_t group,     \
+                                    int32_t band) {                         \
+    gemv_q4_pool_group(t, tab, (unsigned)group, y + band * kBandRows * kRowSplit / 2); \
+  }
+#define GEMV_Q4_GROUP_ENTRY_(P, B, R) GEMV_Q4_GROUP_ENTRY__(P, B, R)
+#define GEMV_Q4_GROUP_ENTRY() GEMV_Q4_GROUP_ENTRY_(GEMV_PER_CALL, GEMV_PER_BAND, GEMV_ROWSPLIT)

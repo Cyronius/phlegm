@@ -125,3 +125,5 @@ Unit tests, all PASS with the same tolerances as before:
   whole-layer context −54), then dynamic KV (item 3) before the resident
   driver (item 4). DMA is at 25–35 GB/s per design against a ~40 GB/s
   per-agent ceiling; 16 streams (2 per column) untested.
+
+- **Next step taken: the whole-layer context** — see `open-kernels-phase2-whole-layer.md` (208 → 165 ms).

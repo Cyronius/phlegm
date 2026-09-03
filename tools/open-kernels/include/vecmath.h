@@ -10,6 +10,8 @@
 // transcendentals are polynomial / Newton on top of that (~1e-7).
 //
 // 32-lane variants (v32f) and 16-lane variants (v16f) are provided.
+// The transcendentals are `inline` + noinline (COMDAT): one copy per core program
+// however many translation units use them (16 KB program memory).
 
 #include "aie_kernel_utils.h"
 #include <aie_api/aie.hpp>
@@ -137,7 +139,7 @@ __attribute__((noinline)) inline vfN<N> vsigmoidN(const vfN<N> &x) {
   return vrecipN<N>(faddN<N>(e, aie::broadcast<float, N>(1.0f)));
 }
 template <unsigned N>
-static inline vfN<N> vsiluN(const vfN<N> &x) { return fmulN<N>(x, vsigmoidN<N>(x)); }
+inline __attribute__((noinline)) vfN<N> vsiluN(const vfN<N> &x) { return fmulN<N>(x, vsigmoidN<N>(x)); }
 
 // ---- scalar transcendentals (software float on the scalar unit: slow, use
 // for a few dozen values per call). No libm dependency.

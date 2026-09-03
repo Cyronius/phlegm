@@ -45,6 +45,7 @@ def _load(name, path):
 
 LL = _load("lin_layout", HERE.parent / "lin_layer" / "layout.py")      # lin_a / lin_c byte layouts
 AL = _load("attn_layout", HERE.parent / "attn_layer" / "layout.py")    # attn_l byte layouts
+XL = _load("x_layout", HERE.parent / "layer_x" / "layout.py")          # lx / ax (whole-layer) byte layouts
 
 D = "C:/code/phlegm/tools/open-kernels/designs"
 OUT = f"{D}/decode_chain/w27"
@@ -83,6 +84,8 @@ def main() -> int:
     ap.add_argument("--layers", type=int, default=None, help="only the first N layers (+ final norm/lm_head)")
     ap.add_argument("--token", type=int, default=248045)
     ap.add_argument("--cfg-only", action="store_true", help="only rewrite run_27b.cfg (weights/refs from a previous run)")
+    ap.add_argument("--whole-layer", action="store_true",
+                    help="run every layer through designs/layer_x (lx / ax): run_27b_x.cfg, consts2/state files")
     a = ap.parse_args()
     WDIR.mkdir(exist_ok=True)
     cfgj = json.load(open(f"{MODEL_DIR}/config.json"))
@@ -175,6 +178,9 @@ def main() -> int:
             consts[AL.CA_META:AL.CA_META + 2048] = np.fromfile(WDIR / f"meta{l}.bin", np.uint8)[:2048]
             wr(f"constsa{l}.bin", consts)
 
+    if a.whole_layer:
+        return whole_layer_cfg(NL, full, ref_argmax)
+
     # ---- config
     X = [("L", "ln", "ln/build"),
          ("A", "la", "lin_layer/build_a"), ("N", "dn", "deltanet/build"), ("C", "lc", "lin_layer/build_c"),
@@ -215,6 +221,68 @@ def main() -> int:
     runs += [f"run ln xc{NL - 1} zero normw xresf hn", "run lm lmpool hn logits", f"dump logits {OUT}/y_logits.bin 993280", ""]
     (HERE / "run_27b.cfg").write_text("\n".join(cfg + runs), newline="\n")
     print(f"{NL} layers, {len([r for r in runs if r.startswith('run ')])} runs; ref argmax {ref_argmax}")
+    return 0
+
+
+def whole_layer_cfg(NL, full, ref_argmax) -> int:
+    """lx (linear + MoE) / ax (attention + MoE), one context each; per layer 2 dispatches around
+    `moeroute2`. consts2{l} = [lnw | glue side | nw | postln | router W | sgw | out_proj] (linear) or
+    [lnw | postln | meta | router W | sgw] (attention); state{l} = [conv state | S (140-row heads)],
+    both updated in place; one xres BO threads the residual through the layers."""
+    for l in range(NL):
+        rw = np.fromfile(WDIR / f"rw{l}.bin", np.uint8)[:1048576]
+        sgw = np.fromfile(WDIR / f"sgw{l}.bin", np.uint8)[:4096]
+        if not full[l]:
+            c = np.zeros(XL.C_BYTES, np.uint8)
+            c[XL.C_LNW:XL.C_LNW + 4096] = np.fromfile(WDIR / f"lnw{l}.bin", np.uint8)[:4096]
+            c[XL.C_SIDE:XL.C_SIDE + XL.GLUE_SIDE_BYTES] = np.fromfile(WDIR / f"side{l}.bin", np.uint8)[4096:4096 + XL.GLUE_SIDE_BYTES]
+            c[XL.C_NW:XL.C_NW + 4096] = np.fromfile(WDIR / f"nw{l}.bin", np.uint8)[:4096]
+            c[XL.C_POSTLN:XL.C_POSTLN + 4096] = np.fromfile(WDIR / f"postln{l}.bin", np.uint8)[:4096]
+            c[XL.C_RW:XL.C_RW + 1048576] = rw
+            c[XL.C_SGW:XL.C_SGW + 4096] = sgw
+            wout = np.fromfile(WDIR / f"wout{l}.bin", np.uint8)[:5242880]
+            c[XL.C_WOUT:XL.C_WOUT + len(wout)] = wout
+            wr(f"consts2_{l}.bin", c)
+        else:
+            c = np.zeros(XL.CA_BYTES, np.uint8)
+            c[XL.CA_LNW:XL.CA_LNW + 4096] = np.fromfile(WDIR / f"lnw{l}.bin", np.uint8)[:4096]
+            c[XL.CA_POSTLN:XL.CA_POSTLN + 4096] = np.fromfile(WDIR / f"postln{l}.bin", np.uint8)[:4096]
+            c[XL.CA_META:XL.CA_META + 2048] = np.fromfile(WDIR / f"meta{l}.bin", np.uint8)[:2048]
+            c[XL.CA_RW:XL.CA_RW + 1048576] = rw
+            c[XL.CA_SGW:XL.CA_SGW + 4096] = sgw
+            wr(f"constsa2_{l}.bin", c)
+    wr("zstate2.bin", np.zeros(XL.STATE_BYTES, np.uint8))
+    cfg = ["device",
+           f"xclbin X {D}/layer_x/build_lx0/final.xclbin",
+           f"kernelx lx0 X {D}/layer_x/build_lx0/insts.bin", f"kernelx lx1 X {D}/layer_x/build_lx1/insts.bin",
+           f"xclbin Y {D}/layer_x/build_ax0/final.xclbin",
+           f"kernelx ax0 Y {D}/layer_x/build_ax0/insts.bin", f"kernelx ax1 Y {D}/layer_x/build_ax1/insts.bin",
+           f"xclbin L {D}/ln/build/final.xclbin", f"kernelx ln L {D}/ln/build/insts.bin",
+           f"xclbin K {D}/lm_head_q8/build_full/final.xclbin", f"kernelx lm K {D}/lm_head_q8/build_full/insts.bin",
+           f"buf xres 8192 {OUT}/xres0.bin", f"buf zero 8192 {OUT}/zero.bin", f"buf normw 4096 {OUT}/normw.bin",
+           f"buf lmpool 542113792 {OUT}/lm27.bin",
+           "buf xresf 8192", "buf hn 4096", "buf logits 993280",
+           f"buf zkv 3145728 {OUT}/zkv.bin"]
+    runs = []
+    for l in range(NL):
+        cfg += [f"buf pool{l} 536870912 {POOLS}/pool_L{l}.bin"]
+        if not full[l]:
+            cfg += [f"buf consts2_{l} {XL.C_BYTES} {OUT}/consts2_{l}.bin", f"buf state{l} {XL.STATE_BYTES} {OUT}/zstate2.bin",
+                    f"buf act{l} {XL.A_BYTES}"]
+            runs += [f"run lx0 pool{l} xres consts2_{l} state{l} act{l}",
+                     f"moeroute2 lx1 act{l} {XL.A_ROUT + 1024}",
+                     f"run lx1 pool{l} xres consts2_{l} state{l} act{l}",
+                     f"dump act{l} {OUT}/y_rout{l}.bin 4096 {XL.A_ROUT}"]
+        else:
+            cfg += [f"buf constsa2_{l} {XL.CA_BYTES} {OUT}/constsa2_{l}.bin", f"buf acta{l} {XL.AA_BYTES}"]
+            runs += [f"run ax0 pool{l} xres constsa2_{l} zkv acta{l}",
+                     f"moeroute2 ax1 acta{l} {XL.AA_ROUT + 1024}",
+                     f"run ax1 pool{l} xres constsa2_{l} zkv acta{l}",
+                     f"dump acta{l} {OUT}/y_rout{l}.bin 4096 {XL.AA_ROUT}"]
+        runs += [f"dump xres {OUT}/y_res{l}.bin 8192"]
+    runs += ["run ln xres zero normw xresf hn", "run lm lmpool hn logits", f"dump logits {OUT}/y_logits.bin 993280", ""]
+    (HERE / "run_27b_x.cfg").write_text("\n".join(cfg + runs), newline="\n")
+    print(f"{NL} layers, {len([r for r in runs if r.startswith('run ')])} runs (whole-layer); ref argmax {ref_argmax}")
     return 0
 
 

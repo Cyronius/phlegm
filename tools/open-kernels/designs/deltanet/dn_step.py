@@ -34,6 +34,11 @@ SLICE_ROWS = 16
 NBLK = D // SLICE_ROWS
 VEC = 512                       # fp32 per head: k, q, v, decay, beta, pad
 N_CORES = int(os.environ.get("DN_CORES", 8))
+# The whole-layer designs (layer_x) keep vec and o inside their `act` scratch BO: build with
+# DN_ACT_F32 = its length in floats and the two offsets (floats) to read/write them there.
+ACT_F32 = int(os.environ.get("DN_ACT_F32", 0))
+VEC_OFF = int(os.environ.get("DN_VEC_OFF", 0))
+O_OFF = int(os.environ.get("DN_O_OFF", 0))
 
 
 def _include_dirs() -> list[str]:
@@ -47,7 +52,8 @@ def _include_dirs() -> list[str]:
 
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
-def dn_step(s_in: In, vec: In, s_out: Out, o: Out, *, n_cores: CompileTime[int]):
+def dn_step(s_in: In, vec: In, s_out: Out, o: Out, *, n_cores: CompileTime[int],
+            act_f32: CompileTime[int] = 0, vec_off: CompileTime[int] = 0, o_off: CompileTime[int] = 0):
     heads_per_core = HEADS // n_cores
     s_elems = D * D                       # fp32 per head
     slice_ty = np.ndarray[(SLICE_ROWS * D,), np.dtype[np.float32]]
@@ -56,8 +62,8 @@ def dn_step(s_in: In, vec: In, s_out: Out, o: Out, *, n_cores: CompileTime[int])
     f128 = np.ndarray[(D,), np.dtype[np.float32]]
     b256 = np.ndarray[(2 * D,), np.dtype[bfloat16]]
     S_all = np.ndarray[(HEADS * s_elems,), np.dtype[np.float32]]
-    vec_all = np.ndarray[(HEADS * VEC,), np.dtype[np.float32]]
-    o_all = np.ndarray[(HEADS * D,), np.dtype[np.float32]]
+    vec_all = np.ndarray[(act_f32 or HEADS * VEC,), np.dtype[np.float32]]
+    o_all = np.ndarray[(act_f32 or HEADS * D,), np.dtype[np.float32]]
 
     pass1 = ExternalFunction("dn_pass1", source_file=str(HERE / "dn_pass1.cc"),
                              arg_types=[slice_ty, vec_ty, f128, b256, b256, np.int32],
@@ -117,10 +123,10 @@ def dn_step(s_in: In, vec: In, s_out: Out, o: Out, *, n_cores: CompileTime[int])
     so_taps = [TensorAccessPattern((1, HEADS * s_elems), c * heads_per_core * s_elems,
                                    [1, 1, 1, heads_per_core * s_elems], [0, 0, 0, 1])
                for c in range(n_cores)]
-    v_taps = [TensorAccessPattern((1, HEADS * VEC), c * heads_per_core * VEC,
+    v_taps = [TensorAccessPattern((1, act_f32 or HEADS * VEC), vec_off + c * heads_per_core * VEC,
                                   [1, 1, 1, heads_per_core * VEC], [0, 0, 0, 1])
               for c in range(n_cores)]
-    o_taps = [TensorAccessPattern((1, HEADS * D), c * heads_per_core * D,
+    o_taps = [TensorAccessPattern((1, act_f32 or HEADS * D), o_off + c * heads_per_core * D,
                                   [1, 1, 1, heads_per_core * D], [0, 0, 0, 1])
               for c in range(n_cores)]
 
@@ -158,4 +164,4 @@ def dn_step(s_in: In, vec: In, s_out: Out, o: Out, *, n_cores: CompileTime[int])
 
 
 DESIGN = dn_step
-SPECIALIZE = {"n_cores": N_CORES}
+SPECIALIZE = {"n_cores": N_CORES, "act_f32": ACT_F32, "vec_off": VEC_OFF, "o_off": O_OFF}

@@ -54,40 +54,94 @@ static inline void block_sum_split(const bfloat16 *__restrict xb,
 
 static constexpr unsigned gemv_q4_tab_bytes(unsigned K) { return 2 * K + K / 8 + K / 8; }
 
-// Block-quantise x[K] (bf16) into the table. Integer scalar work only (the
-// scalar unit has no FPU); the float work is vector ops. The block sum is the
-// exact bf16 x's (fp32 tree), not the quantised one; the two agree to ~2^-15.
-// K is a runtime argument so every K shares ONE body (noinline + inline,
-// COMDAT): a design mixing K = 512 and 2048 overflowed the 16 KB program
-// memory with per-K copies.
-__attribute__((noinline)) inline void gemv_q4_prep(const bfloat16 *__restrict x, uint8_t *__restrict tab,
-                                                   unsigned K) {
+// One 32-wide block of x (already bf16) -> xi, s, xs_hi/lo of block kb.
+__attribute__((noinline)) inline void gemv_q4_prep_block(const aie::vector<bfloat16, 32> &xv, int16_t *__restrict xi,
+                                      int32_t *__restrict sh, bfloat16 *__restrict xsh,
+                                      bfloat16 *__restrict xsl, unsigned kb,
+                                      const aie::vector<uint8_t, 64> &absmask) {
+  const aie::vector<int16_t, 32> ab =
+      aie::bit_and(xv.template cast_to<uint8_t>(), absmask).template cast_to<int16_t>();
+  const int mx = aie::reduce_max(ab);            // positive floats order as their bits
+  int s = 141 - (mx >> 7);                       // 14 - (e - 127)
+  if (s > 126) s = 126;                          // zero / tiny block: any scale works
+  sh[kb] = s;
+  const aie::vector<bfloat16, 32> sc =
+      aie::broadcast<int16_t, 32>((int16_t)((127 + s) << 7)).template cast_to<bfloat16>();
+  const aie::accum<accfloat, 32> a = aie::mul(xv, sc);
+  aie::store_v(xi + kb * 32, aie::to_fixed<int16_t>(a, 0));
+  // block sum of the exact bf16 x (fp32 tree) as bf16 hi/lo
+  aie::accum<accfloat, 32> xa;
+  xa.from_vector(xv);
+  const aie::vector<float, 32> v32 = xa.template to_vector<float>();
+  aie::accum<accfloat, 16> a16, b16;
+  a16.from_vector(v32.template extract<16>(0));
+  b16.from_vector(v32.template extract<16>(1));
+  const aie::vector<float, 16> v16 = aie::add(a16, b16).template to_vector<float>();
+  aie::accum<accfloat, 8> a8, b8;
+  a8.from_vector(v16.template extract<8>(0));
+  b8.from_vector(v16.template extract<8>(1));
+  aie::vector<float, 16> t = aie::concat(aie::add(a8, b8).template to_vector<float>(),
+                                         aie::zeros<float, 8>());
+#pragma clang loop unroll(full)
+  for (unsigned st = 4; st >= 1; st >>= 1) {
+    aie::accum<accfloat, 16> p, q;
+    p.from_vector(t);
+    q.from_vector(aie::shuffle_down_rotate(t, st));
+    t = aie::add(p, q).template to_vector<float>();
+  }
+  aie::accum<accfloat, 32> bc;
+  bc.from_vector(aie::broadcast<float, 32>(t[0]));
+  const aie::vector<bfloat16, 32> hi = bc.template to_vector<bfloat16>();
+  const aie::vector<bfloat16, 32> lo = aie::sub(bc, hi).template to_vector<bfloat16>();
+  xsh[kb] = hi[0];
+  xsl[kb] = lo[0];
+}
+
+static inline aie::vector<uint8_t, 64> gemv_q4_absmask() {
+  // |x| as int16 bit patterns: clear bit 15 (byte mask [0xFF, 0x7F] per lane)
+  return aie::interleave_zip(aie::broadcast<uint8_t, 64>(0xFF), aie::broadcast<uint8_t, 64>(0x7F), 1).first;
+}
+
+// Block-quantise blocks b0 .. b0+nb-1 of a K-long activation into the table
+// (x points at block b0). Integer scalar work only (the scalar unit has no
+// FPU); the float work is vector ops. K is a runtime argument so every K
+// shares ONE body (noinline + inline, COMDAT): a design mixing K = 512 and
+// 2048 overflowed the 16 KB program memory with per-K copies.
+__attribute__((noinline)) inline void gemv_q4_prep_blocks(const bfloat16 *__restrict x, uint8_t *__restrict tab,
+                                                          unsigned K, unsigned b0, unsigned nb) {
   const unsigned NB = K / 32;
   aie::set_rounding(aie::rounding_mode::conv_even);
   int16_t *__restrict xi = (int16_t *)tab;
   int32_t *__restrict sh = (int32_t *)(tab + 2 * K);
   bfloat16 *__restrict xsh = (bfloat16 *)(tab + 2 * K + 4 * NB);
   bfloat16 *__restrict xsl = xsh + NB;
-  // |x| as int16 bit patterns: clear bit 15 (byte mask [0xFF, 0x7F] per lane)
-  const aie::vector<uint8_t, 64> absmask =
-      aie::interleave_zip(aie::broadcast<uint8_t, 64>(0xFF), aie::broadcast<uint8_t, 64>(0x7F), 1).first;
+  const aie::vector<uint8_t, 64> absmask = gemv_q4_absmask();
+#pragma clang loop unroll(disable)
+  for (unsigned j = 0; j < nb; ++j) {
+    gemv_q4_prep_block(aie::load_v<32>(x + j * 32), xi, sh, xsh, xsl, b0 + j, absmask);
+  }
+}
+
+static inline void gemv_q4_prep(const bfloat16 *__restrict x, uint8_t *__restrict tab, unsigned K) {
+  gemv_q4_prep_blocks(x, tab, K, 0, K / 32);
+}
+
+// The same from an fp32 activation, rounded to bf16 (conv_even) first --
+// exactly what a producer that emits bf16 would have done.
+__attribute__((noinline)) inline void gemv_q4_prep_f32(const float *__restrict xf, uint8_t *__restrict tab,
+                                                       unsigned K) {
+  const unsigned NB = K / 32;
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  int16_t *__restrict xi = (int16_t *)tab;
+  int32_t *__restrict sh = (int32_t *)(tab + 2 * K);
+  bfloat16 *__restrict xsh = (bfloat16 *)(tab + 2 * K + 4 * NB);
+  bfloat16 *__restrict xsl = xsh + NB;
+  const aie::vector<uint8_t, 64> absmask = gemv_q4_absmask();
 #pragma clang loop unroll(disable)
   for (unsigned kb = 0; kb < NB; ++kb) {
-    const aie::vector<bfloat16, 32> xv = aie::load_v<32>(x + kb * 32);
-    const aie::vector<int16_t, 32> ab =
-        aie::bit_and(xv.template cast_to<uint8_t>(), absmask).template cast_to<int16_t>();
-    const int mx = aie::reduce_max(ab);            // positive floats order as their bits
-    int s = 141 - (mx >> 7);                       // 14 - (e - 127)
-    if (s > 126) s = 126;                          // zero / tiny block: any scale works
-    sh[kb] = s;
-    const aie::vector<bfloat16, 32> sc =
-        aie::broadcast<int16_t, 32>((int16_t)((127 + s) << 7)).template cast_to<bfloat16>();
-    const aie::accum<accfloat, 32> a = aie::mul(xv, sc);
-    aie::store_v(xi + kb * 32, aie::to_fixed<int16_t>(a, 0));
-    aie::vector<bfloat16, 32> hi, lo;
-    block_sum_split(x + kb * 32, hi, lo);
-    xsh[kb] = hi[0];
-    xsl[kb] = lo[0];
+    aie::accum<accfloat, 32> a;
+    a.from_vector(aie::load_v<32>(xf + kb * 32));
+    gemv_q4_prep_block(a.template to_vector<bfloat16>(), xi, sh, xsh, xsl, kb, absmask);
   }
 }
 
@@ -97,3 +151,15 @@ __attribute__((noinline)) inline void gemv_q4_prep(const bfloat16 *__restrict x,
     gemv_q4_prep(x, tab, K);                                                \
   }
 #define GEMV_Q4_PREP_ENTRY(K) GEMV_Q4_PREP_ENTRY_(K)
+// A block range of a K-long activation: gemv_q4_prep_k<K>_b<B0>n<NB>(x_at_b0, tab)
+#define GEMV_Q4_PREP_BLOCKS_ENTRY_(K, B0, NB)                                          \
+  void gemv_q4_prep_k##K##_b##B0##n##NB(const bfloat16 *__restrict x, uint8_t *__restrict tab) { \
+    gemv_q4_prep_blocks(x, tab, K, B0, NB);                                            \
+  }
+#define GEMV_Q4_PREP_BLOCKS_ENTRY(K, B0, NB) GEMV_Q4_PREP_BLOCKS_ENTRY_(K, B0, NB)
+// From fp32: gemv_q4_prep_f32_k<K>(xf, tab)
+#define GEMV_Q4_PREP_F32_ENTRY_(K)                                                     \
+  void gemv_q4_prep_f32_k##K(const float *__restrict xf, uint8_t *__restrict tab) {    \
+    gemv_q4_prep_f32(xf, tab, K);                                                      \
+  }
+#define GEMV_Q4_PREP_F32_ENTRY(K) GEMV_Q4_PREP_F32_ENTRY_(K)
