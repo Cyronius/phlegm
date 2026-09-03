@@ -225,8 +225,11 @@ captured decode step now reproduces on open kernels.**
   cos/sin for the position supplied by the host in a 2 KB meta record),
   online-softmax attention over the cached K/V rows (streamed 1 KB per row,
   two fills per position) plus the new position, sigmoid gate; emits the new
-  bf16 cache rows. The number of cached rows is a CompileTime parameter
-  (`ATTN_POS`): the runtime sequence is a static instruction stream.
+  bf16 cache rows. The meta record is two 1 KB elements, `[qn | kn]` and the
+  position record `[pos | nf | cos | sin]` (`layer_x/layout.py ptab()` builds
+  the table of them); the core loops over the record's `nf` rows and masks
+  rows `t >= pos`. In this standalone design the row fills are still static
+  (`ATTN_POS`); `layer_x/ax.py` streams the window as one driver-patched fill.
 - `designs/attn_chain/` — **layer 2 (full attention) of the captured decode
   step on open kernels**: ln → gemv q/gate/k/v → attn → gemv o → ln. PASS:
   residual cos 0.9999999 (maxrel 4.0e-5), new cache rows and gated output
@@ -477,6 +480,41 @@ expert, 1350 dispatches in all), hence MoE first.
   1.10, lm_head 18.9. Driver: `moeroute2 <kernel> <buf> <idx offset>` (pool-
   layout placeholders), `dump <buf> <file> [size [offset]]`, `NPU_KEEP_GOING=1`
   (continue after a timed-out run so dumps show how far the cores got).
+
+- **Phase 2 item 3 — dynamic KV length (2026-09-03,** plan
+  `open-kernels-phase2-dynamic-kv.md`). `ax` no longer takes the position at
+  build time: the KV cache is one BO per attention layer of interleaved 2 KB
+  rows `[K_t | V_t]` (`MAX_CTX` = 4096 rows, 8 MB), the window `[0, nf)` is
+  ONE linear fill (the fifo delivers it as `2 nf` 1 KB elements), the new row
+  ONE 2 KB drain to row `pos`, and the RoPE cos/sin come from a shared
+  position record table `ptab` (1 KB per position: `[pos | nf | cos | sin]`,
+  `nf = max(pos, 1)`; position 0 streams one dummy row that the core masks —
+  a zero-length DMA is not an option). The stream is built for position 1
+  and the driver's **`attnpos <kernel> <pos>`** rewrites three words per
+  token (the window fill's BD length, the drain offset, the record offset:
+  the same DDR-patch mechanism `moeroute2` uses, plus the length word of the
+  BD blockwrite before the patch op) with one instruction-BO sync — the
+  `ax0` stream is shared by all attention layers. Unit test
+  (`layer_x/make_test_ax.py`, layer 2 at position 11 from attn_chain's
+  inputs, the captured cache re-laid as rows): PASS with attn_layer's
+  numbers (og cos 0.9999993, xres 0.9999998, new row 0.9999998), three
+  replays bit-identical; ax0 1.7 ms warm. **Trap: the instruction-buffer
+  runtime's firmware translates only the first 5 buffer args into the AIE
+  address space; DDR patches on args 5+ carry `+0x80000000` in the offset
+  word (mlir-aie `kDDRAIEAddrOffset`)** — a driver patch must keep that bit
+  (dropping it read the record from the raw host address: wrong cos/sin, a
+  hang on the next run). `attn.py` and `attn_layer` moved to the same record
+  and still PASS at position 11. **27B, three greedy tokens in one config
+  (`make_27b.py --whole-layer --tokens 3`, `compare_27b.py --tokens 3`,
+  `run_27b_t3.log`): 186 runs, ~155 ms of NPU time per position (no change),
+  argmax = the replica's at every position (846, 198, 3710), position 0 corr
+  0.999998, every layer through 22 at 1.000000 at position 1.** The logits
+  corr at position 1 is 0.9945: at layer 23 the attention output cancels the
+  input (|x| 26 -> residual 2.5), so the delta's bf16-level rounding is 2.7 %
+  of the residual and layers 25/26 amplify it — the cache path replayed in
+  the replica on the NPU's inputs matches (delta cos 0.99999997); see the
+  plan doc. `decode_step.moe_decode(..., top=)` takes a routing override for
+  like-for-like MoE checks (8th-slot near-ties).
 
 - **Phase 2 item 5 — GEMV bandwidth (2026-09-02).** With the mmul GEMV
   (above) in every design — `moe_experts`, `lin_a`, `lin_c`, `attn_l`

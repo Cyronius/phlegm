@@ -110,12 +110,13 @@ def attn_l(w: In, xres: In, consts: In, kv: In, act: InOut, hdr: Out, *,
                               arg_types=[x_ty, tab_ty], include_dirs=inc)
     prep32 = ExternalFunction("gemv_q4_prep_k4096", source_file=str(GEMV / "gemv_q4_prep_k4096.cc"),
                               arg_types=[x_ty, tab_ty], include_dirs=inc)
-    f_meta = ExternalFunction("attn_meta", source_file=str(ATTN / "attn_meta.cc"), arg_types=[u8_1k, u8_1k, b256, b256, f64], include_dirs=inc)
+    i32_4 = np.ndarray[(4,), np.dtype[np.int32]]
+    f_meta = ExternalFunction("attn_meta", source_file=str(ATTN / "attn_meta.cc"), arg_types=[u8_1k, u8_1k, b256, b256, f64, i32_4], include_dirs=inc)
     f_q = ExternalFunction("attn_q", source_file=str(ATTN / "attn_q.cc"), arg_types=[u8_1k, b256, f64, f4096, np.int32], include_dirs=inc)
     f_k = ExternalFunction("attn_k", source_file=str(ATTN / "attn_k.cc"), arg_types=[u8_1k, b256, f64, f256, b512, np.int32], include_dirs=inc)
     f_v = ExternalFunction("attn_v", source_file=str(ATTN / "attn_v.cc"), arg_types=[u8_1k, b512, np.int32], include_dirs=inc)
     f_init = ExternalFunction("attn_init", source_file=str(ATTN / "attn_init.cc"), arg_types=[f4096, f32_], include_dirs=inc)
-    f_step = ExternalFunction("attn_step", source_file=str(ATTN / "attn_step.cc"), arg_types=[u8_1k, u8_1k, f4096, f4096, f32_], include_dirs=inc)
+    f_step = ExternalFunction("attn_step", source_file=str(ATTN / "attn_step.cc"), arg_types=[u8_1k, u8_1k, f4096, f4096, f32_, i32_4], include_dirs=inc)
     f_stepn = ExternalFunction("attn_step_new", source_file=str(ATTN / "attn_step_new.cc"), arg_types=[b512, b512, f4096, f4096, f32_], include_dirs=inc)
     f_fin = ExternalFunction("attn_fin", source_file=str(ATTN / "attn_fin.cc"), arg_types=[f4096, f32_, u8_1k, u8_1k, b512, np.int32], include_dirs=inc)
 
@@ -164,9 +165,9 @@ def attn_l(w: In, xres: In, consts: In, kv: In, act: InOut, hdr: Out, *,
             yout.release(1)
         xin.release(1)
 
-    def attn_body(ain, aout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, fm, fq, fk, fv, fi, fs, fsn, ff):
+    def attn_body(ain, aout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, fm, fq, fk, fv, fi, fs, fsn, ff):
         e = ain.acquire(2)
-        fm(e[0], e[1], qn, kn, cs)
+        fm(e[0], e[1], qn, kn, cs, pb)
         ain.release(2)
         for h in range_(NH):
             e = ain.acquire(1)
@@ -189,9 +190,9 @@ def attn_l(w: In, xres: In, consts: In, kv: In, act: InOut, hdr: Out, *,
             o[j] = vout[j]
         aout.release(1)
         fi(oacc, ml)
-        for _ in range_(pos):
+        for _ in range_(pb[1]):                                 # the record's nf = pos (static fills)
             e = ain.acquire(2)
-            fs(e[0], e[1], qs, oacc, ml)
+            fs(e[0], e[1], qs, oacc, ml, pb)
             ain.release(2)
         fsn(kout, vout, qs, oacc, ml)
         for hp in range_(NH // 2):
@@ -211,7 +212,7 @@ def attn_l(w: In, xres: In, consts: In, kv: In, act: InOut, hdr: Out, *,
                                    Buffer(b256, name="qn"), Buffer(b256, name="kn"), Buffer(f64, name="cs"),
                                    Buffer(f4096, name="qs"), Buffer(f256, name="tmp"), Buffer(b512, name="kout"),
                                    Buffer(b512, name="vout"), Buffer(f4096, name="oacc"), Buffer(f32_, name="ml"),
-                                   f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin],
+                                   Buffer(i32_4, name="pb"), f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin],
                           tile=Tile(2, 3), stack_size=0x1800))
 
     # per-core weight regions (pool offsets) and y placements (act byte offsets), in stream order

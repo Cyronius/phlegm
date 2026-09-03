@@ -116,10 +116,10 @@ def main() -> int:
     wr("w_v.bin", np.asarray(pool[511_180_800:511_180_800 + 655_360]))
     wr("w_gate.bin", np.asarray(pool[511_836_160:511_836_160 + 5_242_880]))
     wr("w_o.bin", np.asarray(pool[517_079_040:517_079_040 + 5_242_880]))
-    meta = np.zeros(2048, np.uint8)
-    meta[0:4] = np.array([POS], np.int32).view(np.uint8)
-    meta[512:1024] = side[128:640]                  # q_norm (effective) bf16[256]
-    meta[1024:1536] = side[640:1152]                # k_norm
+    meta = np.zeros(2048, np.uint8)                 # attn.h's two elements: [qn | kn], the position record
+    meta[0:512] = side[128:640]                     # q_norm (effective) bf16[256]
+    meta[512:1024] = side[640:1152]                 # k_norm
+    meta[1024:1032] = np.array([POS, POS], np.int32).view(np.uint8)   # pos, nf (= the static row fills)
     meta[1536:1664] = C.astype(np.float32).view(np.uint8)
     meta[1664:1792] = Sn.astype(np.float32).view(np.uint8)
     wr("meta.bin", meta)

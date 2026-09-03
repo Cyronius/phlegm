@@ -41,6 +41,10 @@ pub struct Driver {
     /// expert's stripe set / down slice in the pool). Kernels whose fills already use the pool
     /// layout with expert j standing in for routed slot j (designs/layer_x).
     moe2_patches: HashMap<String, Vec<(usize, usize, u64)>>,
+    /// `attnpos` patch table per kernel: (word index, kind: 0 = the KV window fill's BD length,
+    /// 1 = the new-row drain offset, 2 = the position record fill offset, flag bits of the offset
+    /// word as built), see attn_patch_table.
+    attn_patches: HashMap<String, Vec<(usize, u8, u32)>>,
     /// name -> (bo, logical size). The Bo's own size is padded up to 1 MB.
     bufs: HashMap<String, (Bo, usize)>,
     layeridx: i32,
@@ -58,6 +62,11 @@ const MOE_DOWN_CORE: u64 = 81_920;
 const MOE_POOL_DOWN: u64 = 335_544_320;
 const MOE_POOL_SHARE_UP: u64 = 503_316_480;
 const MOE_POOL_SHARE_GATE: u64 = 503_971_840;
+// designs/layer_x/layout.py: the KV cache row ([K_t | V_t] bf16, one cache BO per attention
+// layer), the position record (ptab row: pos, nf, RoPE cos/sin) and the cache capacity.
+const ATTN_KV_ROW: u64 = 2048;
+const ATTN_PTAB_ROW: u64 = 1024;
+const ATTN_MAX_CTX: u64 = 4096;
 const MOE_POOL_SHARE_DOWN: u64 = 504_627_200;
 
 fn read_file(p: &str) -> Result<Vec<u8>, String> {
@@ -74,6 +83,7 @@ impl Driver {
             instr_src: HashMap::new(),
             moe_patches: HashMap::new(),
             moe2_patches: HashMap::new(),
+            attn_patches: HashMap::new(),
             bufs: HashMap::new(),
             layeridx: 0,
         }
@@ -198,6 +208,66 @@ impl Driver {
             return Err(format!("moeroute2: {kn} has no routed-expert fills"));
         }
         self.moe2_patches.insert(kn.to_string(), t.clone());
+        Ok(t)
+    }
+
+    /// The `attnpos` patch table of an `ax0` stream (designs/layer_x/ax.py, built for the
+    /// placeholder position 1): the KV window fill is the DDR-patch op on arg 3 (kv) at offset 0
+    /// -- its length is word 0 of the BD blockwrite just before it (op 1: the BD's 8 registers at
+    /// +4.., the patch op names register +4 of that BD); the new-row drain is arg 3 at offset
+    /// KV_ROW; the position record fill is arg 5 (ptab). Exactly one of each.
+    fn attn_patch_table(&mut self, kn: &str) -> Result<Vec<(usize, u8, u32)>, String> {
+        if let Some(t) = self.attn_patches.get(kn) {
+            return Ok(t.clone());
+        }
+        let src = self.instr_src.get(kn).ok_or(format!("no kernelx {kn}"))?;
+        let w: Vec<u32> = src.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let mut t = Vec::new();
+        let mut bd_write: Option<usize> = None;
+        let mut i = 4;
+        while i < w.len() {
+            let len = match w[i] {
+                0 => 6,
+                1 => 12,
+                3 => 7,
+                0x80 => 4,
+                0x81 => 12,
+                _ => 1,
+            };
+            if w[i] == 1 {
+                bd_write = Some(i);
+            }
+            if w[i] == 0x81 && i + 11 < w.len() {
+                // The instruction-buffer runtime's firmware translates only the first 5 host
+                // buffer args into the AIE address space; patches on args 5+ fold that translation
+                // into the offset as +0x80000000 (mlir-aie AIETargetNPU.cpp kDDRAIEAddrOffset).
+                // Keep the fold, patch the low bits.
+                let (reg, arg, off) = (w[i + 6], w[i + 8], (w[i + 10] & 0x7fff_ffff) as u64);
+                let flags = w[i + 10] & 0x8000_0000;
+                match arg {
+                    3 if off == 0 => {
+                        let j = bd_write
+                            .filter(|&j| j + 2 < w.len() && w[j + 2] + 4 == reg)
+                            .ok_or(format!("attnpos: {kn}: no BD write before the KV window fill"))?;
+                        t.push((j + 4, 0u8, 0));
+                    }
+                    3 if off == ATTN_KV_ROW => t.push((i + 10, 1u8, flags)),
+                    3 => return Err(format!("attnpos: {kn}: unexpected kv transfer at offset {off}")),
+                    5 => t.push((i + 10, 2u8, flags)),
+                    _ => {}
+                }
+            }
+            i += len;
+        }
+        for kind in 0..3u8 {
+            let n = t.iter().filter(|e| e.1 == kind).count();
+            if n != 1 {
+                return Err(format!(
+                    "attnpos: {kn}: {n} patches of kind {kind}, expected 1 (window fill, row drain, record fill)"
+                ));
+            }
+        }
+        self.attn_patches.insert(kn.to_string(), t.clone());
         Ok(t)
     }
 
@@ -419,6 +489,31 @@ impl Driver {
                 }
                 ibo.sync_to_device()?;
                 println!("moeroute2 {kn} idx {:?} ({:.3} ms)", idx, t0.elapsed().as_secs_f64() * 1e3);
+            }
+            "attnpos" => {
+                // attnpos <kernel> <pos>: the attention layers' cache position for this token in
+                // the (shared) ax0 stream: the KV window fill reads rows [0, max(pos, 1)), the new
+                // row lands at row pos, the position record (RoPE cos/sin) is ptab row pos. Three
+                // words and one instruction-BO sync per token.
+                let kn = it.next().ok_or("attnpos: kernel")?.to_string();
+                let pos: u64 = it.next().ok_or("attnpos: pos")?.parse().map_err(|_| "attnpos: bad pos")?;
+                if pos >= ATTN_MAX_CTX {
+                    return Err(format!("attnpos: pos {pos} >= MAX_CTX {ATTN_MAX_CTX}"));
+                }
+                let t0 = std::time::Instant::now();
+                let table = self.attn_patch_table(&kn)?;
+                let nf = pos.max(1);
+                let (ibo, _) = self.instr.get_mut(&kn).ok_or(format!("no kernelx {kn}"))?;
+                for &(word, kind, flags) in &table {
+                    let v = match kind {
+                        0 => nf * ATTN_KV_ROW / 4, // the BD length is in 32-bit words
+                        1 => pos * ATTN_KV_ROW,
+                        _ => pos * ATTN_PTAB_ROW,
+                    };
+                    ibo.write(&(v as u32 | flags).to_le_bytes(), word * 4)?;
+                }
+                ibo.sync_to_device()?;
+                println!("attnpos {kn} pos {pos} ({:.3} ms)", t0.elapsed().as_secs_f64() * 1e3);
             }
             "runx" => {
                 // `run`'s arg binding, but queued on the open `runlist` instead

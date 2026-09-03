@@ -58,13 +58,15 @@ def linear_decode(layer, x_res, conv_state, S):
     new_conv_state = np.vstack([conv_state[1:], qkv[None, :]]) if qkv.ndim == 1 else np.vstack([conv_state[1:], qkv])
     return x_res + og.astype(np.float32) @ Wout.T, new_conv_state, S
 
-def moe_decode(layer, x_res):
+def moe_decode(layer, x_res, top=None):
+    """top: an optional routing override (the 8 expert ids the NPU chose, for a like-for-like
+    comparison when the 8th slot is a near-tie); the weights are still the replica's probabilities."""
     postln = m.bf16(f"model.layer.{layer}.post_attention_layernorm.weight")
     xm = (F.rms(x_res) * postln).astype(np.float32)
     router = m.bf16(f"model.layer.{layer}.moe_router.weight")
     lg = xm @ router
     p = np.exp(lg - lg.max()); p /= p.sum()
-    top = np.argsort(-p)[:8]
+    top = np.argsort(-p)[:8] if top is None else np.asarray(top, np.int64)
     w8 = p[top]; w8 /= w8.sum()
     out = np.zeros(2048)
     for e, ww in zip(top, w8):

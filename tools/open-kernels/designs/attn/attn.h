@@ -10,7 +10,11 @@
 // for position p come from the host in the meta record.
 // Reference: tools/kernel-interp/decode_step.py attn_decode.
 //
-// meta (2 KB): int32 pos @0 | qn bf16[256] @512 B | kn bf16[256] @1024 B | cos f32[32] @1536 | sin f32[32] @1664
+// meta = two 1 KB elements: [qn bf16[256] @0 | kn bf16[256] @512] (per layer) and the position
+// record [int32 pos @0 | int32 nf @4 | cos f32[32] @512 | sin f32[32] @640] (layer_x/layout.py
+// ptab row pos; nf = the number of cache rows streamed). pb (int32[4]) = [pos, nf, rows seen]:
+// attn_meta fills it, the core loops nf times, attn_step masks rows t >= pos (the whole-layer
+// design streams one dummy row at position 0: a zero-length DMA is not an option).
 // Elements are 1 KB: q/gate = one head (fp32[256]) each, k/v = one head each,
 // K_t/V_t cache rows = bf16[512] (two kv heads).
 
@@ -23,13 +27,18 @@ static constexpr unsigned kV = 32;
 
 static inline void attn_meta_impl(const uint8_t *__restrict m0, const uint8_t *__restrict m1,
                                   bfloat16 *__restrict qn, bfloat16 *__restrict kn,
-                                  float *__restrict cs) {
-  const bfloat16 *q = (const bfloat16 *)(m0 + 512);
+                                  float *__restrict cs, int32_t *__restrict pb) {
+  const bfloat16 *q = (const bfloat16 *)m0;
   for (unsigned j = 0; j < kHD; j += kV) aie::store_v(qn + j, aie::load_v<kV>(q + j));
-  const bfloat16 *k = (const bfloat16 *)m1;
+  const bfloat16 *k = (const bfloat16 *)(m0 + 512);
   for (unsigned j = 0; j < kHD; j += kV) aie::store_v(kn + j, aie::load_v<kV>(k + j));
   const float *c = (const float *)(m1 + 512);
   for (unsigned j = 0; j < 64; j += kV) aie::store_v(cs + j, aie::load_v<kV>(c + j));
+  const int32_t *p = (const int32_t *)m1;
+  pb[0] = p[0];
+  pb[1] = p[1];
+  pb[2] = 0;
+  pb[3] = 0;
 }
 
 // x (fp32[256]) -> rms256 * w -> partial rope -> dst (fp32[256])
@@ -95,7 +104,7 @@ static inline void attn_init_impl(float *__restrict oacc, float *__restrict ml) 
 }
 
 // one position: K_t, V_t bf16[512] (kv head 0 then 1)
-__attribute__((noinline)) inline void attn_step_impl(const bfloat16 *__restrict Kt, const bfloat16 *__restrict Vt,
+__attribute__((noinline)) inline void attn_row_impl(const bfloat16 *__restrict Kt, const bfloat16 *__restrict Vt,
                                   const float *__restrict qs, float *__restrict oacc,
                                   float *__restrict ml) {
   aie::set_rounding(aie::rounding_mode::conv_even);
@@ -125,6 +134,16 @@ __attribute__((noinline)) inline void attn_step_impl(const bfloat16 *__restrict 
       aie::store_v(o + j, acc.template to_vector<float>());
     }
   }
+}
+
+// cached row number pb[2] of the nf streamed: rows t >= pos are the position-0 dummy
+static inline void attn_step_impl(const bfloat16 *__restrict Kt, const bfloat16 *__restrict Vt,
+                                  const float *__restrict qs, float *__restrict oacc,
+                                  float *__restrict ml, int32_t *__restrict pb) {
+  const int32_t t = pb[2];
+  pb[2] = t + 1;
+  if (t >= pb[0]) return;
+  attn_row_impl(Kt, Vt, qs, oacc, ml);
 }
 
 // two heads -> one output element: og = o/l * sigmoid(gate)

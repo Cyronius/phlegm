@@ -1,17 +1,21 @@
 r"""Josh's pruned Qwen3.6-27B-A2.8B (30 layers, full_attention_interval=3) through
-the open kernels: one decode step at position 0 (empty states/cache), all 30
-layers + final norm + lm_head, as one driver config. Oracle: the HF-faithful CPU
-replica (decode_step.py) on the same q4nx -- FLM cannot be the oracle for an
-interval-3 model (it skips the full-attention block, see the plan's Finding).
+the open kernels: a decode step at position 0 (empty states/cache), all 30
+layers + final norm + lm_head, as one driver config -- or, with `--whole-layer
+--tokens N`, N greedy tokens at positions 0..N-1 in one config (the linear
+states and the KV caches persist in their BOs; the replica picks each next
+token, and the driver's `attnpos` sets the position per token). Oracle: the
+HF-faithful CPU replica (decode_step.py) on the same q4nx -- FLM cannot be the
+oracle for an interval-3 model (it skips the full-attention block, see the
+plan's Finding).
 
 Weights come from the q4nx via tools/kernel-interp/build_pools.py (the same pool
 /pack/side layouts the resident engine builds), sliced per kernel. Run from
 tools/kernel-interp (it imports decode_step, which loads MODEL_Q4NX):
 
     cd tools/kernel-interp && MODEL_Q4NX=/mnt/c/Users/josha/.flm/models/Qwen3.6-27B-A2.8B-open/model.q4nx \
-        python .../decode_chain/make_27b.py [--layers N] [--token T]
-    ATTN_POS=0 python build_design.py designs/attn/attn.py designs/attn/build_pos0   (once)
-    open-qwen-npu npu designs/decode_chain/run_27b.cfg ; python compare_27b.py
+        python .../decode_chain/make_27b.py [--layers N] [--token T] [--whole-layer [--tokens N]]
+    open-qwen-npu npu designs/decode_chain/run_27b_x.cfg ; python compare_27b.py [--tokens N]
+(run_27b.cfg, without --whole-layer, is the superseded per-block chain: attn_layer at position 0.)
 """
 from __future__ import annotations
 
@@ -53,6 +57,7 @@ POOLS = "C:/code/FastFlowLM/npu-engine/m3out/l30_27b"      # `open-qwen-npu l30-
 WDIR = HERE / "w27"
 S = 163_840
 NE = 8
+sfx = lambda t: "" if t == 0 else f"_t{t}"    # per-token file suffix (token 0's files are unsuffixed)
 
 
 def bf(x):
@@ -64,19 +69,56 @@ def wr(name, arr):
     (WDIR / name).write_bytes(a.tobytes())
 
 
-def routing(m, l, x_res):
+def routing(m, l, x_res, t=0):
     postln = m.bf16(f"model.layer.{l}.post_attention_layernorm.weight")
     xm = bf(DS.F.rms(x_res) * postln)
     lg = xm @ m.bf16(f"model.layer.{l}.moe_router.weight").astype(np.float64)
     p = np.exp(lg - lg.max()); p /= p.sum()
     top = np.argsort(-p, kind="stable")[:NE]
-    prev = WDIR / f"y_rout{l}.bin"
+    prev = WDIR / f"y_rout{l}{sfx(t)}.bin"
     if prev.is_file():
         got = np.fromfile(prev, np.float32)[256:264].view(np.int32)
-        if got.tolist() != top.tolist():
-            print(f"layer {l}: NPU routing {got.tolist()} != predicted {top.tolist()}; using the NPU's")
+        if sorted(got.tolist()) != sorted(top.tolist()):
+            print(f"token {t} layer {l}: NPU routing {sorted(got.tolist())} != predicted {sorted(top.tolist())}; using the NPU's")
             top = got.astype(np.int64)
     return top
+
+
+def write_layer_weights(m, l, is_full):
+    """Layer l's weight slices from build_pools.py's pool / pack / side, as the designs' files."""
+    pool = np.frombuffer(BP.build_layer_pool(m, l, is_full), np.uint8)
+    pack = np.frombuffer(BP.build_pack(m, l), np.uint8)
+    side = np.frombuffer(BP.build_side(m, l, is_full), np.uint8)
+    wr(f"lnw{l}.bin", pack[0:4096]); wr(f"postln{l}.bin", pack[4096:8192])
+    wr(f"sgw{l}.bin", pack[8192:12288]); wr(f"rw{l}.bin", pack[12288:12288 + 1048576])
+    # (the experts stream straight out of the resident layer pool: the driver's moeroute2
+    # points the kernel's fills at the router's choice)
+    if not is_full:
+        # (qkv / z stream straight out of the resident pool: the layer reads them at their pool offsets)
+        wr(f"wout{l}.bin", side[328_192:328_192 + 10_485_760])
+        nwp = np.zeros(2048, bfloat16); nwp[:128] = side[65536:65536 + 256].view(bfloat16)
+        wr(f"nw{l}.bin", nwp)
+        sb = np.zeros(335872, np.uint8)
+        sb[4096:4096 + 131072] = side[66048:66048 + 131072]
+        sb[135168:135168 + 131072] = side[197120:197120 + 131072]
+        small = np.zeros(1024, np.float32)
+        small[:32] = side[65792:65792 + 128].view(np.float32); small[32:64] = side[65920:65920 + 128].view(np.float32)
+        sb[266240:266240 + 4096] = small.view(np.uint8)
+        convw = side[0:65536].view(bfloat16).reshape(4, 8192)
+        sb[270336:270336 + 65536] = convw.reshape(4, 8, 1024).transpose(1, 0, 2).reshape(-1).view(np.uint8)
+        wr(f"side{l}.bin", sb)
+    else:
+        wr(f"wq{l}.bin", pool[505_282_560:505_282_560 + 5_242_880])
+        wr(f"wk{l}.bin", pool[510_525_440:510_525_440 + 655_360])
+        wr(f"wv{l}.bin", pool[511_180_800:511_180_800 + 655_360])
+        wr(f"wgate{l}.bin", pool[511_836_160:511_836_160 + 5_242_880])
+        wr(f"wo{l}.bin", pool[517_079_040:517_079_040 + 5_242_880])
+        # attn.h's meta, both elements: [qn | kn] @0, the position-0 record @1024 (pos = nf = 0:
+        # the static attn_layer design issues no row fills; ax takes [qn | kn] and reads ptab)
+        meta = np.zeros(2048, np.uint8)
+        meta[0:512] = side[128:640]; meta[512:1024] = side[640:1152]
+        meta[1536:1664] = np.ones(32, np.float32).view(np.uint8)       # cos(0); sin(0) = 0
+        wr(f"meta{l}.bin", meta)
 
 
 def main() -> int:
@@ -86,7 +128,11 @@ def main() -> int:
     ap.add_argument("--cfg-only", action="store_true", help="only rewrite run_27b.cfg (weights/refs from a previous run)")
     ap.add_argument("--whole-layer", action="store_true",
                     help="run every layer through designs/layer_x (lx / ax): run_27b_x.cfg, consts2/state files")
+    ap.add_argument("--tokens", type=int, default=1,
+                    help="decode N greedy tokens (positions 0..N-1) in one config; whole-layer only")
     a = ap.parse_args()
+    if a.tokens > 1 and not a.whole_layer:
+        ap.error("--tokens needs --whole-layer (the ax design with the driver's attnpos)")
     WDIR.mkdir(exist_ok=True)
     cfgj = json.load(open(f"{MODEL_DIR}/config.json"))
     NL = a.layers or cfgj["num_hidden_layers"]
@@ -95,67 +141,48 @@ def main() -> int:
     full = {l: ((l + 1) % INT == 0) for l in range(NL)}
     t0 = m.tensors["model.embed_tokens.weight"]
     base = m.data_base + t0["data_offsets"][0]
-    x = bf16_to_f32(np.frombuffer(m.mm[base + a.token * 4096: base + (a.token + 1) * 4096], dtype=np.uint16)).astype(np.float64)
-    wr("xres0.bin", x.astype(np.float32))
+
+    def embed(tok):
+        return bf16_to_f32(np.frombuffer(m.mm[base + tok * 4096: base + (tok + 1) * 4096], dtype=np.uint16)).astype(np.float64)
+
     wr("zero.bin", np.zeros(2048, np.float32))
     wr("zstate.bin", np.zeros(3 * 8192, bfloat16))
     wr("zS.bin", np.zeros(32 * 128 * 128, np.float32))
     wr("zkv.bin", np.zeros(3145728, np.uint8))
     normw = m.bf16("model.norm.weight")
     wr("normw.bin", normw.astype(np.float32).astype(bfloat16))
-    freqs = (1e7) ** (-np.arange(32) / 32)
-    meta_cs = np.concatenate([np.cos(0 * freqs), np.sin(0 * freqs)]).astype(np.float32)
 
-    # ---- replica + per-layer routing, and weights per layer
-    cs = np.zeros((3, 8192)); S0 = np.zeros((32, 128, 128))
-    top = {}
-    xr = x.copy()
-    for l in range(NL if not a.cfg_only else 0):
-        if full[l]:
-            xa, _, _ = DS.attn_decode(l, xr.copy(), np.zeros((0, 2, 256)), np.zeros((0, 2, 256)), 0)
-        else:
-            xa, _, _ = DS.linear_decode(l, xr.copy(), cs.copy(), S0.copy())
-        top[l] = routing(m, l, xa)
-        xr = DS.moe_decode(l, xa)
-        wr(f"ref_res{l}.bin", xr.astype(np.float32))
-        pool = np.frombuffer(BP.build_layer_pool(m, l, full[l]), np.uint8)
-        pack = np.frombuffer(BP.build_pack(m, l), np.uint8)
-        side = np.frombuffer(BP.build_side(m, l, full[l]), np.uint8)
-        wr(f"lnw{l}.bin", pack[0:4096]); wr(f"postln{l}.bin", pack[4096:8192])
-        wr(f"sgw{l}.bin", pack[8192:12288]); wr(f"rw{l}.bin", pack[12288:12288 + 1048576])
-        # (the experts stream straight out of the resident layer pool: the
-        # driver's `moeroute` points the kernel's fills at the router's choice)
-        if not full[l]:
-            # (qkv / z stream straight out of the resident pool: lin_a reads them at their pool offsets)
-            wr(f"wout{l}.bin", side[328_192:328_192 + 10_485_760])
-            nwp = np.zeros(2048, bfloat16); nwp[:128] = side[65536:65536 + 256].view(bfloat16)
-            wr(f"nw{l}.bin", nwp)
-            sb = np.zeros(335872, np.uint8)
-            sb[4096:4096 + 131072] = side[66048:66048 + 131072]
-            sb[135168:135168 + 131072] = side[197120:197120 + 131072]
-            small = np.zeros(1024, np.float32)
-            small[:32] = side[65792:65792 + 128].view(np.float32); small[32:64] = side[65920:65920 + 128].view(np.float32)
-            sb[266240:266240 + 4096] = small.view(np.uint8)
-            convw = side[0:65536].view(bfloat16).reshape(4, 8192)
-            sb[270336:270336 + 65536] = convw.reshape(4, 8, 1024).transpose(1, 0, 2).reshape(-1).view(np.uint8)
-            wr(f"side{l}.bin", sb)
-        else:
-            wr(f"wq{l}.bin", pool[505_282_560:505_282_560 + 5_242_880])
-            wr(f"wk{l}.bin", pool[510_525_440:510_525_440 + 655_360])
-            wr(f"wv{l}.bin", pool[511_180_800:511_180_800 + 655_360])
-            wr(f"wgate{l}.bin", pool[511_836_160:511_836_160 + 5_242_880])
-            wr(f"wo{l}.bin", pool[517_079_040:517_079_040 + 5_242_880])
-            meta = np.zeros(2048, np.uint8)
-            meta[512:1024] = side[128:640]; meta[1024:1536] = side[640:1152]
-            meta[1536:1792] = meta_cs.view(np.uint8)
-            wr(f"meta{l}.bin", meta)
-        print(f"layer {l} {'FULL' if full[l] else 'lin '} top8={top[l].tolist()}", flush=True)
-    if not a.cfg_only:
+    # ---- replica: a.tokens greedy tokens through all layers (the per-layer states persist across
+    # tokens: conv state + S of the linear layers, K/V of the attention layers; decode_step's rope1
+    # reads the module global POS), the per-layer routing, and (token 0) the weights per layer
+    cs = {l: np.zeros((3, 8192)) for l in range(NL)}
+    S = {l: np.zeros((32, 128, 128)) for l in range(NL)}
+    K = {l: np.zeros((0, 2, 256)) for l in range(NL)}
+    V = {l: np.zeros((0, 2, 256)) for l in range(NL)}
+    tok = a.token
+    for t in range(a.tokens if not a.cfg_only else 0):
+        x = embed(tok)
+        wr(f"xres{t}.bin", x.astype(np.float32))
+        DS.POS = t
+        xr = x.copy()
+        for l in range(NL):
+            if full[l]:
+                xa, K[l], V[l] = DS.attn_decode(l, xr.copy(), K[l], V[l], t)
+            else:
+                xa, cs[l], S[l] = DS.linear_decode(l, xr.copy(), cs[l], S[l])
+            top = routing(m, l, xa, t)
+            xr = DS.moe_decode(l, xa)
+            wr(f"ref_res{l}{sfx(t)}.bin", xr.astype(np.float32))
+            if t == 0:
+                write_layer_weights(m, l, full[l])
+            print(f"token {t} layer {l} {'FULL' if full[l] else 'lin '} top8={top.tolist()}", flush=True)
         hn = (DS.F.rms(xr) * normw).astype(np.float32)
         logits_ref = m.lmhead_logits(hn)
-        wr("ref_logits.bin", logits_ref.astype(np.float32))
-        if not (WDIR / "lm27.bin").is_file():
-            (WDIR / "lm27.bin").write_bytes(BP.build_lmhead_pool(m))
+        wr(f"ref_logits{sfx(t)}.bin", logits_ref.astype(np.float32))
+        tok = int(logits_ref.argmax())
+        print(f"token {t} (position {t}): ref argmax {tok}", flush=True)
+    if not a.cfg_only and not (WDIR / "lm27.bin").is_file():
+        (WDIR / "lm27.bin").write_bytes(BP.build_lmhead_pool(m))
     ref_argmax = int(np.fromfile(WDIR / "ref_logits.bin", np.float32).argmax())
 
     # ---- per-layer records for the fused linear layer (lin_layer/layout.py), from the files above:
@@ -179,7 +206,7 @@ def main() -> int:
             wr(f"constsa{l}.bin", consts)
 
     if a.whole_layer:
-        return whole_layer_cfg(NL, full, ref_argmax)
+        return whole_layer_cfg(NL, full, ref_argmax, a.tokens)
 
     # ---- config
     X = [("L", "ln", "ln/build"),
@@ -224,11 +251,13 @@ def main() -> int:
     return 0
 
 
-def whole_layer_cfg(NL, full, ref_argmax) -> int:
+def whole_layer_cfg(NL, full, ref_argmax, tokens=1) -> int:
     """lx (linear + MoE) / ax (attention + MoE), one context each; per layer 2 dispatches around
     `moeroute2`. consts2{l} = [lnw | glue side | nw | postln | router W | sgw | out_proj] (linear) or
-    [lnw | postln | meta | router W | sgw] (attention); state{l} = [conv state | S (140-row heads)],
-    both updated in place; one xres BO threads the residual through the layers."""
+    [lnw | postln | qn kn | router W | sgw] (attention); state{l} = [conv state | S (140-row heads)]
+    and kv{l} (the attention layer's cache, MAX_CTX rows) updated in place; ptab = the position
+    record table; one xres BO threads the residual through the layers. Per token: `load xres`
+    (the token's embedding), `attnpos ax0 <pos>`, the layers, final norm, lm_head, `dump logits`."""
     for l in range(NL):
         rw = np.fromfile(WDIR / f"rw{l}.bin", np.uint8)[:1048576]
         sgw = np.fromfile(WDIR / f"sgw{l}.bin", np.uint8)[:4096]
@@ -247,11 +276,12 @@ def whole_layer_cfg(NL, full, ref_argmax) -> int:
             c = np.zeros(XL.CA_BYTES, np.uint8)
             c[XL.CA_LNW:XL.CA_LNW + 4096] = np.fromfile(WDIR / f"lnw{l}.bin", np.uint8)[:4096]
             c[XL.CA_POSTLN:XL.CA_POSTLN + 4096] = np.fromfile(WDIR / f"postln{l}.bin", np.uint8)[:4096]
-            c[XL.CA_META:XL.CA_META + 2048] = np.fromfile(WDIR / f"meta{l}.bin", np.uint8)[:2048]
+            c[XL.CA_META:XL.CA_META + 1024] = np.fromfile(WDIR / f"meta{l}.bin", np.uint8)[:1024]   # [qn | kn]
             c[XL.CA_RW:XL.CA_RW + 1048576] = rw
             c[XL.CA_SGW:XL.CA_SGW + 4096] = sgw
             wr(f"constsa2_{l}.bin", c)
     wr("zstate2.bin", np.zeros(XL.STATE_BYTES, np.uint8))
+    wr("ptab.bin", XL.ptab())
     cfg = ["device",
            f"xclbin X {D}/layer_x/build_lx0/final.xclbin",
            f"kernelx lx0 X {D}/layer_x/build_lx0/insts.bin", f"kernelx lx1 X {D}/layer_x/build_lx1/insts.bin",
@@ -262,27 +292,37 @@ def whole_layer_cfg(NL, full, ref_argmax) -> int:
            f"buf xres 8192 {OUT}/xres0.bin", f"buf zero 8192 {OUT}/zero.bin", f"buf normw 4096 {OUT}/normw.bin",
            f"buf lmpool 542113792 {OUT}/lm27.bin",
            "buf xresf 8192", "buf hn 4096", "buf logits 993280",
-           f"buf zkv 3145728 {OUT}/zkv.bin"]
-    runs = []
+           f"buf ptab {XL.PTAB_BYTES} {OUT}/ptab.bin"]
     for l in range(NL):
         cfg += [f"buf pool{l} 536870912 {POOLS}/pool_L{l}.bin"]
         if not full[l]:
             cfg += [f"buf consts2_{l} {XL.C_BYTES} {OUT}/consts2_{l}.bin", f"buf state{l} {XL.STATE_BYTES} {OUT}/zstate2.bin",
                     f"buf act{l} {XL.A_BYTES}"]
-            runs += [f"run lx0 pool{l} xres consts2_{l} state{l} act{l}",
-                     f"moeroute2 lx1 act{l} {XL.A_ROUT + 1024}",
-                     f"run lx1 pool{l} xres consts2_{l} state{l} act{l}",
-                     f"dump act{l} {OUT}/y_rout{l}.bin 4096 {XL.A_ROUT}"]
         else:
-            cfg += [f"buf constsa2_{l} {XL.CA_BYTES} {OUT}/constsa2_{l}.bin", f"buf acta{l} {XL.AA_BYTES}"]
-            runs += [f"run ax0 pool{l} xres constsa2_{l} zkv acta{l}",
-                     f"moeroute2 ax1 acta{l} {XL.AA_ROUT + 1024}",
-                     f"run ax1 pool{l} xres constsa2_{l} zkv acta{l}",
-                     f"dump acta{l} {OUT}/y_rout{l}.bin 4096 {XL.AA_ROUT}"]
-        runs += [f"dump xres {OUT}/y_res{l}.bin 8192"]
-    runs += ["run ln xres zero normw xresf hn", "run lm lmpool hn logits", f"dump logits {OUT}/y_logits.bin 993280", ""]
+            cfg += [f"buf constsa2_{l} {XL.CA_BYTES} {OUT}/constsa2_{l}.bin", f"buf acta{l} {XL.AA_BYTES}",
+                    f"buf kv{l} {XL.KV_BYTES}"]
+    runs = []
+    for t in range(tokens):
+        s = sfx(t)
+        if t:
+            runs += [f"load xres {OUT}/xres{t}.bin"]
+        runs += [f"attnpos ax0 {t}"]
+        for l in range(NL):
+            if not full[l]:
+                runs += [f"run lx0 pool{l} xres consts2_{l} state{l} act{l}",
+                         f"moeroute2 lx1 act{l} {XL.A_ROUT + 1024}",
+                         f"run lx1 pool{l} xres consts2_{l} state{l} act{l}",
+                         f"dump act{l} {OUT}/y_rout{l}{s}.bin 4096 {XL.A_ROUT}"]
+            else:
+                runs += [f"run ax0 pool{l} xres constsa2_{l} kv{l} acta{l} ptab",
+                         f"moeroute2 ax1 acta{l} {XL.AA_ROUT + 1024}",
+                         f"run ax1 pool{l} xres constsa2_{l} kv{l} acta{l} ptab",
+                         f"dump acta{l} {OUT}/y_rout{l}{s}.bin 4096 {XL.AA_ROUT}"]
+            runs += [f"dump xres {OUT}/y_res{l}{s}.bin 8192"]
+        runs += ["run ln xres zero normw xresf hn", "run lm lmpool hn logits", f"dump logits {OUT}/y_logits{s}.bin 993280"]
+    runs += [""]
     (HERE / "run_27b_x.cfg").write_text("\n".join(cfg + runs), newline="\n")
-    print(f"{NL} layers, {len([r for r in runs if r.startswith('run ')])} runs (whole-layer); ref argmax {ref_argmax}")
+    print(f"{NL} layers, {tokens} token(s), {len([r for r in runs if r.startswith('run ')])} runs (whole-layer); ref argmax {ref_argmax}")
     return 0
 
 

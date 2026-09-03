@@ -2,13 +2,14 @@ r"""Full-attention decode step on the NPU (one core): head norms + partial RoPE,
 online-softmax attention over `pos` cached rows plus the new position, sigmoid
 gate. Math in attn.h.
 
-Args (6 -- the firmware rejects runs with ~9+ buffers): meta u8[2048], qg f32[8192]
-([q | gate], two GEMVs sharing one BO via GEMV_YOFF), kvn f32[1024] ([k | v]), kv
-bf16[1572864] (the 3 MB cache: K rows @0, V rows @byte 1073152, 1 KB per row),
-kvnew bf16[1024] (out: [k' | v'] cache rows), og bf16[4096] (out).
-`pos` (rows already in the cache) is a CompileTime parameter: the runtime
-sequence is a static instruction stream, so the number of K/V row fills is
-baked into the build (per-length streams or a max-length read are phase 2).
+Args (6 -- the firmware rejects runs with ~9+ buffers): meta u8[2048] (attn.h's two
+elements: [qn | kn] @0, the position record [pos | nf | cos @512 | sin @640] @1024),
+qg f32[8192] ([q | gate], two GEMVs sharing one BO via GEMV_YOFF), kvn f32[1024]
+([k | v]), kv bf16[1572864] (the 3 MB cache: K rows @0, V rows @byte 1073152,
+1 KB per row), kvnew bf16[1024] (out: [k' | v'] cache rows), og bf16[4096] (out).
+`pos` (rows already in the cache) is a CompileTime parameter of this standalone
+design: its row fills are static, and the record's nf must equal it. The
+whole-layer design layer_x/ax.py streams the window as one driver-patched fill.
 Build: ATTN_POS=11 python build_design.py designs/attn/attn.py
 """
 
@@ -56,12 +57,13 @@ def attn(meta: In, qg: In, kvn: In, kv: In, kvnew: Out, og: Out, *,
     cache_ty = np.ndarray[(KV_ELEMS,), np.dtype[bfloat16]]
     og_ty = np.ndarray[(NH * HD,), np.dtype[bfloat16]]
     inc = include_dirs()
-    f_meta = ExternalFunction("attn_meta", source_file=str(HERE / "attn_meta.cc"), arg_types=[u8, u8, b256, b256, f64], include_dirs=inc)
+    i32_4 = np.ndarray[(4,), np.dtype[np.int32]]
+    f_meta = ExternalFunction("attn_meta", source_file=str(HERE / "attn_meta.cc"), arg_types=[u8, u8, b256, b256, f64, i32_4], include_dirs=inc)
     f_q = ExternalFunction("attn_q", source_file=str(HERE / "attn_q.cc"), arg_types=[u8, b256, f64, f4096, np.int32], include_dirs=inc)
     f_k = ExternalFunction("attn_k", source_file=str(HERE / "attn_k.cc"), arg_types=[u8, b256, f64, f256, b512, np.int32], include_dirs=inc)
     f_v = ExternalFunction("attn_v", source_file=str(HERE / "attn_v.cc"), arg_types=[u8, b512, np.int32], include_dirs=inc)
     f_init = ExternalFunction("attn_init", source_file=str(HERE / "attn_init.cc"), arg_types=[f4096, f32_], include_dirs=inc)
-    f_step = ExternalFunction("attn_step", source_file=str(HERE / "attn_step.cc"), arg_types=[u8, u8, f4096, f4096, f32_], include_dirs=inc)
+    f_step = ExternalFunction("attn_step", source_file=str(HERE / "attn_step.cc"), arg_types=[u8, u8, f4096, f4096, f32_, i32_4], include_dirs=inc)
     f_stepn = ExternalFunction("attn_step_new", source_file=str(HERE / "attn_step_new.cc"), arg_types=[b512, b512, f4096, f4096, f32_], include_dirs=inc)
     f_fin = ExternalFunction("attn_fin", source_file=str(HERE / "attn_fin.cc"), arg_types=[f4096, f32_, u8, u8, b512, np.int32], include_dirs=inc)
 
@@ -70,11 +72,11 @@ def attn(meta: In, qg: In, kvn: In, kv: In, kvnew: Out, og: Out, *,
     qn = Buffer(b256, name="qn"); kn = Buffer(b256, name="kn"); cs = Buffer(f64, name="cs")
     qs = Buffer(f4096, name="qs"); tmp = Buffer(f256, name="tmp")
     kout = Buffer(b512, name="kout"); vout = Buffer(b512, name="vout")
-    oacc = Buffer(f4096, name="oacc"); ml = Buffer(f32_, name="ml")
+    oacc = Buffer(f4096, name="oacc"); ml = Buffer(f32_, name="ml"); pb = Buffer(i32_4, name="pb")
 
-    def core_body(ain, aout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, fm, fq, fk, fv, fi, fs, fsn, ff):
+    def core_body(ain, aout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, fm, fq, fk, fv, fi, fs, fsn, ff):
         e = ain.acquire(2)
-        fm(e[0], e[1], qn, kn, cs)
+        fm(e[0], e[1], qn, kn, cs, pb)
         ain.release(2)
         for h in range_(NH):
             e = ain.acquire(1)
@@ -97,9 +99,9 @@ def attn(meta: In, qg: In, kvn: In, kv: In, kvnew: Out, og: Out, *,
             o[j] = vout[j]
         aout.release(1)
         fi(oacc, ml)
-        for _ in range_(pos):
+        for _ in range_(pb[1]):
             e = ain.acquire(2)
-            fs(e[0], e[1], qs, oacc, ml)
+            fs(e[0], e[1], qs, oacc, ml, pb)
             ain.release(2)
         fsn(kout, vout, qs, oacc, ml)
         for hp in range_(NH // 2):
@@ -109,7 +111,7 @@ def attn(meta: In, qg: In, kvn: In, kv: In, kvnew: Out, og: Out, *,
             aout.release(1)
             ain.release(2)
 
-    worker = Worker(core_body, fn_args=[of_in.cons(), of_out.prod(), qn, kn, cs, qs, tmp, kout, vout, oacc, ml,
+    worker = Worker(core_body, fn_args=[of_in.cons(), of_out.prod(), qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
                                         f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin],
                     tile=Tile(0, 2), stack_size=0x1800)
 
