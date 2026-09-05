@@ -1,137 +1,156 @@
-"""Generate the small kernel TUs of the whole-layer designs (one extern "C" entry per file).
+"""Generate the small kernel TUs of the whole-layer designs (one extern "C" entry per file),
+with the recipe's geometry baked in (open_kernels/recipes/qwen36moe.py, `Common`): the ms
+scratch offsets, the rows / hidden per core, the top-k, the widest K and the h table offset.
 
-Scratch layouts (floats; xcommon.MS_FLOATS / DS_FLOATS):
+    python gen_kernels.py            # for OPEN_KERNELS_SPEC, else the checked-in 27B
+
+Scratch layouts (floats; xcommon.MS_FLOATS / DS_FLOATS), for the 27B:
   ms (MoE, 928):  rw[32] @0 | xr[256] @32 | acc[256] @288 | u[64] @544 | g[64] @608 | yd[256] @672
   ds (DeltaNet, 1280): vec[512] @0 | t[128] @512 | o[128] @640 | k_hl bf16[320] @768 | q_hl @928
                        | delta_hl bf16[256] @1088 | dd bf16[16] @1216
 """
+import sys
 from pathlib import Path
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[1]))          # open_kernels/
+from recipes.load import current_recipe  # noqa: E402
+from recipes import qwen36moe as Q  # noqa: E402
 
-GEMV_HDR = '''#define GEMV_PER_CALL 2
+
+def files(R) -> dict[str, str]:
+    C, L = R.common, R.layout
+    hid, ff, ne = C.HID, C.FF, C.NE
+    kw = C.KWIDE
+    nb = Q.ELEM // 2 // 32                        # bf16 blocks of 32 in one 4 KB element
+    pb_hid = Q.band_bytes(hid) // C.TILE          # chunks per 64-row band, K = HID
+    pb_wide = Q.band_bytes(kw) // C.TILE
+    pb_down = Q.q4_bytes(128, ff) // C.TILE       # the routed down band: 128 rows x FF, RS=4
+    pb_sdown = Q.band_bytes(ff) // C.TILE         # the shared down band: 64 rows x FF, RS=2
+    g_down = C.DOWN_BAND // C.CALL_BYTES          # elements per routed down band
+    g_sdown = Q.band_bytes(ff) // C.CALL_BYTES    # elements per shared down band
+    gemv_hdr = f'''#define GEMV_PER_CALL {C.PER_CALL}
 #include "gemv_q4.h"
 '''
-
-FILES = {
-    # ---- q4 GEMV entry points: runtime group / band law, 2 chunks per element (10240 B)
-    "gemv_q4_gy.cc": GEMV_HDR + '''// A projection band into its y element: (per_band, rs) = (16, 2) K=2048, (32, 2) K=4096.
-extern "C" {
+    return {
+        # ---- q4 GEMV entry points: runtime group / band law, PER_CALL chunks per element
+        "gemv_q4_gy.cc": gemv_hdr + f'''// A projection band into its y element: (per_band, rs) = ({pb_hid}, 2) K={hid}, ({pb_wide}, 2) K={kw}.
+extern "C" {{
 void gemv_q4_gy(const uint8_t *__restrict t, const uint8_t *__restrict tab, float *__restrict y,
-                int32_t group, int32_t per_band, int32_t rs) {
+                int32_t group, int32_t per_band, int32_t rs) {{
   gemv_q4_pool_group_rt(t, tab, (unsigned)group, y, (unsigned)per_band, (unsigned)rs);
-}
-}
+}}
+}}
 ''',
-    "gemv_q4_gup.cc": GEMV_HDR + '''// MoE up (band 0) / gate (band 1): 64-row K=2048 bands (the routed stripe halves through the
-// strided tap, the shared expert's band as it lies) into ms[544 + 64 band ..].
-extern "C" {
+        "gemv_q4_gup.cc": gemv_hdr + f'''// MoE up (band 0) / gate (band 1): 64-row K={hid} bands (the routed stripe halves through the
+// strided tap, the shared expert's band as it lies) into ms[{C.MS_U} + {C.HID_PC} band ..].
+extern "C" {{
 void gemv_q4_gup(const uint8_t *__restrict t, const uint8_t *__restrict tab, float *__restrict ms,
-                 int32_t group, int32_t band) {
-  gemv_q4_pool_group_rt(t, tab, (unsigned)group, ms + 544 + 64 * band, 16, 2);
-}
-}
+                 int32_t group, int32_t band) {{
+  gemv_q4_pool_group_rt(t, tab, (unsigned)group, ms + {C.MS_U} + {C.HID_PC} * band, {pb_hid}, 2);
+}}
+}}
 ''',
-    "gemv_q4_gdown.cc": GEMV_HDR + '''// MoE down, element j of 8, into ms[672 ..] (the core's 256 rows) against h's table at tab + 4608:
-// routed slots: two 128-row RS=4 bands of 4 elements; the shared expert: four 64-row RS=2 bands of 2.
-extern "C" {
+        "gemv_q4_gdown.cc": gemv_hdr + f'''// MoE down, element j of {C.DOWN_ELEMS}, into ms[{C.MS_YD} ..] (the core's {C.ROWS_PC} rows) against h's table at tab + {C.H_TAB_OFF}:
+// routed slots: {C.DOWN_PER_CORE} 128-row RS=4 bands of {g_down} elements; the shared expert: {C.ROWS_PC // 64} 64-row RS=2 bands of {g_sdown}.
+extern "C" {{
 void gemv_q4_gdown(const uint8_t *__restrict t, const uint8_t *__restrict tab, float *__restrict ms,
-                   int32_t j, int32_t slot) {
-  if (slot < 8)
-    gemv_q4_pool_group_rt(t, tab + 4608, (unsigned)(j % 4), ms + 672 + 128 * (j / 4), 8, 4);
+                   int32_t j, int32_t slot) {{
+  if (slot < {ne})
+    gemv_q4_pool_group_rt(t, tab + {C.H_TAB_OFF}, (unsigned)(j % {g_down}), ms + {C.MS_YD} + 128 * (j / {g_down}), {pb_down}, 4);
   else
-    gemv_q4_pool_group_rt(t, tab + 4608, (unsigned)(j % 2), ms + 672 + 64 * (j / 2), 4, 2);
-}
-}
+    gemv_q4_pool_group_rt(t, tab + {C.H_TAB_OFF}, (unsigned)(j % {g_sdown}), ms + {C.MS_YD} + 64 * (j / {g_sdown}), {pb_sdown}, 2);
+}}
+}}
 ''',
-    "gemv_q4_prep_k4096_b0n64.cc": '''// og (bf16[4096]) arrives as two 4 KB act elements: blocks 0..63 from the first.
+        f"gemv_q4_prep_k{kw}_b0n{nb}.cc": f'''// og (bf16[{kw}]) arrives as two 4 KB act elements: blocks 0..{nb - 1} from the first.
 #include "gemv_q4.h"
 
-extern "C" {
-GEMV_Q4_PREP_BLOCKS_ENTRY(4096, 0, 64)
-}
+extern "C" {{
+GEMV_Q4_PREP_BLOCKS_ENTRY({kw}, 0, {nb})
+}}
 ''',
-    "gemv_q4_prep_k4096_b64n64.cc": '''// og (bf16[4096]) arrives as two 4 KB act elements: blocks 64..127 from the second.
+        f"gemv_q4_prep_k{kw}_b{nb}n{nb}.cc": f'''// og (bf16[{kw}]) arrives as two 4 KB act elements: blocks {nb}..{2 * nb - 1} from the second.
 #include "gemv_q4.h"
 
-extern "C" {
-GEMV_Q4_PREP_BLOCKS_ENTRY(4096, 64, 64)
-}
+extern "C" {{
+GEMV_Q4_PREP_BLOCKS_ENTRY({kw}, {nb}, {nb})
+}}
 ''',
-    "gemv_q4_prep_h.cc": '''// the expert hidden h (f32[512], assembled in DDR from the cores' parts) -> bf16 -> its table
-// at tab + 4608 (past xm's K=2048 table).
+        "gemv_q4_prep_h.cc": f'''// the expert hidden h (f32[{ff}], assembled in DDR from the cores' parts) -> bf16 -> its table
+// at tab + {C.H_TAB_OFF} (past xm's K={hid} table).
 #include "gemv_q4.h"
 
-extern "C" {
-void gemv_q4_prep_h(const float *__restrict hf, uint8_t *__restrict tab) {
-  gemv_q4_prep_f32(hf, tab + 4608, 512);
-}
-}
+extern "C" {{
+void gemv_q4_prep_h(const float *__restrict hf, uint8_t *__restrict tab) {{
+  gemv_q4_prep_f32(hf, tab + {C.H_TAB_OFF}, {ff});
+}}
+}}
 ''',
-    # ---- MoE
-    "moe_hdr2.cc": '''// The MoE header, three 10 KB w-stream elements per core (mode 0, 1, 2):
-//   0: [router output f32[1024] | junk]  -> rw = floats 256..287 (w[e] at 8 + e)
-//   1: [sgw bf16[2048] | junk]           -> rw[0] = sigmoid(xm . sgw), xm = the act element
-//   2: [xres slice f32[256] | junk]      -> xr (this core's 256 residual rows)
+        # ---- MoE
+        "moe_hdr2.cc": f'''// The MoE header, three 10 KB w-stream elements per core (mode 0, 1, 2):
+//   0: [router output f32[{Q.ELEM // 4}] | junk]  -> rw = floats {Q.ROUT_IDX_OFF // 4}..{Q.ROUT_IDX_OFF // 4 + 31} (w[e] at 8 + e)
+//   1: [sgw bf16[{hid}] | junk]           -> rw[0] = sigmoid(xm . sgw), xm = the act element
+//   2: [xres slice f32[{C.ROWS_PC}] | junk]      -> xr (this core's {C.ROWS_PC} residual rows)
 #include "vecmath.h"
 
-extern "C" {
-void moe_hdr2(const uint8_t *__restrict e, const bfloat16 *__restrict xm, float *__restrict ms, int32_t mode) {
+extern "C" {{
+void moe_hdr2(const uint8_t *__restrict e, const bfloat16 *__restrict xm, float *__restrict ms, int32_t mode) {{
   aie::set_rounding(aie::rounding_mode::conv_even);
   float *__restrict rw = ms;
-  float *__restrict xr = ms + 32;
-  if (mode == 0) {
-    aie::store_v(rw, aie::load_v<32>((const float *)(e + 1024)));
-  } else if (mode == 1) {
+  float *__restrict xr = ms + {C.MS_XR};
+  if (mode == 0) {{
+    aie::store_v(rw, aie::load_v<32>((const float *)(e + {Q.ROUT_IDX_OFF})));
+  }} else if (mode == 1) {{
     const bfloat16 *__restrict sgw = (const bfloat16 *)e;
     accf32 d = aie::zeros<accfloat, 32>();
 #pragma clang loop unroll(disable)
-    for (unsigned j = 0; j < 2048; j += 32)
+    for (unsigned j = 0; j < {hid}; j += 32)
       d = aie::mac(d, aie::load_v<32>(xm + j), aie::load_v<32>(sgw + j));
     // sigmoid on a vector lane: no scalar float ops (they pull in the soft-float library)
     const v32f u = aie::broadcast<float, 32>(aie::reduce_add(d.template to_vector<float>()));
     rw[0] = vsigmoidN<32>(u)[0];
-  } else {
+  }} else {{
     const float *__restrict xrs = (const float *)e;
 #pragma clang loop unroll(disable)
-    for (unsigned j = 0; j < 256; j += 32)
+    for (unsigned j = 0; j < {C.ROWS_PC}; j += 32)
       aie::store_v(xr + j, aie::load_v<32>(xrs + j));
-  }
-}
-}
+  }}
+}}
+}}
 ''',
-    "moe_silu32.cc": '''// h part = silu(g) * u for this core's 64 rows (ms: u @544, g @608), emitted as f32 (one 256 B y
+        "moe_silu32.cc": f'''// h part = silu(g) * u for this core's {C.HID_PC} rows (ms: u @{C.MS_U}, g @{C.MS_G}), emitted as f32 (one 256 B y
 // element); the bf16 rounding happens in the consumer's table prep.
 #include "vecmath.h"
 
-extern "C" {
-void moe_silu32(const float *__restrict ms, float *__restrict h) {
+extern "C" {{
+void moe_silu32(const float *__restrict ms, float *__restrict h) {{
   aie::set_rounding(aie::rounding_mode::conv_even);
-  const float *__restrict u = ms + 544;
-  const float *__restrict g = ms + 608;
+  const float *__restrict u = ms + {C.MS_U};
+  const float *__restrict g = ms + {C.MS_G};
 #pragma clang loop unroll(disable)
-  for (unsigned j = 0; j < 64; j += 32)
+  for (unsigned j = 0; j < {C.HID_PC}; j += 32)
     aie::store_v(h + j, fmul32(vsiluN<32>(aie::load_v<32>(g + j)), aie::load_v<32>(u + j)));
-}
-}
+}}
+}}
 ''',
-    "moe_accfin.cc": '''// slot < 8:  acc = (slot == 0 ? 0 : acc) + w[slot] * yd     (the routed weight, rw[8 + slot])
-// slot == 8: acc = xres + acc + sigmoid(xm . sgw) * yd        (the shared expert, rw[0]) = the block output
-// ms: rw @0, xr @32, acc @288, yd @672. No scalar float ops (soft-float library).
+        "moe_accfin.cc": f'''// slot < {ne}:  acc = (slot == 0 ? 0 : acc) + w[slot] * yd     (the routed weight, rw[8 + slot])
+// slot == {ne}: acc = xres + acc + sigmoid(xm . sgw) * yd        (the shared expert, rw[0]) = the block output
+// ms: rw @0, xr @{C.MS_XR}, acc @{C.MS_ACC}, yd @{C.MS_YD}. No scalar float ops (soft-float library).
 #include "vecmath.h"
 
-extern "C" {
-void moe_accfin(float *__restrict ms, int32_t slot) {
+extern "C" {{
+void moe_accfin(float *__restrict ms, int32_t slot) {{
   aie::set_rounding(aie::rounding_mode::conv_even);
   const float *__restrict rw = ms;
-  const float *__restrict xr = ms + 32;
-  float *__restrict acc = ms + 288;
-  const float *__restrict y = ms + 672;
-  const bool shared = slot >= 8;
+  const float *__restrict xr = ms + {C.MS_XR};
+  float *__restrict acc = ms + {C.MS_ACC};
+  const float *__restrict y = ms + {C.MS_YD};
+  const bool shared = slot >= {ne};
   v32b wh, wl;
   split32(aie::broadcast<float, 32>(shared ? rw[0] : rw[8 + slot]), wh, wl);
 #pragma clang loop unroll(disable)
-  for (unsigned j = 0; j < 256; j += 32) {
+  for (unsigned j = 0; j < {C.ROWS_PC}; j += 32) {{
     accf32 a;
     if (shared)
       a.from_vector(fadd32(aie::load_v<32>(xr + j), aie::load_v<32>(acc + j)));
@@ -145,23 +164,23 @@ void moe_accfin(float *__restrict ms, int32_t slot) {
     a = aie::mac(a, yh, wl);
     a = aie::mac(a, yl, wh);
     aie::store_v(acc + j, a.template to_vector<float>());
-  }
-}
-}
+  }}
+}}
+}}
 ''',
-    "moe_out.cc": '''// y element j (64 floats) = rows 64j..64j+63 of this core's 256-row block output (ms: acc @288).
+        "moe_out.cc": f'''// y element j (64 floats) = rows 64j..64j+63 of this core's {C.ROWS_PC}-row block output (ms: acc @{C.MS_ACC}).
 #include "vecmath.h"
 
-extern "C" {
-void moe_out(const float *__restrict ms, float *__restrict y, int32_t j) {
-  const float *__restrict acc = ms + 288;
+extern "C" {{
+void moe_out(const float *__restrict ms, float *__restrict y, int32_t j) {{
+  const float *__restrict acc = ms + {C.MS_ACC};
   aie::store_v(y, aie::load_v<32>(acc + 64 * j));
   aie::store_v(y + 32, aie::load_v<32>(acc + 64 * j + 32));
-}
-}
+}}
+}}
 ''',
-    # ---- DeltaNet (dnx.h; ds layout in its header)
-    "dnx_vcopy.cc": '''#include "dnx.h"
+        # ---- DeltaNet (dnx.h; ds layout in its header)
+        "dnx_vcopy.cc": '''#include "dnx.h"
 extern "C" {
 void dnx_vcopy(const float *__restrict e, float *__restrict ds) {
 #pragma clang loop unroll(disable)
@@ -170,45 +189,55 @@ void dnx_vcopy(const float *__restrict e, float *__restrict ds) {
 }
 }
 ''',
-    "dnx_pass1.cc": '''#include "dnx.h"
+        "dnx_pass1.cc": '''#include "dnx.h"
 extern "C" {
 void dnx_pass1(const float *__restrict S, float *__restrict ds, int32_t blk) {
   dnx_pass1_slice(S, ds, (unsigned)blk);
 }
 }
 ''',
-    "dnx_delta.cc": '''#include "dnx.h"
+        "dnx_delta.cc": '''#include "dnx.h"
 extern "C" {
 void dnx_delta(float *__restrict ds) {
   dnx_delta_head(ds);
 }
 }
 ''',
-    "dnx_row.cc": '''#include "dnx.h"
+        "dnx_row.cc": '''#include "dnx.h"
 extern "C" {
 void dnx_row(const float *__restrict S, float *__restrict ds, float *__restrict ye, int32_t blk, int32_t j) {
   dnx_row_half(S, ds, ye, (unsigned)blk, (unsigned)(j >> 1), (unsigned)(j & 1));
 }
 }
 ''',
-    "dnx_ofin.cc": '''#include "dnx.h"
+        "dnx_ofin.cc": '''#include "dnx.h"
 extern "C" {
 void dnx_ofin(const float *__restrict ds, float *__restrict ye, int32_t hf) {
   dnx_ofin_half(ds, ye, (unsigned)hf);
 }
 }
 ''',
-}
+    }
+
 
 STALE = ["gemv_q4_p2b16r2_g.cc", "gemv_q4_p2b16r2_gu.cc", "gemv_q4_p2b32r2_g.cc", "gemv_q4_p2b8r4_g.cc",
          "gemv_q4_r2h2.cc", "gemv_q4_prep_f32_k512.cc", "moe_acc2.cc", "moe_fin2.cc"]
 
-for name, src in FILES.items():
-    p = HERE / name
-    if not p.is_file() or p.read_text(encoding="utf-8") != src:
-        p.write_text(src, encoding="utf-8", newline="\n")
-for name in STALE:
-    p = HERE / name
-    if p.is_file():
-        p.unlink()
-print(f"{len(FILES)} kernel files")
+
+def generate(R, out: Path = HERE) -> int:
+    """Write the TUs for recipe R into `out` (only files whose text changed); returns the count."""
+    fs = files(R)
+    for name, src in fs.items():
+        p = out / name
+        if not p.is_file() or p.read_text(encoding="utf-8") != src:
+            p.write_text(src, encoding="utf-8", newline="\n")
+    for name in STALE:
+        p = out / name
+        if p.is_file():
+            p.unlink()
+    return len(fs)
+
+
+if __name__ == "__main__":
+    n = generate(current_recipe())
+    print(f"{n} kernel files")

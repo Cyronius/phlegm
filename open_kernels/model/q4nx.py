@@ -10,8 +10,9 @@ plain row-major. Quantized tensors are packed chunks of 8192 values:
   q8 chunk, 8704 B (lm_head only): 256 bf16 scales, then 8192 int8.
 
 In the file, chunk f of a [out, in] tensor covers rows 32*(f//ncol) and cols
-256*(f%ncol) -- plain raster. (The NPU weight pools reorder those chunks; that
-permutation lives in pools.py, which reads the raw bytes from here.)
+256*(f%ncol) -- plain raster. (The NPU weight pools reorder those chunks; the
+recipe's packing plan says how -- recipes/qwen36moe.py, applied by recipes/pack.py
+over the raw bytes read here.)
 
 Adapted from phlegm's tools/kernel-interp/q4nx.py, trimmed to the 1.0.2 path:
 the 1.0.3 container packs Q4_K superblocks and needs a different dequant, so

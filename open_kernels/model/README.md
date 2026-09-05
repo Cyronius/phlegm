@@ -10,8 +10,9 @@ kernels stream, writes a driver program for `../harness/run_kernel.exe`, and
 computes an fp64 CPU reference to score the result against.
 
 Nothing here is closed: the container is parsed by [q4nx.py](q4nx.py), the pool
-layouts by [pools.py](pools.py), the math by [replica.py](replica.py). FLM's
-engine is never loaded. (The weights are still FLM's file — the GGUF path that
+layouts by the recipe's packing plan (`../recipes/qwen36moe.py`, applied by
+`../recipes/pack.py` -- the same plan `src/open_qwen36/pools.cpp` interprets),
+the math by [replica.py](replica.py). FLM's engine is never loaded. (The weights are still FLM's file — the GGUF path that
 replaces it is a separate piece of work; see the repo plan.)
 
 ## Use
@@ -59,11 +60,14 @@ the array state a fused layer carries between its two dispatches would be lost.
 
 ## Provenance
 
-`pools.py` and `replica.py` are vendored from phlegm's `tools/kernel-interp/`
-(`build_pools.py`, `decode_step.py`, `full_forward.py`), where every layout law
-and every math element was verified against buffers captured from FLM's own
-engine. The port is checked byte-for-byte: our pools, packs, sides and lm_head
-pool are identical to phlegm's for both layer types of this model.
+`replica.py` is vendored from phlegm's `tools/kernel-interp/` (`decode_step.py`,
+`full_forward.py`), where every math element was verified against buffers
+captured from FLM's own engine. The pool laws came the same way
+(`build_pools.py`, checked byte-for-byte for both layer types of this model);
+they now live as ops of the recipe's packing plan, and the original
+hand-written packer is frozen as the oracle in
+`specs/open-engine/tests/legacy_pools.py`, which `test_pack_plan.py` holds the
+plan interpreter to.
 
 The kernels themselves are `../designs/`, and their provenance is
 `../PROVENANCE.md`.

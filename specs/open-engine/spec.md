@@ -1,0 +1,128 @@
+# open-engine: the open Qwen3.6-MoE engine and its model recipes
+
+Prefix `OPEN`. Home repo: openflowlm-next. Covers `src/open_qwen36/` (the
+resident engine behind the app's `causal_lm` seam) and `open_kernels/recipes/`
+(the ModelSpec → kernel-set generator whose `manifest.json` the engine reads).
+Plan: `.claude/plans/open-kernels-phase3-model-recipes.md`.
+
+Tests: `python -m pytest specs/open-engine/tests` (recipe, spec derivation,
+build key, op range, packing plan) and `src/open_qwen36/manifest_test`
+(the C++ manifest reader; built and run by `src/open_qwen36/build.cmd`, or
+`ctest` after a CMake build of that directory). Hardware requirements are
+documented procedures.
+
+## Requirements
+
+### OPEN-MANIFEST: the engine reads its kernel set from manifest.json
+**Applies to:** openflowlm-next (`src/open_qwen36/manifest.cpp`, `core.cpp`, `engine.cpp`)
+**Test category:** unit
+**Tests:** `src/open_qwen36/manifest_test.cpp`, `tests/test_recipe_layout.py`, `tests/test_manifest_fixture.py`
+
+The engine shall derive every layout constant, xclbin context, kernel,
+per-layer-type verb sequence, buffer size and packing law from the
+`manifest.json` beside the kernels. No model dimension, pool offset or kernel
+name is a compile-time constant of the engine. A kernel directory without a
+readable manifest, or whose manifest names a missing file, is not a kernel
+set (`Engine::find_kernels` skips it). A model whose `config.json` disagrees
+with the manifest's `hf_config_check` is refused at engine construction with
+the offending key named.
+
+**Acceptance criteria:**
+- `Manifest::load` on the checked-in fixture (`tests/fixtures/manifest_qwen36.json`) yields 40 layers, two layer types with the 27B's buffer sizes and three-step programs, four contexts, six kernels with their patch kinds (`ax0` attnpos, `lx1`/`ax1` moeroute2), the tail `ln` → `lm`, and the MoE pool geometry `stripe 163840, up 655360, down_core 81920, pool_down 335544320, share 503316480 / 503971840 / 504627200`.
+- A config with `hidden_size: 2560` → error naming `hidden_size`; `model_type: llama` → error naming `model_type`; a missing `num_experts` → error `lacks 'num_experts'`; a 24-layer config → error naming `num_hidden_layers`; `full_attention_interval: 5` → error naming `layer_types`; `full_attention_interval: 4` without `layer_types` → accepted.
+- `manifest_version: 2` → refused by the parser.
+- The fixture equals the recipe's current output (`make_fixtures.py`) apart from the build key.
+
+### OPEN-LAYOUT-FREEZE: the recipe reproduces the shipped 27B kernels
+**Applies to:** openflowlm-next (`open_kernels/recipes/qwen36moe.py`, `designs/layer_x/`)
+**Test category:** unit (constants) + manual (the rebuild)
+**Tests:** `tests/test_recipe_layout.py`
+
+The qwen36moe recipe shall derive, from the ModelSpec alone, every constant
+that `designs/layer_x/layout.py`, `xcommon.py`, `lx.py` and `ax.py` carried
+by hand on 2026-09-05, and the designs built from the recipe shall be the
+kernels that shipped.
+
+**Acceptance criteria:**
+- `recipe(default_spec()).layout.constants()` equals the frozen `LAYOUT_27B` dict (every consts / act / state / pool / KV offset, `LMHEAD_POOL_BYTES 542113792`); `Common`, `Linear`, `Attn` equal their frozen dicts.
+- Manual: `python open_kernels/export_qwen36_kernels.py --out <new> --check <previous export>` reports every `insts.bin` byte-identical and every `final.xclbin` identical apart from build stamps. Done 2026-09-05 against the kernels built from the hand-written sources: 6/6 streams identical, xclbins 75–82 stamp bytes each.
+
+### OPEN-SPEC-DERIVE: ModelSpec from a model's own metadata
+**Applies to:** openflowlm-next (`open_kernels/recipes/spec.py`)
+**Test category:** unit
+**Tests:** `tests/test_spec_derive.py`
+
+`ModelSpec.from_hf_config` (the HF-style `config.json` FLM ships) and
+`ModelSpec.from_gguf_metadata` (llama.cpp's key names) shall produce the
+hyperparameter tuple for every supported family; an unknown family or a
+missing key is an error naming it.
+
+**Acceptance criteria:**
+- The 27B's `config.json` fields (+ the tokenizer's 248070 ids) → a spec equal to `recipes/specs/qwen36-35b-a3b.json`; `layer_types` from the list when present, else from `full_attention_interval`.
+- GGUF metadata for arch `qwen35moe` (or `qwen3next`) → the same hyperparameters (`real_vocab` = `vocab_size`, GGUF has no tokenizer-side count).
+- `model_type: llama` → `SpecError` naming `model_type 'llama'`; `general.architecture: gemma3` likewise; a missing `linear_num_value_heads` / `qwen35moe.expert_count` → `SpecError` naming the key.
+- JSON round trip preserves the spec and its hash; an unknown field is refused.
+
+### OPEN-OP-RANGE: a recipe fails at generation outside a template's validated set
+**Applies to:** openflowlm-next (`open_kernels/recipes/catalogue.py`, `qwen36moe.py`)
+**Test category:** unit
+**Tests:** `tests/test_op_range.py`
+
+Each kernel template declares the parameter points it has been validated at.
+A recipe requesting another point shall raise `OpRangeError` naming the
+template, the parameter and the validated set, before any build; more than 8
+buffer arguments on a dispatch is likewise refused.
+
+**Acceptance criteria:**
+- The 27B spec passes every check.
+- `head_dim=128` → `attn: head_dim=128 is outside the validated set {256}`; `hidden=2560` → `ln: width=2560 is outside the validated set {2048}`; `gemv_q4 K=3072` → names `{2048, 4096}`; `quant='q4_k'` → refused.
+- Nine buffer arguments → `9 buffer arguments`.
+
+### OPEN-BUILD-CACHE: the build key covers every build input
+**Applies to:** openflowlm-next (`open_kernels/recipes/cache.py`, `export_qwen36_kernels.py`)
+**Test category:** unit
+**Tests:** `tests/test_build_cache.py`
+
+The build key shall hash the recipe package's sources, every kernel source
+the recipe's designs include, the ModelSpec (without its informational
+`extra`) and the quant format. `export_qwen36_kernels.py` skips the build
+when the destination's manifest already carries the key (`--force`
+overrides). The KV / ptab capacity is a runtime buffer size in this tree,
+not a build input, and is not in the key.
+
+**Acceptance criteria:**
+- The key is stable across calls and covers `recipes/qwen36moe.py`, `designs/layer_x/lx.py`, `designs/attn/attn.h`, `designs/gemv_q4/gemv_q4.h`, `designs/lm_head_q8/lm_head_q8.py`, `include/vecmath.h` (among others).
+- Appending a comment to `attn.h` or to `qwen36moe.py` changes the key; changing `rope_theta` or `quant` changes it; changing `extra` does not.
+
+### OPEN-PACK-PLAN: the packing plan reproduces the verified pool laws
+**Applies to:** openflowlm-next (`open_kernels/recipes/pack.py`, `src/open_qwen36/pools.cpp`)
+**Test category:** unit (Python interpreter) + integration (C++, through OPEN-FAMILY-QWEN36MOE)
+**Tests:** `tests/test_pack_plan.py`, `tests/legacy_pools.py` (the frozen originals)
+
+The recipe's plan (`expert_stripes`, `expert_down`, `std_perm`, `put`,
+`conv_transpose`, the lm_head supertile order, the position table) applied
+by `recipes/pack.py` shall produce, for a container with the 27B's tensor
+shapes, exactly the bytes the hand-written packers produced (the ones
+verified against pools captured from FLM's engine). `pools.cpp` interprets
+the same plan and is verified by the hardware run.
+
+**Acceptance criteria:**
+- Layer pool, consts blob (linear and attention), lm_head pool and ptab are byte-equal to `legacy_pools.py` on random-byte tensors of the right sizes.
+- A small weight larger than its slot is refused (`does not fit its 4096 B slot`).
+
+### OPEN-FAMILY-QWEN36MOE: greedy agreement with the fp64 reference on the 27B
+**Applies to:** openflowlm-next (`src/open_qwen36/`)
+**Test category:** manual (needs the NPU and the model)
+
+Through the manifest path, the 8-layer slice of `Qwen3.6-35B-A3B-NPU2`
+decoding `[248045]` greedily for 3 tokens shall match `open_kernels/model/out8t3`'s
+fp64 logits at every position, and the full model shall answer a chat prompt
+coherently.
+
+**Procedure:**
+1. `python -m recipes.manifest --model-dir ~/.flm/models/Qwen3.6-35B-A3B-NPU2 --out src/xclbins/Qwen3.6-35B-A3B-NPU2/open_kernels/manifest.json` (or a full `export_qwen36_kernels.py` run).
+2. `src\open_qwen36\out\open_qwen36_cli.exe --model <model dir> --kernels src/xclbins/Qwen3.6-35B-A3B-NPU2/open_kernels --ids 248045 --max-tokens 3 --layers 8 --dump-logits <dir>/y --twice`
+3. Correlate `y_t{0,1,2}.bin` with `open_kernels/model/out8t3/ref_logits{,_t1,_t2}.bin` over the first 248070 ids: corr ≥ 0.9999, same argmax; the second request reproduces the first.
+4. `python src/open_qwen36/chat.py "Explain what an NPU is in two sentences."` → a coherent two-sentence answer ending in `<|im_end|>`.
+
+**Result 2026-09-05:** corr 0.999998 / 0.999996 / 0.999991, argmax and top-5 identical at every position, request 2 reproduced request 1 (8 layers, 35 ms/step). Full model: see the plan's "Phase A result".

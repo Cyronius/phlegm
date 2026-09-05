@@ -7,6 +7,12 @@
 // at +10). Every weight fill and every cache transfer is one 0x81, so
 // re-pointing a DMA is one word plus an instruction-BO sync.
 //
+// The pool geometry the tables are decoded against (where the routed experts'
+// stripes and down slices lie, the KV row and position-record sizes) is a
+// parameter: the engine passes the manifest's (open_kernels/recipes ->
+// manifest.json `layout.moe`), the .cfg harness the defaults, which are the
+// Qwen3.6-27B's (open_kernels/recipes/qwen36moe.py for the 27B spec).
+//
 // Shared by open_kernels/harness/run_kernel.cpp (the .cfg driver) and
 // src/open_qwen36 (the engine). Header-only, no XRT dependency: callers own
 // the instruction BO and pass its mapped words. Ported from phlegm's
@@ -20,24 +26,31 @@
 
 namespace stream_patch {
 
-// --- layer-pool geometry (open_kernels/model/pools.py) ----------------------
-// Routed experts: up/gate as interleaved 160 KB stripes from 0, four of each
-// per expert; down slices from kMoePoolDown, 640 KB per expert; then the
-// shared expert's up/gate/down at fixed offsets.
-constexpr uint64_t kMoeStripe = 163840;
-constexpr uint64_t kMoeUpBytes = 4 * kMoeStripe;  // one expert's up (or gate, or down)
-constexpr uint64_t kMoeExpertBytes = 3 * kMoeUpBytes;
-constexpr uint64_t kMoeDownCore = 81920;  // down rows one core streams
-constexpr uint64_t kMoePoolDown = 335544320;
-constexpr uint64_t kMoePoolShareUp = 503316480;
-constexpr uint64_t kMoePoolShareGate = 503971840;
-constexpr uint64_t kMoePoolShareDown = 504627200;
-// designs/layer_x/layout.py: the KV cache row [K_t | V_t] and the position
-// record (pos, nf, RoPE cos/sin). The cache capacity is not a kernel property:
-// the window length, the new row's offset and the record's offset are all
-// runtime-patched words, so it is whatever the KV and ptab buffers were sized to.
-constexpr uint64_t kAttnKvRow = 2048;
-constexpr uint64_t kAttnPtabRow = 1024;
+/// Layer-pool geometry of the MoE block: routed experts' up/gate as
+/// interleaved stripes from 0 (2 * up_bytes per expert), down slices from
+/// pool_down (up_bytes each), then the shared expert's up/gate/down.
+struct MoeGeometry {
+    uint64_t stripe = 163840;        ///< one 128-row up (or gate) stripe
+    uint64_t up_bytes = 655360;      ///< one expert's up (= gate = down)
+    uint64_t down_core = 81920;      ///< down rows one core streams
+    uint64_t pool_down = 335544320;
+    uint64_t share_up = 503316480;
+    uint64_t share_gate = 503971840;
+    uint64_t share_down = 504627200;
+    unsigned experts = 256;
+    unsigned topk = 8;               ///< routed slots (the placeholder experts 0..topk-1)
+    uint64_t expert_stripes() const { return 2 * up_bytes; }     ///< one expert's up + gate stripes
+    uint64_t expert_bytes() const { return 3 * up_bytes; }       ///< moe_table's host-concatenated [up | gate | down]
+};
+
+/// The KV cache row [K_t | V_t] and the position record (pos, nf, RoPE
+/// cos/sin). The cache capacity is not a kernel property: the window length,
+/// the new row's offset and the record's offset are all runtime-patched
+/// words, so it is whatever the KV and ptab buffers were sized to.
+struct AttnGeometry {
+    uint64_t kv_row = 2048;
+    uint64_t ptab_row = 1024;
+};
 
 /// Word length of the instruction-stream op starting with word `w`.
 inline size_t op_len(uint32_t w) {
@@ -75,20 +88,21 @@ struct AttnPatch {
 /// host-concatenated `[up | gate | down]` per expert slot, so each fill's
 /// static offset names its (slot, core, kind) and its position inside that
 /// stripe. 144 fills (4 cores x 3) or 216 (the balanced 8-core split).
-inline std::vector<MoePatch> moe_table(const std::vector<uint32_t>& w, const std::string& kn) {
+inline std::vector<MoePatch> moe_table(const std::vector<uint32_t>& w, const std::string& kn,
+                                       const MoeGeometry& g = MoeGeometry{}) {
     std::vector<MoePatch> t;
     for (size_t i = 4; i < w.size(); i += op_len(w[i])) {
         if (w[i] != 0x81 || i + 11 >= w.size() || w[i + 8] != 0) continue;
         uint64_t off = w[i + 10];
-        uint64_t rem = off % kMoeExpertBytes;
-        MoePatch p{i + 10, static_cast<size_t>(off / kMoeExpertBytes)};
-        if (rem < kMoeUpBytes) {
-            p.kind = 0; p.core = rem / kMoeStripe; p.intra = rem % kMoeStripe;
-        } else if (rem < 2 * kMoeUpBytes) {
-            p.kind = 1; p.core = (rem - kMoeUpBytes) / kMoeStripe; p.intra = (rem - kMoeUpBytes) % kMoeStripe;
+        uint64_t rem = off % g.expert_bytes();
+        MoePatch p{i + 10, static_cast<size_t>(off / g.expert_bytes())};
+        if (rem < g.up_bytes) {
+            p.kind = 0; p.core = rem / g.stripe; p.intra = rem % g.stripe;
+        } else if (rem < 2 * g.up_bytes) {
+            p.kind = 1; p.core = (rem - g.up_bytes) / g.stripe; p.intra = (rem - g.up_bytes) % g.stripe;
         } else {
-            p.kind = 2; p.core = (rem - 2 * kMoeUpBytes) / kMoeDownCore;
-            p.intra = (rem - 2 * kMoeUpBytes) % kMoeDownCore;
+            p.kind = 2; p.core = (rem - 2 * g.up_bytes) / g.down_core;
+            p.intra = (rem - 2 * g.up_bytes) % g.down_core;
         }
         t.push_back(p);
     }
@@ -100,20 +114,21 @@ inline std::vector<MoePatch> moe_table(const std::vector<uint32_t>& w, const std
 
 /// `moeroute2`'s table: for designs whose fills already read the layer pool
 /// (layer_x), routed slot j is compiled as expert j, so every DDR patch on
-/// arg 0 landing in expert 0..7's stripe set or down slice is a placeholder;
-/// the shared expert, qkv, o, ... are real offsets and are left alone.
-inline std::vector<MoePatch> moe2_table(const std::vector<uint32_t>& w, const std::string& kn) {
+/// arg 0 landing in expert 0..topk-1's stripe set or down slice is a
+/// placeholder; the shared expert, qkv, o, ... are real offsets and are left alone.
+inline std::vector<MoePatch> moe2_table(const std::vector<uint32_t>& w, const std::string& kn,
+                                        const MoeGeometry& g = MoeGeometry{}) {
     std::vector<MoePatch> t;
     for (size_t i = 4; i < w.size(); i += op_len(w[i])) {
         if (w[i] != 0x81 || i + 11 >= w.size() || w[i + 8] != 0) continue;
         uint64_t off = w[i + 10];
-        if (off < kMoePoolDown) {
-            uint64_t e = off / (8 * kMoeStripe);
-            if (e < 8) t.push_back({i + 10, static_cast<size_t>(e), 0, 0, off % (8 * kMoeStripe)});
-        } else if (off < kMoePoolShareUp) {
-            uint64_t e = (off - kMoePoolDown) / kMoeUpBytes;
-            if (e < 8)
-                t.push_back({i + 10, static_cast<size_t>(e) | 0x100, 0, 0, (off - kMoePoolDown) % kMoeUpBytes});
+        if (off < g.pool_down) {
+            uint64_t e = off / g.expert_stripes();
+            if (e < g.topk) t.push_back({i + 10, static_cast<size_t>(e), 0, 0, off % g.expert_stripes()});
+        } else if (off < g.share_up) {
+            uint64_t e = (off - g.pool_down) / g.up_bytes;
+            if (e < g.topk)
+                t.push_back({i + 10, static_cast<size_t>(e) | 0x100, 0, 0, (off - g.pool_down) % g.up_bytes});
         }
     }
     if (t.empty()) throw std::runtime_error("moeroute2: " + kn + " has no routed-expert fills");
@@ -124,7 +139,8 @@ inline std::vector<MoePatch> moe2_table(const std::vector<uint32_t>& w, const st
 /// 1): the KV window fill is the patch on arg 3 at offset 0 — its length lives
 /// in the BD blockwrite just before it, not in the patch — the new row's drain
 /// is arg 3 at one row, the position record is arg 5.
-inline std::vector<AttnPatch> attn_table(const std::vector<uint32_t>& w, const std::string& kn) {
+inline std::vector<AttnPatch> attn_table(const std::vector<uint32_t>& w, const std::string& kn,
+                                         const AttnGeometry& g = AttnGeometry{}) {
     std::vector<AttnPatch> t;
     size_t bd_write = 0;
     bool have_bd = false;
@@ -142,7 +158,7 @@ inline std::vector<AttnPatch> attn_table(const std::vector<uint32_t>& w, const s
             if (!have_bd || bd_write + 2 >= w.size() || w[bd_write + 2] + 4 != reg)
                 throw std::runtime_error("attnpos: " + kn + ": no BD write before the KV window fill");
             t.push_back({bd_write + 4, 0, 0});
-        } else if (arg == 3 && off == kAttnKvRow) {
+        } else if (arg == 3 && off == g.kv_row) {
             t.push_back({i + 10, 1, flags});
         } else if (arg == 3) {
             throw std::runtime_error("attnpos: " + kn + ": unexpected kv transfer at offset " + std::to_string(off));
@@ -160,41 +176,44 @@ inline std::vector<AttnPatch> attn_table(const std::vector<uint32_t>& w, const s
     return t;
 }
 
-/// Point a `moeroute` table's fills at experts idx[0..7] (slot 8 = the shared expert).
-inline void moe_apply(uint32_t* iw, const std::vector<MoePatch>& table, const uint32_t* idx) {
+/// Point a `moeroute` table's fills at experts idx[0..topk-1] (slot topk = the shared expert).
+inline void moe_apply(uint32_t* iw, const std::vector<MoePatch>& table, const uint32_t* idx,
+                      const MoeGeometry& g = MoeGeometry{}) {
     for (const auto& p : table) {
         uint64_t base;
-        if (p.slot < 8) {
+        if (p.slot < g.topk) {
             uint64_t e = idx[p.slot];
-            base = p.kind == 0   ? (8 * e + 2 * p.core) * kMoeStripe
-                   : p.kind == 1 ? (8 * e + 2 * p.core + 1) * kMoeStripe
-                                 : kMoePoolDown + e * kMoeUpBytes + p.core * kMoeDownCore;
+            base = p.kind == 0   ? (e * g.expert_stripes() + 2 * p.core * g.stripe)
+                   : p.kind == 1 ? (e * g.expert_stripes() + (2 * p.core + 1) * g.stripe)
+                                 : g.pool_down + e * g.up_bytes + p.core * g.down_core;
         } else {
-            base = p.kind == 0   ? kMoePoolShareUp + p.core * kMoeStripe
-                   : p.kind == 1 ? kMoePoolShareGate + p.core * kMoeStripe
-                                 : kMoePoolShareDown + p.core * kMoeDownCore;
+            base = p.kind == 0   ? g.share_up + p.core * g.stripe
+                   : p.kind == 1 ? g.share_gate + p.core * g.stripe
+                                 : g.share_down + p.core * g.down_core;
         }
         iw[p.word] = static_cast<uint32_t>(base + p.intra);
     }
 }
 
-/// Point a `moeroute2` table's fills at experts idx[0..7].
-inline void moe2_apply(uint32_t* iw, const std::vector<MoePatch>& table, const uint32_t* idx) {
+/// Point a `moeroute2` table's fills at experts idx[0..topk-1].
+inline void moe2_apply(uint32_t* iw, const std::vector<MoePatch>& table, const uint32_t* idx,
+                       const MoeGeometry& g = MoeGeometry{}) {
     for (const auto& p : table) {
         uint64_t e = idx[p.slot & 0xff];
-        iw[p.word] = static_cast<uint32_t>((p.slot & 0x100) == 0 ? 8 * e * kMoeStripe + p.intra
-                                                                  : kMoePoolDown + e * kMoeUpBytes + p.intra);
+        iw[p.word] = static_cast<uint32_t>((p.slot & 0x100) == 0 ? e * g.expert_stripes() + p.intra
+                                                                  : g.pool_down + e * g.up_bytes + p.intra);
     }
 }
 
 /// Set the cache position: the window fill reads rows [0, max(pos, 1)), the
 /// new row lands at row pos, the RoPE record is ptab row pos.
-inline void attn_apply(uint32_t* iw, const std::vector<AttnPatch>& table, uint64_t pos) {
+inline void attn_apply(uint32_t* iw, const std::vector<AttnPatch>& table, uint64_t pos,
+                       const AttnGeometry& g = AttnGeometry{}) {
     uint64_t nf = pos ? pos : 1;
     for (const auto& p : table) {
-        uint64_t v = p.kind == 0   ? nf * kAttnKvRow / 4  // a BD length is in words
-                     : p.kind == 1 ? pos * kAttnKvRow
-                                   : pos * kAttnPtabRow;
+        uint64_t v = p.kind == 0   ? nf * g.kv_row / 4  // a BD length is in words
+                     : p.kind == 1 ? pos * g.kv_row
+                                   : pos * g.ptab_row;
         iw[p.word] = static_cast<uint32_t>(v) | p.flags;
     }
 }

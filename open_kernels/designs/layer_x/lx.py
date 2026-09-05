@@ -17,9 +17,13 @@ designs/deltanet's context, on `act`), 1 = post -> out -> ln -> router, 2 = the
 MoE (the driver's `moeroute2` patches the routed slots' fills from the router
 output between parts 1 and 2). Build all three; they share part 0's xclbin.
 
+Geometry: the recipe's (open_kernels/recipes/qwen36moe.py) for the spec named
+by OPEN_KERNELS_SPEC (else the checked-in 27B) -- layout.py for the byte
+layouts, xcommon.py for the main-core streams, `R.linear` for this layer type.
+
 Args (layout.py): pool u8[POOL_BYTES] (qkv, z, experts at their pool offsets),
-xres f32[2048] (in: the layer input; out: the layer output), consts (per layer),
-state bf16[3x8192] (conv state, in place), act (scratch; vec/o for DeltaNet).
+xres f32[HID] (in: the layer input; out: the layer output), consts (per layer),
+state (conv state + S, in place), act (scratch; vec/o for DeltaNet).
 Build (WSL): for p in 0 1 2: LX_PART=$p python build_design.py designs/layer_x/lx.py designs/layer_x/build_lx$p
 """
 
@@ -48,29 +52,34 @@ sys.path.insert(0, str(HERE))
 from ironutil import Pipeline, include_dirs  # noqa: E402
 from layout import (A_BYTES, A_O, A_OG, A_OUT, A_QKV, A_RES, A_ROUT, A_VEC, A_XM, A_XN, A_Z, A_HP,  # noqa: E402
                     C_BYTES, C_LNW, C_NW, C_POSTLN, C_RW, C_SGW, C_SIDE, C_WOUT, GLUE_SIDE_BYTES, POOL_BYTES,
-                    POOL_QKV, POOL_Z, STATE_BYTES, STATE_S_OFF, S_HEAD_BYTES)
+                    POOL_QKV, POOL_Z, STATE_BYTES, STATE_S_OFF, S_HEAD_BYTES, R, SPEC)
 import xcommon as X  # noqa: E402
 
-HID = 2048
-N_CORES = 8
-QKV_PC = 8192 // 64 // N_CORES        # 16 bands per core
-Z_PC = 4096 // 64 // N_CORES          # 8
-OUT_PC = HID // 64 // N_CORES         # 4 (K = 4096)
+D = R.linear
+if D is None:
+    sys.exit("lx.py: the spec has no linear-attention layers")
+HID = X.HID
+N_CORES = X.N_CORES
+ELEM = X.ELEM
+QKV_PC, Z_PC, OUT_PC = D.QKV_PC, D.Z_PC, D.OUT_PC      # bands per core: qkv (K = HID), z (K = HID), out (K = VW)
+VW, OUT_K = D.VW, D.OUT_K
 # dn_glue / dn_post
-NCH, NHEAD = 8192, 32
-TILE, NT = 1024, 8
-AB_ELEMS = 32
-G, NG = 1024, 4
+NCH, NHEAD = D.NCH, D.NHEAD
+TILE, NT = D.TILE, D.NT
+AB_ELEMS = D.AB_ELEMS
+G, NG = D.G, D.NG
+CONV_ROWS = SPEC.conv_kernel - 1                        # conv state rows (the taps before the new one)
+KEY_TILES = D.VALUE_TILE0                               # tiles of the two key groups; the value tiles follow
+CONVW_ELEMS = SPEC.conv_kernel * TILE * 2 // ELEM       # 4 KB side elements holding one tile's conv taps
 PART = int(os.environ.get("LX_PART", 0))
 STOP = int(os.environ.get("LX_STOP", 99))     # debug: truncate part 0 after the glue (1) / DeltaNet (2)
 
 
 def rows3(t: int):
-    """Tile t (1024 bf16 = 2048 B) of each of the 3 conv-state rows, in BYTES of the state BO
-    (the conv state is its first 48 KB; S follows)."""
+    """Tile t (1024 bf16 = 2048 B) of each of the conv-state rows, in BYTES of the state BO
+    (the conv state is its first STATE_S_OFF bytes; S follows)."""
     from aie.helpers.taplib import TensorAccessPattern
-    from layout import STATE_BYTES
-    return TensorAccessPattern((1, STATE_BYTES), t * TILE * 2, [1, 1, 3, TILE * 2], [0, 0, NCH * 2, 1])
+    return TensorAccessPattern((1, STATE_BYTES), t * TILE * 2, [1, 1, CONV_ROWS, TILE * 2], [0, 0, NCH * 2, 1])
 
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
@@ -84,9 +93,9 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
     consts_ty = np.ndarray[(C_BYTES,), np.dtype[np.uint8]]
     state_ty = np.ndarray[(STATE_BYTES,), np.dtype[np.uint8]]      # [conv state | S (in place)]
     act_ty = np.ndarray[(A_BYTES,), np.dtype[np.uint8]]
-    nw_ty = np.ndarray[(128,), np.dtype[bfloat16]]
-    f32 = np.ndarray[(32,), np.dtype[np.float32]]
-    fqk = np.ndarray[(4096,), np.dtype[np.float32]]
+    nw_ty = np.ndarray[(SPEC.lin_value_dim,), np.dtype[bfloat16]]
+    f32 = np.ndarray[(NHEAD,), np.dtype[np.float32]]
+    fqk = np.ndarray[(2 * D.KEY_WIDTH,), np.dtype[np.float32]]
     fvt = np.ndarray[(TILE,), np.dtype[np.float32]]
     fxn = np.ndarray[(HID,), np.dtype[bfloat16]]
 
@@ -119,17 +128,17 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
     def main_body(win, xin, yout, *args):
         B, K = X.unpack_args(args)
         tab = B["tab"]
-        # part 0: qkv | z against xn, then this core's 4 DeltaNet heads
+        # part 0: qkv | z against xn, then this core's DeltaNet heads
         xe = xin.acquire(1)
         K["prep2048"](xe, tab)
-        X.gemv_bands(win, yout, tab, K["gy"], QKV_PC + Z_PC, 8, 16, 2)
+        X.gemv_bands(win, yout, tab, K["gy"], QKV_PC + Z_PC, X.n_groups(HID), X.per_band(HID), 2)
         xin.release(1)
         X.dn_body(win, yout, B, K)
-        # (still part 0) out against og (two 4 KB elements, K = 4096)
+        # (still part 0) out against og (two 4 KB elements, K = VW)
         oe = xin.acquire(2)
         K["prep4096a"](oe[0], tab)
         K["prep4096b"](oe[1], tab)
-        X.gemv_bands(win, yout, tab, K["gy"], OUT_PC, 16, 32, 2)
+        X.gemv_bands(win, yout, tab, K["gy"], OUT_PC, X.n_groups(OUT_K), X.per_band(OUT_K), 2)
         xin.release(2)
         # part 1: the MoE block
         X.moe_body(win, xin, yout, B, K)
@@ -146,17 +155,17 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
         sm = sin.acquire(1)
         fsmall(sm, acc_a, acc_b, decay, beta)
         sin.release(1)
-        for base in (0, 4):
-            for tt in range_(4):
-                ww = sin.acquire(2)
-                e = ain.acquire(5)
-                o = oout.acquire(3)
+        for base in (0, KEY_TILES):
+            for tt in range_(KEY_TILES):
+                ww = sin.acquire(CONVW_ELEMS)
+                e = ain.acquire(2 + CONV_ROWS)
+                o = oout.acquire(CONV_ROWS)
                 fconv(e[0], e[1], e[2], e[3], e[4], ww[0], ww[1], o[0], o[1], o[2], qk, vt, tt, base)
-                oout.release(3)
-                ain.release(5)
-                sin.release(2)
-                if base == 4:
-                    for i in range_(8):
+                oout.release(CONV_ROWS)
+                ain.release(2 + CONV_ROWS)
+                sin.release(CONVW_ELEMS)
+                if base == KEY_TILES:
+                    for i in range_(D.HEADS_PER_TILE):
                         r = oout.acquire(1)
                         femit(qk, vt, decay, beta, r, tt, i)
                         oout.release(1)
@@ -190,6 +199,8 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
                           tile=Tile(2, 3), stack_size=0x1800))
 
     bt = X.bt
+    BB_HID, BB_OUT = X.band_bytes(HID), X.band_bytes(OUT_K)
+    YB = X.BAND_ROWS * 4                                   # one band's y bytes
 
     # ---- host sequences (one per instruction stream)
     def sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss, side_p, gact_p, gout_c, pin_p, pout_c):
@@ -197,28 +208,29 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
             # 1. layer-entry norm: xn -> act[A_XN]
             tg_ln = TaskGroup()
             lni.fill(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln)
-            lni.fill(a_consts, tap=bt(C_BYTES, C_LNW, 4096), wait=True, group=tg_ln)
-            lno.drain(a_act, tap=bt(A_BYTES, A_XN, 4096), wait=True, group=tg_ln)
+            lni.fill(a_consts, tap=bt(C_BYTES, C_LNW, ELEM), wait=True, group=tg_ln)
+            lno.drain(a_act, tap=bt(A_BYTES, A_XN, ELEM), wait=True, group=tg_ln)
             # 2. qkv | z GEMV: weights now, x after the norm
             pw, py = Pipeline(3), Pipeline(3)
             for c in range(N_CORES):
-                pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_QKV + c * QKV_PC * X.BAND16, QKV_PC * X.BAND16))
-                pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_Z + c * Z_PC * X.BAND16, Z_PC * X.BAND16))
-                py.drain(y_conss[c], a_act, bt(A_BYTES, A_QKV + c * QKV_PC * 64 * 4, QKV_PC * 64 * 4))
-                py.drain(y_conss[c], a_act, bt(A_BYTES, A_Z + c * Z_PC * 64 * 4, Z_PC * 64 * 4))
+                pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_QKV + c * QKV_PC * BB_HID, QKV_PC * BB_HID))
+                pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_Z + c * Z_PC * BB_HID, Z_PC * BB_HID))
+                py.drain(y_conss[c], a_act, bt(A_BYTES, A_QKV + c * QKV_PC * YB, QKV_PC * YB))
+                py.drain(y_conss[c], a_act, bt(A_BYTES, A_Z + c * Z_PC * YB, Z_PC * YB))
             tg_ln.finish()                                   # xn is in DDR
             px = Pipeline(3)
-            px.fill(x_prod, a_act, bt(A_BYTES, A_XN, 4096))
+            px.fill(x_prod, a_act, bt(A_BYTES, A_XN, ELEM))
             tg_s = TaskGroup()
-            side_p.fill(a_act, tap=bt(A_BYTES, A_XN, 4096), wait=True, group=tg_s)
+            side_p.fill(a_act, tap=bt(A_BYTES, A_XN, ELEM), wait=True, group=tg_s)
             side_p.fill(a_consts, tap=bt(C_BYTES, C_SIDE, GLUE_SIDE_BYTES), wait=True, group=tg_s)
             py.finish()                                      # qkv, z are in DDR
             # 3. glue: conv state updated in place, DeltaNet records -> act[A_VEC]
             pipe = Pipeline(3)
             for tt in range(NT):
                 pipe.drain(gout_c, a_state, rows3(tt))
-                if tt >= 4:
-                    pipe.drain(gout_c, a_act, bt(A_BYTES, A_VEC + (tt - 4) * 8 * 512 * 4, 8 * 512 * 4))
+                if tt >= KEY_TILES:
+                    pipe.drain(gout_c, a_act, bt(A_BYTES, A_VEC + (tt - KEY_TILES) * D.HEADS_PER_TILE * D.RECORD_BYTES,
+                                                 D.HEADS_PER_TILE * D.RECORD_BYTES))
                 pipe.fill(gact_p, a_act, bt(A_BYTES, A_QKV + tt * TILE * 4, TILE * 4))
                 pipe.fill(gact_p, a_state, rows3(tt))
             pipe.finish()                                    # the records are in DDR
@@ -234,7 +246,7 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
                 return
             # 5. post: og -> act[A_OG] (z from act, o from DeltaNet)
             pipe = Pipeline(3)
-            pipe.fill(pin_p, a_consts, bt(C_BYTES, C_NW, 4096))
+            pipe.fill(pin_p, a_consts, bt(C_BYTES, C_NW, ELEM))
             for g in range(NG):
                 pipe.drain(pout_c, a_act, bt(A_BYTES, A_OG + g * G * 2, G * 2))
                 pipe.fill(pin_p, a_act, bt(A_BYTES, A_O + g * G * 4, G * 4))
@@ -242,21 +254,21 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
             pipe.finish()                                    # og is in DDR
             # 6. out projection (weights in consts) against og
             for c in range(N_CORES):
-                pw.fill(w_prods[c], a_consts, bt(C_BYTES, C_WOUT + c * OUT_PC * X.BAND32, OUT_PC * X.BAND32))
-                py.drain(y_conss[c], a_act, bt(A_BYTES, A_OUT + c * OUT_PC * 64 * 4, OUT_PC * 64 * 4))
-            px.fill(x_prod, a_act, bt(A_BYTES, A_OG, 8192))
+                pw.fill(w_prods[c], a_consts, bt(C_BYTES, C_WOUT + c * OUT_PC * BB_OUT, OUT_PC * BB_OUT))
+                py.drain(y_conss[c], a_act, bt(A_BYTES, A_OUT + c * OUT_PC * YB, OUT_PC * YB))
+            px.fill(x_prod, a_act, bt(A_BYTES, A_OG, VW * 2))
             py.finish()                                      # out is in DDR
             # 7. residual + post-attention norm, then the router
             tg_ln = TaskGroup()
             lni.fill(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln)
-            lni.fill(a_consts, tap=bt(C_BYTES, C_POSTLN, 4096), wait=True, group=tg_ln)
+            lni.fill(a_consts, tap=bt(C_BYTES, C_POSTLN, ELEM), wait=True, group=tg_ln)
             lni.fill(a_act, tap=bt(A_BYTES, A_OUT, HID * 4), wait=True, group=tg_ln)
-            lno.drain(a_act, tap=bt(A_BYTES, A_RES, 8192), wait=True, group=tg_ln)
-            lno.drain(a_act, tap=bt(A_BYTES, A_XM, 4096), wait=True, group=tg_ln)
+            lno.drain(a_act, tap=bt(A_BYTES, A_RES, HID * 4), wait=True, group=tg_ln)
+            lno.drain(a_act, tap=bt(A_BYTES, A_XM, ELEM), wait=True, group=tg_ln)
             tg_ln.finish()
             tg_r = TaskGroup()
-            lni.fill(a_consts, tap=bt(C_BYTES, C_RW, X.W_ELEMS * 4096), wait=True, group=tg_r)
-            lno.drain(a_act, tap=bt(A_BYTES, A_ROUT, 4096), wait=True, group=tg_r)
+            lni.fill(a_consts, tap=bt(C_BYTES, C_RW, X.W_ELEMS * ELEM), wait=True, group=tg_r)
+            lno.drain(a_act, tap=bt(A_BYTES, A_ROUT, ELEM), wait=True, group=tg_r)
             tg_r.finish()
             pw.finish()
             px.finish()
@@ -277,9 +289,10 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
 
 DESIGN = lx
 _src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + sorted(f.read_bytes() for f in HERE.glob("*.h"))
-                + [(HERE / "xcommon.py").read_bytes()]
+                + [(HERE / "xcommon.py").read_bytes()] + X.source_hash_inputs()
                 + sorted(f.read_bytes() for f in GLUE.glob("*.cc")) + sorted(f.read_bytes() for f in GLUE.glob("*.h"))
                 + sorted(f.read_bytes() for f in POST.glob("*.cc")) + sorted(f.read_bytes() for f in X.RT.glob("*.cc"))
                 + [(X.LN / "ln.cc").read_bytes(), (X.LINL / "ln_nr.cc").read_bytes(), (GEMV / "gemv_q4.h").read_bytes(),
-                   (GEMV / "gemv_tab.h").read_bytes(), (HERE.parent.parent / "include" / "vecmath.h").read_bytes()])
+                   (GEMV / "gemv_tab.h").read_bytes(), (HERE.parent.parent / "include" / "vecmath.h").read_bytes(),
+                   SPEC.spec_hash().encode()])
 SPECIALIZE = {"part": PART, "stop": STOP, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

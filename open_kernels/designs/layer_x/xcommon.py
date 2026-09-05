@@ -1,7 +1,9 @@
 r"""Shared pieces of the whole-layer designs lx / ax: the main cores' GEMV entry
 points, the MoE block and the DeltaNet step on those cores (kernels, the core
 program fragments, the host-sequence fragments), the norm + router helper core,
-and the DMA tap helpers. See lx.py for the design as a whole.
+and the DMA tap helpers. See lx.py for the design as a whole. The geometry
+(cores, widths, element counts, scratch offsets) is the recipe's `Common`
+(open_kernels/recipes/qwen36moe.py), computed from the ModelSpec.
 
 Program memory (16 KB per core) shapes everything here: the main core's IRON
 program alone was 10 KB with one kernel call site per stage, so the kernels
@@ -12,7 +14,7 @@ index), and every GEMV shape is one runtime-parameterised entry point.
 
 Main-core streams (all layer types):
   w (10 KB elements from the shim): weights, the MoE header, experts, S slices, DeltaNet records
-  x (4 KB elements, broadcast): xn, og (2 elements), xm, the expert hidden h (f32[512])
+  x (4 KB elements, broadcast): xn, og (2 elements), xm, the expert hidden h (f32[FF])
   y (256 B elements to the shim): band results, S' half rows, o, hidden parts, the block output
 """
 
@@ -28,32 +30,51 @@ from aie.iron.controlflow import range_
 from aie.iron.kernel import ExternalFunction
 from aie.helpers.taplib import TensorAccessPattern
 
-from layout import POOL_BYTES, POOL_DOWN, POOL_SHARE_DOWN, POOL_SHARE_GATE, POOL_SHARE_UP
+from layout import R, SPEC, POOL_BYTES, POOL_DOWN, POOL_SHARE_DOWN, POOL_SHARE_GATE, POOL_SHARE_UP
 
 HERE = Path(__file__).parent
 GEMV = HERE.parent / "gemv_q4"
+ELEM = 4096
 
-NE, NX = 8, 9                         # routed experts, + the shared one
-HID, FF = 2048, 512
-TILE = 5120
-PER_CALL = 2
-CALL_BYTES = PER_CALL * TILE          # 10240: one w element
-STRIPE = 32 * TILE                    # 128 rows x 2048 (RS=4 band)
-HALF = 16 * TILE                      # 64 rows x 2048 = 8 elements
-PAIR = 2 * TILE                       # the two chunks of one half at one k-tile = 1 element
-DOWN_BAND = 8 * TILE                  # 128 rows x 512
-UP_BYTES = 4 * STRIPE                 # 655360 per projection
-N_CORES = 8
-DOWN_PER_CORE = 2
-BAND_ROWS = 64
-BAND16, BAND32 = 16 * TILE, 32 * TILE  # K=2048 / K=4096 band bytes
-N_HDR = 3
+C = R.common
+NE, NX = C.NE, C.NX                   # routed experts, + the shared one
+HID, FF = C.HID, C.FF
+TILE = C.TILE
+PER_CALL = C.PER_CALL
+CALL_BYTES = C.CALL_BYTES             # one w element
+STRIPE = C.STRIPE                     # 128 rows x HID (RS=4 band)
+HALF = C.HALF                         # 64 rows x HID = UP_ELEMS elements
+PAIR = C.PAIR                         # the two chunks of one half at one k-tile = 1 element
+DOWN_BAND = C.DOWN_BAND               # 128 rows x FF
+UP_BYTES = C.UP_BYTES                 # one expert's up (= gate = down)
+N_CORES = C.N_CORES
+DOWN_PER_CORE = C.DOWN_PER_CORE
+BAND_ROWS = C.BAND_ROWS
+BAND16, BAND32 = C.BAND16, C.BAND32   # K=HID / K=2*HID band bytes
+N_HDR = C.N_HDR
+ROWS_PC, HID_PC = C.ROWS_PC, C.HID_PC # MoE rows per core, hidden per core
 OS = ["-Os"]                          # main-core kernels: size over speed (the GEMV is DMA-bound)
 
-# scratch layouts (floats) -- keep in sync with moe_x.h / dnx.h
-MS_FLOATS = 928
-DS_FLOATS = 1280
-TAB_BYTES = 2 * 4096 + 4096 // 4      # gemv_q4_tab_bytes(4096); K=2048 uses a prefix, h's table sits at +4608
+# scratch layouts (floats) -- gen_kernels.py writes the same offsets into the kernel TUs
+MS_FLOATS = C.MS_FLOATS
+DS_FLOATS = C.DS_FLOATS
+TAB_BYTES = C.TAB_BYTES               # gemv_q4_tab_bytes(widest K); h's table sits at +H_TAB_OFF
+H_TAB_OFF = C.H_TAB_OFF
+KWIDE = C.KWIDE                       # the widest K a main core prepares (the og / out projections)
+
+
+def band_bytes(K: int) -> int:
+    return BAND_ROWS * K // 8192 * TILE
+
+
+def per_band(K: int) -> int:
+    """chunks per 64-row band of a K-wide standard-layout matrix (the runtime band law)."""
+    return band_bytes(K) // TILE
+
+
+def n_groups(K: int) -> int:
+    """w elements per band."""
+    return band_bytes(K) // CALL_BYTES
 
 
 def bt(total: int, off: int, n: int) -> TensorAccessPattern:
@@ -61,10 +82,10 @@ def bt(total: int, off: int, n: int) -> TensorAccessPattern:
 
 
 def half_tap(off: int) -> TensorAccessPattern:
-    """One 64-row half of an RS=4 stripe in the pool: chunk pairs at every k-tile (8 x 10240 B,
+    """One 64-row half of an RS=4 stripe in the pool: chunk pairs at every k-tile (HID/256 x 10240 B,
     stride 20480), as three real DMA dims (the BD's highest dim is a repeat count, its length
     covers only the lowest three, the innermost wrap is < 4096 B)."""
-    return TensorAccessPattern((1, POOL_BYTES), off, [1, 8, 4, PAIR // 4], [0, 2 * PAIR, PAIR // 4, 1])
+    return TensorAccessPattern((1, POOL_BYTES), off, [1, HID // 256, 4, PAIR // 4], [0, 2 * PAIR, PAIR // 4, 1])
 
 
 def types():
@@ -81,6 +102,7 @@ def types():
 def kernels(inc, t):
     e, x, y, tab, ms, ds = t["elem"], t["x"], t["y"], t["tab"], t["ms"], t["ds"]
     i32 = np.int32
+    nb = ELEM // 2 // 32                                            # bf16 blocks of 32 per 4 KB element
 
     def ef(sym, args):
         return ExternalFunction(sym, source_file=str(HERE / f"{sym}.cc"), arg_types=args, include_dirs=inc, compile_flags=OS)
@@ -90,12 +112,12 @@ def kernels(inc, t):
     k["gy"] = ef("gemv_q4_gy", [e, tab, y, i32, i32, i32])          # (t, tab, ye, group, per_band, rs)
     k["gup"] = ef("gemv_q4_gup", [e, tab, ms, i32, i32])            # (t, tab, ms, group, band)  u | g
     k["gdown"] = ef("gemv_q4_gdown", [e, tab, ms, i32, i32])        # (t, tab, ms, j, slot)      routed / shared law
-    # activation tables
-    k["prep2048"] = ExternalFunction("gemv_q4_prep_k2048", source_file=str(GEMV / "gemv_q4_prep_k2048.cc"),
+    # activation tables: x (one element, K = HID) and the two-element og (K = KWIDE)
+    k["prep2048"] = ExternalFunction(f"gemv_q4_prep_k{HID}", source_file=str(GEMV / f"gemv_q4_prep_k{HID}.cc"),
                                      arg_types=[x, tab], include_dirs=inc, compile_flags=OS)
-    k["prep4096a"] = ef("gemv_q4_prep_k4096_b0n64", [x, tab])
-    k["prep4096b"] = ef("gemv_q4_prep_k4096_b64n64", [x, tab])
-    k["prepf"] = ef("gemv_q4_prep_h", [x, tab])                     # h (f32[512] in the element) -> tab + 4608
+    k["prep4096a"] = ef(f"gemv_q4_prep_k{KWIDE}_b0n{nb}", [x, tab])
+    k["prep4096b"] = ef(f"gemv_q4_prep_k{KWIDE}_b{nb}n{nb}", [x, tab])
+    k["prepf"] = ef("gemv_q4_prep_h", [x, tab])                     # h (f32[FF] in the element) -> tab + H_TAB_OFF
     # MoE
     k["hdr"] = ef("moe_hdr2", [e, x, ms, i32])
     k["silu"] = ef("moe_silu32", [ms, y])
@@ -150,24 +172,24 @@ def moe_body(win, ain, yout, B, K):
         K["hdr"](we, xm, ms, mode)
         win.release(1)
     ain.release(1)
-    for e in range_(NX):                          # 8 routed slots, then the shared expert
-        for b in range_(2):                       # u then g, 64 rows each, 8 elements per band
-            for g in range_(8):
+    for e in range_(NX):                          # NE routed slots, then the shared expert
+        for b in range_(2):                       # u then g, HID_PC rows each, UP_ELEMS elements per band
+            for g in range_(C.UP_ELEMS):
                 we = win.acquire(1)
                 K["gup"](we, tab, ms, g, b)
                 win.release(1)
         he = yout.acquire(1)
-        K["silu"](ms, he)                         # this core's 64 rows of the hidden, f32, to DDR
+        K["silu"](ms, he)                         # this core's rows of the hidden, f32, to DDR
         yout.release(1)
         hh = ain.acquire(1)
-        K["prepf"](hh, tab)                       # the whole h back, -> its table (tab + 4608)
+        K["prepf"](hh, tab)                       # the whole h back, -> its table (tab + H_TAB_OFF)
         ain.release(1)
-        for j in range_(8):                       # the core's 256 down rows: 8 elements either way
+        for j in range_(C.DOWN_ELEMS):            # the core's ROWS_PC down rows: DOWN_ELEMS elements either way
             we = win.acquire(1)
             K["gdown"](we, tab, ms, j, e)
             win.release(1)
         K["accfin"](ms, e)                        # routed: acc += w[e] y; shared: out = xres + acc + gate y
-    for j in range_(4):
+    for j in range_(C.OUT_ELEMS):
         ye = yout.acquire(1)
         K["out"](ms, ye, j)
         yout.release(1)
@@ -177,23 +199,24 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
                  A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW):
     """Host sequence of the MoE block (one instruction-stream part). Routed slot j's fills carry
     placeholder pool offsets (expert j); moeroute2 rewrites them from the router output."""
-    pipe_x.fill(x_prod, a_act, bt(A_BYTES, A_XM, 4096))
+    spp, cps = C.STRIPES_PER_PROJ, C.CORES_PER_STRIPE
+    pipe_x.fill(x_prod, a_act, bt(A_BYTES, A_XM, ELEM))
     for c in range(N_CORES):
         pipe_w.fill(w_prods[c], a_act, bt(A_BYTES, A_ROUT, CALL_BYTES))
         pipe_w.fill(w_prods[c], a_consts, bt(C_BYTES, C_SGW, CALL_BYTES))
-        pipe_w.fill(w_prods[c], a_act, bt(A_BYTES, A_RES + c * 1024, CALL_BYTES))
+        pipe_w.fill(w_prods[c], a_act, bt(A_BYTES, A_RES + c * ROWS_PC * 4, CALL_BYTES))
     for e in range(NX):
         for c in range(N_CORES):
             if e < NE:
-                up = (8 * e + 2 * (c // 2)) * STRIPE + (c % 2) * PAIR
+                up = (2 * spp * e + 2 * (c // cps)) * STRIPE + (c % cps) * PAIR
                 pipe_w.fill(w_prods[c], a_pool, half_tap(up))
                 pipe_w.fill(w_prods[c], a_pool, half_tap(up + STRIPE))
             else:
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_UP + c * HALF, HALF))
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_GATE + c * HALF, HALF))
-            pipe_y.drain(y_conss[c], a_act, bt(A_BYTES, A_HP + c * 256, 256))
-        pipe_y.finish(*y_conss)                           # the 8 hidden parts are in DDR
-        pipe_x.fill(x_prod, a_act, bt(A_BYTES, A_HP, 4096))
+            pipe_y.drain(y_conss[c], a_act, bt(A_BYTES, A_HP + c * HID_PC * 4, HID_PC * 4))
+        pipe_y.finish(*y_conss)                           # the hidden parts are in DDR
+        pipe_x.fill(x_prod, a_act, bt(A_BYTES, A_HP, ELEM))
         for c in range(N_CORES):
             if e < NE:
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_DOWN + e * UP_BYTES + c * DOWN_PER_CORE * DOWN_BAND,
@@ -202,19 +225,20 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_DOWN + c * DOWN_PER_CORE * DOWN_BAND,
                                                    DOWN_PER_CORE * DOWN_BAND))
     for c in range(N_CORES):
-        pipe_y.drain(y_conss[c], c_xres, bt(HID, c * 256, 256))   # the block output = the new residual
+        pipe_y.drain(y_conss[c], c_xres, bt(HID, c * ROWS_PC, ROWS_PC))   # the block output = the new residual
     pipe_w.finish()
     pipe_x.finish()
     pipe_y.finish()
 
 
 # ---- DeltaNet on the main cores (dnx.h): S slices ride the w stream, S' rows leave through y
-DN_ROWS, DN_SLICES, DN_HEADS_PC = 20, 7, 4
+DN_ROWS, DN_SLICES, DN_HEADS_PC = C.DN_ROWS, C.DN_SLICES, C.DN_HEADS_PC
 
 
 def dn_body(win, yout, B, K):
-    """This core's 4 heads: the record (copied out of its element: release() frees the OLDEST held
-    element), 7 slices (pass 1), delta, 7 slices x 40 half rows (pass 2, into y elements), o."""
+    """This core's heads: the record (copied out of its element: release() frees the OLDEST held
+    element), DN_SLICES slices (pass 1), delta, DN_SLICES slices x 2*DN_ROWS half rows (pass 2, into
+    y elements), o."""
     ds = B["ds"]
     for _ in range_(DN_HEADS_PC):
         re_ = win.acquire(1)
@@ -241,13 +265,14 @@ def dn_body(win, yout, B, K):
 def dn_sequence(pipe_w, pipe_y, a_state, a_act, w_prods, y_conss, A_BYTES, A_VEC, A_O, STATE_BYTES, STATE_S_OFF,
                 S_HEAD_BYTES):
     """Per core, per head: the record, S twice (pass 1, pass 2), S' back in place, o -> act[A_O]."""
+    rec, ohb = R.linear.RECORD_BYTES, R.linear.O_HEAD_BYTES
     for c in range(N_CORES):
         for h in range(DN_HEADS_PC):
             hd = c * DN_HEADS_PC + h
-            pipe_w.fill(w_prods[c], a_act, bt(A_BYTES, A_VEC + hd * 2048, CALL_BYTES))
+            pipe_w.fill(w_prods[c], a_act, bt(A_BYTES, A_VEC + hd * rec, CALL_BYTES))
             pipe_w.fill(w_prods[c], a_state, bt(STATE_BYTES, STATE_S_OFF + hd * S_HEAD_BYTES, S_HEAD_BYTES))
             pipe_y.drain(y_conss[c], a_state, bt(STATE_BYTES, STATE_S_OFF + hd * S_HEAD_BYTES, S_HEAD_BYTES))
-            pipe_y.drain(y_conss[c], a_act, bt(A_BYTES, A_O + hd * 512, 512))
+            pipe_y.drain(y_conss[c], a_act, bt(A_BYTES, A_O + hd * ohb, ohb))
             pipe_w.fill(w_prods[c], a_state, bt(STATE_BYTES, STATE_S_OFF + hd * S_HEAD_BYTES, S_HEAD_BYTES))
 
 
@@ -255,12 +280,12 @@ def dn_sequence(pipe_w, pipe_y, a_state, a_act, w_prods, y_conss, A_BYTES, A_VEC
 LN = HERE.parent / "ln"
 LINL = HERE.parent / "lin_layer"
 RT = HERE.parent / "router"
-W_ELEMS = HID * 256 * 2 // 4096       # router W as 256 elements of 4 KB
+W_ELEMS = C.W_ELEMS                   # router W as elements of 4 KB
 
 
 def ln_types():
-    return dict(u8_4k=np.ndarray[(4096,), np.dtype[np.uint8]], xb=np.ndarray[(HID,), np.dtype[bfloat16]],
-                racc=np.ndarray[(256,), np.dtype[np.float32]])
+    return dict(u8_4k=np.ndarray[(ELEM,), np.dtype[np.uint8]], xb=np.ndarray[(HID,), np.dtype[bfloat16]],
+                racc=np.ndarray[(SPEC.num_experts,), np.dtype[np.float32]])
 
 
 def ln_kernels(inc, t):
@@ -294,3 +319,8 @@ def ln_router_body(ain, aout, xs, acc, f_nr, f_ln, f_rc, f_ra, f_rf):
     o = aout.acquire(1)
     f_rf(acc, o)
     aout.release(1)
+
+
+def source_hash_inputs():
+    """The recipe sources, for the designs' srchash (a recipe change re-jits)."""
+    return sorted(f.read_bytes() for f in (HERE.parent.parent / "recipes").glob("*.py"))

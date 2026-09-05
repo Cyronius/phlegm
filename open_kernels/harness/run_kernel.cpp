@@ -338,7 +338,7 @@ struct Host {
             // The capacity is whatever the KV / ptab buffers were sized to (the
             // kernel only sees runtime-patched offsets); the ptab buffer is the
             // one declared in this program, so bound by it.
-            if (Buf* pt = bufs.count("ptab") ? &buf("ptab") : nullptr; pt && (pos + 1) * stream_patch::kAttnPtabRow > pt->size)
+            if (Buf* pt = bufs.count("ptab") ? &buf("ptab") : nullptr; pt && (pos + 1) * stream_patch::AttnGeometry{}.ptab_row > pt->size)
                 throw std::runtime_error("attnpos: pos " + std::to_string(pos) + " beyond the ptab buffer");
             auto t0 = std::chrono::steady_clock::now();
             Kernel& k = kernel(kn);

@@ -20,20 +20,41 @@
 
 #include "vecmath.h"
 
-static constexpr unsigned kNH = 16;
-static constexpr unsigned kKVH = 2;
-static constexpr unsigned kHD = 256;
+// Compile-time knobs (designs/layer_x/ax.py passes them from the ModelSpec; the defaults are
+// the point the kernel has been validated at -- recipes/catalogue.py's `attn` set).
+#ifndef ATTN_NH
+#define ATTN_NH 16
+#endif
+#ifndef ATTN_KVH
+#define ATTN_KVH 2
+#endif
+#ifndef ATTN_HD
+#define ATTN_HD 256
+#endif
+#ifndef ATTN_ROT
+#define ATTN_ROT 64
+#endif
+static constexpr unsigned kNH = ATTN_NH;
+static constexpr unsigned kKVH = ATTN_KVH;
+static constexpr unsigned kHD = ATTN_HD;
+static constexpr unsigned kRot = ATTN_ROT;    // rotated dims per head (half-split pairs (i, i + kRot/2))
 static constexpr unsigned kV = 32;
+static_assert(kHD % kV == 0 && kRot == 2 * kV && kNH % 2 == 0 && kNH % kKVH == 0,
+              "attn.h: HD a multiple of 32, rotary dim 64, an even head count divisible by the kv heads");
+
+static constexpr float kScale = kHD == 256 ? 0.0625f : kHD == 128 ? 0.08838834764831845f
+                                : kHD == 64 ? 0.125f : 0.0f;   // 1/sqrt(HD); a new HD adds its constant here
+static_assert(kScale > 0.0f, "attn.h: no 1/sqrt(HD) for this head dim");
 
 static inline void attn_meta_impl(const uint8_t *__restrict m0, const uint8_t *__restrict m1,
                                   bfloat16 *__restrict qn, bfloat16 *__restrict kn,
                                   float *__restrict cs, int32_t *__restrict pb) {
   const bfloat16 *q = (const bfloat16 *)m0;
   for (unsigned j = 0; j < kHD; j += kV) aie::store_v(qn + j, aie::load_v<kV>(q + j));
-  const bfloat16 *k = (const bfloat16 *)(m0 + 512);
+  const bfloat16 *k = (const bfloat16 *)(m0 + kHD * 2);
   for (unsigned j = 0; j < kHD; j += kV) aie::store_v(kn + j, aie::load_v<kV>(k + j));
   const float *c = (const float *)(m1 + 512);
-  for (unsigned j = 0; j < 64; j += kV) aie::store_v(cs + j, aie::load_v<kV>(c + j));
+  for (unsigned j = 0; j < kRot; j += kV) aie::store_v(cs + j, aie::load_v<kV>(c + j));
   const int32_t *p = (const int32_t *)m1;
   pb[0] = p[0];
   pb[1] = p[1];
@@ -62,13 +83,13 @@ __attribute__((noinline)) inline void norm_rope(const float *__restrict x, const
     u = mac_vv(u, t.template to_vector<float>(), aie::load_v<kV>(w + j));
     aie::store_v(dst + j, u.template to_vector<float>());
   }
-  // rope on dims [0,64): a = dst[0..32), b = dst[32..64)
+  // rope on dims [0, kRot): a = dst[0..kRot/2), b = dst[kRot/2..kRot)
   const v32f c = aie::load_v<kV>(cs);
-  const v32f s = aie::load_v<kV>(cs + 32);
+  const v32f s = aie::load_v<kV>(cs + kRot / 2);
   const v32f a = aie::load_v<kV>(dst);
-  const v32f b = aie::load_v<kV>(dst + 32);
+  const v32f b = aie::load_v<kV>(dst + kRot / 2);
   aie::store_v(dst, fsub32(fmul32(a, c), fmul32(b, s)));
-  aie::store_v(dst + 32, fadd32(fmul32(b, c), fmul32(a, s)));
+  aie::store_v(dst + kRot / 2, fadd32(fmul32(b, c), fmul32(a, s)));
 }
 
 static inline void to_bf16_256(const float *__restrict src, bfloat16 *__restrict dst) {
@@ -116,7 +137,7 @@ __attribute__((noinline)) inline void attn_row_impl(const bfloat16 *__restrict K
     accf32 d = aie::zeros<accfloat, kV>();
     for (unsigned j = 0; j < kHD; j += kV)
       d = mac_vv(d, aie::load_v<kV>(q + j), aie::load_v<kV>(k + j));
-    const float s = aie::reduce_add(d.template to_vector<float>()) * 0.0625f;   // / sqrt(256)
+    const float s = aie::reduce_add(d.template to_vector<float>()) * kScale;   // / sqrt(HD)
     const float m_old = ml[h];
     const float m_new = (s > m_old) ? s : m_old;
     const float a = sexp(m_old - m_new);

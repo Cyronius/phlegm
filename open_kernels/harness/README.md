@@ -34,7 +34,9 @@ attnpos   <kernel> <pos>             # KV window length, new-row offset, RoPE re
 An mlir-aie stream is a sequence of ops; op `0x81` is a DDR patch naming a
 register, a buffer arg and a byte offset, so re-pointing a DMA is one word plus
 an instruction-BO sync (~0.04 ms per layer). See `../model/` for the decode
-program that uses them.
+program that uses them. The pool geometry the patch tables are decoded
+against (`stream_patch::MoeGeometry` / `AttnGeometry`) defaults to the
+Qwen3.6-27B's here; the engine passes its manifest's.
 
 ## Build
 
