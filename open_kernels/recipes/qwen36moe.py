@@ -550,6 +550,7 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
         "chunk_bytes": CHUNK, "pool_bytes": L.POOL_BYTES,
         "lmhead_pool_bytes": L.LMHEAD_POOL_BYTES, "lmhead_chunk_bytes": Q8_CHUNK,
         "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim, "rope_theta": spec.rope_theta,
+        "rope_inv_freq": spec.rope_inv_freq(),
         "rout_idx_off": ROUT_IDX_OFF,
         "moe": {"experts": spec.num_experts, "topk": spec.experts_per_tok,
                 "stripe": C.STRIPE, "up_bytes": C.UP_BYTES, "down_core": C.DOWN_PER_CORE * C.DOWN_BAND,
@@ -575,13 +576,14 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
 
 
 # the design sources a build of this recipe depends on (for the build key), relative to open_kernels/
+GEN_KERNELS = "designs/layer_x/gen_kernels.py"      # the design's kernel-TU generator (export_qwen36_kernels.py runs it per spec)
 KERNEL_SOURCES = [
     "designs/layer_x/*.py", "designs/layer_x/*.cc", "designs/layer_x/*.h",
     "designs/gemv_q4/gemv_q4.h", "designs/gemv_q4/gemv_tab.h", "designs/gemv_q4/gemv_q4_prep_k2048.cc",
     "designs/attn/*.cc", "designs/attn/*.h",
     "designs/dn_glue/*.cc", "designs/dn_glue/*.h", "designs/dn_post/*.cc",
     "designs/router/*.cc", "designs/router/*.h",
-    "designs/ln/ln.cc", "designs/ln/ln.py", "designs/lin_layer/ln_nr.cc",
+    "designs/ln/ln.h", "designs/ln/*.cc", "designs/ln/ln.py", "designs/lin_layer/ln_nr.cc",
     "designs/lm_head_q8/*.py", "designs/lm_head_q8/*.cc", "designs/lm_head_q8/*.h",
     "include/vecmath.h", "ironutil.py", "build_design.py",
 ]

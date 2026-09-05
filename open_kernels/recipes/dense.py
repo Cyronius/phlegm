@@ -1,8 +1,13 @@
-"""The Qwen3 dense recipe: ModelSpec -> everything designs/dense/dx.py, the
-packers and the driver need for a GQA + silu-FFN decoder layer.
+"""The dense recipe (Qwen3 dense, Llama 3): ModelSpec -> everything
+designs/dense/dx.py, the packers and the driver need for a GQA + silu-FFN
+decoder layer.
 
-    ln -> gemv q | k | v -> attention (q/k RMSNorm, full RoPE, no gate) -> gemv o
+    ln -> gemv q | k | v -> attention ([q/k RMSNorm,] RoPE, no gate) -> gemv o
        -> ln (+residual) -> gemv up | gate -> silu(gate) * up -> gemv down -> +residual
+
+The family differences are spec fields: Qwen3 has q/k RMSNorm and eps 1e-6;
+Llama 3 has no q/k norms, eps 1e-5 and the llama3 RoPE frequency scaling
+(host side: the position table takes the spec's inverse frequencies).
 
 One xclbin, ONE instruction stream per layer (no routing read, so no part
 split). Same 8 main cores as the MoE designs (w / x / y streams), the ln
@@ -21,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .catalogue import LIMITS, OpRangeError, check_buffer_args, require
-from .qwen36moe import BAND_ROWS, CHUNK, ELEM, MB, PER_CALL, CALL_BYTES, band_bytes, q4_bytes, q4_chunks, roundup, tab_bytes
+from .qwen36moe import BAND_ROWS, CHUNK, ELEM, MB, band_bytes, q4_bytes, q4_chunks, roundup, tab_bytes
 from .spec import DENSE, ModelSpec
 
 
@@ -45,7 +50,9 @@ class DenseLayout:
 
 @dataclass(frozen=True)
 class DenseGeometry:
-    N_CORES: int; HID: int; FF: int; NH: int; KVH: int; HD: int; ROT: int; GATE: bool
+    N_CORES: int; HID: int; FF: int; NH: int; KVH: int; HD: int; ROT: int; GATE: bool; QKNORM: bool
+    EPS: float
+    PER_CALL: int; CALL_BYTES: int                                  # chunks per weight element (1 when the table is wide)
     QW: int; KVW: int
     Q_PC: int; KV_PC: int; O_PC: int; UP_PC: int; DOWN_PC: int      # bands per core
     XN_ELEMS: int; XN_BLOCKS: int; OG_ELEMS: int; OG_BLOCKS: int    # x-stream elements / 32-blocks of the activations
@@ -66,12 +73,14 @@ class DenseRecipe:
 
 def _check(spec: ModelSpec) -> None:
     n = LIMITS["n_cols"]
-    if spec.family != "qwen3":
-        raise OpRangeError(f"qwen3 recipe given a {spec.family!r} spec")
+    if spec.family not in ("qwen3", "llama3"):
+        raise OpRangeError(f"dense recipe given a {spec.family!r} spec")
     if spec.quant != "q4_1":
-        raise OpRangeError(f"qwen3: quant={spec.quant!r}; the gemv_q4 template reads q4_1 chunks only")
+        raise OpRangeError(f"dense: quant={spec.quant!r}; the gemv_q4 template reads q4_1 chunks only")
     if not spec.has_dense or spec.has_linear or spec.has_full or spec.intermediate == 0:
-        raise OpRangeError("qwen3: every layer must be a dense layer with an FFN")
+        raise OpRangeError("dense: every layer must be a dense layer with an FFN")
+    if spec.attn_gate:
+        raise OpRangeError("dense: the attention gate is a MoE-family feature; dx.py has no gate elements")
     for what, v in (("hidden", spec.hidden), ("intermediate", spec.intermediate), ("q width", spec.attn_q_width),
                     ("kv width", spec.attn_kv_width)):
         if v % (BAND_ROWS * n):
@@ -83,11 +92,27 @@ def _check(spec: ModelSpec) -> None:
     require("ln", width=spec.hidden)
     require("attn", head_dim=spec.head_dim, num_heads=spec.num_heads, num_kv_heads=spec.num_kv_heads,
             rotary_dim=spec.rotary_dim, rope_theta=spec.rope_theta, qk_norm=spec.qk_norm, attn_gate=spec.attn_gate)
-    require("gemv_q4", K=spec.hidden, rs=2, rows_per_core=spec.attn_q_width // n, per_call=PER_CALL)
-    require("gemv_q4", K=spec.attn_q_width, rs=2, rows_per_core=spec.hidden // n, per_call=PER_CALL)
-    require("gemv_q4", K=spec.hidden, rs=2, rows_per_core=spec.intermediate // n, per_call=PER_CALL)
-    require("gemv_q4", K=spec.intermediate, rs=2, rows_per_core=spec.hidden // n, per_call=PER_CALL)
+    pc = per_call(spec)
+    require("gemv_q4", K=spec.hidden, rs=2, rows_per_core=spec.attn_q_width // n, per_call=pc)
+    require("gemv_q4", K=spec.attn_q_width, rs=2, rows_per_core=spec.hidden // n, per_call=pc)
+    require("gemv_q4", K=spec.hidden, rs=2, rows_per_core=spec.intermediate // n, per_call=pc)
+    require("gemv_q4", K=spec.intermediate, rs=2, rows_per_core=spec.hidden // n, per_call=pc)
     require("lm_head_q4", K=spec.hidden, vocab=spec.vocab)
+
+
+L1_BUDGET = 60 * 1024      # a main core's 64 KB data memory less IRON's own bookkeeping
+STACK = 0x1800
+
+
+def per_call(spec: ModelSpec) -> int:
+    """Chunks per weight element: 2 (10 KB, as the MoE designs) unless the widest activation table
+    leaves no room for two of them beside the x elements -- then 1 (Llama 3 8B: K = 14336 -> 32 KB)."""
+    wide = max(spec.hidden, spec.attn_q_width, spec.intermediate)
+    for pc in (2, 1):
+        l1 = tab_bytes(wide) + 2 * pc * CHUNK + 2 * ELEM + 2 * BAND_ROWS * 4 + 2 * BAND_ROWS * 4 + STACK
+        if l1 <= L1_BUDGET:
+            return pc
+    raise OpRangeError(f"dense: a {wide}-wide activation table does not leave room for the streams in a core's L1")
 
 
 def geometry(spec: ModelSpec) -> DenseGeometry:
@@ -98,8 +123,10 @@ def geometry(spec: ModelSpec) -> DenseGeometry:
     hpe = e_a // (hd * 4)                     # q/k/v heads (f32) per ain element = KVH/2
     hpo = e_a // (hd * 2)                     # og heads (bf16) per aout element = KVH
     wide = max(hid, qw, ff)
+    pc = per_call(spec)
     return DenseGeometry(
         N_CORES=n, HID=hid, FF=ff, NH=nh, KVH=kvh, HD=hd, ROT=spec.rotary_dim, GATE=spec.attn_gate,
+        QKNORM=spec.qk_norm, EPS=spec.norm_eps, PER_CALL=pc, CALL_BYTES=pc * CHUNK,
         QW=qw, KVW=kvw,
         Q_PC=qw // BAND_ROWS // n, KV_PC=kvw // BAND_ROWS // n, O_PC=hid // BAND_ROWS // n,
         UP_PC=ff // BAND_ROWS // n, DOWN_PC=hid // BAND_ROWS // n,
@@ -119,7 +146,7 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> DenseLayout:
     G = geometry(spec)
     eln, e_a = hid * 2, G.KVW * 2
     if 2 * G.HD * 2 > e_a or 512 + 4 * spec.rotary_dim > max(1024, e_a):
-        raise OpRangeError("qwen3: qn | kn or the RoPE record do not fit the attention element")
+        raise OpRangeError("dense: qn | kn or the RoPE record do not fit the attention element")
     # consts
     c = {"lnw": 0, "postln": eln, "meta": 2 * eln}
     cd_bytes = roundup(2 * eln + e_a, ELEM)
@@ -180,9 +207,10 @@ def pack_plan(spec: ModelSpec) -> dict:
             "consts": [
                 {"op": "put", "tensor": pre + "input_layernorm.weight", "dst": L.CD_LNW, "cap": L.ELN},
                 {"op": "put", "tensor": pre + "post_attention_layernorm.weight", "dst": L.CD_POSTLN, "cap": L.ELN},
+            ] + ([
                 {"op": "put", "tensor": pre + "self_attn.q_norm.weight", "dst": L.CD_META, "cap": G.HD * 2},
                 {"op": "put", "tensor": pre + "self_attn.k_norm.weight", "dst": L.CD_META + G.HD * 2, "cap": G.HD * 2},
-            ],
+            ] if spec.qk_norm else []),
         }},
         "lm_head": {"pool_bytes": L.LMHEAD_POOL_BYTES,
                     "ops": [{"op": "std_perm", "tensor": "lm_head.weight", "dst": 0, "nch": q4_chunks(spec.vocab, hid), "in_dim": hid}]},
@@ -215,8 +243,8 @@ def programs(spec: ModelSpec) -> dict:
 def builds(spec: ModelSpec) -> dict[str, dict]:
     n = LIMITS["n_cols"]
     return {
-        "dx": {"design": "dense/dx.py", "build_dir": f"dense/build_h{spec.hidden}", "env": {}},
-        "ln": {"design": "ln/ln.py", "build_dir": f"ln/build_{spec.hidden}", "env": {"LN_N": str(spec.hidden)}},
+        "dx": {"design": "dense/dx.py", "build_dir": f"dense/build_{spec.family}_h{spec.hidden}", "env": {}},
+        "ln": {"design": "ln/ln.py", "build_dir": f"ln/build_{spec.hidden}_{spec.norm_eps:g}", "env": {"LN_N": str(spec.hidden), "LN_EPS": f"{spec.norm_eps:g}"}},
         "lm_head_q4": {"design": "lm_head_q4/lm_head_q4.py", "build_dir": f"lm_head_q4/build_{spec.vocab}",
                        "env": {"LMHEAD_N": str(spec.vocab), "LMHEAD_K": str(spec.hidden), "LMHEAD_CORES": str(n)}},
     }
@@ -226,21 +254,26 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
     L = layout(spec, max_ctx)
     return {"hidden": spec.hidden, "vocab": spec.vocab, "real_vocab": spec.real_vocab,
             "chunk_bytes": CHUNK, "pool_bytes": L.POOL_BYTES, "lmhead_pool_bytes": L.LMHEAD_POOL_BYTES,
-            "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim, "rope_theta": spec.rope_theta}
+            "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim, "rope_theta": spec.rope_theta,
+            "rope_inv_freq": spec.rope_inv_freq()}
 
 
 def hf_config_check(spec: ModelSpec) -> dict:
-    return {"hidden_size": spec.hidden, "num_hidden_layers": spec.num_layers, "vocab_size": spec.vocab,
-            "num_attention_heads": spec.num_heads, "num_key_value_heads": spec.num_kv_heads, "head_dim": spec.head_dim,
-            "intermediate_size": spec.intermediate}
+    d = {"hidden_size": spec.hidden, "num_hidden_layers": spec.num_layers, "vocab_size": spec.vocab,
+         "num_attention_heads": spec.num_heads, "num_key_value_heads": spec.num_kv_heads,
+         "intermediate_size": spec.intermediate}
+    if spec.family == "qwen3":
+        d["head_dim"] = spec.head_dim          # Llama configs may omit it (hidden / heads)
+    return d
 
 
+GEN_KERNELS = "designs/dense/gen_kernels.py"      # the design's kernel-TU generator (export_qwen36_kernels.py runs it per spec)
 KERNEL_SOURCES = [
     "designs/dense/*.py", "designs/dense/*.cc", "designs/dense/*.h",
     "designs/gemv_q4/gemv_q4.h", "designs/gemv_q4/gemv_tab.h", "designs/gemv_q4/gemv_q4_prep_rt.cc",
     "designs/gemv_q4/gemv_q4_prep_f32_rt.cc",
     "designs/attn/*.cc", "designs/attn/*.h",
-    "designs/ln/ln.cc", "designs/ln/ln.py", "designs/lin_layer/ln_nr.cc",
+    "designs/ln/ln.h", "designs/ln/*.cc", "designs/ln/ln.py", "designs/lin_layer/ln_nr.cc",
     "designs/lm_head_q4/*.py", "designs/lm_head_q4/*.cc",
     "include/vecmath.h", "ironutil.py", "build_design.py",
 ]

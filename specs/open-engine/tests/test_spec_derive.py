@@ -62,8 +62,8 @@ def test_gguf_metadata_gives_the_same_hyperparameters():
 
 
 def test_unknown_family_names_the_key():
-    with pytest.raises(SpecError, match="model_type 'llama'"):
-        ModelSpec.from_hf_config(dict(HF_QWEN36, model_type="llama"))
+    with pytest.raises(SpecError, match="model_type 'gemma3'"):
+        ModelSpec.from_hf_config(dict(HF_QWEN36, model_type="gemma3"))
     with pytest.raises(SpecError, match="general.architecture 'gemma3'"):
         ModelSpec.from_gguf_metadata({"general.architecture": "gemma3"})
 

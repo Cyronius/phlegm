@@ -147,17 +147,21 @@ def build_lmhead_pool(plan: dict, m) -> np.ndarray:
     return out
 
 
-def ptab(rows: int, rotary_dim: int, theta: float, ptab_row: int = 1024) -> np.ndarray:
+def ptab(rows: int, rotary_dim: int, theta: float, ptab_row: int = 1024, inv_freq=None) -> np.ndarray:
     """The position record table: row p = [i32 pos | i32 nf = max(p, 1) | cos f32[rot/2] @512 | sin f32[rot/2]
     right after the cos, @512 + 2*rot] for the RoPE over the first `rotary_dim` dims of a head (half-split
-    pairs (i, i + rot/2)); attn.h reads the rot floats at +512 as [cos | sin]."""
+    pairs (i, i + rot/2)); attn.h reads the rot floats at +512 as [cos | sin]. `inv_freq` (rot/2 values,
+    ModelSpec.rope_inv_freq -- Llama 3's scaling lives there) defaults to theta^(-2i/rot)."""
     half = rotary_dim // 2
     if 512 + 8 * half > ptab_row:
         raise ValueError(f"a rotary dim of {rotary_dim} does not fit a {ptab_row}-byte position record")
     t = np.zeros((rows, ptab_row), np.uint8)
     p = np.arange(rows)
     t[:, :8] = np.stack([p, np.maximum(p, 1)], 1).astype(np.int32).view(np.uint8)
-    ang = p[:, None] * (theta ** (-np.arange(half) / half))[None, :]
+    f = np.asarray(inv_freq, np.float64) if inv_freq is not None else theta ** (-np.arange(half) / half)
+    if len(f) != half:
+        raise ValueError(f"inv_freq has {len(f)} values, the rotary dim wants {half}")
+    ang = p[:, None] * f[None, :]
     t[:, 512:512 + 4 * half] = np.cos(ang).astype(np.float32).view(np.uint8)
     t[:, 512 + 4 * half:512 + 8 * half] = np.sin(ang).astype(np.float32).view(np.uint8)
     return t.reshape(-1)

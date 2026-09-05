@@ -163,7 +163,7 @@ def main() -> int:
     types = list(spec.layer_types[:nl])
     q = Q4NX(md / "model.q4nx")
     q.hidden = spec.hidden
-    tok0 = a.token if a.token is not None else (248045 if spec.family == "qwen36moe" else 151644)
+    tok0 = a.token if a.token is not None else {"qwen36moe": 248045, "qwen3": 151644, "llama3": 128000}[spec.family]
     print(f"{md.name} ({spec.family}): {spec.num_layers} layers -> running {nl}: {types}")
 
     if not a.cfg_only:
@@ -172,7 +172,7 @@ def main() -> int:
             st = d["buffers"]["state"]
             if st["kind"] == "linear":
                 write(out / f"zstate_{lt}.bin", np.zeros(st["bytes"], np.uint8))
-        write(out / "ptab.bin", PK.ptab(a.max_ctx, spec.rotary_dim, spec.rope_theta, lay["ptab_row"]))
+        write(out / "ptab.bin", PK.ptab(a.max_ctx, spec.rotary_dim, spec.rope_theta, lay["ptab_row"], spec.rope_inv_freq()))
         write(out / "normw.bin", f32_to_bf16(q.bf16(plan["norm"]["tensor"])))
         for l, lt in enumerate(types):
             pf = pool_dir / f"pool_L{l}.bin"

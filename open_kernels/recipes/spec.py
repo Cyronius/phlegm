@@ -25,7 +25,7 @@ class SpecError(ValueError):
 
 @dataclass(frozen=True)
 class ModelSpec:
-    family: str                       # the recipe: "qwen36moe" | "qwen3"
+    family: str                       # the recipe: "qwen36moe" | "qwen3" | "llama3"
     hidden: int
     num_layers: int
     layer_types: tuple[str, ...]      # per layer: LINEAR | FULL | DENSE
@@ -37,6 +37,7 @@ class ModelSpec:
     head_dim: int
     rotary_dim: int                   # partial RoPE: rotated dims per head
     rope_theta: float
+    rope_scaling: dict | None = None  # Llama 3: {"factor", "low_freq_factor", "high_freq_factor", "original_max_position_embeddings"}
     qk_norm: bool = True
     attn_gate: bool = True            # sigmoid output gate (a second q-width projection)
     # linear attention (Gated DeltaNet); zeros for a family without it
@@ -85,6 +86,56 @@ class ModelSpec:
     @property
     def has_dense(self) -> bool:
         return DENSE in self.layer_types
+
+    def rope_inv_freq(self) -> list[float]:
+        """The inverse frequency of each rotary pair i < rotary_dim/2: theta^(-2i/rot), with Llama 3's
+        wavelength-dependent scaling when `rope_scaling` says so (HF _compute_llama3_parameters)."""
+        import math
+        half = self.rotary_dim // 2
+        inv = [self.rope_theta ** (-i / half) for i in range(half)]
+        sc = self.rope_scaling
+        if sc:
+            factor = float(sc["factor"])
+            lo, hi = float(sc["low_freq_factor"]), float(sc["high_freq_factor"])
+            old = float(sc["original_max_position_embeddings"])
+            low_wl, high_wl = old / lo, old / hi
+            out = []
+            for f in inv:
+                wl = 2 * math.pi / f
+                if wl < high_wl:
+                    out.append(f)
+                elif wl > low_wl:
+                    out.append(f / factor)
+                else:
+                    smooth = (old / wl - lo) / (hi - lo)
+                    out.append((1 - smooth) * f / factor + smooth * f)
+            inv = out
+        return inv
+
+    def rope_inv_freq(self) -> list[float]:
+        """The inverse frequency of each rotary pair i < rotary_dim/2: theta^(-2i/rot), with Llama 3's
+        wavelength-dependent scaling when `rope_scaling` says so (HF _compute_llama3_parameters)."""
+        import math
+        half = self.rotary_dim // 2
+        inv = [self.rope_theta ** (-i / half) for i in range(half)]
+        sc = self.rope_scaling
+        if sc:
+            factor = float(sc["factor"])
+            lo, hi = float(sc["low_freq_factor"]), float(sc["high_freq_factor"])
+            old = float(sc["original_max_position_embeddings"])
+            low_wl, high_wl = old / lo, old / hi
+            out = []
+            for f in inv:
+                wl = 2 * math.pi / f
+                if wl < high_wl:
+                    out.append(f)
+                elif wl > low_wl:
+                    out.append(f / factor)
+                else:
+                    smooth = (old / wl - lo) / (hi - lo)
+                    out.append((1 - smooth) * f / factor + smooth * f)
+            inv = out
+        return inv
 
     # ---- serialisation
     def to_dict(self) -> dict:
@@ -316,9 +367,89 @@ def _qwen3_gguf(md: Mapping[str, Any]) -> ModelSpec:
     )
 
 
-HF_FAMILIES = {"qwen3_5_moe": _qwen36moe_hf, "qwen3_next": _qwen36moe_hf, "qwen3": _qwen3_hf}
-GGUF_FAMILIES = {"qwen35moe": _qwen36moe_gguf, "qwen3next": _qwen36moe_gguf, "qwen3": _qwen3_gguf}
-_FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen3_hf: "qwen3", _qwen3_gguf: "qwen3"}
+def _llama3_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+    """Llama 3: GQA without q/k norms, full RoPE with the llama3 frequency scaling, no gate, silu FFN."""
+    n = _need(cfg, "num_hidden_layers")
+    heads = _need(cfg, "num_attention_heads")
+    hd = cfg.get("head_dim") or _need(cfg, "hidden_size") // heads
+    vocab = _need(cfg, "vocab_size")
+    sc = cfg.get("rope_scaling")
+    scaling = None
+    if sc:
+        if sc.get("rope_type", sc.get("type")) != "llama3":
+            raise SpecError(f"llama: rope_scaling type {sc.get('rope_type', sc.get('type'))!r} is not supported (llama3 only)")
+        scaling = {k: sc[k] for k in ("factor", "low_freq_factor", "high_freq_factor", "original_max_position_embeddings")}
+    if cfg.get("tie_word_embeddings"):
+        raise SpecError("llama: tied embeddings are not supported (the head must be its own q4 tensor)")
+    return ModelSpec(
+        family="llama3",
+        hidden=_need(cfg, "hidden_size"),
+        num_layers=n,
+        layer_types=tuple([DENSE] * n),
+        vocab=vocab,
+        real_vocab=real_vocab if real_vocab is not None else vocab,
+        num_heads=heads,
+        num_kv_heads=_need(cfg, "num_key_value_heads"),
+        head_dim=hd,
+        rotary_dim=hd,
+        rope_theta=float(_need(cfg, "rope_theta")),
+        rope_scaling=scaling,
+        qk_norm=False,
+        attn_gate=False,
+        intermediate=_need(cfg, "intermediate_size"),
+        norm_eps=float(cfg.get("rms_norm_eps", 1e-5)),
+        quant="q4_1",
+        extra={"model_type": cfg["model_type"], "source": "hf_config"},
+    )
+
+
+def _llama3_gguf(md: Mapping[str, Any]) -> ModelSpec:
+    a = md["general.architecture"]
+
+    def k(name: str):
+        return _need(md, f"{a}.{name}", "GGUF metadata")
+
+    n = k("block_count")
+    heads = k("attention.head_count")
+    hd = md.get(f"{a}.attention.key_length", k("embedding_length") // heads)
+    vocab = md.get(f"{a}.vocab_size")
+    if vocab is None:
+        toks = md.get("tokenizer.ggml.tokens")
+        if toks is None:
+            raise SpecError(f"GGUF metadata lacks '{a}.vocab_size' and 'tokenizer.ggml.tokens'")
+        vocab = len(toks)
+    scaling = None
+    if md.get(f"{a}.rope.scaling.type") == "llama3" or f"{a}.rope.scaling.factor" in md:
+        scaling = {"factor": md[f"{a}.rope.scaling.factor"],
+                   "low_freq_factor": md.get(f"{a}.rope.scaling.low_freq_factor", 1.0),
+                   "high_freq_factor": md.get(f"{a}.rope.scaling.high_freq_factor", 4.0),
+                   "original_max_position_embeddings": md.get(f"{a}.rope.scaling.original_context_length", 8192)}
+    return ModelSpec(
+        family="llama3",
+        hidden=k("embedding_length"),
+        num_layers=n,
+        layer_types=tuple([DENSE] * n),
+        vocab=vocab,
+        real_vocab=vocab,
+        num_heads=heads,
+        num_kv_heads=k("attention.head_count_kv"),
+        head_dim=hd,
+        rotary_dim=md.get(f"{a}.rope.dimension_count", hd),
+        rope_theta=float(k("rope.freq_base")),
+        rope_scaling=scaling,
+        qk_norm=False,
+        attn_gate=False,
+        intermediate=k("feed_forward_length"),
+        norm_eps=float(md.get(f"{a}.attention.layer_norm_rms_epsilon", 1e-5)),
+        quant="q4_1",
+        extra={"architecture": a, "source": "gguf"},
+    )
+
+
+HF_FAMILIES = {"qwen3_5_moe": _qwen36moe_hf, "qwen3_next": _qwen36moe_hf, "qwen3": _qwen3_hf, "llama": _llama3_hf}
+GGUF_FAMILIES = {"qwen35moe": _qwen36moe_gguf, "qwen3next": _qwen36moe_gguf, "qwen3": _qwen3_gguf, "llama": _llama3_gguf}
+_FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen3_hf: "qwen3", _qwen3_gguf: "qwen3",
+              _llama3_hf: "llama3", _llama3_gguf: "llama3"}
 
 
 def hf_model_types(family: str) -> list[str]:

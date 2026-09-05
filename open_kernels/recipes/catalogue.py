@@ -85,11 +85,11 @@ class Template:
 
 CATALOGUE: dict[str, Template] = {t.name: t for t in [
     Template("gemv_q4", "designs/gemv_q4/gemv_q4.h",
-             {"K": values(2048, 4096, 2560, 9728),   # 2048 / 4096: the 27B layers; 2560 / 9728: the Qwen3-4B
-                                                     # dense layer (OPEN-FAMILY-QWEN3, 2026-09-05)
+             {"K": values(2048, 4096, 2560, 9728, 14336),   # 2048 / 4096: the 27B layers; 2560 / 9728: Qwen3-4B;
+                                                            # 14336: Llama 3.1 8B (OPEN-FAMILY-QWEN3 / -LLAMA3)
               "rs": values(2, 4),                # band row split: standard layout / expert stripes
               "rows_per_core": multiple_of(64),  # one y element per 64-row band
-              "per_call": values(2)},            # chunks per w element (10 KB)
+              "per_call": values(2, 1)},         # chunks per w element (10 KB; 5 KB when the table is wide)
              note="a new K needs gemv_q4/make_test.py + compare.py at that K first"),
     Template("gemv_q4_prep_f32", "designs/gemv_q4/gemv_tab.h",
              {"K": values(512)},                 # the expert hidden h (moe_experts' law)
@@ -97,14 +97,14 @@ CATALOGUE: dict[str, Template] = {t.name: t for t in [
     Template("attn", "designs/attn/attn.h",
              {"head_dim": values(256, 128), "num_heads": values(16, 32), "num_kv_heads": values(2, 8),
               "rotary_dim": values(64, 128), "rope_theta": any_positive(),
-              "qk_norm": values(True), "attn_gate": values(True, False)},
-             note="ATTN_* are compile-time macros; compared at (256, 16, 2, 64, gate) on the 27B and "
-                  "(128, 32, 8, 128, no gate) on Qwen3-4B"),
+              "qk_norm": values(True, False), "attn_gate": values(True, False)},
+             note="ATTN_* are compile-time macros; compared at (256, 16, 2, 64, gate, qk-norm) on the 27B, "
+                  "(128, 32, 8, 128, no gate, qk-norm) on Qwen3-4B and (128, 32, 8, 128, no gate, no qk-norm) on Llama 3.1 8B"),
     Template("deltanet", "designs/layer_x/dnx.h",
              {"heads": values(32), "dim": values(128), "key_heads": values(16), "conv_kernel": values(4)},
              note="Qwen3-Next / 3.5 / 3.6 families only"),
     Template("ln", "designs/ln/ln.cc",
-             {"width": values(2048, 2560)}),      # LN_N; 2560 checked standalone (ln/make_test.py) and in the dense layer
+             {"width": values(2048, 2560, 4096)}),   # LN_N; 2560 / 4096 in the dense layers (4096: the split-output entries)
     Template("router", "designs/router/router.h",
              {"experts": values(256), "topk": values(8)}),
     Template("moe", "designs/layer_x/moe_*.cc",
@@ -113,7 +113,7 @@ CATALOGUE: dict[str, Template] = {t.name: t for t in [
     Template("lm_head_q8", "designs/lm_head_q8/lm_head_q8.h",
              {"K": values(2048), "vocab": multiple_of(128)}),
     Template("lm_head_q4", "designs/lm_head_q4/lm_head_q4.py",
-             {"K": values(2560), "vocab": multiple_of(64)},
+             {"K": values(2560, 4096), "vocab": multiple_of(64)},
              note="the q4 head is the gemv_q4 kernel with lm_head_q8's uneven band split; validated per K"),
 ]}
 

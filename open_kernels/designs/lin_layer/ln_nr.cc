@@ -9,6 +9,9 @@
 #ifndef LN_N
 #define LN_N 2048
 #endif
+#ifndef LN_EPS
+#define LN_EPS 1e-6f
+#endif
 static constexpr unsigned kN = LN_N;
 static constexpr unsigned kHalf = LN_N / 2;
 static constexpr unsigned kV = 32;
@@ -29,7 +32,7 @@ void ln_nr(const float *__restrict x0, const float *__restrict x1, const bfloat1
     ss = aie::mac(ss, h, l);
     ss = aie::mac(ss, h, l);
   }
-  const float inv = srsqrt(aie::reduce_add(ss.template to_vector<float>()) * (1.0f / kN) + 1e-6f);
+  const float inv = srsqrt(aie::reduce_add(ss.template to_vector<float>()) * (1.0f / kN) + LN_EPS);
   const bfloat16 ih = (bfloat16)inv;
   const bfloat16 il = (bfloat16)(inv - (float)ih);
 #pragma clang loop unroll(disable)

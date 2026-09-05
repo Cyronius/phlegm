@@ -208,9 +208,9 @@ def main() -> int:
     # ---- the whole-layer designs' kernel TUs for this spec, then the builds
     if not a.no_build:
         os.environ["OPEN_KERNELS_SPEC"] = str(spec_file)
-        gen_dir = DESIGNS / ("dense" if spec.family == "qwen3" else "layer_x")
+        gen_dir = HERE / F.GEN_KERNELS
         import importlib.util
-        gspec = importlib.util.spec_from_file_location("gen_kernels", gen_dir / "gen_kernels.py")
+        gspec = importlib.util.spec_from_file_location("gen_kernels", gen_dir)
         gen = importlib.util.module_from_spec(gspec)
         gspec.loader.exec_module(gen)
         gen.generate(F.recipe(spec))

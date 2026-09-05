@@ -2,7 +2,7 @@
 
     python gen_kernels.py            # for OPEN_KERNELS_SPEC (a qwen3 spec)
 
-The GEMV band entry (gemv_q4_gy) is shared with designs/layer_x. Here: the up /
+The GEMV band entry (gemv_q4_gy) is generated here with the recipe's chunks-per-element. Also: the up /
 gate band into the silu scratch, silu(gate) * up for one 64-row band, and the
 activation-table preps that take the ELEMENT index (the core loops over 4 KB
 elements; the kernel derives the block range, so no arithmetic on loop indices
@@ -16,16 +16,23 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))          # open_kernels/
 from recipes.load import current_spec  # noqa: E402
-from recipes import qwen3 as QR  # noqa: E402
-from recipes.qwen36moe import PER_CALL  # noqa: E402
+from recipes import dense as QR  # noqa: E402
 
 
 def files(R) -> dict[str, str]:
     G = R.geo
-    hdr = f'''#define GEMV_PER_CALL {PER_CALL}
+    hdr = f'''#define GEMV_PER_CALL {G.PER_CALL}
 #include "gemv_q4.h"
 '''
     return {
+        "gemv_q4_gy.cc": hdr + '''// A band into its y element: runtime band law (per_band chunks, row split rs).
+extern "C" {
+void gemv_q4_gy(const uint8_t *__restrict t, const uint8_t *__restrict tab, float *__restrict y,
+                int32_t group, int32_t per_band, int32_t rs) {
+  gemv_q4_pool_group_rt(t, tab, (unsigned)group, y, (unsigned)per_band, (unsigned)rs);
+}
+}
+''',
         "gemv_q4_gms.cc": hdr + f'''// A 64-row band into the silu scratch at ms + dst (the up band at {G.MS_U}, the gate band at {G.MS_G}).
 extern "C" {{
 void gemv_q4_gms(const uint8_t *__restrict t, const uint8_t *__restrict tab, float *__restrict ms,

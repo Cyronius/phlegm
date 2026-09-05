@@ -1,4 +1,4 @@
-# open-engine: the open engine (Qwen3.6-MoE, Qwen3 dense) and its model recipes
+# open-engine: the open engine (Qwen3.6-MoE, Qwen3 dense, Llama 3) and its model recipes
 
 Prefix `OPEN`. Home repo: openflowlm-next. Covers `src/open_qwen36/` (the
 resident engine behind the app's `causal_lm` seam) and `open_kernels/recipes/`
@@ -75,7 +75,7 @@ buffer arguments on a dispatch is likewise refused.
 
 **Acceptance criteria:**
 - The 27B spec passes every check.
-- `head_dim=64` → `attn: head_dim=64 is outside the validated set {128, 256}`; `hidden=3072` → `ln: width=3072 is outside the validated set {2048, 2560}`; `gemv_q4 K=3072` → names `{2048, 2560, 4096, 9728}`; `quant='q4_k'` → refused. (The 128 / 2560 / 9728 points entered the sets with OPEN-FAMILY-QWEN3 on 2026-09-05.)
+- `head_dim=64` → `attn: head_dim=64 is outside the validated set {128, 256}`; `hidden=3072` → `ln: width=3072 is outside the validated set {2048, 2560, 4096}`; `gemv_q4 K=3072` → names `{2048, 2560, 4096, 9728, 14336}`; `quant='q4_k'` → refused. (The 128 / 2560 / 9728 points entered the sets with OPEN-FAMILY-QWEN3 on 2026-09-05.)
 - Nine buffer arguments → `9 buffer arguments`.
 
 ### OPEN-BUILD-CACHE: the build key covers every build input
@@ -147,3 +147,23 @@ in the catalogue's validated sets only once this procedure has passed.
 4. `python src/open_qwen36/chat.py "Explain what an NPU is in two sentences." --model <model dir> --kernels src/xclbins/Qwen3-4B-NPU2/open_kernels` → a coherent answer ending in `<|im_end|>`.
 
 **Result 2026-09-05 (Qwen3-4B):** step 2 logits corr 0.999997 / 0.999994, same argmax and top-5, residual corr ≥ 0.999996 in every layer at both positions; step 3 identical through the engine, request 2 reproduced request 1; step 4 a coherent two-sentence answer ending in `<|im_end|>` at token 58 (272 ms/token). Details: `.claude/plans/open-kernels-phase-b-qwen3-dense.md`.
+
+### OPEN-FAMILY-LLAMA3: Llama 3 on the dense recipe
+**Applies to:** openflowlm-next (`open_kernels/recipes/dense.py`, `spec.py`, `designs/dense/dx.py`, `src/open_qwen36/`)
+**Test category:** manual (needs the NPU and `FastFlowLM/Llama-3.1-8B-NPU2`); the derivation, the RoPE scaling and the 8B layout are unit-tested in `tests/test_llama3.py`
+
+A Llama 3 model (GQA without q/k norms, full RoPE with the llama3 frequency
+scaling, eps 1e-5, silu FFN, untied q4_1 head) shall run on the open kernels
+from its `config.json` alone through the dense recipe: `qk_norm` / `norm_eps`
+become the `ATTN_QKNORM` / `LN_EPS` knobs, the scaled inverse frequencies are
+computed host side (`ModelSpec.rope_inv_freq`, in the manifest, used by both
+position-table builders), and widths that overflow a core's memory are handled
+by the recipe (one chunk per weight element; one norm output element per call).
+
+**Acceptance criteria (unit):**
+- HF and GGUF derivations agree; `rope_inv_freq()` equals transformers' `_compute_llama3_parameters` for the 8B's parameters; a non-llama3 `rope_scaling` and tied embeddings are refused.
+- The 8B layout: 8 KB norm elements, one chunk per weight element (`TAB_BYTES 32256`), `PER_CALL 1`; Qwen3-4B keeps two.
+
+**Procedure (manual):** as OPEN-FAMILY-QWEN3 with `Llama-3.1-8B-NPU2`, `out_l3`, prompt id 128000, and `chat.py` (which switches to the Llama 3 template when the tokenizer has `<|start_header_id|>`).
+
+**Result 2026-09-05 (Llama-3.1-8B):** slice logits corr 1.000000 / 0.999993, same argmax and top-5, residual corr ≥ 0.999994 every layer; identical through the engine; a coherent two-sentence answer ending in `<|eot_id|>` at token 79 (203 ms/token). Details: `.claude/plans/open-kernels-phase-c-llama3.md`.

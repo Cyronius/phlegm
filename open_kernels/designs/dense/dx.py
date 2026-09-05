@@ -47,8 +47,8 @@ LX = HERE.parent / "layer_x"
 sys.path.insert(0, str(HERE.parent.parent))
 from ironutil import Pipeline, include_dirs  # noqa: E402
 from recipes.load import current_spec  # noqa: E402
-from recipes import qwen3 as QR  # noqa: E402
-from recipes.qwen36moe import BAND_ROWS, CALL_BYTES, ELEM, band_bytes  # noqa: E402
+from recipes import dense as QR  # noqa: E402
+from recipes.qwen36moe import BAND_ROWS, ELEM, band_bytes  # noqa: E402
 from aie.helpers.taplib import TensorAccessPattern  # noqa: E402
 
 SPEC = current_spec()
@@ -57,6 +57,7 @@ L, G = R.layout, R.geo
 HID, FF, N_CORES = G.HID, G.FF, G.N_CORES
 QW, KVW = G.QW, G.KVW
 ELN, E_A = L.ELN, L.E_A
+CALL_BYTES = G.CALL_BYTES
 OS = ["-Os"]
 STOP = int(os.environ.get("DX_STOP", 99))     # debug: 1 = after q/k/v, 2 = after attention, 3 = after the o proj + norm
 assert not G.GATE, "dx.py: the Qwen3 dense recipe has no attention gate"
@@ -74,8 +75,9 @@ def bt(total, off, n):
     return TensorAccessPattern((1, total), off, [1, 1, 1, n], [0, 0, 0, 1])
 
 
-ATTN_FLAGS = [f"-DATTN_NH={G.NH}", f"-DATTN_KVH={G.KVH}", f"-DATTN_HD={G.HD}", f"-DATTN_ROT={G.ROT}", "-DATTN_GATE=0"]
-LN_FLAGS = [f"-DLN_N={HID}"]
+ATTN_FLAGS = [f"-DATTN_NH={G.NH}", f"-DATTN_KVH={G.KVH}", f"-DATTN_HD={G.HD}", f"-DATTN_ROT={G.ROT}", "-DATTN_GATE=0",
+              f"-DATTN_QKNORM={1 if G.QKNORM else 0}"]
+LN_FLAGS = [f"-DLN_N={HID}", f"-DLN_EPS={G.EPS:g}f"]
 
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
@@ -108,13 +110,14 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
     def ef(sym, src, args, flags=OS):
         return ExternalFunction(sym, source_file=str(src), arg_types=args, include_dirs=inc, compile_flags=flags)
 
-    f_gy = ef("gemv_q4_gy", LX / "gemv_q4_gy.cc", [elem, tab_ty, y_ty, i32, i32, i32])
+    f_gy = ef("gemv_q4_gy", HERE / "gemv_q4_gy.cc", [elem, tab_ty, y_ty, i32, i32, i32])
     f_gms = ef("gemv_q4_gms", HERE / "gemv_q4_gms.cc", [elem, tab_ty, ms_ty, i32, i32, i32])
     f_silu = ef("dense_silu", HERE / "dense_silu.cc", [ms_ty, y_ty])
     f_prep = ef("dense_prep", HERE / "dense_prep.cc", [x_ty, tab_ty, i32, i32])
     f_prepf = ef("dense_prep_f32", HERE / "dense_prep_f32.cc", [x_ty, tab_ty, i32, i32])
     f_nr = ef("ln_nr", LINL / "ln_nr.cc", [u8_ln] * 4, LN_FLAGS)
-    f_ln = ef("ln_fn", LN / "ln.cc", [u8_ln] * 8, LN_FLAGS)
+    f_lny = ef("ln_y", LN / "ln_y.cc", [u8_ln] * 5 + [i32], LN_FLAGS)
+    f_lnx = ef("ln_xn", LN / "ln_xn.cc", [u8_ln] * 6, LN_FLAGS)
     f_meta = ef("attn_meta", ATTN / "attn_meta.cc", [u8_a, u8_a, bhd, bhd, fcs, i32_4], ATTN_FLAGS)
     f_q = ef("attn_q", ATTN / "attn_q.cc", [u8_a, bhd, fcs, fq, i32], ATTN_FLAGS)
     f_k = ef("attn_k", ATTN / "attn_k.cc", [u8_a, bhd, fcs, fhd, brow, i32], ATTN_FLAGS)
@@ -129,7 +132,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
     of_y = [ObjectFifo(y_ty, name=f"y{c}", depth=2) for c in range(N_CORES)]
     of_x = ObjectFifo(x_ty, name="x", depth=2)
     of_lni = ObjectFifo(u8_ln, name="lni", depth=5)
-    of_lno = ObjectFifo(u8_ln, name="lno", depth=3)
+    of_lno = ObjectFifo(u8_ln, name="lno", depth=1)      # one output element at a time (8 KB elements at 4096 wide)
     of_ain = ObjectFifo(u8_a, name="ain", depth=4)
     of_aout = ObjectFifo(brow, name="aout", depth=2)
 
@@ -189,20 +192,24 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             xin.release(1)
         gemv_bands(win, yout, tab, f_gy, G.DOWN_PC, NG_F, PB_F)
 
-    def ln_body(ain, aout, f_nr, f_ln):
+    def ln_body(ain, aout, f_nr, f_lny, f_lnx):
         # 1. the layer-entry norm: [x0 x1 lnw] -> [xn]
         e = ain.acquire(3)
         o = aout.acquire(1)
         f_nr(e[0], e[1], e[2], o)
         aout.release(1)
         ain.release(3)
-        # 2. residual + post-attention norm: [x0 x1 w a0 a1] -> [res0 res1 xm]
-        # 3. the output residual: [res0 res1 w out0 out1] -> [xres0 xres1 junk]
+        # 2. residual + post-attention norm: [x0 x1 w a0 a1] -> [res0] [res1] [xm]
+        # 3. the output residual: [res0 res1 w out0 out1] -> [xres0] [xres1] [junk]
         for _ in range_(2 if stop >= 3 else 1):
             e = ain.acquire(5)
-            oo = aout.acquire(3)
-            f_ln(e[0], e[1], e[3], e[4], e[2], oo[0], oo[1], oo[2])
-            aout.release(3)
+            for i in range(2):
+                o = aout.acquire(1)
+                f_lny(e[0], e[1], e[3], e[4], o, i)
+                aout.release(1)
+            o = aout.acquire(1)
+            f_lnx(e[0], e[1], e[3], e[4], e[2], o)
+            aout.release(1)
             ain.release(5)
 
     def attn_body(ain, aout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin):
@@ -240,7 +247,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             f_fin(oacc, ml, o, hp)
             aout.release(1)
 
-    workers = [Worker(ln_body, fn_args=[of_lni.cons(), of_lno.prod(), f_nr, f_ln], tile=Tile(0, 3), stack_size=0x1800)]
+    workers = [Worker(ln_body, fn_args=[of_lni.cons(), of_lno.prod(), f_nr, f_lny, f_lnx], tile=Tile(0, 3), stack_size=0x1800)]
     for c in range(N_CORES):
         workers.append(Worker(main_body, fn_args=[of_w[c].cons(), of_x.cons(), of_y[c].prod(),
                                                   Buffer(tab_ty, name=f"tab{c}"), Buffer(ms_ty, name=f"ms{c}"),
@@ -359,7 +366,7 @@ DESIGN = dx
 _src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + sorted(f.read_bytes() for f in HERE.glob("*.py"))
                 + sorted(f.read_bytes() for f in ATTN.glob("*.cc")) + sorted(f.read_bytes() for f in ATTN.glob("*.h"))
                 + sorted(f.read_bytes() for f in (HERE.parent.parent / "recipes").glob("*.py"))
-                + [(LN / "ln.cc").read_bytes(), (LINL / "ln_nr.cc").read_bytes(), (GEMV / "gemv_q4.h").read_bytes(),
-                   (GEMV / "gemv_tab.h").read_bytes(), (LX / "gemv_q4_gy.cc").read_bytes(),
+                + [(LN / "ln.h").read_bytes(), (LN / "ln_y.cc").read_bytes(), (LN / "ln_xn.cc").read_bytes(), (LINL / "ln_nr.cc").read_bytes(), (GEMV / "gemv_q4.h").read_bytes(),
+                   (GEMV / "gemv_tab.h").read_bytes(),
                    (HERE.parent.parent / "include" / "vecmath.h").read_bytes(), SPEC.spec_hash().encode()])
 SPECIALIZE = {"stop": STOP, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

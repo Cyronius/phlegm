@@ -24,12 +24,12 @@ def test_head_dim_64_is_refused_by_name():
 
 def test_hidden_3072_is_refused_by_the_first_template_that_cannot_take_it():
     spec = dataclasses.replace(default_spec(), hidden=3072)
-    with pytest.raises(OpRangeError, match=r"ln: width=3072 is outside the validated set \{2048, 2560\}"):
+    with pytest.raises(OpRangeError, match=r"ln: width=3072 is outside the validated set \{2048, 2560, 4096\}"):
         Q.recipe(spec)
 
 
 def test_an_unvalidated_gemv_k_is_refused():
-    with pytest.raises(OpRangeError, match=r"gemv_q4: K=3072 is outside the validated set \{2048, 2560, 4096, 9728\}"):
+    with pytest.raises(OpRangeError, match=r"gemv_q4: K=3072 is outside the validated set \{2048, 2560, 4096, 9728, 14336\}"):
         require("gemv_q4", K=3072)
 
 

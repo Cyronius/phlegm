@@ -1,18 +1,5 @@
-// Layer RMSNorm with fused residual add (decode, one call):
-//   y  = x + add                       (fp32 [2048], the new residual)
-//   xn = bf16( y * rsqrt(mean(y^2) + 1e-6) * w )
-// Elements are 4 KB: x, add, y as two fp32[1024] halves; w, xn as bf16[2048].
-#include "vecmath.h"
-
-// LN_N: the width (designs/ln/ln.py and the whole-layer designs pass it from the ModelSpec);
-// elements are LN_N*2 bytes: x / add / y as two f32 halves, w / xn as one bf16 element.
-#ifndef LN_N
-#define LN_N 2048
-#endif
-static constexpr unsigned kN = LN_N;
-static constexpr unsigned kHalf = LN_N / 2;
-static constexpr unsigned kV = 32;
-static_assert(kHalf % kV == 0, "LN_N must be a multiple of 64");
+// One entry point per TU (IRON compiles a source once per ExternalFunction); the math is ln.h.
+#include "ln.h"
 
 extern "C" {
 void ln_fn(const float *__restrict x0, const float *__restrict x1, const float *__restrict a0,
@@ -33,7 +20,7 @@ void ln_fn(const float *__restrict x0, const float *__restrict x1, const float *
     ss = aie::mac(ss, h, l);
     ss = aie::mac(ss, h, l);
   }
-  const float inv = srsqrt(aie::reduce_add(ss.template to_vector<float>()) * (1.0f / kN) + 1e-6f);
+  const float inv = srsqrt(aie::reduce_add(ss.template to_vector<float>()) * (1.0f / kN) + LN_EPS);
   const bfloat16 ih = (bfloat16)inv;
   const bfloat16 il = (bfloat16)(inv - (float)ih);
 #pragma clang loop unroll(disable)

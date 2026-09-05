@@ -22,7 +22,7 @@ from ml_dtypes import bfloat16
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
-from recipes import qwen3 as QR  # noqa: E402
+from recipes import dense as QR  # noqa: E402
 from recipes.load import spec_from_model_dir  # noqa: E402
 from q4nx import Q4NX  # noqa: E402
 import replica_dense as RD  # noqa: E402
@@ -66,7 +66,7 @@ def main() -> int:
         return act[off:off + n * np.dtype(dt).itemsize].view(dt).astype(np.float64)
 
     # ---- the replica, stage by stage, from the NPU's own layer input
-    x = (RD.rms(xin) * m.bf16(pre + "input_layernorm.weight"))
+    x = (RD.rms(xin, spec.norm_eps) * m.bf16(pre + "input_layernorm.weight"))
     print(f"layer {l} position {t}")
     print("  xn   ", corr(region(L.AD_XN, hid, bfloat16), x.astype(np.float32).astype(bfloat16).astype(np.float64)))
     xf = x.astype(np.float32)
@@ -77,10 +77,15 @@ def main() -> int:
     print("  q    ", corr(region(L.AD_Q, nh * hd, np.float32), q_raw))
     print("  k    ", corr(region(L.AD_KVN, kvh * hd, np.float32), k_raw))
     print("  v    ", corr(region(L.AD_KVN + kvh * hd * 4, kvh * hd, np.float32), v_raw))
-    qn = m.bf16(pre + "self_attn.q_norm.weight")
-    kn = m.bf16(pre + "self_attn.k_norm.weight")
-    q = RD.rope((RD.rms(q_raw.reshape(nh, hd)) * qn), pos, spec.rotary_dim, spec.rope_theta)
-    k = RD.rope((RD.rms(k_raw.reshape(kvh, hd)) * kn), pos, spec.rotary_dim, spec.rope_theta)
+    qn = m.bf16(pre + "self_attn.q_norm.weight") if spec.qk_norm else None
+    kn = m.bf16(pre + "self_attn.k_norm.weight") if spec.qk_norm else None
+    inv = spec.rope_inv_freq()
+    if spec.qk_norm:
+        q = RD.rope((RD.rms(q_raw.reshape(nh, hd), spec.norm_eps) * qn), pos, spec.rotary_dim, spec.rope_theta, inv)
+        k = RD.rope((RD.rms(k_raw.reshape(kvh, hd), spec.norm_eps) * kn), pos, spec.rotary_dim, spec.rope_theta, inv)
+    else:
+        q = RD.rope(q_raw.reshape(nh, hd).astype(np.float64), pos, spec.rotary_dim, spec.rope_theta, inv)
+        k = RD.rope(k_raw.reshape(kvh, hd).astype(np.float64), pos, spec.rotary_dim, spec.rope_theta, inv)
     v = v_raw.reshape(kvh, hd).astype(np.float64)
     # at position 0 the attention output is v of the matching kv head
     if pos == 0:
@@ -97,7 +102,7 @@ def main() -> int:
     res_ref = xin + out_npu
     print("  res  ", corr(region(L.AD_RES, hid, np.float32), res_ref), "(from the NPU's out)")
     res_npu = region(L.AD_RES, hid, np.float32)
-    xm_ref = RD.rms(res_npu) * m.bf16(pre + "post_attention_layernorm.weight")
+    xm_ref = RD.rms(res_npu, spec.norm_eps) * m.bf16(pre + "post_attention_layernorm.weight")
     print("  xm   ", corr(region(L.AD_XM, hid, bfloat16), xm_ref.astype(np.float32).astype(bfloat16).astype(np.float64)), "(from the NPU's res)")
     xm_npu = region(L.AD_XM, hid, bfloat16).astype(np.float32)
     Wup = m.matmul_w(pre + "mlp.up_proj.weight", ff, hid)

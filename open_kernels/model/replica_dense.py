@@ -30,9 +30,9 @@ def silu(x):
     return x / (1 + np.exp(-x))
 
 
-def rope(t, p, rot, theta):
+def rope(t, p, rot, theta, inv_freq=None):
     half = rot // 2
-    ang = p * theta ** (-np.arange(half) / half)
+    ang = p * (np.asarray(inv_freq, np.float64) if inv_freq is not None else theta ** (-np.arange(half) / half))
     c, s = np.cos(ang), np.sin(ang)
     y = t.copy()
     x1, x2 = t[..., :half], t[..., half:rot]
@@ -45,17 +45,22 @@ def dense_decode(m, spec, layer, x_res, K, V, pos):
     """One token through a dense layer. Returns (residual, K, V)."""
     pre = f"model.layers.{layer}."
     hid, nh, kvh, hd, ff = spec.hidden, spec.num_heads, spec.num_kv_heads, spec.head_dim, spec.intermediate
-    x = (rms(x_res) * m.bf16(pre + "input_layernorm.weight")).astype(np.float32)
+    eps, inv = spec.norm_eps, spec.rope_inv_freq()
+    x = (rms(x_res, eps) * m.bf16(pre + "input_layernorm.weight")).astype(np.float32)
     Wq = m.matmul_w(pre + "self_attn.q_proj.weight", nh * hd, hid)
     Wk = m.matmul_w(pre + "self_attn.k_proj.weight", kvh * hd, hid)
     Wv = m.matmul_w(pre + "self_attn.v_proj.weight", kvh * hd, hid)
     Wo = m.matmul_w(pre + "self_attn.o_proj.weight", hid, nh * hd)
-    qn = m.bf16(pre + "self_attn.q_norm.weight")
-    kn = m.bf16(pre + "self_attn.k_norm.weight")
-    q = (rms((x @ Wq.T).reshape(nh, hd)) * qn).astype(np.float64)
-    k = (rms((x @ Wk.T).reshape(kvh, hd)) * kn).astype(np.float64)
+    if spec.qk_norm:
+        qn = m.bf16(pre + "self_attn.q_norm.weight")
+        kn = m.bf16(pre + "self_attn.k_norm.weight")
+        q = (rms((x @ Wq.T).reshape(nh, hd), eps) * qn).astype(np.float64)
+        k = (rms((x @ Wk.T).reshape(kvh, hd), eps) * kn).astype(np.float64)
+    else:
+        q = (x @ Wq.T).reshape(nh, hd).astype(np.float64)
+        k = (x @ Wk.T).reshape(kvh, hd).astype(np.float64)
     v = (x @ Wv.T).reshape(kvh, hd).astype(np.float64)
-    q, k = rope(q, pos, spec.rotary_dim, spec.rope_theta), rope(k, pos, spec.rotary_dim, spec.rope_theta)
+    q, k = rope(q, pos, spec.rotary_dim, spec.rope_theta, inv), rope(k, pos, spec.rotary_dim, spec.rope_theta, inv)
     K = np.concatenate([K, k[None]], 0)
     V = np.concatenate([V, v[None]], 0)
     o = np.zeros((nh, hd))
@@ -65,7 +70,7 @@ def dense_decode(m, spec, layer, x_res, K, V, pos):
         a = np.exp(s - s.max())
         o[h] = (a / a.sum()) @ V[:, h // grp]
     res = x_res + o.reshape(nh * hd).astype(np.float32) @ Wo.T
-    xm = (rms(res) * m.bf16(pre + "post_attention_layernorm.weight")).astype(np.float32)
+    xm = (rms(res, eps) * m.bf16(pre + "post_attention_layernorm.weight")).astype(np.float32)
     Wup = m.matmul_w(pre + "mlp.up_proj.weight", ff, hid)
     Wg = m.matmul_w(pre + "mlp.gate_proj.weight", ff, hid)
     Wd = m.matmul_w(pre + "mlp.down_proj.weight", hid, ff)
@@ -91,5 +96,5 @@ def lmhead_q4_logits(m, hn, spec, block=2048):
 
 
 def final_logits(m, spec, x_res):
-    hn = (rms(x_res) * m.bf16("model.norm.weight")).astype(np.float32)
+    hn = (rms(x_res, spec.norm_eps) * m.bf16("model.norm.weight")).astype(np.float32)
     return hn, lmhead_q4_logits(m, hn, spec)

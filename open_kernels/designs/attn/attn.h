@@ -41,6 +41,9 @@
 #ifndef ATTN_GATE
 #define ATTN_GATE 1
 #endif
+#ifndef ATTN_QKNORM
+#define ATTN_QKNORM 1        // 1: rms over the head * qn / kn before RoPE (Qwen3); 0: RoPE only (Llama)
+#endif
 static constexpr unsigned kNH = ATTN_NH;
 static constexpr unsigned kKVH = ATTN_KVH;
 static constexpr unsigned kHD = ATTN_HD;
@@ -71,9 +74,12 @@ static inline void attn_meta_impl(const uint8_t *__restrict m0, const uint8_t *_
   pb[3] = 0;
 }
 
-// x (fp32[HD]) -> rms_HD * w -> rope over [0, ROT) -> dst (fp32[HD])
+// x (fp32[HD]) -> [rms_HD * w] -> rope over [0, ROT) -> dst (fp32[HD])
 __attribute__((noinline)) inline void norm_rope(const float *__restrict x, const bfloat16 *__restrict w,
                              const float *__restrict cs, float *__restrict dst) {
+#if !ATTN_QKNORM
+  for (unsigned j = 0; j < kHD; j += kV) aie::store_v(dst + j, aie::load_v<kV>(x + j));
+#else
   accf32 ss = aie::zeros<accfloat, kV>();
   for (unsigned j = 0; j < kHD; j += kV) {
     v32b h, l;
@@ -92,6 +98,7 @@ __attribute__((noinline)) inline void norm_rope(const float *__restrict x, const
     u = mac_vv(u, t.template to_vector<float>(), aie::load_v<kV>(w + j));
     aie::store_v(dst + j, u.template to_vector<float>());
   }
+#endif
   // rope on dims [0, ROT): pairs (a = dst[j], b = dst[j + ROT/2]); cs = [cos ROT/2 | sin ROT/2]
   for (unsigned j = 0; j < kRot / 2; j += kV) {
     const v32f c = aie::load_v<kV>(cs + j);

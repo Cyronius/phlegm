@@ -9,7 +9,7 @@ import pytest
 
 import legacy_pools as LEG
 from recipes import pack
-from recipes import qwen3 as QR
+from recipes import dense as QR
 from recipes.load import load_spec, DEFAULT_SPEC
 from recipes.manifest import manifest
 from recipes.spec import DENSE, ModelSpec
