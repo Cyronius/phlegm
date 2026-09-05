@@ -338,7 +338,10 @@ struct Host {
             // streams that follow (manifest.json layout.kv_row / ptab_row); default the 27B's.
             ag.kv_row = num(need(it, "attngeom kv_row"), "attngeom kv_row");
             ag.ptab_row = num(need(it, "attngeom ptab_row"), "attngeom ptab_row");
-            std::printf("attngeom kv_row %llu ptab_row %llu\n", (unsigned long long)ag.kv_row, (unsigned long long)ag.ptab_row);
+            std::string w;
+            ag.window = (it >> w) ? num(w, "attngeom window") : 0;
+            std::printf("attngeom kv_row %llu ptab_row %llu window %llu\n", (unsigned long long)ag.kv_row,
+                        (unsigned long long)ag.ptab_row, (unsigned long long)ag.window);
         } else if (cmd == "moegeom") {
             // moegeom <experts> <topk> <stripe> <up_bytes> <down_core> <pool_down> <share_up> <share_gate> <share_down>
             mg.experts = (unsigned)num(need(it, "moegeom experts"), "moegeom");

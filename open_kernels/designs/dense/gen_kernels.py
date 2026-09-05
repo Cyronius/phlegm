@@ -41,17 +41,28 @@ void gemv_q4_gms(const uint8_t *__restrict t, const uint8_t *__restrict tab, flo
 }}
 }}
 ''',
-        "dense_silu.cc": f'''// h band = silu(g) * u for one 64-row band (ms: u @{G.MS_U}, g @{G.MS_G}) -> one f32 y element.
+        "dense_act.cc": f'''// h band = act(g) * u for one 64-row band (ms: u @{G.MS_U}, g @{G.MS_G}) -> one f32 y element.
+// act = {G.ACT}: silu(x) = x sigmoid(x); gelu_tanh(x) = 0.5 x (1 + tanh(z)) = x sigmoid(2z),
+// z = sqrt(2/pi) (x + 0.044715 x^3). Vector ops only (no scalar float on this core).
 #include "vecmath.h"
 
 extern "C" {{
-void dense_silu(const float *__restrict ms, float *__restrict h) {{
+void dense_act(const float *__restrict ms, float *__restrict h) {{
   aie::set_rounding(aie::rounding_mode::conv_even);
   const float *__restrict u = ms + {G.MS_U};
   const float *__restrict g = ms + {G.MS_G};
 #pragma clang loop unroll(disable)
-  for (unsigned j = 0; j < 64; j += 32)
-    aie::store_v(h + j, fmul32(vsiluN<32>(aie::load_v<32>(g + j)), aie::load_v<32>(u + j)));
+  for (unsigned j = 0; j < 64; j += 32) {{
+    const v32f x = aie::load_v<32>(g + j);
+#if {1 if G.ACT == "gelu_tanh" else 0}
+    const v32f x3 = fmul32(fmul32(x, x), x);
+    const v32f z2 = fscaleN<32>(fadd32(x, fscaleN<32>(x3, 0.044715f)), 2.0f * 0.7978845608028654f);
+    const v32f a = fmul32(x, vsigmoidN<32>(z2));
+#else
+    const v32f a = vsiluN<32>(x);
+#endif
+    aie::store_v(h + j, fmul32(a, aie::load_v<32>(u + j)));
+  }}
 }}
 }}
 ''',
@@ -82,8 +93,14 @@ void dense_prep_f32(const bfloat16 *__restrict e, uint8_t *__restrict tab, int32
     }
 
 
+STALE = ["dense_silu.cc"]
+
+
 def generate(R, out: Path = HERE) -> int:
     fs = files(R)
+    for name in STALE:
+        if (out / name).is_file():
+            (out / name).unlink()
     for name, src in fs.items():
         p = out / name
         if not p.is_file() or p.read_text(encoding="utf-8") != src:

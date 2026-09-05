@@ -1,4 +1,4 @@
-# open-engine: the open engine (Qwen3.6-MoE, Qwen3 dense, Llama 3) and its model recipes
+# open-engine: the open engine (Qwen3.6-MoE, Qwen3 dense, Llama 3, Gemma 3) and its model recipes
 
 Prefix `OPEN`. Home repo: openflowlm-next. Covers `src/open_qwen36/` (the
 resident engine behind the app's `causal_lm` seam) and `open_kernels/recipes/`
@@ -75,7 +75,7 @@ buffer arguments on a dispatch is likewise refused.
 
 **Acceptance criteria:**
 - The 27B spec passes every check.
-- `head_dim=64` → `attn: head_dim=64 is outside the validated set {128, 256}`; `hidden=3072` → `ln: width=3072 is outside the validated set {2048, 2560, 4096}`; `gemv_q4 K=3072` → names `{2048, 2560, 4096, 9728, 14336}`; `quant='q4_k'` → refused. (The 128 / 2560 / 9728 points entered the sets with OPEN-FAMILY-QWEN3 on 2026-09-05.)
+- `head_dim=64` → `attn: head_dim=64 is outside the validated set {128, 256}`; `hidden=3072` → `ln: width=3072 is outside the validated set {2048, 2560, 4096}`; `gemv_q4 K=3072` → names `{2048, 2560, 4096, 9728, 10240, 14336}`; `quant='q4_k'` → refused. (The 128 / 2560 / 9728 points entered the sets with OPEN-FAMILY-QWEN3 on 2026-09-05.)
 - Nine buffer arguments → `9 buffer arguments`.
 
 ### OPEN-BUILD-CACHE: the build key covers every build input
@@ -167,3 +167,27 @@ by the recipe (one chunk per weight element; one norm output element per call).
 **Procedure (manual):** as OPEN-FAMILY-QWEN3 with `Llama-3.1-8B-NPU2`, `out_l3`, prompt id 128000, and `chat.py` (which switches to the Llama 3 template when the tokenizer has `<|start_header_id|>`).
 
 **Result 2026-09-05 (Llama-3.1-8B):** slice logits corr 1.000000 / 0.999993, same argmax and top-5, residual corr ≥ 0.999994 every layer; identical through the engine; a coherent two-sentence answer ending in `<|eot_id|>` at token 79 (203 ms/token). Details: `.claude/plans/open-kernels-phase-c-llama3.md`.
+
+### OPEN-FAMILY-GEMMA3: Gemma 3 on the dense recipe
+**Applies to:** openflowlm-next (`open_kernels/recipes/dense.py`, `spec.py`, `designs/dense/dx.py`, `designs/ln/ln_nr32.cc`, `harness/stream_patch.hpp`, `src/open_qwen36/`)
+**Test category:** manual (needs the NPU and `FastFlowLM/Gemma3-4B-NPU2`); the derivation, the two RoPE tables, the window's row counts and the 4B layout are unit-tested in `tests/test_gemma3.py`
+
+A Gemma 3 text model (GQA with q/k RMSNorm, GeGLU-tanh, sandwich norms, five
+sliding-window layers per global one, a local and a linearly scaled global
+RoPE, the tied head stored as q4) shall run on the open kernels from its
+`config.json` through the dense recipe: the activation is a generated kernel
+knob, the sandwich norms are the `ln_nr32` entry plus the design's sandwich
+program, the sliding window is a per-token `attnpos` patch (the fill's offset
+and length, the record's row counts) on a second kernel entry sharing the
+global layers' stream, and each layer type has its own position table. The
+container's folded `1 + w` norms and sqrt(hidden) embeddings are used as
+stored.
+
+**Acceptance criteria (unit):**
+- HF and GGUF derivations agree; the global table is `1e6^(-2i/256) / 8`, the local `1e4^(-2i/256)`; `window_rows` gives `valid = min(p, 1023)`, `nf = max(1, valid)` for a 1024 window.
+- The 4B layout: two layer types sharing one design, `dx` / `dx_local` with windows 0 / 1024 on the same stream, `ptab` / `ptab_local` globals, six consts per layer.
+- A silu activation, softcapping, or a `query_pre_attn_scalar` unequal to the head dim is refused by name.
+
+**Procedure (manual):** as OPEN-FAMILY-QWEN3 with `Gemma3-4B-NPU2`, `out_g3`, 6 layers (five local, one global), prompt id 2; then `open_qwen36_cli --at-position 1100 --layers 6` (finite logits through the window path); then `chat.py` (the Gemma template when the tokenizer has `<start_of_turn>`).
+
+**Result 2026-09-05 (Gemma3-4B):** slice logits corr 0.999998 / 0.999998, same argmax and top-5, residual corr 1.000000 every layer; identical through the engine; a finite step at position 1103; a coherent two-sentence answer ending in `<end_of_turn>` at token 43 (96 ms/token). Details: `.claude/plans/open-kernels-phase-d-gemma3.md`.

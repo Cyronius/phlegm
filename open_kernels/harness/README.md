@@ -29,8 +29,8 @@ one compiled program per layer type serves every layer and every token:
 moeroute2 <kernel> <buf> <idx-off>   # point the expert fills at the router's top-8
 moeroute  <kernel> <rout-buf>        # same, for moe_experts' host-concatenated weights
 attnpos   <kernel> <pos>             # KV window length, new-row offset, RoPE record
-attngeom  <kv_row> <ptab_row>        # the cache row / record sizes the attnpos tables decode
-                                     # against (manifest.json layout.kv_row / ptab_row; default the 27B's)
+attngeom  <kv_row> <ptab_row> [window]   # the cache row / record sizes (manifest.json layout.kv_row /
+                                     # ptab_row; default the 27B's) and a sliding window in rows (0 = all)
 moegeom   <experts> <topk> <stripe> <up_bytes> <down_core> <pool_down> <share_up> <share_gate> <share_down>
 ```
 

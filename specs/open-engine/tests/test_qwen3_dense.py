@@ -77,7 +77,8 @@ def test_dense_layout_for_the_4b(unvalidated):
     assert m["kernels"]["dx"]["patch"] == "attnpos" and m["kernels"]["lm"]["build"] == "lm_head_q4"
     assert [o["op"] for o in d["pack"]["pool"]] == ["std_perm"] * 7 and len(d["pack"]["consts"]) == 4
     assert m["pack"]["lm_head"]["ops"][0] == {"op": "std_perm", "tensor": "lm_head.weight", "dst": 0, "nch": 47480, "in_dim": 2560}
-    assert m["globals"]["normw"] == 5120 and m["globals"]["ptab"] == {"per_row": 2048}
+    assert m["globals"]["normw"] == 5120 and m["globals"]["ptab"]["per_row"] == 2048 and m["globals"]["ptab"]["window"] == 0
+    assert len(m["globals"]["ptab"]["inv_freq"]) == 64
 
 
 def test_the_catalogue_refuses_the_dense_points_until_validated(monkeypatch):

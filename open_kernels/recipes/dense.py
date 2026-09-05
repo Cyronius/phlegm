@@ -1,13 +1,18 @@
-"""The dense recipe (Qwen3 dense, Llama 3): ModelSpec -> everything
-designs/dense/dx.py, the packers and the driver need for a GQA + silu-FFN
+"""The dense recipe (Qwen3 dense, Llama 3, Gemma 3): ModelSpec -> everything
+designs/dense/dx.py, the packers and the driver need for a GQA + gated-FFN
 decoder layer.
 
     ln -> gemv q | k | v -> attention ([q/k RMSNorm,] RoPE, no gate) -> gemv o
-       -> ln (+residual) -> gemv up | gate -> silu(gate) * up -> gemv down -> +residual
+       -> [post-attention ln] -> +residual -> ln -> gemv up | gate -> act(gate) * up -> gemv down
+       -> [post-FFN ln] -> +residual
 
 The family differences are spec fields: Qwen3 has q/k RMSNorm and eps 1e-6;
 Llama 3 has no q/k norms, eps 1e-5 and the llama3 RoPE frequency scaling
-(host side: the position table takes the spec's inverse frequencies).
+(host side: the position table takes the spec's inverse frequencies); Gemma 3
+has GeGLU-tanh, the sandwich norms in brackets above, and two layer types --
+`dense_local` (a 1024-row sliding window, its own RoPE theta) and `dense`
+(global, linearly scaled RoPE) -- served by ONE design: the window is a
+per-token patch of the KV fill (attnpos), the tables are two `ptab` globals.
 
 One xclbin, ONE instruction stream per layer (no routing read, so no part
 split). Same 8 main cores as the MoE designs (w / x / y streams), the ln
@@ -27,16 +32,16 @@ from dataclasses import dataclass
 
 from .catalogue import LIMITS, OpRangeError, check_buffer_args, require
 from .qwen36moe import BAND_ROWS, CHUNK, ELEM, MB, band_bytes, q4_bytes, q4_chunks, roundup, tab_bytes
-from .spec import DENSE, ModelSpec
+from .spec import DENSE, DENSE_LOCAL, ModelSpec
 
 
 @dataclass(frozen=True)
 class DenseLayout:
-    # consts: [lnw (ELN)][postln (ELN)][meta: qn bf16 HD @0 | kn @HD*2 (E_A)]
-    CD_LNW: int; CD_POSTLN: int; CD_META: int; CD_BYTES: int
-    # act: the DDR bounce between stages
+    # consts: [lnw (ELN)][postln (ELN)][meta: qn bf16 HD @0 | kn @HD*2 (E_A)][sandwich: preffn (ELN)][postffn (ELN)]
+    CD_LNW: int; CD_POSTLN: int; CD_META: int; CD_PREFFN: int; CD_POSTFFN: int; CD_BYTES: int
+    # act: the DDR bounce between stages (T / T2: the sandwich norms' outputs, f32 HID)
     AD_XN: int; AD_Q: int; AD_KVN: int; AD_OG: int; AD_OUT: int; AD_RES: int; AD_XM: int
-    AD_H: int; AD_OUT2: int; AD_JUNK: int; AD_BYTES: int
+    AD_H: int; AD_OUT2: int; AD_JUNK: int; AD_T: int; AD_T2: int; AD_BYTES: int
     # pool
     POOL_Q: int; POOL_K: int; POOL_V: int; POOL_O: int; POOL_UP: int; POOL_GATE: int; POOL_DOWN: int; POOL_BYTES: int
     # KV / ptab / lm_head
@@ -51,7 +56,7 @@ class DenseLayout:
 @dataclass(frozen=True)
 class DenseGeometry:
     N_CORES: int; HID: int; FF: int; NH: int; KVH: int; HD: int; ROT: int; GATE: bool; QKNORM: bool
-    EPS: float
+    EPS: float; ACT: str; SANDWICH: bool; WINDOW: int
     PER_CALL: int; CALL_BYTES: int                                  # chunks per weight element (1 when the table is wide)
     QW: int; KVW: int
     Q_PC: int; KV_PC: int; O_PC: int; UP_PC: int; DOWN_PC: int      # bands per core
@@ -73,8 +78,12 @@ class DenseRecipe:
 
 def _check(spec: ModelSpec) -> None:
     n = LIMITS["n_cols"]
-    if spec.family not in ("qwen3", "llama3"):
+    if spec.family not in ("qwen3", "llama3", "gemma3"):
         raise OpRangeError(f"dense recipe given a {spec.family!r} spec")
+    if spec.activation not in ("silu", "gelu_tanh"):
+        raise OpRangeError(f"dense: activation {spec.activation!r} (silu | gelu_tanh)")
+    if spec.has_local and spec.sliding_window <= 0:
+        raise OpRangeError("dense: dense_local layers need a positive sliding_window")
     if spec.quant != "q4_1":
         raise OpRangeError(f"dense: quant={spec.quant!r}; the gemv_q4 template reads q4_1 chunks only")
     if not spec.has_dense or spec.has_linear or spec.has_full or spec.intermediate == 0:
@@ -126,7 +135,8 @@ def geometry(spec: ModelSpec) -> DenseGeometry:
     pc = per_call(spec)
     return DenseGeometry(
         N_CORES=n, HID=hid, FF=ff, NH=nh, KVH=kvh, HD=hd, ROT=spec.rotary_dim, GATE=spec.attn_gate,
-        QKNORM=spec.qk_norm, EPS=spec.norm_eps, PER_CALL=pc, CALL_BYTES=pc * CHUNK,
+        QKNORM=spec.qk_norm, EPS=spec.norm_eps, ACT=spec.activation, SANDWICH=spec.sandwich_norms,
+        WINDOW=spec.sliding_window if spec.has_local else 0, PER_CALL=pc, CALL_BYTES=pc * CHUNK,
         QW=qw, KVW=kvw,
         Q_PC=qw // BAND_ROWS // n, KV_PC=kvw // BAND_ROWS // n, O_PC=hid // BAND_ROWS // n,
         UP_PC=ff // BAND_ROWS // n, DOWN_PC=hid // BAND_ROWS // n,
@@ -148,14 +158,14 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> DenseLayout:
     if 2 * G.HD * 2 > e_a or 512 + 4 * spec.rotary_dim > max(1024, e_a):
         raise OpRangeError("dense: qn | kn or the RoPE record do not fit the attention element")
     # consts
-    c = {"lnw": 0, "postln": eln, "meta": 2 * eln}
-    cd_bytes = roundup(2 * eln + e_a, ELEM)
+    c = {"lnw": 0, "postln": eln, "meta": 2 * eln, "preffn": 2 * eln + e_a, "postffn": 3 * eln + e_a}
+    cd_bytes = roundup((4 * eln + e_a) if spec.sandwich_norms else (2 * eln + e_a), ELEM)
     # act
     a: dict[str, int] = {}
     off = 0
     for name, size in (("xn", G.XN_ELEMS * ELEM), ("q", G.QW * 4), ("kvn", 2 * G.KVW * 4), ("og", G.QW * 2),
                        ("out", hid * 4), ("res", hid * 4), ("xm", G.XM_ELEMS * ELEM), ("h", G.H_ELEMS * ELEM),
-                       ("out2", hid * 4), ("junk", eln)):
+                       ("out2", hid * 4), ("junk", eln), ("t", hid * 4), ("t2", hid * 4)):
         a[name] = off
         off += size
     ad_bytes = roundup(off, ELEM)
@@ -172,9 +182,10 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> DenseLayout:
     band = band_bytes(hid)
     bands = spec.vocab // BAND_ROWS
     return DenseLayout(
-        CD_LNW=c["lnw"], CD_POSTLN=c["postln"], CD_META=c["meta"], CD_BYTES=cd_bytes,
+        CD_LNW=c["lnw"], CD_POSTLN=c["postln"], CD_META=c["meta"], CD_PREFFN=c["preffn"], CD_POSTFFN=c["postffn"],
+        CD_BYTES=cd_bytes,
         AD_XN=a["xn"], AD_Q=a["q"], AD_KVN=a["kvn"], AD_OG=a["og"], AD_OUT=a["out"], AD_RES=a["res"], AD_XM=a["xm"],
-        AD_H=a["h"], AD_OUT2=a["out2"], AD_JUNK=a["junk"], AD_BYTES=ad_bytes,
+        AD_H=a["h"], AD_OUT2=a["out2"], AD_JUNK=a["junk"], AD_T=a["t"], AD_T2=a["t2"], AD_BYTES=ad_bytes,
         POOL_Q=p["q"], POOL_K=p["k"], POOL_V=p["v"], POOL_O=p["o"], POOL_UP=p["up"], POOL_GATE=p["gate"],
         POOL_DOWN=p["down"], POOL_BYTES=pool_bytes,
         KV_ROW=kv_row, PTAB_ROW=ptab_row, MAX_CTX=max_ctx, KV_BYTES=max_ctx * kv_row, PTAB_BYTES=max_ctx * ptab_row,
@@ -192,9 +203,7 @@ def pack_plan(spec: ModelSpec) -> dict:
     L, G = layout(spec), geometry(spec)
     hid, ff = spec.hidden, spec.intermediate
     pre = "model.layers.{l}."
-    return {
-        "pool_bytes": L.POOL_BYTES, "chunk_bytes": CHUNK,
-        "layer_types": {DENSE: {
+    one = {
             "pool": [
                 {"op": "std_perm", "tensor": pre + "self_attn.q_proj.weight", "dst": L.POOL_Q, "nch": q4_chunks(G.QW, hid), "in_dim": hid},
                 {"op": "std_perm", "tensor": pre + "self_attn.k_proj.weight", "dst": L.POOL_K, "nch": q4_chunks(G.KVW, hid), "in_dim": hid},
@@ -210,8 +219,14 @@ def pack_plan(spec: ModelSpec) -> dict:
             ] + ([
                 {"op": "put", "tensor": pre + "self_attn.q_norm.weight", "dst": L.CD_META, "cap": G.HD * 2},
                 {"op": "put", "tensor": pre + "self_attn.k_norm.weight", "dst": L.CD_META + G.HD * 2, "cap": G.HD * 2},
-            ] if spec.qk_norm else []),
-        }},
+            ] if spec.qk_norm else []) + ([
+                {"op": "put", "tensor": pre + "pre_feedforward_layernorm.weight", "dst": L.CD_PREFFN, "cap": L.ELN},
+                {"op": "put", "tensor": pre + "post_feedforward_layernorm.weight", "dst": L.CD_POSTFFN, "cap": L.ELN},
+            ] if spec.sandwich_norms else []),
+    }
+    return {
+        "pool_bytes": L.POOL_BYTES, "chunk_bytes": CHUNK,
+        "layer_types": {lt: one for lt in sorted(set(spec.layer_types))},
         "lm_head": {"pool_bytes": L.LMHEAD_POOL_BYTES,
                     "ops": [{"op": "std_perm", "tensor": "lm_head.weight", "dst": 0, "nch": q4_chunks(spec.vocab, hid), "in_dim": hid}]},
         "embed": {"tensor": "model.embed_tokens.weight", "dim": hid},
@@ -220,24 +235,36 @@ def pack_plan(spec: ModelSpec) -> dict:
 
 
 def programs(spec: ModelSpec) -> dict:
-    L = layout(spec)
-    args = ["pool", "xres", "consts", "state", "act", "ptab"]
-    check_buffer_args("dx", args)
-    return {
+    """One design serves every dense layer type; a layer type with a sliding window gets its own
+    kernel entry (the same instruction stream, its own instruction BO, patched with its window)
+    and its own position table (its RoPE frequencies, its window's row counts)."""
+    L, G = layout(spec), geometry(spec)
+    out = {
         "contexts": {"dx": "dx/final.xclbin", "ln": "ln/final.xclbin", "lm": "lm_head_q4/final.xclbin"},
-        "kernels": {"dx": {"context": "dx", "insts": "dx/insts.bin", "patch": "attnpos", "build": "dx"},
-                    "ln": {"context": "ln", "insts": "ln/insts.bin", "build": "ln"},
+        "kernels": {"ln": {"context": "ln", "insts": "ln/insts.bin", "build": "ln"},
                     "lm": {"context": "lm", "insts": "lm_head_q4/insts.bin", "build": "lm_head_q4"}},
-        "layer_types": {DENSE: {
-            "buffers": {"consts": L.CD_BYTES, "act": L.AD_BYTES, "state": {"kind": "kv", "row": L.KV_ROW}},
-            "program": [{"op": "run", "kernel": "dx", "args": args}],
-        }},
+        "layer_types": {},
         "tail": [{"op": "run", "kernel": "ln", "args": ["xres", "zero", "normw", "xresf", "hn"]},
                  {"op": "run", "kernel": "lm", "args": ["lmpool", "hn", "logits"]}],
         "globals": {"xres": spec.hidden * 4, "zero": spec.hidden * 4, "normw": spec.hidden * 2,
                     "xresf": spec.hidden * 4, "hn": spec.hidden * 2, "logits": spec.vocab * 4,
-                    "lmpool": L.LMHEAD_POOL_BYTES, "ptab": {"per_row": L.PTAB_ROW}},
+                    "lmpool": L.LMHEAD_POOL_BYTES},
     }
+    types = sorted(set(spec.layer_types))
+    for lt in types:
+        local = lt == DENSE_LOCAL
+        kn = "dx_local" if local else "dx"
+        tab = "ptab_local" if local else "ptab"
+        window = spec.sliding_window if local else 0
+        args = ["pool", "xres", "consts", "state", "act", tab]
+        check_buffer_args(kn, args)
+        out["kernels"][kn] = {"context": "dx", "insts": "dx/insts.bin", "patch": "attnpos", "build": "dx", "window": window}
+        out["globals"][tab] = {"per_row": L.PTAB_ROW, "inv_freq": spec.rope_inv_freq(local=local), "window": window}
+        out["layer_types"][lt] = {
+            "buffers": {"consts": L.CD_BYTES, "act": L.AD_BYTES, "state": {"kind": "kv", "row": L.KV_ROW}},
+            "program": [{"op": "run", "kernel": kn, "args": args}],
+        }
+    return out
 
 
 def builds(spec: ModelSpec) -> dict[str, dict]:
@@ -255,15 +282,17 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
     return {"hidden": spec.hidden, "vocab": spec.vocab, "real_vocab": spec.real_vocab,
             "chunk_bytes": CHUNK, "pool_bytes": L.POOL_BYTES, "lmhead_pool_bytes": L.LMHEAD_POOL_BYTES,
             "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim, "rope_theta": spec.rope_theta,
-            "rope_inv_freq": spec.rope_inv_freq()}
+            "rope_inv_freq": spec.rope_inv_freq()}     # the global table's; each ptab global carries its own
 
 
 def hf_config_check(spec: ModelSpec) -> dict:
     d = {"hidden_size": spec.hidden, "num_hidden_layers": spec.num_layers, "vocab_size": spec.vocab,
          "num_attention_heads": spec.num_heads, "num_key_value_heads": spec.num_kv_heads,
          "intermediate_size": spec.intermediate}
-    if spec.family == "qwen3":
+    if spec.family in ("qwen3", "gemma3"):
         d["head_dim"] = spec.head_dim          # Llama configs may omit it (hidden / heads)
+    if spec.family == "gemma3":
+        d["sliding_window"] = spec.sliding_window
     return d
 
 

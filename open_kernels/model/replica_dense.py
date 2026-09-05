@@ -30,6 +30,10 @@ def silu(x):
     return x / (1 + np.exp(-x))
 
 
+def gelu_tanh(x):
+    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))
+
+
 def rope(t, p, rot, theta, inv_freq=None):
     half = rot // 2
     ang = p * (np.asarray(inv_freq, np.float64) if inv_freq is not None else theta ** (-np.arange(half) / half))
@@ -43,9 +47,12 @@ def rope(t, p, rot, theta, inv_freq=None):
 
 def dense_decode(m, spec, layer, x_res, K, V, pos):
     """One token through a dense layer. Returns (residual, K, V)."""
+    from recipes.spec import DENSE_LOCAL
     pre = f"model.layers.{layer}."
     hid, nh, kvh, hd, ff = spec.hidden, spec.num_heads, spec.num_kv_heads, spec.head_dim, spec.intermediate
-    eps, inv = spec.norm_eps, spec.rope_inv_freq()
+    local = spec.layer_types[layer] == DENSE_LOCAL
+    eps, inv = spec.norm_eps, spec.rope_inv_freq(local=local)
+    act = gelu_tanh if spec.activation == "gelu_tanh" else silu
     x = (rms(x_res, eps) * m.bf16(pre + "input_layernorm.weight")).astype(np.float32)
     Wq = m.matmul_w(pre + "self_attn.q_proj.weight", nh * hd, hid)
     Wk = m.matmul_w(pre + "self_attn.k_proj.weight", kvh * hd, hid)
@@ -65,16 +72,26 @@ def dense_decode(m, spec, layer, x_res, K, V, pos):
     V = np.concatenate([V, v[None]], 0)
     o = np.zeros((nh, hd))
     grp = nh // kvh
+    t0 = max(0, pos + 1 - spec.sliding_window) if (local and spec.sliding_window) else 0   # the window's first row
     for h in range(nh):
-        s = (K[:, h // grp] @ q[h]) / np.sqrt(hd)
+        s = (K[t0:, h // grp] @ q[h]) / np.sqrt(hd)
         a = np.exp(s - s.max())
-        o[h] = (a / a.sum()) @ V[:, h // grp]
-    res = x_res + o.reshape(nh * hd).astype(np.float32) @ Wo.T
-    xm = (rms(res, eps) * m.bf16(pre + "post_attention_layernorm.weight")).astype(np.float32)
+        o[h] = (a / a.sum()) @ V[t0:, h // grp]
+    out = o.reshape(nh * hd).astype(np.float32) @ Wo.T
     Wup = m.matmul_w(pre + "mlp.up_proj.weight", ff, hid)
     Wg = m.matmul_w(pre + "mlp.gate_proj.weight", ff, hid)
     Wd = m.matmul_w(pre + "mlp.down_proj.weight", hid, ff)
-    h = silu(xm @ Wg.T) * (xm @ Wup.T)
+    if spec.sandwich_norms:
+        t = (rms(out, eps) * m.bf16(pre + "post_attention_layernorm.weight")).astype(np.float32)
+        res = x_res + t
+        xm = (rms(res, eps) * m.bf16(pre + "pre_feedforward_layernorm.weight")).astype(np.float32)
+        h = act(xm @ Wg.T) * (xm @ Wup.T)
+        out2 = h.astype(np.float32) @ Wd.T
+        t2 = (rms(out2, eps) * m.bf16(pre + "post_feedforward_layernorm.weight")).astype(np.float32)
+        return res + t2, K, V
+    res = x_res + out
+    xm = (rms(res, eps) * m.bf16(pre + "post_attention_layernorm.weight")).astype(np.float32)
+    h = act(xm @ Wg.T) * (xm @ Wup.T)
     return res + h.astype(np.float32) @ Wd.T, K, V
 
 

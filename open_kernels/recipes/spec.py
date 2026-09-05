@@ -15,8 +15,8 @@ import json
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Mapping
 
-LINEAR, FULL, DENSE = "linear_attention", "full_attention", "dense"
-LAYER_TYPES = (LINEAR, FULL, DENSE)
+LINEAR, FULL, DENSE, DENSE_LOCAL = "linear_attention", "full_attention", "dense", "dense_local"
+LAYER_TYPES = (LINEAR, FULL, DENSE, DENSE_LOCAL)      # dense_local: a dense layer with sliding-window attention
 
 
 class SpecError(ValueError):
@@ -25,7 +25,7 @@ class SpecError(ValueError):
 
 @dataclass(frozen=True)
 class ModelSpec:
-    family: str                       # the recipe: "qwen36moe" | "qwen3" | "llama3"
+    family: str                       # the recipe: "qwen36moe" | "qwen3" | "llama3" | "gemma3"
     hidden: int
     num_layers: int
     layer_types: tuple[str, ...]      # per layer: LINEAR | FULL | DENSE
@@ -37,7 +37,10 @@ class ModelSpec:
     head_dim: int
     rotary_dim: int                   # partial RoPE: rotated dims per head
     rope_theta: float
-    rope_scaling: dict | None = None  # Llama 3: {"factor", "low_freq_factor", "high_freq_factor", "original_max_position_embeddings"}
+    rope_scaling: dict | None = None  # Llama 3: {"factor", "low_freq_factor", "high_freq_factor", "original_max_position_embeddings"};
+                                      # Gemma 3: {"rope_type": "linear", "factor"} (the global layers)
+    rope_local_theta: float = 0.0     # Gemma 3: the sliding-window layers' theta (unscaled); 0 = one RoPE for every layer
+    sliding_window: int = 0           # rows a dense_local layer attends to (the newest W, itself included)
     qk_norm: bool = True
     attn_gate: bool = True            # sigmoid output gate (a second q-width projection)
     # linear attention (Gated DeltaNet); zeros for a family without it
@@ -46,8 +49,10 @@ class ModelSpec:
     lin_key_dim: int = 0
     lin_value_dim: int = 0
     conv_kernel: int = 0
-    # dense FFN (silu(gate) * up @ down); 0 for a MoE-only family
+    # dense FFN (act(gate) * up @ down); 0 for a MoE-only family
     intermediate: int = 0
+    activation: str = "silu"          # "silu" | "gelu_tanh"
+    sandwich_norms: bool = False      # Gemma: post-attention and post-FFN norms on the block outputs, pre-FFN norm on the residual
     # MoE; num_experts == 0 means dense
     num_experts: int = 0
     experts_per_tok: int = 0
@@ -85,15 +90,26 @@ class ModelSpec:
 
     @property
     def has_dense(self) -> bool:
-        return DENSE in self.layer_types
+        return DENSE in self.layer_types or DENSE_LOCAL in self.layer_types
 
-    def rope_inv_freq(self) -> list[float]:
+    @property
+    def has_local(self) -> bool:
+        return DENSE_LOCAL in self.layer_types
+
+    def rope_inv_freq(self, local: bool = False) -> list[float]:
         """The inverse frequency of each rotary pair i < rotary_dim/2: theta^(-2i/rot), with Llama 3's
-        wavelength-dependent scaling when `rope_scaling` says so (HF _compute_llama3_parameters)."""
+        wavelength-dependent scaling or a linear factor when `rope_scaling` says so (HF's
+        _compute_llama3_parameters / _compute_linear_scaling_rope_parameters). `local`: the
+        sliding-window layers' table (Gemma: rope_local_theta, unscaled)."""
         import math
         half = self.rotary_dim // 2
+        if local:
+            theta = self.rope_local_theta or self.rope_theta
+            return [theta ** (-i / half) for i in range(half)]
         inv = [self.rope_theta ** (-i / half) for i in range(half)]
         sc = self.rope_scaling
+        if sc and sc.get("rope_type") == "linear":
+            return [f / float(sc["factor"]) for f in inv]
         if sc:
             factor = float(sc["factor"])
             lo, hi = float(sc["low_freq_factor"]), float(sc["high_freq_factor"])
@@ -112,13 +128,20 @@ class ModelSpec:
             inv = out
         return inv
 
-    def rope_inv_freq(self) -> list[float]:
+    def rope_inv_freq(self, local: bool = False) -> list[float]:
         """The inverse frequency of each rotary pair i < rotary_dim/2: theta^(-2i/rot), with Llama 3's
-        wavelength-dependent scaling when `rope_scaling` says so (HF _compute_llama3_parameters)."""
+        wavelength-dependent scaling or a linear factor when `rope_scaling` says so (HF's
+        _compute_llama3_parameters / _compute_linear_scaling_rope_parameters). `local`: the
+        sliding-window layers' table (Gemma: rope_local_theta, unscaled)."""
         import math
         half = self.rotary_dim // 2
+        if local:
+            theta = self.rope_local_theta or self.rope_theta
+            return [theta ** (-i / half) for i in range(half)]
         inv = [self.rope_theta ** (-i / half) for i in range(half)]
         sc = self.rope_scaling
+        if sc and sc.get("rope_type") == "linear":
+            return [f / float(sc["factor"]) for f in inv]
         if sc:
             factor = float(sc["factor"])
             lo, hi = float(sc["low_freq_factor"]), float(sc["high_freq_factor"])
@@ -446,10 +469,116 @@ def _llama3_gguf(md: Mapping[str, Any]) -> ModelSpec:
     )
 
 
-HF_FAMILIES = {"qwen3_5_moe": _qwen36moe_hf, "qwen3_next": _qwen36moe_hf, "qwen3": _qwen3_hf, "llama": _llama3_hf}
-GGUF_FAMILIES = {"qwen35moe": _qwen36moe_gguf, "qwen3next": _qwen36moe_gguf, "qwen3": _qwen3_gguf, "llama": _llama3_gguf}
+def _gemma3_layer_types(n: int, cfg: Mapping[str, Any]) -> tuple[str, ...]:
+    if "layer_types" in cfg:
+        m = {"sliding_attention": DENSE_LOCAL, "full_attention": DENSE}
+        bad = sorted({t for t in cfg["layer_types"] if t not in m})
+        if bad:
+            raise SpecError(f"gemma3: unknown layer type(s) {bad}")
+        lt = tuple(m[t] for t in cfg["layer_types"])
+    else:
+        pat = int(cfg.get("sliding_window_pattern", 6))
+        lt = tuple(DENSE if (l + 1) % pat == 0 else DENSE_LOCAL for l in range(n))
+    if len(lt) != n:
+        raise SpecError(f"gemma3: layer_types has {len(lt)} entries, num_hidden_layers is {n}")
+    return lt
+
+
+def _gemma3_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+    """Gemma 3 (text): GQA with q/k RMSNorm, GeGLU-tanh FFN, sandwich norms, 5:1 sliding / global layers,
+    a local RoPE theta and a linearly scaled global one. The container stores the norms' 1 + w and the
+    sqrt(hidden)-scaled embeddings, so neither is a recipe transform."""
+    tc = cfg.get("text_config", cfg)
+    n = _need(tc, "num_hidden_layers")
+    hd = _need(tc, "head_dim")
+    vocab = _need(tc, "vocab_size")
+    if tc.get("hidden_activation", "gelu_pytorch_tanh") != "gelu_pytorch_tanh":
+        raise SpecError(f"gemma3: hidden_activation {tc.get('hidden_activation')!r} is not gelu_pytorch_tanh")
+    if tc.get("final_logit_softcapping") or tc.get("attn_logit_softcapping"):
+        raise SpecError("gemma3: logit softcapping is not supported (Gemma 3 has none)")
+    qps = tc.get("query_pre_attn_scalar", hd)
+    if abs(float(qps) - hd) > 1e-6:
+        raise SpecError(f"gemma3: query_pre_attn_scalar {qps} != head_dim {hd} (attn.h scales by 1/sqrt(HD))")
+    sc = tc.get("rope_scaling")
+    scaling = None
+    if sc:
+        if sc.get("rope_type", sc.get("type")) != "linear":
+            raise SpecError(f"gemma3: rope_scaling type {sc.get('rope_type')!r} is not supported (linear only)")
+        scaling = {"rope_type": "linear", "factor": float(sc["factor"])}
+    return ModelSpec(
+        family="gemma3",
+        hidden=_need(tc, "hidden_size"),
+        num_layers=n,
+        layer_types=_gemma3_layer_types(n, tc),
+        vocab=vocab,
+        real_vocab=real_vocab if real_vocab is not None else vocab,
+        num_heads=_need(tc, "num_attention_heads"),
+        num_kv_heads=_need(tc, "num_key_value_heads"),
+        head_dim=hd,
+        rotary_dim=hd,
+        rope_theta=float(_need(tc, "rope_theta")),
+        rope_scaling=scaling,
+        rope_local_theta=float(tc.get("rope_local_base_freq", 10000.0)),
+        sliding_window=int(_need(tc, "sliding_window")),
+        qk_norm=True,
+        attn_gate=False,
+        intermediate=_need(tc, "intermediate_size"),
+        activation="gelu_tanh",
+        sandwich_norms=True,
+        norm_eps=float(tc.get("rms_norm_eps", 1e-6)),
+        quant="q4_1",
+        extra={"model_type": cfg.get("model_type", tc.get("model_type")), "source": "hf_config"},
+    )
+
+
+def _gemma3_gguf(md: Mapping[str, Any]) -> ModelSpec:
+    a = md["general.architecture"]
+
+    def k(name: str):
+        return _need(md, f"{a}.{name}", "GGUF metadata")
+
+    n = k("block_count")
+    hd = k("attention.key_length")
+    vocab = md.get(f"{a}.vocab_size")
+    if vocab is None:
+        toks = md.get("tokenizer.ggml.tokens")
+        if toks is None:
+            raise SpecError(f"GGUF metadata lacks '{a}.vocab_size' and 'tokenizer.ggml.tokens'")
+        vocab = len(toks)
+    pat = int(md.get(f"{a}.attention.sliding_window_pattern", 6))
+    factor = md.get(f"{a}.rope.scaling.factor")
+    return ModelSpec(
+        family="gemma3",
+        hidden=k("embedding_length"),
+        num_layers=n,
+        layer_types=tuple(DENSE if (l + 1) % pat == 0 else DENSE_LOCAL for l in range(n)),
+        vocab=vocab,
+        real_vocab=vocab,
+        num_heads=k("attention.head_count"),
+        num_kv_heads=k("attention.head_count_kv"),
+        head_dim=hd,
+        rotary_dim=md.get(f"{a}.rope.dimension_count", hd),
+        rope_theta=float(k("rope.freq_base")),
+        rope_scaling={"rope_type": "linear", "factor": float(factor)} if factor else None,
+        rope_local_theta=float(md.get(f"{a}.rope.local_freq_base", 10000.0)),
+        sliding_window=int(k("attention.sliding_window")),
+        qk_norm=True,
+        attn_gate=False,
+        intermediate=k("feed_forward_length"),
+        activation="gelu_tanh",
+        sandwich_norms=True,
+        norm_eps=float(md.get(f"{a}.attention.layer_norm_rms_epsilon", 1e-6)),
+        quant="q4_1",
+        extra={"architecture": a, "source": "gguf"},
+    )
+
+
+HF_FAMILIES = {"qwen3_5_moe": _qwen36moe_hf, "qwen3_next": _qwen36moe_hf, "qwen3": _qwen3_hf, "llama": _llama3_hf,
+               "gemma3_text": _gemma3_hf, "gemma3": _gemma3_hf}
+GGUF_FAMILIES = {"qwen35moe": _qwen36moe_gguf, "qwen3next": _qwen36moe_gguf, "qwen3": _qwen3_gguf, "llama": _llama3_gguf,
+                 "gemma3": _gemma3_gguf}
 _FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen3_hf: "qwen3", _qwen3_gguf: "qwen3",
-              _llama3_hf: "llama3", _llama3_gguf: "llama3"}
+              _llama3_hf: "llama3", _llama3_gguf: "llama3", _gemma3_hf: "gemma3", _gemma3_gguf: "gemma3"}
 
 
 def hf_model_types(family: str) -> list[str]:

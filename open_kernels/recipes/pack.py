@@ -147,17 +147,29 @@ def build_lmhead_pool(plan: dict, m) -> np.ndarray:
     return out
 
 
-def ptab(rows: int, rotary_dim: int, theta: float, ptab_row: int = 1024, inv_freq=None) -> np.ndarray:
-    """The position record table: row p = [i32 pos | i32 nf = max(p, 1) | cos f32[rot/2] @512 | sin f32[rot/2]
+def window_rows(p, window: int):
+    """(valid, nf) for position p: the cached rows the attention core sees are [s, p) with
+    s = max(0, p - (window - 1)) (window 0: all of them); it streams nf = max(1, p - s) rows and
+    masks the ones at index >= valid = p - s (the dummy row at position 0)."""
+    p = np.asarray(p)
+    s = np.maximum(0, p - (window - 1)) if window else np.zeros_like(p)
+    valid = p - s
+    return valid, np.maximum(valid, 1)
+
+
+def ptab(rows: int, rotary_dim: int, theta: float, ptab_row: int = 1024, inv_freq=None, window: int = 0) -> np.ndarray:
+    """The position record table: row p = [i32 valid | i32 nf | cos f32[rot/2] @512 | sin f32[rot/2]
     right after the cos, @512 + 2*rot] for the RoPE over the first `rotary_dim` dims of a head (half-split
     pairs (i, i + rot/2)); attn.h reads the rot floats at +512 as [cos | sin]. `inv_freq` (rot/2 values,
-    ModelSpec.rope_inv_freq -- Llama 3's scaling lives there) defaults to theta^(-2i/rot)."""
+    ModelSpec.rope_inv_freq -- Llama 3's scaling lives there) defaults to theta^(-2i/rot). `window`
+    (rows, 0 = unbounded) makes the record count the sliding window's rows (window_rows)."""
     half = rotary_dim // 2
     if 512 + 8 * half > ptab_row:
         raise ValueError(f"a rotary dim of {rotary_dim} does not fit a {ptab_row}-byte position record")
     t = np.zeros((rows, ptab_row), np.uint8)
     p = np.arange(rows)
-    t[:, :8] = np.stack([p, np.maximum(p, 1)], 1).astype(np.int32).view(np.uint8)
+    valid, nf = window_rows(p, window)
+    t[:, :8] = np.stack([valid, nf], 1).astype(np.int32).view(np.uint8)
     f = np.asarray(inv_freq, np.float64) if inv_freq is not None else theta ** (-np.arange(half) / half)
     if len(f) != half:
         raise ValueError(f"inv_freq has {len(f)} values, the rotary dim wants {half}")

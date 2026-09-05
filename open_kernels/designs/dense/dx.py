@@ -112,12 +112,13 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
 
     f_gy = ef("gemv_q4_gy", HERE / "gemv_q4_gy.cc", [elem, tab_ty, y_ty, i32, i32, i32])
     f_gms = ef("gemv_q4_gms", HERE / "gemv_q4_gms.cc", [elem, tab_ty, ms_ty, i32, i32, i32])
-    f_silu = ef("dense_silu", HERE / "dense_silu.cc", [ms_ty, y_ty])
+    f_silu = ef("dense_act", HERE / "dense_act.cc", [ms_ty, y_ty])
     f_prep = ef("dense_prep", HERE / "dense_prep.cc", [x_ty, tab_ty, i32, i32])
     f_prepf = ef("dense_prep_f32", HERE / "dense_prep_f32.cc", [x_ty, tab_ty, i32, i32])
     f_nr = ef("ln_nr", LINL / "ln_nr.cc", [u8_ln] * 4, LN_FLAGS)
     f_lny = ef("ln_y", LN / "ln_y.cc", [u8_ln] * 5 + [i32], LN_FLAGS)
     f_lnx = ef("ln_xn", LN / "ln_xn.cc", [u8_ln] * 6, LN_FLAGS)
+    f_nr32 = ef("ln_nr32", LN / "ln_nr32.cc", [u8_ln] * 4 + [i32], LN_FLAGS) if G.SANDWICH else None
     f_meta = ef("attn_meta", ATTN / "attn_meta.cc", [u8_a, u8_a, bhd, bhd, fcs, i32_4], ATTN_FLAGS)
     f_q = ef("attn_q", ATTN / "attn_q.cc", [u8_a, bhd, fcs, fq, i32], ATTN_FLAGS)
     f_k = ef("attn_k", ATTN / "attn_k.cc", [u8_a, bhd, fcs, fhd, brow, i32], ATTN_FLAGS)
@@ -149,9 +150,13 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
                 win.release(1)
             yout.release(1)
 
+    def acq(fifo, n):
+        e = fifo.acquire(n)
+        return [e] if n == 1 else e            # acquire(1) yields the element itself
+
     def main_body(win, xin, yout, tab, ms, f_gy, f_gms, f_silu, f_prep, f_prepf):
         # q | k | v against xn (K = HID; XN_ELEMS elements)
-        xe = xin.acquire(G.XN_ELEMS)
+        xe = acq(xin, G.XN_ELEMS)
         for i in range(G.XN_ELEMS):
             f_prep(xe[i], tab, HID, i)
         gemv_bands(win, yout, tab, f_gy, G.Q_PC + 2 * G.KV_PC, NG_H, PB_H)
@@ -159,7 +164,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
         if stop == 1:
             return
         # o against og (K = QW)
-        oe = xin.acquire(G.OG_ELEMS)
+        oe = acq(xin, G.OG_ELEMS)
         for i in range(G.OG_ELEMS):
             f_prep(oe[i], tab, QW, i)
         gemv_bands(win, yout, tab, f_gy, G.O_PC, NG_Q, PB_Q)
@@ -167,7 +172,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
         if stop == 2:
             return
         # up | gate per band against xm (K = HID), silu -> h band
-        me = xin.acquire(G.XM_ELEMS)
+        me = acq(xin, G.XM_ELEMS)
         for i in range(G.XM_ELEMS):
             f_prep(me[i], tab, HID, i)
         for _ in range_(G.UP_PC):
@@ -192,25 +197,47 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             xin.release(1)
         gemv_bands(win, yout, tab, f_gy, G.DOWN_PC, NG_F, PB_F)
 
-    def ln_body(ain, aout, f_nr, f_lny, f_lnx):
+    def ln_body(ain, aout, f_nr, f_lny, f_lnx, *rest):
         # 1. the layer-entry norm: [x0 x1 lnw] -> [xn]
         e = ain.acquire(3)
         o = aout.acquire(1)
         f_nr(e[0], e[1], e[2], o)
         aout.release(1)
         ain.release(3)
-        # 2. residual + post-attention norm: [x0 x1 w a0 a1] -> [res0] [res1] [xm]
-        # 3. the output residual: [res0 res1 w out0 out1] -> [xres0] [xres1] [junk]
-        for _ in range_(2 if stop >= 3 else 1):
+
+        def post_norm(f_nr32):
+            # a sandwich norm on a block output: [o0 o1 w] -> [t0] [t1] (fp32 halves)
+            e = ain.acquire(3)
+            for i in range(2):
+                o = aout.acquire(1)
+                f_nr32(e[0], e[1], e[2], o, i)
+                aout.release(1)
+            ain.release(3)
+
+        def add_norm(with_xn):
+            # [x0 x1 w a0 a1] -> [y0] [y1] [xn]
             e = ain.acquire(5)
             for i in range(2):
                 o = aout.acquire(1)
                 f_lny(e[0], e[1], e[3], e[4], o, i)
                 aout.release(1)
-            o = aout.acquire(1)
-            f_lnx(e[0], e[1], e[3], e[4], e[2], o)
-            aout.release(1)
+            if with_xn:
+                o = aout.acquire(1)
+                f_lnx(e[0], e[1], e[3], e[4], e[2], o)
+                aout.release(1)
             ain.release(5)
+
+        if G.SANDWICH:
+            f_nr32 = rest[0]
+            post_norm(f_nr32)                  # 2a. t = post_attn_norm(out)
+            add_norm(True)                     # 2b. res = x + t; xm = pre_ffn_norm(res)
+            if stop >= 3:
+                post_norm(f_nr32)              # 3a. t2 = post_ffn_norm(out2)
+                add_norm(False)                # 3b. xres = res + t2
+        else:
+            add_norm(True)                     # 2. res = x + out; xm = post_attn_norm(res)
+            if stop >= 3:
+                add_norm(True)                 # 3. xres = res + out2 (the xn is junk)
 
     def attn_body(ain, aout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin):
         e = ain.acquire(2)                                      # [qn | kn], the position record
@@ -247,7 +274,8 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             f_fin(oacc, ml, o, hp)
             aout.release(1)
 
-    workers = [Worker(ln_body, fn_args=[of_lni.cons(), of_lno.prod(), f_nr, f_lny, f_lnx], tile=Tile(0, 3), stack_size=0x1800)]
+    workers = [Worker(ln_body, fn_args=[of_lni.cons(), of_lno.prod(), f_nr, f_lny, f_lnx] + ([f_nr32] if G.SANDWICH else []),
+                      tile=Tile(0, 3), stack_size=0x1800)]
     for c in range(N_CORES):
         workers.append(Worker(main_body, fn_args=[of_w[c].cons(), of_x.cons(), of_y[c].prod(),
                                                   Buffer(tab_ty, name=f"tab{c}"), Buffer(ms_ty, name=f"ms{c}"),
@@ -310,14 +338,28 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             tg_x.finish()
             return
         x_prod.fill(a_act, tap=bt(L.AD_BYTES, L.AD_OG, G.OG_ELEMS * ELEM), wait=True, group=tg_x)
-        # 5. residual + post-attention norm -> res, xm
+        # 5. residual + norms -> res, xm (sandwich: t = post_attn_norm(out) first, then res = x + t,
+        #    xm = pre_ffn_norm(res); plain: res = x + out, xm = post_attn_norm(res))
         tg_ln2 = TaskGroup()
-        lni.fill(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln2)
-        lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_POSTLN, ELN), wait=True, group=tg_ln2)
-        lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_RES, HID * 4), wait=True, group=tg_ln2)
-        lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_XM, ELN), wait=True, group=tg_ln2)
-        py.finish()                                               # out is in DDR
-        lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_OUT, HID * 4), wait=True, group=tg_ln2)
+        if G.SANDWICH:
+            py.finish()                                           # out is in DDR
+            tg_t = TaskGroup()
+            lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_OUT, HID * 4), wait=True, group=tg_t)
+            lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_POSTLN, ELN), wait=True, group=tg_t)
+            lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_T, HID * 4), wait=True, group=tg_t)
+            tg_t.finish()                                         # t is in DDR
+            lni.fill(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln2)
+            lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_PREFFN, ELN), wait=True, group=tg_ln2)
+            lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_T, HID * 4), wait=True, group=tg_ln2)
+            lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_RES, HID * 4), wait=True, group=tg_ln2)
+            lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_XM, ELN), wait=True, group=tg_ln2)
+        else:
+            lni.fill(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln2)
+            lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_POSTLN, ELN), wait=True, group=tg_ln2)
+            lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_RES, HID * 4), wait=True, group=tg_ln2)
+            lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_XM, ELN), wait=True, group=tg_ln2)
+            py.finish()                                           # out is in DDR
+            lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_OUT, HID * 4), wait=True, group=tg_ln2)
         tg_ln2.finish()                                           # res, xm are in DDR
         # 6. up | gate per band, silu -> h
         x_prod.fill(a_act, tap=bt(L.AD_BYTES, L.AD_XM, G.XM_ELEMS * ELEM), wait=True, group=tg_x)
@@ -342,12 +384,24 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             pw.fill(w_prods[c], a_pool, bt(L.POOL_BYTES, L.POOL_DOWN + c * G.DOWN_PC * BB_F, G.DOWN_PC * BB_F))
             py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_OUT2 + c * G.DOWN_PC * YB, G.DOWN_PC * YB))
         tg_ln3 = TaskGroup()
-        lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_RES, HID * 4), wait=True, group=tg_ln3)
-        lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_POSTLN, ELN), wait=True, group=tg_ln3)
-        lno.drain(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln3)
-        lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_JUNK, ELN), wait=True, group=tg_ln3)
-        py.finish()                                               # out2 is in DDR
-        lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_OUT2, HID * 4), wait=True, group=tg_ln3)
+        if G.SANDWICH:
+            py.finish()                                           # out2 is in DDR
+            tg_t2 = TaskGroup()
+            lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_OUT2, HID * 4), wait=True, group=tg_t2)
+            lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_POSTFFN, ELN), wait=True, group=tg_t2)
+            lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_T2, HID * 4), wait=True, group=tg_t2)
+            tg_t2.finish()                                        # t2 is in DDR
+            lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_RES, HID * 4), wait=True, group=tg_ln3)
+            lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_POSTFFN, ELN), wait=True, group=tg_ln3)   # unused w
+            lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_T2, HID * 4), wait=True, group=tg_ln3)
+            lno.drain(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln3)
+        else:
+            lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_RES, HID * 4), wait=True, group=tg_ln3)
+            lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_POSTLN, ELN), wait=True, group=tg_ln3)
+            lno.drain(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln3)
+            lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_JUNK, ELN), wait=True, group=tg_ln3)
+            py.finish()                                           # out2 is in DDR
+            lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_OUT2, HID * 4), wait=True, group=tg_ln3)
         tg_ln3.finish()
         pw.finish()
         pa_in.finish()
@@ -366,7 +420,7 @@ DESIGN = dx
 _src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + sorted(f.read_bytes() for f in HERE.glob("*.py"))
                 + sorted(f.read_bytes() for f in ATTN.glob("*.cc")) + sorted(f.read_bytes() for f in ATTN.glob("*.h"))
                 + sorted(f.read_bytes() for f in (HERE.parent.parent / "recipes").glob("*.py"))
-                + [(LN / "ln.h").read_bytes(), (LN / "ln_y.cc").read_bytes(), (LN / "ln_xn.cc").read_bytes(), (LINL / "ln_nr.cc").read_bytes(), (GEMV / "gemv_q4.h").read_bytes(),
+                + [(LN / "ln.h").read_bytes(), (LN / "ln_y.cc").read_bytes(), (LN / "ln_xn.cc").read_bytes(), (LN / "ln_nr32.cc").read_bytes(), (LINL / "ln_nr.cc").read_bytes(), (GEMV / "gemv_q4.h").read_bytes(),
                    (GEMV / "gemv_tab.h").read_bytes(),
                    (HERE.parent.parent / "include" / "vecmath.h").read_bytes(), SPEC.spec_hash().encode()])
 SPECIALIZE = {"stop": STOP, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

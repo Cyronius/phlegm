@@ -55,6 +55,8 @@
   "rotary_dim": 64,
   "rope_theta": 10000000.0,
   "rope_scaling": null,
+  "rope_local_theta": 0.0,
+  "sliding_window": 0,
   "qk_norm": true,
   "attn_gate": true,
   "lin_key_heads": 16,
@@ -63,6 +65,8 @@
   "lin_value_dim": 128,
   "conv_kernel": 4,
   "intermediate": 0,
+  "activation": "silu",
+  "sandwich_norms": false,
   "num_experts": 256,
   "experts_per_tok": 8,
   "moe_intermediate": 512,
@@ -75,7 +79,7 @@
    "source": "hf_config"
   }
  },
- "spec_hash": "sha256:6848607f0348ec79f8b77662cc2cff66d85daf201a648ebd393f51dc3659bb8e",
+ "spec_hash": "sha256:32e980528551df6ae76741cce159c2e79a7a7daa6b0d01d78f665a1164b9f780",
  "build_key": "sha256:fixture",
  "max_ctx_default": 4096,
  "hf_config_check": {

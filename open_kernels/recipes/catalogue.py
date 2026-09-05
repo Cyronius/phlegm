@@ -85,8 +85,8 @@ class Template:
 
 CATALOGUE: dict[str, Template] = {t.name: t for t in [
     Template("gemv_q4", "designs/gemv_q4/gemv_q4.h",
-             {"K": values(2048, 4096, 2560, 9728, 14336),   # 2048 / 4096: the 27B layers; 2560 / 9728: Qwen3-4B;
-                                                            # 14336: Llama 3.1 8B (OPEN-FAMILY-QWEN3 / -LLAMA3)
+             {"K": values(2048, 4096, 2560, 9728, 14336, 10240),   # 2048 / 4096: the 27B layers; 2560 / 9728: Qwen3-4B;
+                                                                   # 14336: Llama 3.1 8B; 10240: Gemma 3 4B
               "rs": values(2, 4),                # band row split: standard layout / expert stripes
               "rows_per_core": multiple_of(64),  # one y element per 64-row band
               "per_call": values(2, 1)},         # chunks per w element (10 KB; 5 KB when the table is wide)
@@ -95,11 +95,12 @@ CATALOGUE: dict[str, Template] = {t.name: t for t in [
              {"K": values(512)},                 # the expert hidden h (moe_experts' law)
              note="validated through the whole-layer MoE block only"),
     Template("attn", "designs/attn/attn.h",
-             {"head_dim": values(256, 128), "num_heads": values(16, 32), "num_kv_heads": values(2, 8),
-              "rotary_dim": values(64, 128), "rope_theta": any_positive(),
+             {"head_dim": values(256, 128), "num_heads": values(16, 32, 8), "num_kv_heads": values(2, 8, 4),
+              "rotary_dim": values(64, 128, 256), "rope_theta": any_positive(),
               "qk_norm": values(True, False), "attn_gate": values(True, False)},
              note="ATTN_* are compile-time macros; compared at (256, 16, 2, 64, gate, qk-norm) on the 27B, "
-                  "(128, 32, 8, 128, no gate, qk-norm) on Qwen3-4B and (128, 32, 8, 128, no gate, no qk-norm) on Llama 3.1 8B"),
+                  "(128, 32, 8, 128, no gate, qk-norm) on Qwen3-4B, (128, 32, 8, 128, no gate, no qk-norm) on Llama 3.1 8B "
+                  "and (256, 8, 4, 256, no gate, qk-norm, a 1024-row window) on Gemma 3 4B"),
     Template("deltanet", "designs/layer_x/dnx.h",
              {"heads": values(32), "dim": values(128), "key_heads": values(16), "conv_kernel": values(4)},
              note="Qwen3-Next / 3.5 / 3.6 families only"),

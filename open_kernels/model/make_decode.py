@@ -91,7 +91,7 @@ def build_cfg(m: dict, nl: int, tokens: int, out: Path, pool_dir: Path, max_ctx:
     hid = lay["hidden"]
     for name, size in m["globals"].items():
         if isinstance(size, dict):
-            cfg.append(f"buf {name} {size['per_row'] * max_ctx} {o}/{name}.bin")
+            cfg.append(f"buf {name} {size['per_row'] * max_ctx} {o}/{name}.bin")   # a position table (written below)
         elif name == "lmpool":
             cfg.append(f"buf lmpool {size} {pool_dir.as_posix()}/pool_lmhead.bin")
         elif name in ("xres", "normw", "zero"):
@@ -109,12 +109,14 @@ def build_cfg(m: dict, nl: int, tokens: int, out: Path, pool_dir: Path, max_ctx:
         else:
             cfg.append(f"buf state{l} {st['bytes']} {o}/zstate_{lt}.bin")
     attnpos = [kn for kn, kd in m["kernels"].items() if kn in used and kd.get("patch") == "attnpos"]
+    windows = {kn: m["kernels"][kn].get("window", 0) for kn in attnpos}
     runs = []
     for t in range(tokens):
         s = sfx(t)
         if t:
             runs.append(f"load xres {o}/xres{t}.bin")
         for kn in attnpos:
+            runs.append(f"attngeom {lay['kv_row']} {lay['ptab_row']} {windows[kn]}")
             runs.append(f"attnpos {kn} {t}")
         for l, lt in enumerate(types):
             for step in m["layer_types"][lt]["program"]:
@@ -163,7 +165,7 @@ def main() -> int:
     types = list(spec.layer_types[:nl])
     q = Q4NX(md / "model.q4nx")
     q.hidden = spec.hidden
-    tok0 = a.token if a.token is not None else {"qwen36moe": 248045, "qwen3": 151644, "llama3": 128000}[spec.family]
+    tok0 = a.token if a.token is not None else {"qwen36moe": 248045, "qwen3": 151644, "llama3": 128000, "gemma3": 2}[spec.family]
     print(f"{md.name} ({spec.family}): {spec.num_layers} layers -> running {nl}: {types}")
 
     if not a.cfg_only:
@@ -172,7 +174,10 @@ def main() -> int:
             st = d["buffers"]["state"]
             if st["kind"] == "linear":
                 write(out / f"zstate_{lt}.bin", np.zeros(st["bytes"], np.uint8))
-        write(out / "ptab.bin", PK.ptab(a.max_ctx, spec.rotary_dim, spec.rope_theta, lay["ptab_row"], spec.rope_inv_freq()))
+        for name, g in m["globals"].items():
+            if isinstance(g, dict):
+                write(out / f"{name}.bin", PK.ptab(a.max_ctx, spec.rotary_dim, spec.rope_theta, g["per_row"],
+                                                   g.get("inv_freq", spec.rope_inv_freq()), g.get("window", 0)))
         write(out / "normw.bin", f32_to_bf16(q.bf16(plan["norm"]["tensor"])))
         for l, lt in enumerate(types):
             pf = pool_dir / f"pool_L{l}.bin"

@@ -20,6 +20,8 @@ from recipes.manifest import manifest  # noqa: E402
 FIXTURE = HERE / "fixtures" / "manifest_qwen36.json"
 FIXTURE_Q3 = HERE / "fixtures" / "manifest_qwen3_4b.json"
 SPEC_Q3 = HERE.parents[2] / "open_kernels" / "recipes" / "specs" / "qwen3-4b.json"
+FIXTURE_G3 = HERE / "fixtures" / "manifest_gemma3_4b.json"
+SPEC_G3 = HERE.parents[2] / "open_kernels" / "recipes" / "specs" / "gemma3-4b.json"
 
 
 def fixture_manifest() -> dict:
@@ -30,8 +32,12 @@ def fixture_manifest_q3() -> dict:
     return manifest(load_spec(SPEC_Q3), key="sha256:fixture")
 
 
+def fixture_manifest_g3() -> dict:
+    return manifest(load_spec(SPEC_G3), key="sha256:fixture")
+
+
 if __name__ == "__main__":
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    for f, m in ((FIXTURE, fixture_manifest()), (FIXTURE_Q3, fixture_manifest_q3())):
+    for f, m in ((FIXTURE, fixture_manifest()), (FIXTURE_Q3, fixture_manifest_q3()), (FIXTURE_G3, fixture_manifest_g3())):
         f.write_text(json.dumps(m, indent=1) + "\n", encoding="utf-8", newline="\n")
         print(f"wrote {f}")

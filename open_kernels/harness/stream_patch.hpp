@@ -50,7 +50,17 @@ struct MoeGeometry {
 struct AttnGeometry {
     uint64_t kv_row = 2048;
     uint64_t ptab_row = 1024;
+    uint64_t window = 0;             ///< rows of a sliding window (0 = every cached row); Gemma's local layers
 };
+
+/// The cached rows position `pos` attends to: [start, pos), streamed as nf rows (>= 1: position 0
+/// streams one dummy row the core masks). Mirrors recipes/pack.py window_rows.
+inline void attn_window(uint64_t pos, uint64_t window, uint64_t* start, uint64_t* nf) {
+    uint64_t s = (window && pos + 1 > window) ? pos + 1 - window : 0;
+    *start = s;
+    uint64_t valid = pos - s;
+    *nf = valid ? valid : 1;
+}
 
 /// Word length of the instruction-stream op starting with word `w`.
 inline size_t op_len(uint32_t w) {
@@ -75,9 +85,11 @@ struct MoePatch {
     uint64_t intra = 0;
 };
 
-/// An `attnpos` patch: the word, and which of the three per-token quantities it
+/// An `attnpos` patch: the word, and which of the four per-token quantities it
 /// carries (0 = the KV window fill's BD length, 1 = the new row's drain offset,
-/// 2 = the position record's fill offset) with the offset word's flag bits.
+/// 2 = the position record's fill offset, 3 = the KV window fill's offset -- the
+/// window's first row, 0 unless the layer has a sliding window) with the offset
+/// word's flag bits.
 struct AttnPatch {
     size_t word;
     uint8_t kind;
@@ -158,6 +170,7 @@ inline std::vector<AttnPatch> attn_table(const std::vector<uint32_t>& w, const s
             if (!have_bd || bd_write + 2 >= w.size() || w[bd_write + 2] + 4 != reg)
                 throw std::runtime_error("attnpos: " + kn + ": no BD write before the KV window fill");
             t.push_back({bd_write + 4, 0, 0});
+            t.push_back({i + 10, 3, flags});
         } else if (arg == 3 && off == g.kv_row) {
             t.push_back({i + 10, 1, flags});
         } else if (arg == 3) {
@@ -166,12 +179,12 @@ inline std::vector<AttnPatch> attn_table(const std::vector<uint32_t>& w, const s
             t.push_back({i + 10, 2, flags});
         }
     }
-    for (uint8_t kind = 0; kind < 3; ++kind) {
+    for (uint8_t kind = 0; kind < 4; ++kind) {
         size_t n = 0;
         for (const auto& p : t) n += (p.kind == kind);
         if (n != 1)
             throw std::runtime_error("attnpos: " + kn + ": " + std::to_string(n) + " patches of kind " +
-                                     std::to_string(kind) + ", expected 1 (window fill, row drain, record fill)");
+                                     std::to_string(kind) + ", expected 1 (window length, row drain, record fill, window offset)");
     }
     return t;
 }
@@ -205,15 +218,18 @@ inline void moe2_apply(uint32_t* iw, const std::vector<MoePatch>& table, const u
     }
 }
 
-/// Set the cache position: the window fill reads rows [0, max(pos, 1)), the
-/// new row lands at row pos, the RoPE record is ptab row pos.
+/// Set the cache position: the window fill reads rows [start, start + nf) (attn_window: every
+/// cached row, or the sliding window's), the new row lands at row pos, the RoPE record is ptab
+/// row pos (whose [valid | nf] counts match the same window).
 inline void attn_apply(uint32_t* iw, const std::vector<AttnPatch>& table, uint64_t pos,
                        const AttnGeometry& g = AttnGeometry{}) {
-    uint64_t nf = pos ? pos : 1;
+    uint64_t start, nf;
+    attn_window(pos, g.window, &start, &nf);
     for (const auto& p : table) {
         uint64_t v = p.kind == 0   ? nf * g.kv_row / 4  // a BD length is in words
                      : p.kind == 1 ? pos * g.kv_row
-                                   : pos * g.ptab_row;
+                     : p.kind == 2 ? pos * g.ptab_row
+                                   : start * g.kv_row;
         iw[p.word] = static_cast<uint32_t>(v) | p.flags;
     }
 }
