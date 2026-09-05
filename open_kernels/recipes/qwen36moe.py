@@ -428,8 +428,8 @@ def pack_plan(spec: ModelSpec) -> dict:
          "nch": q4_chunks(hid, ff), "in_dim": ff},
     ]
     plan: dict = {"pool_bytes": L.POOL_BYTES, "chunk_bytes": CHUNK, "layer_types": {},
-                  "lm_head": {"op": "lmhead_q8", "tensor": "lm_head.weight", "chunk_bytes": Q8_CHUNK,
-                              "pool_bytes": L.LMHEAD_POOL_BYTES},
+                  "lm_head": {"pool_bytes": L.LMHEAD_POOL_BYTES,
+                              "ops": [{"op": "lmhead_q8", "tensor": "lm_head.weight", "chunk_bytes": Q8_CHUNK, "dst": 0}]},
                   "embed": {"tensor": "model.embed_tokens.weight", "dim": hid},
                   "norm": {"tensor": "model.norm.weight", "bytes": hid * 2}}
     if spec.has_linear:
@@ -504,14 +504,14 @@ def programs(spec: ModelSpec) -> dict:
     }
     out["contexts"]["ln"] = "ln/final.xclbin"
     out["contexts"]["lm"] = "lm_head_q8/final.xclbin"
-    out["kernels"]["ln"] = {"context": "ln", "insts": "ln/insts.bin"}
-    out["kernels"]["lm"] = {"context": "lm", "insts": "lm_head_q8/insts.bin"}
+    out["kernels"]["ln"] = {"context": "ln", "insts": "ln/insts.bin", "build": "ln"}
+    out["kernels"]["lm"] = {"context": "lm", "insts": "lm_head_q8/insts.bin", "build": "lm_head_q8"}
     if spec.has_linear:
         args = ["pool", "xres", "consts", "state", "act"]
         check_buffer_args("lx", args)
         out["contexts"]["lx"] = "lx0/final.xclbin"
-        out["kernels"]["lx0"] = {"context": "lx", "insts": "lx0/insts.bin"}
-        out["kernels"]["lx1"] = {"context": "lx", "insts": "lx1/insts.bin", "patch": "moeroute2"}
+        out["kernels"]["lx0"] = {"context": "lx", "insts": "lx0/insts.bin", "build": "lx0"}
+        out["kernels"]["lx1"] = {"context": "lx", "insts": "lx1/insts.bin", "patch": "moeroute2", "build": "lx1"}
         out["layer_types"][LINEAR] = {
             "buffers": {"consts": L.C_BYTES, "act": L.A_BYTES, "state": {"kind": "linear", "bytes": L.STATE_BYTES}},
             "program": [{"op": "run", "kernel": "lx0", "args": args},
@@ -522,8 +522,8 @@ def programs(spec: ModelSpec) -> dict:
         args = ["pool", "xres", "consts", "state", "act", "ptab"]
         check_buffer_args("ax", args)
         out["contexts"]["ax"] = "ax0/final.xclbin"
-        out["kernels"]["ax0"] = {"context": "ax", "insts": "ax0/insts.bin", "patch": "attnpos"}
-        out["kernels"]["ax1"] = {"context": "ax", "insts": "ax1/insts.bin", "patch": "moeroute2"}
+        out["kernels"]["ax0"] = {"context": "ax", "insts": "ax0/insts.bin", "patch": "attnpos", "build": "ax0"}
+        out["kernels"]["ax1"] = {"context": "ax", "insts": "ax1/insts.bin", "patch": "moeroute2", "build": "ax1"}
         out["layer_types"][FULL] = {
             "buffers": {"consts": L.CA_BYTES, "act": L.AA_BYTES, "state": {"kind": "kv", "row": L.KV_ROW}},
             "program": [{"op": "run", "kernel": "ax0", "args": args},
@@ -531,6 +531,31 @@ def programs(spec: ModelSpec) -> dict:
                         {"op": "run", "kernel": "ax1", "args": args}],
         }
     return out
+
+
+def hf_config_check(spec: ModelSpec) -> dict:
+    return {"hidden_size": spec.hidden, "num_hidden_layers": spec.num_layers, "vocab_size": spec.vocab,
+            "num_experts": spec.num_experts, "num_experts_per_tok": spec.experts_per_tok,
+            "moe_intermediate_size": spec.moe_intermediate, "head_dim": spec.head_dim,
+            "num_attention_heads": spec.num_heads, "num_key_value_heads": spec.num_kv_heads,
+            "layer_types": list(spec.layer_types)}
+
+
+def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
+    """The manifest's `layout` block for this family."""
+    R = recipe(spec, max_ctx)
+    L, C = R.layout, R.common
+    return {
+        "hidden": spec.hidden, "vocab": spec.vocab, "real_vocab": spec.real_vocab,
+        "chunk_bytes": CHUNK, "pool_bytes": L.POOL_BYTES,
+        "lmhead_pool_bytes": L.LMHEAD_POOL_BYTES, "lmhead_chunk_bytes": Q8_CHUNK,
+        "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim, "rope_theta": spec.rope_theta,
+        "rout_idx_off": ROUT_IDX_OFF,
+        "moe": {"experts": spec.num_experts, "topk": spec.experts_per_tok,
+                "stripe": C.STRIPE, "up_bytes": C.UP_BYTES, "down_core": C.DOWN_PER_CORE * C.DOWN_BAND,
+                "pool_down": L.POOL_DOWN, "share_up": L.POOL_SHARE_UP, "share_gate": L.POOL_SHARE_GATE,
+                "share_down": L.POOL_SHARE_DOWN},
+    }
 
 
 def builds(spec: ModelSpec) -> dict[str, dict]:

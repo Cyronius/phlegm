@@ -12,7 +12,7 @@ from recipes.load import default_spec
 
 
 def copy_tree(dst: Path) -> Path:
-    for f in source_files():
+    for f in source_files(default_spec()):
         rel = f.relative_to(ROOT)
         (dst / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(f, dst / rel)
@@ -25,7 +25,7 @@ def test_key_is_stable_and_covers_the_sources(tmp_path):
     k1 = build_key(spec, root)
     assert k1 == build_key(spec, root) == build_key(spec)
     assert k1.startswith("sha256:") and len(k1) == 7 + 64
-    files = [f.relative_to(root).as_posix() for f in source_files(root)]
+    files = [f.relative_to(root).as_posix() for f in source_files(spec, root)]
     for must in ("recipes/qwen36moe.py", "designs/layer_x/lx.py", "designs/layer_x/xcommon.py",
                  "designs/attn/attn.h", "designs/gemv_q4/gemv_q4.h", "designs/layer_x/gen_kernels.py",
                  "designs/lm_head_q8/lm_head_q8.py", "include/vecmath.h"):

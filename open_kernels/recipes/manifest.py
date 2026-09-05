@@ -1,10 +1,10 @@
 """manifest.json: everything src/open_qwen36 reads about a kernel set.
 
-Written by export_qwen36_kernels.py beside the six xclbin / insts pairs. The
+Written by export_qwen36_kernels.py beside the xclbin / insts pairs. The
 driver derives every layout constant, context, kernel, per-layer program and
 packing law from it -- no HID, no POOL_*, no lx0 / ax0 names in C++. A model
 whose config.json disagrees with `hf_config_check` is refused at startup
-(OPEN-MANIFEST).
+(OPEN-MANIFEST). The family recipe (families.py) supplies every block.
 
     python -m recipes.manifest [--spec FILE | --model-dir DIR] [--out manifest.json]
 """
@@ -15,8 +15,8 @@ import json
 import sys
 from pathlib import Path
 
-from . import qwen36moe as Q
 from .cache import build_key
+from .families import for_spec
 from .load import spec_from_model_dir
 from .spec import ModelSpec, hf_model_types
 
@@ -24,9 +24,11 @@ MANIFEST_VERSION = 1
 
 
 def manifest(spec: ModelSpec, max_ctx: int = 4096, key: str | None = None) -> dict:
-    R = Q.recipe(spec, max_ctx)
-    L, C = R.layout, R.common
-    prog = Q.programs(spec)
+    F = for_spec(spec)
+    F.recipe(spec, max_ctx)                 # refuses a spec outside the validated points
+    prog = F.programs(spec)
+    check = {"model_type": hf_model_types(spec.family)}
+    check.update(F.hf_config_check(spec))
     m = {
         "manifest_version": MANIFEST_VERSION,
         "family": spec.family,
@@ -34,37 +36,20 @@ def manifest(spec: ModelSpec, max_ctx: int = 4096, key: str | None = None) -> di
         "spec_hash": spec.spec_hash(),
         "build_key": key if key is not None else build_key(spec),
         "max_ctx_default": max_ctx,
-        "hf_config_check": {
-            "model_type": hf_model_types(spec.family),
-            "hidden_size": spec.hidden, "num_hidden_layers": spec.num_layers, "vocab_size": spec.vocab,
-            "num_experts": spec.num_experts, "num_experts_per_tok": spec.experts_per_tok,
-            "moe_intermediate_size": spec.moe_intermediate, "head_dim": spec.head_dim,
-            "num_attention_heads": spec.num_heads, "num_key_value_heads": spec.num_kv_heads,
-            "layer_types": list(spec.layer_types),
-        },
-        "layout": {
-            "hidden": spec.hidden, "vocab": spec.vocab, "real_vocab": spec.real_vocab,
-            "chunk_bytes": Q.CHUNK, "pool_bytes": L.POOL_BYTES,
-            "lmhead_pool_bytes": L.LMHEAD_POOL_BYTES, "lmhead_chunk_bytes": Q.Q8_CHUNK,
-            "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim, "rope_theta": spec.rope_theta,
-            "rout_idx_off": Q.ROUT_IDX_OFF,
-            "moe": {"experts": spec.num_experts, "topk": spec.experts_per_tok,
-                    "stripe": C.STRIPE, "up_bytes": C.UP_BYTES, "down_core": C.DOWN_PER_CORE * C.DOWN_BAND,
-                    "pool_down": L.POOL_DOWN, "share_up": L.POOL_SHARE_UP, "share_gate": L.POOL_SHARE_GATE,
-                    "share_down": L.POOL_SHARE_DOWN},
-        },
+        "hf_config_check": check,
+        "layout": F.manifest_layout(spec, max_ctx),
         "layers": list(spec.layer_types),
         "contexts": prog["contexts"],
         "kernels": prog["kernels"],
         "layer_types": prog["layer_types"],
         "tail": prog["tail"],
         "globals": prog["globals"],
-        "builds": Q.builds(spec),
+        "builds": F.builds(spec),
     }
-    plan = Q.pack_plan(spec)
+    plan = F.pack_plan(spec)
     for lt, d in plan.pop("layer_types").items():
         m["layer_types"][lt]["pack"] = d
-    m["pack"] = plan          # pool_bytes, chunk_bytes, lm_head, embed, norm
+    m["pack"] = plan          # pool_bytes, chunk_bytes, lm_head {pool_bytes, ops}, embed, norm
     return m
 
 

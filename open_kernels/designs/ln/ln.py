@@ -8,6 +8,7 @@ All streams use 4 KB byte elements: in = [x (2), add (2), w (1)], out = [y (2), 
 from __future__ import annotations
 
 import hashlib
+import os
 import sys
 from pathlib import Path
 
@@ -24,17 +25,18 @@ HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE.parent.parent))
 from ironutil import Pipeline, include_dirs  # noqa: E402
 
-N = 2048
-ELEM = 4096
+N = int(os.environ.get("LN_N", 2048))     # the width; elements are N*2 bytes (ln.cc LN_N)
+ELEM = N * 2
 
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
-def ln(x: In, add: In, w: In, y: Out, xn: Out, *, srchash: CompileTime[int] = 0):
+def ln(x: In, add: In, w: In, y: Out, xn: Out, *, n: CompileTime[int] = 2048, srchash: CompileTime[int] = 0):
     u8 = np.ndarray[(ELEM,), np.dtype[np.uint8]]
     f_ty = np.ndarray[(N,), np.dtype[np.float32]]
     b_ty = np.ndarray[(N,), np.dtype[bfloat16]]
     fn = ExternalFunction("ln_fn", source_file=str(HERE / "ln.cc"),
-                          arg_types=[u8, u8, u8, u8, u8, u8, u8, u8], include_dirs=include_dirs())
+                          arg_types=[u8, u8, u8, u8, u8, u8, u8, u8], include_dirs=include_dirs(),
+                          compile_flags=[f"-DLN_N={N}"])
     of_in = ObjectFifo(u8, name="in", depth=5)
     of_out = ObjectFifo(u8, name="out", depth=3)
 
@@ -62,4 +64,4 @@ def ln(x: In, add: In, w: In, y: Out, xn: Out, *, srchash: CompileTime[int] = 0)
 
 DESIGN = ln
 _src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + [(HERE.parent.parent / "include" / "vecmath.h").read_bytes()])
-SPECIALIZE = {"srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}
+SPECIALIZE = {"n": N, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

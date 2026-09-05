@@ -177,16 +177,21 @@ struct Host {
 
     // The patch tables are pure functions of the instruction words
     // (stream_patch.hpp); build each once per kernel.
+    // The pool / cache geometry the tables are decoded against: the 27B's by
+    // default, set by the `attngeom` / `moegeom` directives (a manifest's values).
+    stream_patch::AttnGeometry ag;
+    stream_patch::MoeGeometry mg;
+
     const std::vector<MoePatch>& moe_table(Kernel& k, const std::string& kn) {
-        if (!k.moe_built) { k.moe = stream_patch::moe_table(k.words, kn); k.moe_built = true; }
+        if (!k.moe_built) { k.moe = stream_patch::moe_table(k.words, kn, mg); k.moe_built = true; }
         return k.moe;
     }
     const std::vector<MoePatch>& moe2_table(Kernel& k, const std::string& kn) {
-        if (!k.moe2_built) { k.moe2 = stream_patch::moe2_table(k.words, kn); k.moe2_built = true; }
+        if (!k.moe2_built) { k.moe2 = stream_patch::moe2_table(k.words, kn, mg); k.moe2_built = true; }
         return k.moe2;
     }
     const std::vector<AttnPatch>& attn_table(Kernel& k, const std::string& kn) {
-        if (!k.attn_built) { k.attn = stream_patch::attn_table(k.words, kn); k.attn_built = true; }
+        if (!k.attn_built) { k.attn = stream_patch::attn_table(k.words, kn, ag); k.attn_built = true; }
         return k.attn;
     }
 
@@ -322,12 +327,30 @@ struct Host {
             auto idx = read_route(rb, ioff);
             Kernel& k = kernel(kn);
             uint32_t* iw = k.instr_words();
-            if (v2) stream_patch::moe2_apply(iw, moe2_table(k, kn), idx.data());
-            else stream_patch::moe_apply(iw, moe_table(k, kn), idx.data());
+            if (v2) stream_patch::moe2_apply(iw, moe2_table(k, kn), idx.data(), mg);
+            else stream_patch::moe_apply(iw, moe_table(k, kn), idx.data(), mg);
             k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             std::printf("%s %s idx [%u %u %u %u %u %u %u %u] (%.3f ms)\n", cmd.c_str(), kn.c_str(), idx[0],
                         idx[1], idx[2], idx[3], idx[4], idx[5], idx[6], idx[7], ms);
+        } else if (cmd == "attngeom") {
+            // attngeom <kv_row> <ptab_row>: the KV cache row and position-record sizes of the
+            // streams that follow (manifest.json layout.kv_row / ptab_row); default the 27B's.
+            ag.kv_row = num(need(it, "attngeom kv_row"), "attngeom kv_row");
+            ag.ptab_row = num(need(it, "attngeom ptab_row"), "attngeom ptab_row");
+            std::printf("attngeom kv_row %llu ptab_row %llu\n", (unsigned long long)ag.kv_row, (unsigned long long)ag.ptab_row);
+        } else if (cmd == "moegeom") {
+            // moegeom <experts> <topk> <stripe> <up_bytes> <down_core> <pool_down> <share_up> <share_gate> <share_down>
+            mg.experts = (unsigned)num(need(it, "moegeom experts"), "moegeom");
+            mg.topk = (unsigned)num(need(it, "moegeom topk"), "moegeom");
+            mg.stripe = num(need(it, "moegeom stripe"), "moegeom");
+            mg.up_bytes = num(need(it, "moegeom up_bytes"), "moegeom");
+            mg.down_core = num(need(it, "moegeom down_core"), "moegeom");
+            mg.pool_down = num(need(it, "moegeom pool_down"), "moegeom");
+            mg.share_up = num(need(it, "moegeom share_up"), "moegeom");
+            mg.share_gate = num(need(it, "moegeom share_gate"), "moegeom");
+            mg.share_down = num(need(it, "moegeom share_down"), "moegeom");
+            std::printf("moegeom set\n");
         } else if (cmd == "attnpos") {
             // attnpos <kernel> <pos>: this token's cache position in the (shared)
             // ax0 stream — the window fill reads rows [0, max(pos, 1)), the new
@@ -338,11 +361,11 @@ struct Host {
             // The capacity is whatever the KV / ptab buffers were sized to (the
             // kernel only sees runtime-patched offsets); the ptab buffer is the
             // one declared in this program, so bound by it.
-            if (Buf* pt = bufs.count("ptab") ? &buf("ptab") : nullptr; pt && (pos + 1) * stream_patch::AttnGeometry{}.ptab_row > pt->size)
+            if (Buf* pt = bufs.count("ptab") ? &buf("ptab") : nullptr; pt && (pos + 1) * ag.ptab_row > pt->size)
                 throw std::runtime_error("attnpos: pos " + std::to_string(pos) + " beyond the ptab buffer");
             auto t0 = std::chrono::steady_clock::now();
             Kernel& k = kernel(kn);
-            stream_patch::attn_apply(k.instr_words(), attn_table(k, kn), pos);
+            stream_patch::attn_apply(k.instr_words(), attn_table(k, kn), pos, ag);
             k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             std::printf("attnpos %s pos %zu (%.3f ms)\n", kn.c_str(), pos, ms);

@@ -15,8 +15,13 @@ Traces: OPEN-OP-RANGE (specs/open-engine/spec.md).
 """
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+
+_WARNED: set = set()
 
 
 class OpRangeError(ValueError):
@@ -67,13 +72,21 @@ class Template:
                 raise OpRangeError(f"{self.name}: no parameter {k!r} (has {sorted(self.params)})")
             p = self.params[k]
             if not p.ok(v):
-                raise OpRangeError(f"{self.name}: {k}={v!r} is outside the validated set {p.expected()}"
-                                   + (f" ({self.note})" if self.note else ""))
+                msg = (f"{self.name}: {k}={v!r} is outside the validated set {p.expected()}"
+                       + (f" ({self.note})" if self.note else ""))
+                if os.environ.get("OPEN_KERNELS_UNVALIDATED"):
+                    # the way a new point gets validated: build it, run its fixture, then add it here
+                    if msg not in _WARNED:
+                        _WARNED.add(msg)
+                        print(f"catalogue: UNVALIDATED point allowed by OPEN_KERNELS_UNVALIDATED: {msg}", file=sys.stderr)
+                    continue
+                raise OpRangeError(msg)
 
 
 CATALOGUE: dict[str, Template] = {t.name: t for t in [
     Template("gemv_q4", "designs/gemv_q4/gemv_q4.h",
-             {"K": values(2048, 4096),           # the int16 activation tables that exist (gemv_q4_prep_k{K})
+             {"K": values(2048, 4096, 2560, 9728),   # 2048 / 4096: the 27B layers; 2560 / 9728: the Qwen3-4B
+                                                     # dense layer (OPEN-FAMILY-QWEN3, 2026-09-05)
               "rs": values(2, 4),                # band row split: standard layout / expert stripes
               "rows_per_core": multiple_of(64),  # one y element per 64-row band
               "per_call": values(2)},            # chunks per w element (10 KB)
@@ -82,15 +95,16 @@ CATALOGUE: dict[str, Template] = {t.name: t for t in [
              {"K": values(512)},                 # the expert hidden h (moe_experts' law)
              note="validated through the whole-layer MoE block only"),
     Template("attn", "designs/attn/attn.h",
-             {"head_dim": values(256), "num_heads": values(16), "num_kv_heads": values(2),
-              "rotary_dim": values(64), "rope_theta": any_positive(),
-              "qk_norm": values(True), "attn_gate": values(True)},
-             note="ATTN_HD / ATTN_NH / ATTN_KVH / ATTN_ROT are compile-time macros; only this point has been compared"),
+             {"head_dim": values(256, 128), "num_heads": values(16, 32), "num_kv_heads": values(2, 8),
+              "rotary_dim": values(64, 128), "rope_theta": any_positive(),
+              "qk_norm": values(True), "attn_gate": values(True, False)},
+             note="ATTN_* are compile-time macros; compared at (256, 16, 2, 64, gate) on the 27B and "
+                  "(128, 32, 8, 128, no gate) on Qwen3-4B"),
     Template("deltanet", "designs/layer_x/dnx.h",
              {"heads": values(32), "dim": values(128), "key_heads": values(16), "conv_kernel": values(4)},
              note="Qwen3-Next / 3.5 / 3.6 families only"),
     Template("ln", "designs/ln/ln.cc",
-             {"width": values(2048)}),
+             {"width": values(2048, 2560)}),      # LN_N; 2560 checked standalone (ln/make_test.py) and in the dense layer
     Template("router", "designs/router/router.h",
              {"experts": values(256), "topk": values(8)}),
     Template("moe", "designs/layer_x/moe_*.cc",
@@ -98,6 +112,9 @@ CATALOGUE: dict[str, Template] = {t.name: t for t in [
               "hidden": values(2048), "n_cores": values(8)}),
     Template("lm_head_q8", "designs/lm_head_q8/lm_head_q8.h",
              {"K": values(2048), "vocab": multiple_of(128)}),
+    Template("lm_head_q4", "designs/lm_head_q4/lm_head_q4.py",
+             {"K": values(2560), "vocab": multiple_of(64)},
+             note="the q4 head is the gemv_q4 kernel with lm_head_q8's uneven band split; validated per K"),
 ]}
 
 

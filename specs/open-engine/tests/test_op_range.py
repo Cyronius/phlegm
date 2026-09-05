@@ -16,20 +16,20 @@ def test_the_27b_is_inside_every_validated_set():
     Q.recipe(default_spec())
 
 
-def test_head_dim_128_is_refused_by_name():
-    spec = dataclasses.replace(default_spec(), head_dim=128, rotary_dim=32)
-    with pytest.raises(OpRangeError, match=r"attn: head_dim=128 is outside the validated set \{256\}"):
+def test_head_dim_64_is_refused_by_name():
+    spec = dataclasses.replace(default_spec(), head_dim=64, rotary_dim=64)
+    with pytest.raises(OpRangeError, match=r"attn: head_dim=64 is outside the validated set \{128, 256\}"):
         Q.recipe(spec)
 
 
-def test_hidden_2560_is_refused_by_the_first_template_that_cannot_take_it():
-    spec = dataclasses.replace(default_spec(), hidden=2560)
-    with pytest.raises(OpRangeError, match=r"ln: width=2560 is outside the validated set \{2048\}"):
+def test_hidden_3072_is_refused_by_the_first_template_that_cannot_take_it():
+    spec = dataclasses.replace(default_spec(), hidden=3072)
+    with pytest.raises(OpRangeError, match=r"ln: width=3072 is outside the validated set \{2048, 2560\}"):
         Q.recipe(spec)
 
 
 def test_an_unvalidated_gemv_k_is_refused():
-    with pytest.raises(OpRangeError, match=r"gemv_q4: K=3072 is outside the validated set \{2048, 4096\}"):
+    with pytest.raises(OpRangeError, match=r"gemv_q4: K=3072 is outside the validated set \{2048, 2560, 4096, 9728\}"):
         require("gemv_q4", K=3072)
 
 

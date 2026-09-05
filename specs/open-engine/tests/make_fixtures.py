@@ -1,5 +1,8 @@
-"""Write fixtures/manifest_qwen36.json: the 27B manifest with a fixed build key
-(the real one hashes the sources, which would churn the fixture on every edit).
+"""Write the manifest fixtures with a fixed build key (the real one hashes the
+sources, which would churn the fixtures on every edit):
+
+    fixtures/manifest_qwen36.json     the 27B (Qwen3.6-35B-A3B, the qwen36moe recipe)
+    fixtures/manifest_qwen3_4b.json   Qwen3-4B (the qwen3 dense recipe)
 
     python specs/open-engine/tests/make_fixtures.py
 """
@@ -11,17 +14,24 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[2] / "open_kernels"))
-from recipes.load import default_spec  # noqa: E402
+from recipes.load import default_spec, load_spec  # noqa: E402
 from recipes.manifest import manifest  # noqa: E402
 
 FIXTURE = HERE / "fixtures" / "manifest_qwen36.json"
+FIXTURE_Q3 = HERE / "fixtures" / "manifest_qwen3_4b.json"
+SPEC_Q3 = HERE.parents[2] / "open_kernels" / "recipes" / "specs" / "qwen3-4b.json"
 
 
 def fixture_manifest() -> dict:
     return manifest(default_spec(), key="sha256:fixture")
 
 
+def fixture_manifest_q3() -> dict:
+    return manifest(load_spec(SPEC_Q3), key="sha256:fixture")
+
+
 if __name__ == "__main__":
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    FIXTURE.write_text(json.dumps(fixture_manifest(), indent=1) + "\n", encoding="utf-8", newline="\n")
-    print(f"wrote {FIXTURE}")
+    for f, m in ((FIXTURE, fixture_manifest()), (FIXTURE_Q3, fixture_manifest_q3())):
+        f.write_text(json.dumps(m, indent=1) + "\n", encoding="utf-8", newline="\n")
+        print(f"wrote {f}")

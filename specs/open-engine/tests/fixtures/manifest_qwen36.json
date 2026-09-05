@@ -61,6 +61,7 @@
   "lin_key_dim": 128,
   "lin_value_dim": 128,
   "conv_kernel": 4,
+  "intermediate": 0,
   "num_experts": 256,
   "experts_per_tok": 8,
   "moe_intermediate": 512,
@@ -73,7 +74,7 @@
    "source": "hf_config"
   }
  },
- "spec_hash": "sha256:c2b96d337619f1d267f7f6e2ca16ab6810956e855c87a84b7a0b5884a65ed425",
+ "spec_hash": "sha256:f5525dc31875801227045a3b9095c5e0d943ab69df42fd7ba544f26f37abab5e",
  "build_key": "sha256:fixture",
  "max_ctx_default": 4096,
  "hf_config_check": {
@@ -209,30 +210,36 @@
  "kernels": {
   "ln": {
    "context": "ln",
-   "insts": "ln/insts.bin"
+   "insts": "ln/insts.bin",
+   "build": "ln"
   },
   "lm": {
    "context": "lm",
-   "insts": "lm_head_q8/insts.bin"
+   "insts": "lm_head_q8/insts.bin",
+   "build": "lm_head_q8"
   },
   "lx0": {
    "context": "lx",
-   "insts": "lx0/insts.bin"
+   "insts": "lx0/insts.bin",
+   "build": "lx0"
   },
   "lx1": {
    "context": "lx",
    "insts": "lx1/insts.bin",
-   "patch": "moeroute2"
+   "patch": "moeroute2",
+   "build": "lx1"
   },
   "ax0": {
    "context": "ax",
    "insts": "ax0/insts.bin",
-   "patch": "attnpos"
+   "patch": "attnpos",
+   "build": "ax0"
   },
   "ax1": {
    "context": "ax",
    "insts": "ax1/insts.bin",
-   "patch": "moeroute2"
+   "patch": "moeroute2",
+   "build": "ax1"
   }
  },
  "layer_types": {
@@ -642,10 +649,15 @@
   "pool_bytes": 536870912,
   "chunk_bytes": 5120,
   "lm_head": {
-   "op": "lmhead_q8",
-   "tensor": "lm_head.weight",
-   "chunk_bytes": 8704,
-   "pool_bytes": 542113792
+   "pool_bytes": 542113792,
+   "ops": [
+    {
+     "op": "lmhead_q8",
+     "tensor": "lm_head.weight",
+     "chunk_bytes": 8704,
+     "dst": 0
+    }
+   ]
   },
   "embed": {
    "tensor": "model.embed_tokens.weight",

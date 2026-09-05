@@ -68,7 +68,7 @@ ELEM = X.ELEM
 Q_PC, KV_PC, O_PC = D.Q_PC, D.KV_PC, D.O_PC             # bands per core: q (and gate), k (and v), o
 QW, KVW, O_K = D.QW, D.KVW, D.O_K
 PART = int(os.environ.get("AX_PART", 0))
-ATTN_FLAGS = [f"-DATTN_NH={NH}", f"-DATTN_KVH={KVH}", f"-DATTN_HD={HD}", f"-DATTN_ROT={D.ROT}"]
+ATTN_FLAGS = [f"-DATTN_NH={NH}", f"-DATTN_KVH={KVH}", f"-DATTN_HD={HD}", f"-DATTN_ROT={D.ROT}", "-DATTN_GATE=1"]
 
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])

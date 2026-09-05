@@ -15,7 +15,8 @@ import json
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Mapping
 
-LINEAR, FULL = "linear_attention", "full_attention"
+LINEAR, FULL, DENSE = "linear_attention", "full_attention", "dense"
+LAYER_TYPES = (LINEAR, FULL, DENSE)
 
 
 class SpecError(ValueError):
@@ -24,10 +25,10 @@ class SpecError(ValueError):
 
 @dataclass(frozen=True)
 class ModelSpec:
-    family: str                       # the recipe: "qwen36moe"
+    family: str                       # the recipe: "qwen36moe" | "qwen3"
     hidden: int
     num_layers: int
-    layer_types: tuple[str, ...]      # per layer: LINEAR | FULL
+    layer_types: tuple[str, ...]      # per layer: LINEAR | FULL | DENSE
     vocab: int                        # lm_head rows (padded)
     real_vocab: int                   # the tokenizer's ids; logits above it are undefined
     # full attention
@@ -44,6 +45,8 @@ class ModelSpec:
     lin_key_dim: int = 0
     lin_value_dim: int = 0
     conv_kernel: int = 0
+    # dense FFN (silu(gate) * up @ down); 0 for a MoE-only family
+    intermediate: int = 0
     # MoE; num_experts == 0 means dense
     num_experts: int = 0
     experts_per_tok: int = 0
@@ -79,6 +82,10 @@ class ModelSpec:
     def has_full(self) -> bool:
         return FULL in self.layer_types
 
+    @property
+    def has_dense(self) -> bool:
+        return DENSE in self.layer_types
+
     # ---- serialisation
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -97,7 +104,7 @@ class ModelSpec:
         kw = dict(d)
         kw["layer_types"] = tuple(kw["layer_types"])
         for t in kw["layer_types"]:
-            if t not in (LINEAR, FULL):
+            if t not in LAYER_TYPES:
                 raise SpecError(f"layer_types: unknown layer type {t!r}")
         if len(kw["layer_types"]) != kw["num_layers"]:
             raise SpecError(f"layer_types has {len(kw['layer_types'])} entries, num_layers is {kw['num_layers']}")
@@ -246,9 +253,72 @@ def _qwen36moe_gguf(md: Mapping[str, Any]) -> ModelSpec:
     )
 
 
-HF_FAMILIES = {"qwen3_5_moe": _qwen36moe_hf, "qwen3_next": _qwen36moe_hf}
-GGUF_FAMILIES = {"qwen35moe": _qwen36moe_gguf, "qwen3next": _qwen36moe_gguf}
-_FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe"}
+def _qwen3_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+    """Qwen3 dense: GQA with q/k RMSNorm, full RoPE, no attention gate, silu-gated FFN."""
+    n = _need(cfg, "num_hidden_layers")
+    hd = _need(cfg, "head_dim")
+    vocab = _need(cfg, "vocab_size")
+    if cfg.get("use_sliding_window"):
+        raise SpecError("qwen3: use_sliding_window is not supported by the dense recipe")
+    return ModelSpec(
+        family="qwen3",
+        hidden=_need(cfg, "hidden_size"),
+        num_layers=n,
+        layer_types=tuple([DENSE] * n),
+        vocab=vocab,
+        real_vocab=real_vocab if real_vocab is not None else vocab,
+        num_heads=_need(cfg, "num_attention_heads"),
+        num_kv_heads=_need(cfg, "num_key_value_heads"),
+        head_dim=hd,
+        rotary_dim=hd,
+        rope_theta=float(_need(cfg, "rope_theta")),
+        qk_norm=True,
+        attn_gate=False,
+        intermediate=_need(cfg, "intermediate_size"),
+        norm_eps=float(cfg.get("rms_norm_eps", 1e-6)),
+        quant="q4_1",
+        extra={"model_type": cfg["model_type"], "source": "hf_config"},
+    )
+
+
+def _qwen3_gguf(md: Mapping[str, Any]) -> ModelSpec:
+    a = md["general.architecture"]
+
+    def k(name: str):
+        return _need(md, f"{a}.{name}", "GGUF metadata")
+
+    n = k("block_count")
+    hd = k("attention.key_length")
+    vocab = md.get(f"{a}.vocab_size")
+    if vocab is None:
+        toks = md.get("tokenizer.ggml.tokens")
+        if toks is None:
+            raise SpecError(f"GGUF metadata lacks '{a}.vocab_size' and 'tokenizer.ggml.tokens'")
+        vocab = len(toks)
+    return ModelSpec(
+        family="qwen3",
+        hidden=k("embedding_length"),
+        num_layers=n,
+        layer_types=tuple([DENSE] * n),
+        vocab=vocab,
+        real_vocab=vocab,
+        num_heads=k("attention.head_count"),
+        num_kv_heads=k("attention.head_count_kv"),
+        head_dim=hd,
+        rotary_dim=md.get(f"{a}.rope.dimension_count", hd),
+        rope_theta=float(k("rope.freq_base")),
+        qk_norm=True,
+        attn_gate=False,
+        intermediate=k("feed_forward_length"),
+        norm_eps=float(md.get(f"{a}.attention.layer_norm_rms_epsilon", 1e-6)),
+        quant="q4_1",
+        extra={"architecture": a, "source": "gguf"},
+    )
+
+
+HF_FAMILIES = {"qwen3_5_moe": _qwen36moe_hf, "qwen3_next": _qwen36moe_hf, "qwen3": _qwen3_hf}
+GGUF_FAMILIES = {"qwen35moe": _qwen36moe_gguf, "qwen3next": _qwen36moe_gguf, "qwen3": _qwen3_gguf}
+_FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen3_hf: "qwen3", _qwen3_gguf: "qwen3"}
 
 
 def hf_model_types(family: str) -> list[str]:

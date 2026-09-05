@@ -1,0 +1,95 @@
+"""fp64 CPU reference for one Qwen3 dense decode step -- the oracle the dense
+kernels (designs/dense/dx.py, lm_head_q4) are checked against.
+
+HF-faithful math in float64 from the same `.q4nx` bytes the NPU pools are
+packed from (q4nx.py dequantizes the chunks), so a disagreement is the kernels'
+or the packing's, not a difference of source weights:
+
+  * x = rms(res) * ln_w; q k v projections; q/k RMSNorm over the head with the
+    stored weights; full RoPE (rotary dim = head dim, half-split pairs, the
+    model's theta); GQA softmax attention over the KV cache; o_proj; residual
+  * post-attention norm; silu(gate) * up @ down; residual
+  * final norm, then the q4_1 lm_head
+
+State (K, V) per layer is carried by the caller: decode from position 0 is
+exact prefill.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+from q4nx import CHUNK_Q4, dq_chunks_q4_1
+
+
+def rms(x, eps=1e-6):
+    x = np.asarray(x, dtype=np.float64)
+    return x / np.sqrt((x ** 2).mean(-1, keepdims=True) + eps)
+
+
+def silu(x):
+    return x / (1 + np.exp(-x))
+
+
+def rope(t, p, rot, theta):
+    half = rot // 2
+    ang = p * theta ** (-np.arange(half) / half)
+    c, s = np.cos(ang), np.sin(ang)
+    y = t.copy()
+    x1, x2 = t[..., :half], t[..., half:rot]
+    y[..., :half] = x1 * c - x2 * s
+    y[..., half:rot] = x2 * c + x1 * s
+    return y
+
+
+def dense_decode(m, spec, layer, x_res, K, V, pos):
+    """One token through a dense layer. Returns (residual, K, V)."""
+    pre = f"model.layers.{layer}."
+    hid, nh, kvh, hd, ff = spec.hidden, spec.num_heads, spec.num_kv_heads, spec.head_dim, spec.intermediate
+    x = (rms(x_res) * m.bf16(pre + "input_layernorm.weight")).astype(np.float32)
+    Wq = m.matmul_w(pre + "self_attn.q_proj.weight", nh * hd, hid)
+    Wk = m.matmul_w(pre + "self_attn.k_proj.weight", kvh * hd, hid)
+    Wv = m.matmul_w(pre + "self_attn.v_proj.weight", kvh * hd, hid)
+    Wo = m.matmul_w(pre + "self_attn.o_proj.weight", hid, nh * hd)
+    qn = m.bf16(pre + "self_attn.q_norm.weight")
+    kn = m.bf16(pre + "self_attn.k_norm.weight")
+    q = (rms((x @ Wq.T).reshape(nh, hd)) * qn).astype(np.float64)
+    k = (rms((x @ Wk.T).reshape(kvh, hd)) * kn).astype(np.float64)
+    v = (x @ Wv.T).reshape(kvh, hd).astype(np.float64)
+    q, k = rope(q, pos, spec.rotary_dim, spec.rope_theta), rope(k, pos, spec.rotary_dim, spec.rope_theta)
+    K = np.concatenate([K, k[None]], 0)
+    V = np.concatenate([V, v[None]], 0)
+    o = np.zeros((nh, hd))
+    grp = nh // kvh
+    for h in range(nh):
+        s = (K[:, h // grp] @ q[h]) / np.sqrt(hd)
+        a = np.exp(s - s.max())
+        o[h] = (a / a.sum()) @ V[:, h // grp]
+    res = x_res + o.reshape(nh * hd).astype(np.float32) @ Wo.T
+    xm = (rms(res) * m.bf16(pre + "post_attention_layernorm.weight")).astype(np.float32)
+    Wup = m.matmul_w(pre + "mlp.up_proj.weight", ff, hid)
+    Wg = m.matmul_w(pre + "mlp.gate_proj.weight", ff, hid)
+    Wd = m.matmul_w(pre + "mlp.down_proj.weight", hid, ff)
+    h = silu(xm @ Wg.T) * (xm @ Wup.T)
+    return res + h.astype(np.float32) @ Wd.T, K, V
+
+
+def lmhead_q4_logits(m, hn, spec, block=2048):
+    """logits[vocab] = W_lm[vocab, hidden] @ hn from the q4_1 chunks in the file's raster order."""
+    hid = spec.hidden
+    raw = np.frombuffer(m.raw("lm_head.weight"), dtype=np.uint8).reshape(-1, CHUNK_Q4)
+    ncol = hid // 256
+    nch = raw.shape[0]
+    hn = np.asarray(hn, np.float64)
+    logits = np.zeros(nch // ncol * 32, np.float64)
+    for c0 in range(0, nch, block):
+        ce = min(c0 + block, nch)
+        w = dq_chunks_q4_1(raw[c0:ce]).reshape(ce - c0, 32, 256).astype(np.float64)
+        for c in range(c0, ce):
+            r0, k0 = 32 * (c // ncol), 256 * (c % ncol)
+            logits[r0:r0 + 32] += w[c - c0] @ hn[k0:k0 + 256]
+    return logits
+
+
+def final_logits(m, spec, x_res):
+    hn = (rms(x_res) * m.bf16("model.norm.weight")).astype(np.float32)
+    return hn, lmhead_q4_logits(m, hn, spec)

@@ -1,10 +1,11 @@
 """The build key: what a kernel set was built from. Any change to it rebuilds.
 
-Covers the recipe package's sources, every kernel source the recipe's designs
-include (qwen36moe.KERNEL_SOURCES), the ModelSpec (without its informational
-`extra`) and the quant format. The KV / ptab capacity is NOT in it: in this
-tree every position-dependent word of the attention stream is patched per
-token, so the capacity is a runtime buffer size, not a kernel input.
+Covers the recipe package's sources, every kernel source the family's designs
+include (the family module's KERNEL_SOURCES), the ModelSpec (without its
+informational `extra`) and the quant format. The KV / ptab capacity is NOT in
+it: in this tree every position-dependent word of the attention stream is
+patched per token, so the capacity is a runtime buffer size, not a kernel
+input.
 
 Traces: OPEN-BUILD-CACHE (specs/open-engine/spec.md).
 """
@@ -14,16 +15,15 @@ import hashlib
 import json
 from pathlib import Path
 
+from .families import for_spec
 from .spec import ModelSpec
 
 ROOT = Path(__file__).resolve().parents[1]      # open_kernels/
 
 
-def source_files(root: Path = ROOT) -> list[Path]:
-    from .qwen36moe import KERNEL_SOURCES
-
+def source_files(spec: ModelSpec, root: Path = ROOT) -> list[Path]:
     files = sorted((root / "recipes").glob("*.py"))
-    for pat in KERNEL_SOURCES:
+    for pat in for_spec(spec).KERNEL_SOURCES:
         files += sorted(root.glob(pat))
     # generated TUs are outputs of gen_kernels.py, not inputs; the generator is already included
     seen, out = set(), []
@@ -36,7 +36,7 @@ def source_files(root: Path = ROOT) -> list[Path]:
 
 def build_key(spec: ModelSpec, root: Path = ROOT) -> str:
     h = hashlib.sha256()
-    for f in source_files(root):
+    for f in source_files(spec, root):
         h.update(f.relative_to(root).as_posix().encode())
         h.update(b"\0")
         h.update(f.read_bytes())

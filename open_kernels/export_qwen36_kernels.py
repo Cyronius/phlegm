@@ -54,10 +54,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent                 # open_kernels/
 REPO = HERE.parent
 DESIGNS = HERE / "designs"
-DEFAULT_OUT = REPO / "src" / "xclbins" / "Qwen3.6-35B-A3B-NPU2" / "open_kernels"
+XCLBINS = REPO / "src" / "xclbins"
+DEFAULT_MODEL = "Qwen3.6-35B-A3B-NPU2"
 sys.path.insert(0, str(HERE))
-from recipes import qwen36moe as Q  # noqa: E402
 from recipes.cache import build_key  # noqa: E402
+from recipes.families import for_spec  # noqa: E402
 from recipes.load import default_spec, load_spec, spec_from_model_dir  # noqa: E402
 from recipes.manifest import dumps, manifest  # noqa: E402
 
@@ -160,8 +161,8 @@ def main() -> int:
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--model-dir", help="derive the spec from this model's config.json (+ tokenizer.json)")
     g.add_argument("--spec", help="a ModelSpec JSON (default: recipes/specs/qwen36-35b-a3b.json)")
-    ap.add_argument("--out", default=str(DEFAULT_OUT),
-                    help=f"destination (default {DEFAULT_OUT.relative_to(REPO).as_posix()})")
+    ap.add_argument("--out", default=None,
+                    help="destination (default src/xclbins/<model name>/open_kernels)")
     ap.add_argument("--only", default=None, help="comma-separated subset of the recipe's kernel sets")
     ap.add_argument("--no-build", action="store_true", help="copy/hash the existing build dirs without rebuilding")
     ap.add_argument("--force", action="store_true", help="rebuild even when <out>/manifest.json has this build key")
@@ -178,14 +179,15 @@ def main() -> int:
         spec = load_spec(Path(a.spec))
     else:
         spec = default_spec()
-    Q.recipe(spec)                                     # refuses a spec outside the validated points
-    sets = Q.builds(spec)
+    F = for_spec(spec)
+    F.recipe(spec)                                     # refuses a spec outside the validated points
+    sets = F.builds(spec)
     names = [n.strip() for n in a.only.split(",") if n.strip()] if a.only else list(sets)
     bad = [n for n in names if n not in sets]
     if bad:
         sys.exit(f"unknown set(s) {bad}; the recipe builds {list(sets)}")
     key = build_key(spec)
-    out_root = Path(a.out).resolve()
+    out_root = Path(a.out).resolve() if a.out else (XCLBINS / spec.extra.get("model", DEFAULT_MODEL) / "open_kernels")
     out_root.mkdir(parents=True, exist_ok=True)
     spec_file = out_root / "spec.json"
     spec_file.write_text(spec.to_json(), encoding="utf-8", newline="\n")
@@ -205,10 +207,13 @@ def main() -> int:
 
     # ---- the whole-layer designs' kernel TUs for this spec, then the builds
     if not a.no_build:
-        sys.path.insert(0, str(DESIGNS / "layer_x"))
         os.environ["OPEN_KERNELS_SPEC"] = str(spec_file)
-        import gen_kernels  # noqa: E402
-        gen_kernels.generate(Q.recipe(spec))
+        gen_dir = DESIGNS / ("dense" if spec.family == "qwen3" else "layer_x")
+        import importlib.util
+        gspec = importlib.util.spec_from_file_location("gen_kernels", gen_dir / "gen_kernels.py")
+        gen = importlib.util.module_from_spec(gspec)
+        gspec.loader.exec_module(gen)
+        gen.generate(F.recipe(spec))
     hashes: dict[str, str] = {}
     for n in names:
         bdir = DESIGNS / sets[n]["build_dir"] if a.no_build else build(n, sets, spec_file)

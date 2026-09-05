@@ -1,4 +1,4 @@
-# open-engine: the open Qwen3.6-MoE engine and its model recipes
+# open-engine: the open engine (Qwen3.6-MoE, Qwen3 dense) and its model recipes
 
 Prefix `OPEN`. Home repo: openflowlm-next. Covers `src/open_qwen36/` (the
 resident engine behind the app's `causal_lm` seam) and `open_kernels/recipes/`
@@ -75,7 +75,7 @@ buffer arguments on a dispatch is likewise refused.
 
 **Acceptance criteria:**
 - The 27B spec passes every check.
-- `head_dim=128` → `attn: head_dim=128 is outside the validated set {256}`; `hidden=2560` → `ln: width=2560 is outside the validated set {2048}`; `gemv_q4 K=3072` → names `{2048, 4096}`; `quant='q4_k'` → refused.
+- `head_dim=64` → `attn: head_dim=64 is outside the validated set {128, 256}`; `hidden=3072` → `ln: width=3072 is outside the validated set {2048, 2560}`; `gemv_q4 K=3072` → names `{2048, 2560, 4096, 9728}`; `quant='q4_k'` → refused. (The 128 / 2560 / 9728 points entered the sets with OPEN-FAMILY-QWEN3 on 2026-09-05.)
 - Nine buffer arguments → `9 buffer arguments`.
 
 ### OPEN-BUILD-CACHE: the build key covers every build input
@@ -126,3 +126,24 @@ coherently.
 4. `python src/open_qwen36/chat.py "Explain what an NPU is in two sentences."` → a coherent two-sentence answer ending in `<|im_end|>`.
 
 **Result 2026-09-05:** corr 0.999998 / 0.999996 / 0.999991, argmax and top-5 identical at every position, request 2 reproduced request 1 (8 layers, 35 ms/step). Full model: see the plan's "Phase A result".
+
+### OPEN-FAMILY-QWEN3: Qwen3 dense on the open kernels
+**Applies to:** openflowlm-next (`open_kernels/recipes/qwen3.py`, `designs/dense/dx.py`, `designs/lm_head_q4`, `src/open_qwen36/`)
+**Test category:** manual (needs the NPU and `FastFlowLM/Qwen3-4B-NPU2`); the recipe's arithmetic is unit-tested in `tests/test_qwen3_dense.py`
+
+A Qwen3 dense model (GQA with q/k RMSNorm, full RoPE, no attention gate,
+silu-gated FFN, a q4_1 lm_head) shall run on the open kernels from its
+`config.json` alone: the `qwen3` recipe derives the layouts, the packing plan
+(`model.layers.N` names, the general pool-order law), the one-run program and
+the kernel builds (`dx`, `ln` at the model's width, `lm_head_q4`); the engine
+is unchanged. The kernel points the family needs (K = 2560 / 9728 GEMVs, HD 128
+attention with 32/8 heads and full RoPE, the 2560-wide norm, the q4 head) are
+in the catalogue's validated sets only once this procedure has passed.
+
+**Procedure:**
+1. `python open_kernels/export_qwen36_kernels.py --model-dir ~/.flm/models/Qwen3-4B-NPU2` (WSL) → `src/xclbins/Qwen3-4B-NPU2/open_kernels/{dx,ln,lm_head_q4}` + `manifest.json`.
+2. `python open_kernels/model/make_decode.py --model-dir ~/.flm/models/Qwen3-4B-NPU2 --layers 4 --tokens 2 --out open_kernels/model/out_q3`, then `open_kernels/harness/out/run_kernel.exe open_kernels/model/out_q3/run_decode.cfg` and `python open_kernels/model/compare_decode.py --tokens 2 --out open_kernels/model/out_q3`: every layer's residual corr > 0.9999, logits corr > 0.9999, same argmax at both positions.
+3. `src\open_qwen36\out\open_qwen36_cli.exe --model <model dir> --kernels src/xclbins/Qwen3-4B-NPU2/open_kernels --ids 151644 --max-tokens 3 --layers 4 --dump-logits <dir>/y` matches step 2's reference logits (the engine's packer, manifest path and attnpos on the dense stream).
+4. `python src/open_qwen36/chat.py "Explain what an NPU is in two sentences." --model <model dir> --kernels src/xclbins/Qwen3-4B-NPU2/open_kernels` → a coherent answer ending in `<|im_end|>`.
+
+**Result 2026-09-05 (Qwen3-4B):** step 2 logits corr 0.999997 / 0.999994, same argmax and top-5, residual corr ≥ 0.999996 in every layer at both positions; step 3 identical through the engine, request 2 reproduced request 1; step 4 a coherent two-sentence answer ending in `<|im_end|>` at token 58 (272 ms/token). Details: `.claude/plans/open-kernels-phase-b-qwen3-dense.md`.

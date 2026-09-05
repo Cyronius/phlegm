@@ -27,14 +27,19 @@ CH = 5120
 
 def std_perm(nch: int, in_dim: int) -> np.ndarray:
     """pool chunk index -> file chunk index, for a standard [out, in] matmul tensor:
-    pool chunk c covers rows 64*(c//per_band) + 32*(c%2), cols 1024*((c//8) % (in//1024)) + 256*((c//2)%4);
-    file chunk f covers rows 32*(f//ncol), cols 256*(f%ncol)."""
+    a band is 64 rows x in_dim = per_band = in_dim/128 chunks; inside its band chunk i
+    covers row half i % 2 and k-tile i // 2 (gemv_q4.h's band law, q4_1_pack.chunk_geometry);
+    file chunk f covers rows 32*(f//ncol), cols 256*(f%ncol).
+
+    The law phlegm verified against FLM's captured pools was written as
+    cols = 1024*((c//8) % (in//1024)) + 256*((c//2) % 4); for in_dim a multiple of 1024
+    that is this same k-tile order (tests/test_pack_plan.py checks the two agree there);
+    this form is the one that also holds for in_dim = 2560 or 9728."""
     ncol = in_dim // 256
     per_band = in_dim // 128
-    kgroups = max(1, in_dim // 1024)
     c = np.arange(nch)
     rows0 = 64 * (c // per_band) + 32 * (c % 2)
-    cols0 = (1024 * ((c // 8) % kgroups) + 256 * ((c // 2) % 4)) % in_dim
+    cols0 = 256 * ((c % per_band) // 2)
     return (rows0 // 32) * ncol + cols0 // 256
 
 
@@ -95,6 +100,17 @@ def apply_op(op: dict, m, layer: int, dst: np.ndarray) -> None:
         if len(b) > op["cap"]:
             raise ValueError(f"{op['tensor']}: {len(b)} B does not fit its {op['cap']} B slot")
         dst[op["dst"]:op["dst"] + len(b)] = b
+    elif kind == "lmhead_q8":
+        # the q8 lm_head's 128-row supertile order: pool chunk k <- file chunk (4*(k//32) + (k%4))*8 + ((k%32)//4)
+        ch = op["chunk_bytes"]
+        raw = _u8(m.raw(_name(op, "tensor", layer))).reshape(-1, ch)
+        k = np.arange(raw.shape[0])
+        s, r = k // 32, k % 32
+        perm = (4 * s + r % 4) * 8 + r // 4
+        n = raw.shape[0] * ch
+        if op["dst"] + n > len(dst):
+            raise ValueError("lm_head larger than its pool")
+        dst[op["dst"]:op["dst"] + n] = raw[perm].reshape(-1)
     elif kind == "conv_transpose":
         b = _u8(m.raw(_name(op, "tensor", layer)))
         taps, groups, width = op["taps"], op["groups"], op["width"]
@@ -123,29 +139,25 @@ def build_consts(plan: dict, layer_type: str, m, layer: int, nbytes: int) -> np.
 
 
 def build_lmhead_pool(plan: dict, m) -> np.ndarray:
-    """The q8 lm_head pool: 128-row supertile order, pool chunk k <- file chunk
-    (4*(k//32) + (k%4))*8 + ((k%32)//4)."""
-    op = plan["lm_head"]
-    ch = op["chunk_bytes"]
-    raw = _u8(m.raw(op["tensor"])).reshape(-1, ch)
-    k = np.arange(raw.shape[0])
-    s, r = k // 32, k % 32
-    perm = (4 * s + r % 4) * 8 + r // 4
-    out = np.zeros(op["pool_bytes"], np.uint8)
-    if raw.shape[0] * ch > op["pool_bytes"]:
-        raise ValueError("lm_head larger than its pool")
-    out[:raw.shape[0] * ch] = raw[perm].reshape(-1)
+    """The lm_head pool: the plan's ops (q8 supertiles for the 27B, a std_perm for a q4 head)."""
+    lm = plan["lm_head"]
+    out = np.zeros(lm["pool_bytes"], np.uint8)
+    for op in lm["ops"]:
+        apply_op(op, m, 0, out)
     return out
 
 
 def ptab(rows: int, rotary_dim: int, theta: float, ptab_row: int = 1024) -> np.ndarray:
-    """The position record table: row p = [i32 pos | i32 nf = max(p, 1) | cos f32[rot/2] @512 | sin @640]
-    for the partial RoPE (half-split pairs (i, i + rot/2))."""
+    """The position record table: row p = [i32 pos | i32 nf = max(p, 1) | cos f32[rot/2] @512 | sin f32[rot/2]
+    right after the cos, @512 + 2*rot] for the RoPE over the first `rotary_dim` dims of a head (half-split
+    pairs (i, i + rot/2)); attn.h reads the rot floats at +512 as [cos | sin]."""
     half = rotary_dim // 2
+    if 512 + 8 * half > ptab_row:
+        raise ValueError(f"a rotary dim of {rotary_dim} does not fit a {ptab_row}-byte position record")
     t = np.zeros((rows, ptab_row), np.uint8)
     p = np.arange(rows)
     t[:, :8] = np.stack([p, np.maximum(p, 1)], 1).astype(np.int32).view(np.uint8)
     ang = p[:, None] * (theta ** (-np.arange(half) / half))[None, :]
     t[:, 512:512 + 4 * half] = np.cos(ang).astype(np.float32).view(np.uint8)
-    t[:, 640:640 + 4 * half] = np.sin(ang).astype(np.float32).view(np.uint8)
+    t[:, 512 + 4 * half:512 + 8 * half] = np.sin(ang).astype(np.float32).view(np.uint8)
     return t.reshape(-1)

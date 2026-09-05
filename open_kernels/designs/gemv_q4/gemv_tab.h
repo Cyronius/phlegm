@@ -145,6 +145,24 @@ __attribute__((noinline)) inline void gemv_q4_prep_f32(const float *__restrict x
   }
 }
 
+// Blocks b0 .. b0+nb-1 from an fp32 activation (xf points at block b0), rounded to bf16 first.
+__attribute__((noinline)) inline void gemv_q4_prep_f32_blocks(const float *__restrict xf, uint8_t *__restrict tab,
+                                                              unsigned K, unsigned b0, unsigned nb) {
+  const unsigned NB = K / 32;
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  int16_t *__restrict xi = (int16_t *)tab;
+  int32_t *__restrict sh = (int32_t *)(tab + 2 * K);
+  bfloat16 *__restrict xsh = (bfloat16 *)(tab + 2 * K + 4 * NB);
+  bfloat16 *__restrict xsl = xsh + NB;
+  const aie::vector<uint8_t, 64> absmask = gemv_q4_absmask();
+#pragma clang loop unroll(disable)
+  for (unsigned j = 0; j < nb; ++j) {
+    aie::accum<accfloat, 32> a;
+    a.from_vector(aie::load_v<32>(xf + j * 32));
+    gemv_q4_prep_block(a.template to_vector<bfloat16>(), xi, sh, xsh, xsl, b0 + j, absmask);
+  }
+}
+
 // The activation prep entry point for one K: gemv_q4_prep_k<K>(x, tab).
 #define GEMV_Q4_PREP_ENTRY_(K)                                              \
   void gemv_q4_prep_k##K(const bfloat16 *__restrict x, uint8_t *__restrict tab) { \
