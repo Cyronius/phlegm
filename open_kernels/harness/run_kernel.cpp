@@ -170,8 +170,12 @@ struct Host {
         b.bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         std::vector<uint32_t> idx(8);
         std::memcpy(idx.data(), b.bo.map<uint8_t*>() + off, 32);
-        for (uint32_t e : idx)
-            if (e >= 256) throw std::runtime_error("route: expert index " + std::to_string(e) + " out of range");
+        // Only the first topk slots are expert indices (moe_apply); bound them by
+        // the routed-expert count the `moegeom` directive set.
+        for (unsigned s = 0; s < mg.topk && s < idx.size(); ++s)
+            if (idx[s] >= mg.experts)
+                throw std::runtime_error("route: expert index " + std::to_string(idx[s]) + " out of range (" +
+                                         std::to_string(mg.experts) + " experts)");
         return idx;
     }
 
