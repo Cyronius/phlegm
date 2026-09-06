@@ -1,31 +1,11 @@
-"""Pack a layer's weights out of the `.q4nx` container into the NPU pool layout
-the kernels read.
+"""The ORIGINAL hand-written packers, frozen as the oracle for the plan-driven
+interpreter (recipes/pack.py). These were open_kernels/model/pools.py
+(build_layer_pool / build_pack / build_side / build_lmhead_pool) and
+model/make_decode.py's layer_consts, byte-verified against pools captured
+from FLM's own engine (phlegm's tools/kernel-interp/build_pools.py). Do not
+"improve" them: they are the definition of correct.
 
-The chunk bytes are copied verbatim -- nothing is dequantized or requantized.
-All that changes is the ORDER of the 5120-byte chunks, because the kernels
-stream weights in the order the AIE array wants them rather than the file's
-raster order:
-
-  standard matmul tensor [out, in]: pool chunk c covers
-     rows0 = 64*(c//per_band) + 32*(c%2)          per_band = in//128
-     cols0 = 1024*((c//8) % max(1, in//1024)) + 256*((c//2)%4)
-     file chunk f covers rows0 = 32*(f//ncol), cols0 = 256*(f%ncol)
-     -> std_perm() matches the two by (rows0, cols0).
-  expert up/gate: interleaved 160 KB stripes [up_k | gate_k] x4 per expert,
-     each stripe internally transposed pool_c = 4*(f%8) + (f//8)
-  expert / shared down [2048, 512]: pool_c = 8*(rt//4) + 4*cg + rt%4, f = 2rt+cg
-  lm_head q8: its own 128-row supertile order, 32-chunk bands.
-
-Layer pool (512 MB), byte offsets:
-  0           routed experts' up/gate stripes
-  335544320   routed experts' down slices (640 KB each)
-  503316480   share_up   503971840  share_gate   504627200  share_down
-  505282560   qkv (linear layer) / q (attention layer)
-  510525440   k        511180800  v        511836160  gate
-  515768320   z-gate (linear layer)        517079040  o (attention layer)
-
-Vendored from phlegm's tools/kernel-interp/build_pools.py, which verified every
-law byte-for-byte against pools captured from FLM's own engine.
+Traces: OPEN-PACK-PLAN (canonical spec: specs/open-engine/spec.md)
 """
 from __future__ import annotations
 
@@ -36,9 +16,15 @@ S = 163840
 POOL_BYTES = 536_870_912
 LMHEAD_POOL_BYTES = 542_113_792
 
+# layout.py's constants as they were on 2026-09-05 (designs/layer_x/layout.py, hand-written)
+C_LNW, C_SIDE, C_NW, C_POSTLN, C_RW, C_SGW, C_WOUT = 0, 4096, 335872, 339968, 344064, 1392640, 1396736
+C_BYTES = C_WOUT + 10_485_760
+GLUE_SIDE_BYTES = 331776
+CA_LNW, CA_POSTLN, CA_META, CA_RW, CA_SGW = 0, 4096, 8192, 10240, 1058816
+CA_BYTES = CA_SGW + 4096
+
 
 def std_perm(nch, out_dim, in_dim):
-    """pool chunk index -> file chunk index, for a standard matmul tensor."""
     ncol = in_dim // 256
     per_band = in_dim // 128
     kgroups = max(1, in_dim // 1024)
@@ -64,7 +50,6 @@ def stripe_transpose():
 
 
 def build_layer_pool(m, layer, full_attn, out=None):
-    """The 512 MB weight pool of one layer. `out` may be a preallocated buffer."""
     pool = np.zeros(POOL_BYTES, dtype=np.uint8) if out is None else out
     if out is not None:
         pool[:] = 0
@@ -89,7 +74,6 @@ def build_layer_pool(m, layer, full_attn, out=None):
     pool[504627200:504627200 + 655360] = permute_chunks(
         m.raw(f"model.layer.{layer}.mlp.share_down_exps_proj.weight"), std_perm(128, 2048, 512))
     if full_attn:
-        # q_proj is the fused [q 4096 | gate 4096]; the pool splits the halves.
         qg = np.frombuffer(m.raw(f"model.layer.{layer}.self_attn.q_proj.weight"), dtype=np.uint8).reshape(-1, CH)
         p1024 = std_perm(1024, 4096, 2048)
         pool[505282560:505282560 + 5242880] = qg[:1024][p1024].reshape(-1)
@@ -109,7 +93,6 @@ def build_layer_pool(m, layer, full_attn, out=None):
 
 
 def build_pack(m, layer):
-    """[input_layernorm @0][post_attention_layernorm @4096][shared_expert_gate @8192][router @12288]"""
     pk = np.zeros(2097152, dtype=np.uint8)
     for off, name in ((0, "input_layernorm.weight"), (4096, "post_attention_layernorm.weight"),
                       (8192, "shared_expert_gate.weight"), (12288, "moe_router.weight")):
@@ -119,9 +102,6 @@ def build_pack(m, layer):
 
 
 def build_side(m, layer, full_attn):
-    """The per-layer small weights: q/k norms for an attention layer; the
-    DeltaNet glue's conv / norm / a / dt_bias / alpha / beta plus the permuted
-    out_proj for a linear one."""
     side = np.zeros(6291456, dtype=np.uint8)
 
     def put(off, name):
@@ -144,8 +124,6 @@ def build_side(m, layer, full_attn):
 
 
 def build_lmhead_pool(m):
-    """The q8 lm_head pool: 128-row supertile order, pool chunk k <- file chunk
-    (4*(k//32) + (k%4))*8 + ((k%32)//4)."""
     raw = np.frombuffer(m.raw("lm_head.weight"), dtype=np.uint8).reshape(-1, 8704)
     k = np.arange(raw.shape[0])
     s, r = k // 32, k % 32
@@ -153,3 +131,51 @@ def build_lmhead_pool(m):
     out = np.zeros(LMHEAD_POOL_BYTES, dtype=np.uint8)
     out[:raw.shape[0] * 8704] = raw[perm].reshape(-1)
     return out
+
+
+def layer_consts(m, layer, full_attn):
+    """make_decode.py's layer_consts as it was: the consts BO from build_pack + build_side."""
+    pack = np.frombuffer(build_pack(m, layer), np.uint8)
+    side = np.frombuffer(build_side(m, layer, full_attn), np.uint8)
+    lnw, postln = pack[0:4096], pack[4096:8192]
+    sgw, rw = pack[8192:12288], pack[12288:12288 + 1048576]
+    if full_attn:
+        c = np.zeros(CA_BYTES, np.uint8)
+        c[CA_LNW:CA_LNW + 4096] = lnw
+        c[CA_POSTLN:CA_POSTLN + 4096] = postln
+        c[CA_META:CA_META + 512] = side[128:640]
+        c[CA_META + 512:CA_META + 1024] = side[640:1152]
+        c[CA_RW:CA_RW + 1048576] = rw
+        c[CA_SGW:CA_SGW + 4096] = sgw
+        return c
+    sb = np.zeros(4096 + GLUE_SIDE_BYTES, np.uint8)
+    sb[4096:4096 + 131072] = side[66048:66048 + 131072]
+    sb[135168:135168 + 131072] = side[197120:197120 + 131072]
+    small = np.zeros(1024, np.float32)
+    small[:32] = side[65792:65792 + 128].view(np.float32)
+    small[32:64] = side[65920:65920 + 128].view(np.float32)
+    sb[266240:266240 + 4096] = small.view(np.uint8)
+    convw = side[0:65536].view(np.uint16).reshape(4, 8192)
+    sb[270336:270336 + 65536] = convw.reshape(4, 8, 1024).transpose(1, 0, 2).reshape(-1).view(np.uint8)
+    nw = np.zeros(2048, np.uint16)
+    nw[:128] = side[65536:65536 + 256].view(np.uint16)
+    c = np.zeros(C_BYTES, np.uint8)
+    c[C_LNW:C_LNW + 4096] = lnw
+    c[C_SIDE:C_SIDE + GLUE_SIDE_BYTES] = sb[4096:]
+    c[C_NW:C_NW + 4096] = nw.view(np.uint8)
+    c[C_POSTLN:C_POSTLN + 4096] = postln
+    c[C_RW:C_RW + 1048576] = rw
+    c[C_SGW:C_SGW + 4096] = sgw
+    c[C_WOUT:C_WOUT + 5242880] = side[328192:328192 + 5242880]
+    return c
+
+
+def ptab(max_ctx=4096):
+    """layout.py's ptab() as it was (theta 1e7, rotary 64 of 256)."""
+    t = np.zeros((max_ctx, 1024), np.uint8)
+    p = np.arange(max_ctx)
+    t[:, :8] = np.stack([p, np.maximum(p, 1)], 1).astype(np.int32).view(np.uint8)
+    ang = p[:, None] * ((1e7) ** (-np.arange(32) / 32))[None, :]
+    t[:, 512:640] = np.cos(ang).astype(np.float32).view(np.uint8)
+    t[:, 640:768] = np.sin(ang).astype(np.float32).view(np.uint8)
+    return t.reshape(-1)

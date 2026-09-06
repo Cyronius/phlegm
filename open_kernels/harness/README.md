@@ -29,12 +29,17 @@ one compiled program per layer type serves every layer and every token:
 moeroute2 <kernel> <buf> <idx-off>   # point the expert fills at the router's top-8
 moeroute  <kernel> <rout-buf>        # same, for moe_experts' host-concatenated weights
 attnpos   <kernel> <pos>             # KV window length, new-row offset, RoPE record
+attngeom  <kv_row> <ptab_row> [window]   # the cache row / record sizes (manifest.json layout.kv_row /
+                                     # ptab_row; default the 27B's) and a sliding window in rows (0 = all)
+moegeom   <experts> <topk> <stripe> <up_bytes> <down_core> <pool_down> <share_up> <share_gate> <share_down>
 ```
 
 An mlir-aie stream is a sequence of ops; op `0x81` is a DDR patch naming a
 register, a buffer arg and a byte offset, so re-pointing a DMA is one word plus
 an instruction-BO sync (~0.04 ms per layer). See `../model/` for the decode
-program that uses them.
+program that uses them. The pool geometry the patch tables are decoded
+against (`stream_patch::MoeGeometry` / `AttnGeometry`) defaults to the
+Qwen3.6-27B's here; the engine passes its manifest's.
 
 ## Build
 

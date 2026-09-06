@@ -18,8 +18,13 @@ V_t in order), the new row ONE 2 KB drain to row pos, the position record
 length, the two offsets). The attention core loops over the record's nf =
 max(pos, 1) rows and masks rows t >= pos (position 0 streams one dummy row).
 
+Geometry: the recipe's (open_kernels/recipes/qwen36moe.py, `R.attn`) for the
+spec named by OPEN_KERNELS_SPEC (else the checked-in 27B); attn.h's head
+count / dims are the compile-time macros ATTN_NH / ATTN_KVH / ATTN_HD /
+ATTN_ROT set from the same spec.
+
 Args (layout.py): pool (q/k/v/gate/o and the experts at their pool offsets),
-xres f32[2048] (in: layer input; out: layer output), consts [lnw | postln |
+xres f32[HID] (in: layer input; out: layer output), consts [lnw | postln |
 meta (qn | kn) | router W | sgw], kv (the layer's KV cache: MAX_CTX rows of
 [K_t | V_t], updated in place), act (scratch), ptab (the position record
 table, shared by the attention layers).
@@ -50,14 +55,20 @@ sys.path.insert(0, str(HERE))
 from ironutil import Pipeline, include_dirs  # noqa: E402
 from layout import (AA_BYTES, AA_HP, AA_KVN, AA_OG, AA_OUT, AA_QG, AA_RES, AA_ROUT, AA_XM, AA_XN,  # noqa: E402
                     CA_BYTES, CA_LNW, CA_META, CA_POSTLN, CA_RW, CA_SGW, KV_BYTES, KV_ROW, POOL_BYTES,
-                    POOL_GATE, POOL_K, POOL_O, POOL_Q, POOL_V, PTAB_BYTES, PTAB_ROW)
+                    POOL_GATE, POOL_K, POOL_O, POOL_Q, POOL_V, PTAB_BYTES, PTAB_ROW, R, SPEC)
 import xcommon as X  # noqa: E402
 
-HID = 2048
-NH, KVH, HD = 16, 2, 256
-N_CORES = 8
-Q_PC, KV_PC, O_PC = 4096 // 64 // N_CORES, 512 // 64 // N_CORES, HID // 64 // N_CORES   # 8, 1, 4
+D = R.attn
+if D is None:
+    sys.exit("ax.py: the spec has no full-attention layers")
+HID = X.HID
+NH, KVH, HD = D.NH, D.KVH, D.HD
+N_CORES = X.N_CORES
+ELEM = X.ELEM
+Q_PC, KV_PC, O_PC = D.Q_PC, D.KV_PC, D.O_PC             # bands per core: q (and gate), k (and v), o
+QW, KVW, O_K = D.QW, D.KVW, D.O_K
 PART = int(os.environ.get("AX_PART", 0))
+ATTN_FLAGS = [f"-DATTN_NH={NH}", f"-DATTN_KVH={KVH}", f"-DATTN_HD={HD}", f"-DATTN_ROT={D.ROT}", "-DATTN_GATE=1"]
 
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
@@ -66,7 +77,7 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
     t = X.types()
     tl = X.ln_types()
     u8_4k = tl["u8_4k"]
-    u8_1k = np.ndarray[(1024,), np.dtype[np.uint8]]
+    u8_1k = np.ndarray[(D.HEAD_BYTES,), np.dtype[np.uint8]]
     pool_ty = np.ndarray[(POOL_BYTES,), np.dtype[np.uint8]]
     xres_ty = np.ndarray[(HID,), np.dtype[np.float32]]
     consts_ty = np.ndarray[(CA_BYTES,), np.dtype[np.uint8]]
@@ -75,23 +86,27 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
     ptab_ty = np.ndarray[(PTAB_BYTES,), np.dtype[np.uint8]]
     i32_4 = np.ndarray[(4,), np.dtype[np.int32]]
     b256 = np.ndarray[(HD,), np.dtype[bfloat16]]
-    b512 = np.ndarray[(2 * HD,), np.dtype[bfloat16]]
-    f64 = np.ndarray[(64,), np.dtype[np.float32]]
+    b512 = np.ndarray[(KVW,), np.dtype[bfloat16]]
+    f64 = np.ndarray[(D.ROT,), np.dtype[np.float32]]           # cos | sin of the rotated dims
     f256 = np.ndarray[(HD,), np.dtype[np.float32]]
-    f4096 = np.ndarray[(NH * HD,), np.dtype[np.float32]]
+    f4096 = np.ndarray[(QW,), np.dtype[np.float32]]
     f32_ = np.ndarray[(2 * NH,), np.dtype[np.float32]]
 
     inc = include_dirs() + [str(GEMV), str(ATTN), str(X.LN), str(X.LINL), str(X.RT), str(HERE.parent / "moe_experts")]
     K = X.kernels(inc, t)
     L = X.ln_kernels(inc, tl)
-    f_meta = ExternalFunction("attn_meta", source_file=str(ATTN / "attn_meta.cc"), arg_types=[u8_1k, u8_1k, b256, b256, f64, i32_4], include_dirs=inc)
-    f_q = ExternalFunction("attn_q", source_file=str(ATTN / "attn_q.cc"), arg_types=[u8_1k, b256, f64, f4096, np.int32], include_dirs=inc)
-    f_k = ExternalFunction("attn_k", source_file=str(ATTN / "attn_k.cc"), arg_types=[u8_1k, b256, f64, f256, b512, np.int32], include_dirs=inc)
-    f_v = ExternalFunction("attn_v", source_file=str(ATTN / "attn_v.cc"), arg_types=[u8_1k, b512, np.int32], include_dirs=inc)
-    f_init = ExternalFunction("attn_init", source_file=str(ATTN / "attn_init.cc"), arg_types=[f4096, f32_], include_dirs=inc)
-    f_step = ExternalFunction("attn_step", source_file=str(ATTN / "attn_step.cc"), arg_types=[u8_1k, u8_1k, f4096, f4096, f32_, i32_4], include_dirs=inc)
-    f_stepn = ExternalFunction("attn_step_new", source_file=str(ATTN / "attn_step_new.cc"), arg_types=[b512, b512, f4096, f4096, f32_], include_dirs=inc)
-    f_fin = ExternalFunction("attn_fin", source_file=str(ATTN / "attn_fin.cc"), arg_types=[f4096, f32_, u8_1k, u8_1k, b512, np.int32], include_dirs=inc)
+
+    def af(sym, args):
+        return ExternalFunction(sym, source_file=str(ATTN / f"{sym}.cc"), arg_types=args, include_dirs=inc, compile_flags=ATTN_FLAGS)
+
+    f_meta = af("attn_meta", [u8_1k, u8_1k, b256, b256, f64, i32_4])
+    f_q = af("attn_q", [u8_1k, b256, f64, f4096, np.int32])
+    f_k = af("attn_k", [u8_1k, b256, f64, f256, b512, np.int32])
+    f_v = af("attn_v", [u8_1k, b512, np.int32])
+    f_init = af("attn_init", [f4096, f32_])
+    f_step = af("attn_step", [u8_1k, u8_1k, f4096, f4096, f32_, i32_4])
+    f_stepn = af("attn_step_new", [b512, b512, f4096, f4096, f32_])
+    f_fin = af("attn_fin", [f4096, f32_, u8_1k, u8_1k, b512, np.int32])
 
     # ---- fifos
     of_w = [ObjectFifo(t["elem"], name=f"w{c}", depth=2) for c in range(N_CORES)]
@@ -107,12 +122,12 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
         tab = B["tab"]
         xe = xin.acquire(1)                                     # xn
         K["prep2048"](xe, tab)
-        X.gemv_bands(win, yout, tab, K["gy"], 2 * Q_PC + 2 * KV_PC, 8, 16, 2)   # q | gate | k | v, K = 2048
+        X.gemv_bands(win, yout, tab, K["gy"], 2 * Q_PC + 2 * KV_PC, X.n_groups(HID), X.per_band(HID), 2)   # q | gate | k | v
         xin.release(1)
-        oe = xin.acquire(2)                                     # og, K = 4096
+        oe = xin.acquire(2)                                     # og, K = QW
         K["prep4096a"](oe[0], tab)
         K["prep4096b"](oe[1], tab)
-        X.gemv_bands(win, yout, tab, K["gy"], O_PC, 16, 32, 2)
+        X.gemv_bands(win, yout, tab, K["gy"], O_PC, X.n_groups(O_K), X.per_band(O_K), 2)
         xin.release(2)
         X.moe_body(win, xin, yout, B, K)
 
@@ -133,11 +148,11 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
             fv(e, vout, h)
             ain.release(1)
         o = aout.acquire(1)
-        for j in range_(2 * HD):
+        for j in range_(KVW):
             o[j] = kout[j]
         aout.release(1)
         o = aout.acquire(1)
-        for j in range_(2 * HD):
+        for j in range_(KVW):
             o[j] = vout[j]
         aout.release(1)
         fi(oacc, ml)
@@ -170,25 +185,26 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
                           tile=Tile(2, 3), stack_size=0x1800))
 
     bt = X.bt
-    BB16, BB32 = X.BAND16, X.BAND32
+    BB_HID, BB_O = X.band_bytes(HID), X.band_bytes(O_K)
+    YB = X.BAND_ROWS * 4
 
     def w_regions(c):
-        return [(POOL_Q + c * Q_PC * BB16, Q_PC * BB16), (POOL_GATE + c * Q_PC * BB16, Q_PC * BB16),
-                (POOL_K + c * KV_PC * BB16, KV_PC * BB16), (POOL_V + c * KV_PC * BB16, KV_PC * BB16),
-                (POOL_O + c * O_PC * BB32, O_PC * BB32)]
+        return [(POOL_Q + c * Q_PC * BB_HID, Q_PC * BB_HID), (POOL_GATE + c * Q_PC * BB_HID, Q_PC * BB_HID),
+                (POOL_K + c * KV_PC * BB_HID, KV_PC * BB_HID), (POOL_V + c * KV_PC * BB_HID, KV_PC * BB_HID),
+                (POOL_O + c * O_PC * BB_O, O_PC * BB_O)]
 
     def y_regions(c):
-        qb, kb = Q_PC * 64 * 4, KV_PC * 64 * 4
-        return [(AA_QG + c * qb, qb), (AA_QG + NH * HD * 4 + c * qb, qb),
-                (AA_KVN + c * kb, kb), (AA_KVN + KVH * HD * 4 + c * kb, kb),
-                (AA_OUT + c * O_PC * 64 * 4, O_PC * 64 * 4)]
+        qb, kb = Q_PC * YB, KV_PC * YB
+        return [(AA_QG + c * qb, qb), (AA_QG + QW * 4 + c * qb, qb),
+                (AA_KVN + c * kb, kb), (AA_KVN + KVW * 4 + c * kb, kb),
+                (AA_OUT + c * O_PC * YB, O_PC * YB)]
 
     def sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss, ain_p, aout_c):
         if part == 0:
             tg_ln = TaskGroup()
             lni.fill(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln)
-            lni.fill(a_consts, tap=bt(CA_BYTES, CA_LNW, 4096), wait=True, group=tg_ln)
-            lno.drain(a_act, tap=bt(AA_BYTES, AA_XN, 4096), wait=True, group=tg_ln)
+            lni.fill(a_consts, tap=bt(CA_BYTES, CA_LNW, ELEM), wait=True, group=tg_ln)
+            lno.drain(a_act, tap=bt(AA_BYTES, AA_XN, ELEM), wait=True, group=tg_ln)
             pw, py = Pipeline(3), Pipeline(3)
             for c in range(N_CORES):
                 for off, n in w_regions(c)[:3]:
@@ -197,36 +213,36 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
                     py.drain(y_conss[c], a_act, bt(AA_BYTES, off, n))
             tg_ln.finish()                                            # xn is in DDR
             tg_x = TaskGroup()
-            x_prod.fill(a_act, tap=bt(AA_BYTES, AA_XN, 4096), wait=True, group=tg_x)
+            x_prod.fill(a_act, tap=bt(AA_BYTES, AA_XN, ELEM), wait=True, group=tg_x)
             for c in range(N_CORES):
                 pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, *w_regions(c)[3]))
                 py.drain(y_conss[c], a_act, bt(AA_BYTES, *y_regions(c)[3]))
             pa_out, pa_in = Pipeline(3), Pipeline(3)
             pa_out.drain(aout_c, a_kv, bt(KV_BYTES, KV_ROW, KV_ROW))        # the new row [k' | v'] -> row pos (attnpos)
-            pa_out.drain(aout_c, a_act, bt(AA_BYTES, AA_OG, NH * HD * 2))
-            pa_in.fill(ain_p, a_consts, bt(CA_BYTES, CA_META, 1024))        # [qn | kn]
+            pa_out.drain(aout_c, a_act, bt(AA_BYTES, AA_OG, QW * 2))
+            pa_in.fill(ain_p, a_consts, bt(CA_BYTES, CA_META, D.META_BYTES))   # [qn | kn]
             pa_in.fill(ain_p, a_ptab, bt(PTAB_BYTES, PTAB_ROW, PTAB_ROW))   # the position record (attnpos)
             py.finish(*y_conss)                                       # q, gate, k, v are in DDR
-            pa_in.fill(ain_p, a_act, bt(AA_BYTES, AA_QG, NH * HD * 4))
-            pa_in.fill(ain_p, a_act, bt(AA_BYTES, AA_KVN, KVH * HD * 4))
-            pa_in.fill(ain_p, a_act, bt(AA_BYTES, AA_KVN + KVH * HD * 4, KVH * HD * 4))
+            pa_in.fill(ain_p, a_act, bt(AA_BYTES, AA_QG, QW * 4))
+            pa_in.fill(ain_p, a_act, bt(AA_BYTES, AA_KVN, KVW * 4))
+            pa_in.fill(ain_p, a_act, bt(AA_BYTES, AA_KVN + KVW * 4, KVW * 4))
             pa_in.fill(ain_p, a_kv, bt(KV_BYTES, 0, KV_ROW))                 # the window: rows [0, nf) (attnpos)
-            pa_in.fill(ain_p, a_act, bt(AA_BYTES, AA_QG + NH * HD * 4, NH * HD * 4))
+            pa_in.fill(ain_p, a_act, bt(AA_BYTES, AA_QG + QW * 4, QW * 4))
             for c in range(N_CORES):
                 pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, *w_regions(c)[4]))
                 py.drain(y_conss[c], a_act, bt(AA_BYTES, *y_regions(c)[4]))
             tg_ln2 = TaskGroup()
             lni.fill(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln2)
-            lni.fill(a_consts, tap=bt(CA_BYTES, CA_POSTLN, 4096), wait=True, group=tg_ln2)
-            lno.drain(a_act, tap=bt(AA_BYTES, AA_RES, 8192), wait=True, group=tg_ln2)
-            lno.drain(a_act, tap=bt(AA_BYTES, AA_XM, 4096), wait=True, group=tg_ln2)
+            lni.fill(a_consts, tap=bt(CA_BYTES, CA_POSTLN, ELEM), wait=True, group=tg_ln2)
+            lno.drain(a_act, tap=bt(AA_BYTES, AA_RES, HID * 4), wait=True, group=tg_ln2)
+            lno.drain(a_act, tap=bt(AA_BYTES, AA_XM, ELEM), wait=True, group=tg_ln2)
             pa_out.finish()                                           # og (and the new cache rows) are in DDR
-            x_prod.fill(a_act, tap=bt(AA_BYTES, AA_OG, 8192), wait=True, group=tg_x)
+            x_prod.fill(a_act, tap=bt(AA_BYTES, AA_OG, QW * 2), wait=True, group=tg_x)
             py.finish()                                               # out is in DDR
             lni.fill(a_act, tap=bt(AA_BYTES, AA_OUT, HID * 4), wait=True, group=tg_ln2)
             tg_r = TaskGroup()
-            lni.fill(a_consts, tap=bt(CA_BYTES, CA_RW, X.W_ELEMS * 4096), wait=True, group=tg_r)
-            lno.drain(a_act, tap=bt(AA_BYTES, AA_ROUT, 4096), wait=True, group=tg_r)
+            lni.fill(a_consts, tap=bt(CA_BYTES, CA_RW, X.W_ELEMS * ELEM), wait=True, group=tg_r)
+            lno.drain(a_act, tap=bt(AA_BYTES, AA_ROUT, ELEM), wait=True, group=tg_r)
             tg_ln2.finish()
             tg_r.finish()
             pw.finish()
@@ -246,9 +262,10 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
 
 
 DESIGN = ax
-_src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + [(HERE / "xcommon.py").read_bytes()]
+_src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + [(HERE / "xcommon.py").read_bytes()] + X.source_hash_inputs()
                 + sorted(f.read_bytes() for f in ATTN.glob("*.cc")) + sorted(f.read_bytes() for f in ATTN.glob("*.h"))
                 + sorted(f.read_bytes() for f in X.RT.glob("*.cc"))
-                + [(X.LN / "ln.cc").read_bytes(), (X.LINL / "ln_nr.cc").read_bytes(), (GEMV / "gemv_q4.h").read_bytes(),
-                   (GEMV / "gemv_tab.h").read_bytes(), (HERE.parent.parent / "include" / "vecmath.h").read_bytes()])
+                + [(X.LN / "ln.cc").read_bytes(), (X.LN / "ln.h").read_bytes(), (X.LINL / "ln_nr.cc").read_bytes(), (GEMV / "gemv_q4.h").read_bytes(),
+                   (GEMV / "gemv_tab.h").read_bytes(), (HERE.parent.parent / "include" / "vecmath.h").read_bytes(),
+                   SPEC.spec_hash().encode()])
 SPECIALIZE = {"part": PART, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

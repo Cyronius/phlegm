@@ -5,6 +5,9 @@
 > (`fixture_paths.py`). For building and running the designs from THIS tree use
 > `harness/README.md` (`run_kernel`, synthetic fixtures, 1.4.2 pin); for the six
 > kernel sets the engine loads, `export_qwen36_kernels.py` (`src/open_qwen36/README.md`).
+> Every model dimension the whole-layer designs (`designs/layer_x`) and the engine
+> use comes from `recipes/` (a `ModelSpec` and the family recipe that turns it into
+> layouts, kernel TUs and the engine's `manifest.json`; `recipes/__init__.py`).
 
 # open-kernels — our own NPU kernels (IRON / mlir-aie), driven by phlegm
 

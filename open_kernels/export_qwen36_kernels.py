@@ -1,16 +1,31 @@
-r"""Build the six open kernel sets the Qwen3.6-MoE engine loads, from source.
+r"""Build the open kernel set a Qwen3.6-MoE model's engine loads, from source,
+with the manifest.json the engine reads beside it.
 
     source ~/ironenv142/bin/activate          # mlir-aie 1.4.2 + Peano, xclbinutil/aiebu-asm on PATH
-    python open_kernels/export_qwen36_kernels.py [--out DIR] [--only lx0,ln] [--no-build] [--check FILE]
+    python open_kernels/export_qwen36_kernels.py [--model-dir DIR | --spec FILE] [--out DIR]
+                                                 [--only lx0,ln] [--no-build] [--force] [--check DIR]
 
 The compiled kernels are NOT checked in (see .gitignore): this script is how
-they come to exist. It runs build_design.py once per set with the design's
-compile-time knobs, then copies final.xclbin + insts.bin into
-<out>/<name>/ -- by default src/xclbins/Qwen3.6-35B-A3B-NPU2/open_kernels/,
-which is where src/open_qwen36/engine.cpp looks for them (and what
-`install(DIRECTORY xclbins ...)` ships in the package). toolchain.json beside
-them records the mlir-aie / Peano versions, the git commit of this tree and
-the sha256 of every file, so a binary can always be traced to its source.
+they come to exist. It derives the ModelSpec (recipes/spec.py) from the
+model's config.json (default: the checked-in 27B spec), regenerates the
+whole-layer designs' kernel TUs for it (designs/layer_x/gen_kernels.py), runs
+build_design.py once per kernel set the recipe names (recipes/qwen36moe.py
+`builds`) with OPEN_KERNELS_SPEC pointing at that spec, and copies
+final.xclbin + insts.bin into <out>/<name>/ -- by default
+src/xclbins/Qwen3.6-35B-A3B-NPU2/open_kernels/, which is where
+src/open_qwen36/engine.cpp looks for them (and what `install(DIRECTORY
+xclbins ...)` ships in the package). Beside them:
+
+  manifest.json    everything the engine reads (recipes/manifest.py): layouts, contexts,
+                   kernels, per-layer programs, packing plan, the spec and its hashes
+  toolchain.json   the mlir-aie / Peano versions, the git commit of this tree and the
+                   sha256 of every file, so a binary can always be traced to its source
+
+The build cache (OPEN-BUILD-CACHE): the manifest's `build_key` hashes the
+recipe sources, every kernel source the designs include, the spec and the
+quant format. When <out>/manifest.json already carries the key this run
+computes, nothing is rebuilt (--force overrides); any change to those inputs
+rebuilds.
 
 --check DIR compares the fresh build against a previous one (a directory with
 the same <name>/final.xclbin, <name>/insts.bin layout) and exits non-zero on
@@ -39,22 +54,16 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent                 # open_kernels/
 REPO = HERE.parent
 DESIGNS = HERE / "designs"
-DEFAULT_OUT = REPO / "src" / "xclbins" / "Qwen3.6-35B-A3B-NPU2" / "open_kernels"
+XCLBINS = REPO / "src" / "xclbins"
+DEFAULT_MODEL = "Qwen3.6-35B-A3B-NPU2"
+sys.path.insert(0, str(HERE))
+from recipes.cache import build_key  # noqa: E402
+from recipes.families import for_spec  # noqa: E402
+from recipes.load import default_spec, load_spec, spec_from_model_dir  # noqa: E402
+from recipes.manifest import dumps, manifest  # noqa: E402
 
-# name -> (design source, build dir, compile-time environment)
-# The build dirs are the ones the batch harness (model/make_decode.py) and the
-# per-design make_test scripts already name, so a run of this script also
-# leaves every design testable in place.
-SETS = {
-    "lx0":        (DESIGNS / "layer_x" / "lx.py",              DESIGNS / "layer_x" / "build_lx0",     {"LX_PART": "0"}),
-    "lx1":        (DESIGNS / "layer_x" / "lx.py",              DESIGNS / "layer_x" / "build_lx1",     {"LX_PART": "1"}),
-    "ax0":        (DESIGNS / "layer_x" / "ax.py",              DESIGNS / "layer_x" / "build_ax0",     {"AX_PART": "0"}),
-    "ax1":        (DESIGNS / "layer_x" / "ax.py",              DESIGNS / "layer_x" / "build_ax1",     {"AX_PART": "1"}),
-    "ln":         (DESIGNS / "ln" / "ln.py",                   DESIGNS / "ln" / "build",              {}),
-    "lm_head_q8": (DESIGNS / "lm_head_q8" / "lm_head_q8.py",   DESIGNS / "lm_head_q8" / "build_full", {"LMHEAD_N": "248320", "LMHEAD_CORES": "8"}),
-}
 # knobs that must NOT leak in from the caller's shell
-CLEAR = ("LX_PART", "LX_STOP", "AX_PART", "LMHEAD_N", "LMHEAD_CORES")
+CLEAR = ("LX_PART", "LX_STOP", "AX_PART", "LMHEAD_N", "LMHEAD_CORES", "OPEN_KERNELS_SPEC")
 FILES = ("final.xclbin", "insts.bin")
 
 
@@ -131,10 +140,11 @@ def git_head(root: Path) -> str:
         return "unavailable"
 
 
-def build(name: str) -> Path:
-    src, out, knobs = SETS[name]
+def build(name: str, sets: dict, spec_file: Path) -> Path:
+    src, out, knobs = DESIGNS / sets[name]["design"], DESIGNS / sets[name]["build_dir"], sets[name]["env"]
     env = {k: v for k, v in os.environ.items() if k not in CLEAR}
     env.update(knobs)
+    env["OPEN_KERNELS_SPEC"] = str(spec_file)
     t0 = time.time()
     knob_str = " ".join(f"{k}={v}" for k, v in knobs.items())
     print(f"[{name}] {knob_str} python build_design.py {src.relative_to(HERE).as_posix()} "
@@ -148,42 +158,91 @@ def build(name: str) -> Path:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--out", default=str(DEFAULT_OUT),
-                    help=f"destination (default {DEFAULT_OUT.relative_to(REPO).as_posix()})")
-    ap.add_argument("--only", default=",".join(SETS), help="comma-separated subset of " + ",".join(SETS))
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--model-dir", help="derive the spec from this model's config.json (+ tokenizer.json)")
+    g.add_argument("--spec", help="a ModelSpec JSON (default: recipes/specs/qwen36-35b-a3b.json)")
+    ap.add_argument("--out", default=None,
+                    help="destination (default src/xclbins/<model name>/open_kernels)")
+    ap.add_argument("--only", default=None, help="comma-separated subset of the recipe's kernel sets")
     ap.add_argument("--no-build", action="store_true", help="copy/hash the existing build dirs without rebuilding")
+    ap.add_argument("--force", action="store_true", help="rebuild even when <out>/manifest.json has this build key")
+    ap.add_argument("--max-ctx", type=int, default=4096, help="the manifest's default context capacity")
     ap.add_argument("--check", metavar="DIR",
                     help="a previous export (or a shipped xclbins/<model>/open_kernels dir) to compare "
                          "against; non-zero exit on any difference beyond the per-build UUID/timestamp stamps")
     a = ap.parse_args()
-    names = [n.strip() for n in a.only.split(",") if n.strip()]
-    bad = [n for n in names if n not in SETS]
-    if bad:
-        sys.exit(f"unknown set(s) {bad}; choose from {list(SETS)}")
 
-    out_root = Path(a.out).resolve()
+    # ---- the spec, its recipe, and the kernel sets that recipe names
+    if a.model_dir:
+        spec = spec_from_model_dir(Path(a.model_dir))
+    elif a.spec:
+        spec = load_spec(Path(a.spec))
+    else:
+        spec = default_spec()
+    F = for_spec(spec)
+    F.recipe(spec)                                     # refuses a spec outside the validated points
+    sets = F.builds(spec)
+    names = [n.strip() for n in a.only.split(",") if n.strip()] if a.only else list(sets)
+    bad = [n for n in names if n not in sets]
+    if bad:
+        sys.exit(f"unknown set(s) {bad}; the recipe builds {list(sets)}")
+    key = build_key(spec)
+    out_root = Path(a.out).resolve() if a.out else (XCLBINS / spec.extra.get("model", DEFAULT_MODEL) / "open_kernels")
+    out_root.mkdir(parents=True, exist_ok=True)
+    spec_file = out_root / "spec.json"
+    spec_file.write_text(spec.to_json(), encoding="utf-8", newline="\n")
+    print(f"spec {spec.spec_hash()[:19]} ({spec.extra.get('model', spec.family)}), build key {key[:19]}")
+
+    # ---- the cache: an export that already carries this key is current
+    mj = out_root / "manifest.json"
+    if not a.force and not a.no_build and mj.is_file():
+        try:
+            old = json.loads(mj.read_text(encoding="utf-8"))
+        except Exception:
+            old = {}
+        have = all((out_root / n / f).is_file() for n in names for f in FILES)
+        if old.get("build_key") == key and have:
+            print(f"up to date: {mj} already has build key {key[:19]} and every file; --force rebuilds")
+            a.no_build = True
+
+    # ---- the whole-layer designs' kernel TUs for this spec, then the builds
+    if not a.no_build:
+        os.environ["OPEN_KERNELS_SPEC"] = str(spec_file)
+        gen_dir = HERE / F.GEN_KERNELS
+        import importlib.util
+        gspec = importlib.util.spec_from_file_location("gen_kernels", gen_dir)
+        gen = importlib.util.module_from_spec(gspec)
+        gspec.loader.exec_module(gen)
+        gen.generate(F.recipe(spec))
     hashes: dict[str, str] = {}
     for n in names:
-        bdir = SETS[n][1] if a.no_build else build(n)
+        bdir = DESIGNS / sets[n]["build_dir"] if a.no_build else build(n, sets, spec_file)
         dst = out_root / n
         dst.mkdir(parents=True, exist_ok=True)
         for f in FILES:
             srcf = bdir / f
             if not srcf.is_file():
                 sys.exit(f"[{n}] {srcf} missing after build")
-            shutil.copyfile(srcf, dst / f)
-            key = f"{n}/{f}"
-            hashes[key] = sha256(dst / f)
-            print(f"  {hashes[key]}  {key}  ({(dst / f).stat().st_size} B)")
+            if srcf.resolve() != (dst / f).resolve():
+                shutil.copyfile(srcf, dst / f)
+            k = f"{n}/{f}"
+            hashes[k] = sha256(dst / f)
+            print(f"  {hashes[k]}  {k}  ({(dst / f).stat().st_size} B)")
 
+    # ---- the manifest and the toolchain record
+    m = manifest(spec, a.max_ctx, key)
+    mj.write_text(dumps(m), encoding="utf-8", newline="\n")
     info = {
-        "model": "Qwen3.6-35B-A3B-NPU2",
+        "model": spec.extra.get("model", spec.family),
+        "spec_hash": spec.spec_hash(),
+        "build_key": key,
         "built": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "mlir_aie_version": pkg_version("mlir_aie"),
         "peano_version": pkg_version("llvm-aie"),
         "mlir_aie_git_head": git_head(Path(os.environ.get("MLIR_AIE_ROOT", Path.home() / "mlir-aie"))),
         "source_git_head": git_head(REPO),
-        "sets": {n: {"design": SETS[n][0].relative_to(REPO).as_posix(), "env": SETS[n][2]} for n in names},
+        "sets": {n: {"design": (DESIGNS / sets[n]["design"]).relative_to(REPO).as_posix(), "env": sets[n]["env"]}
+                 for n in names},
         "sha256": hashes,
     }
     # Keep what an earlier run recorded when this one did not build everything:
@@ -191,7 +250,7 @@ def main() -> int:
     # outside the toolchain venv) keeps the recorded versions instead of
     # overwriting them with "unavailable".
     tj = out_root / "toolchain.json"
-    if tj.is_file() and (a.no_build or len(names) < len(SETS)):
+    if tj.is_file() and (a.no_build or len(names) < len(sets)):
         try:
             old = json.loads(tj.read_text(encoding="utf-8"))
             for k in ("sets", "sha256"):
@@ -204,24 +263,38 @@ def main() -> int:
         except Exception:
             pass
     tj.write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
-    print(f"-> {out_root}  (toolchain.json: mlir-aie {info['mlir_aie_version']}, Peano {info['peano_version']})")
+    print(f"-> {out_root}  (manifest.json + toolchain.json: mlir-aie {info['mlir_aie_version']}, "
+          f"Peano {info['peano_version']})")
 
     if a.check:
         ref = Path(a.check)
         bad = 0
-        for key in hashes:
-            mine, theirs = out_root / key, ref / key
+        for key_ in hashes:
+            mine, theirs = out_root / key_, ref / key_
             if not theirs.is_file():
-                print(f"MISSING  {key}: not in {ref}")
+                print(f"MISSING  {key_}: not in {ref}")
                 bad += 1
                 continue
             x, y = mine.read_bytes(), theirs.read_bytes()
-            if key.endswith("insts.bin"):
+            if key_.endswith("insts.bin"):
                 ok, note = (x == y), ("byte-identical" if x == y else f"differ ({len(x)} vs {len(y)} B)")
             else:
                 ok, note = xclbin_equivalent(x, y)
-            print(f"{'same    ' if ok else 'MISMATCH'} {key}: {note}")
+            print(f"{'same    ' if ok else 'MISMATCH'} {key_}: {note}")
             bad += not ok
+        rm = ref / "manifest.json"
+        if rm.is_file():
+            try:
+                theirs = json.loads(rm.read_text(encoding="utf-8"))
+                mine_ = json.loads(mj.read_text(encoding="utf-8"))
+                for d in (theirs, mine_):
+                    d.pop("build_key", None)
+                ok = theirs == mine_
+                print(f"{'same    ' if ok else 'MISMATCH'} manifest.json: {'equal apart from the build key' if ok else 'differs'}")
+                bad += not ok
+            except Exception as e:
+                print(f"MISMATCH manifest.json: {e}")
+                bad += 1
         if bad:
             print(f"CHECK FAILED: {bad} of {len(hashes)} files differ from {ref}")
             return 1

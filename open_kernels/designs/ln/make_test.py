@@ -20,7 +20,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))
 import fixture_paths as FX  # noqa: E402
 
-N = 2048
+N = int(os.environ.get("LN_N", 2048))
+BUILD = os.environ.get("LN_BUILD", "build")
 
 
 def main() -> int:
@@ -46,8 +47,8 @@ def main() -> int:
     (HERE / "ref_y.bin").write_bytes(y.astype(np.float32).tobytes())
     (HERE / "ref_xn.bin").write_bytes(xn.tobytes())
     cfg = ["device",
-           "xclbin G build/final.xclbin",
-           "kernelx k G build/insts.bin",
+           f"xclbin G {BUILD}/final.xclbin",
+           f"kernelx k G {BUILD}/insts.bin",
            f"buf x {x.nbytes} x.bin",
            f"buf add {add.nbytes} add.bin",
            f"buf w {w.nbytes} w.bin",
