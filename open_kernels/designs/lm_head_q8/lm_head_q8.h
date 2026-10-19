@@ -1,0 +1,164 @@
+#pragma once
+//===- lm_head_q8.h ----------------------------------------*- C++ -*-===//
+//
+// W8A16 GEMV for the lm_head from phlegm's POOL-ORDER q8 chunks:
+//   logits[248320] = W[248320, 2048] @ x[2048]
+//
+// Inner arithmetic ported from vegah/LLMNpuTest designs/lm_head (Apache-2.0,
+// ../../LICENSE.LLMNpuTest); the chunk layout is OFLM's q8 (q4nx.rs):
+//
+//   chunk = 32 output rows x 256 K, 8704 B:
+//     scales[256] bf16 at [0   : 512]     index kb*32 + r          (r = 0..31)
+//     codes [8192] int8 at [512 : 8704]   index (r/16)*4096 + k*16 + (r%16)
+//   value = code * scale
+//
+// so `load_v<32>(s + kb*32)` is the 32 output rows in order, and two 16-lane
+// code loads 4096 apart concatenate to those rows at one k: one 32-lane MAC
+// per activation element, no gather.
+//
+// POOL ORDER (pools.rs build_lmhead_pool, "128-row supertile transpose"):
+//   pool chunk k <- file chunk (4*(k/32) + (k%4))*8 + ((k%32)/4), i.e.
+//   band = 32 consecutive chunks = 128 output rows x 2048 K;
+//   chunk c inside its band: row quarter = c % 4, k-tile = c / 4.
+// One band is consumed with a 128-float accumulator; the runtime `group`
+// argument walks (quarter, kt) off the chunk index.
+
+#include "aie_kernel_utils.h"
+#include <aie_api/aie.hpp>
+#include <stdint.h>
+
+#include "gemv_tab.h"
+
+static constexpr unsigned kRows = 32;        // output rows per chunk
+static constexpr unsigned kKBlocks = 8;      // 32-wide K blocks per chunk
+static constexpr unsigned kKInBlock = 32;
+static constexpr unsigned kTileK = 256;      // K per chunk
+
+// Chunk layout selector (GGUF-direct pools, open_kernels/gguf_pool.py), the
+// lm_head twin of gemv_q4.h's GEMV_Q4_SCALES_F32:
+//   0 (default, q4nx): 256 bf16 scales at [0:512), codes at [512:8704).
+//   1 (GGUF-direct): the scales are the GGUF Q8_0 block scales widened
+//     EXACTLY to f32 at [0:1024), codes at [1024:9216). The RNE accum
+//     convert back to bf16 keeps the numerics identical to the q4nx chunks.
+#ifndef LMHEAD_SCALES_F32
+#define LMHEAD_SCALES_F32 0
+#endif
+#if LMHEAD_SCALES_F32
+static constexpr unsigned kScaleBytes = 1024;
+static constexpr unsigned kTileBytes = 9216;
+#else
+static constexpr unsigned kScaleBytes = 512;
+static constexpr unsigned kTileBytes = 8704;
+#endif
+static constexpr unsigned kRowBlockStride = 4096;  // in codes
+static constexpr unsigned kRowSplit = 4;     // 32-row quarters per 128-row band
+
+// Entry-point symbol prefix (see gemv_q4.h): a GGUF-direct build is compiled
+// with -DLMHEAD_Q8_PREFIX=lm_head_q8s32 (and LMHEAD_SCALES_F32=1).
+#ifndef LMHEAD_Q8_PREFIX
+#define LMHEAD_Q8_PREFIX lm_head_q8
+#endif
+
+#ifndef LMHEAD_PER_CALL
+#define LMHEAD_PER_CALL 2
+#endif
+static constexpr unsigned kPerCall = LMHEAD_PER_CALL;
+
+// The hidden width. It sizes the activation table this kernel indexes into (gemv_tab.h:
+// 2K bytes of int16 x, then the per-block shifts at +2K), so it is a compile-time knob,
+// not a runtime one. The default is the Qwen3.6-27B's; Qwen3.5 dense passes 4096.
+#ifndef LMHEAD_K
+#define LMHEAD_K 2048
+#endif
+
+// Phase 2 item 5 (2026-09-02): the inner product on the integer matrix unit,
+// like gemv_q4.h. vegah's form (int8 -> bf16 through the accumulator, bf16 x
+// scalar MACs) ran at ~3 GB/s per core against a ~4 GB/s stream; this one is
+// DMA-bound. Per 128 B (8 k x 16 rows, 16 B per k): an unzip at step 8 gives
+// [8 k][rows 0..7] and [8 k][rows 8..15] -- two mmul<4,8,8,int16,int8> B
+// operands -- against the x octet from the int16 table (gemv_tab.h). The
+// four 8-row results assemble into the chunk's 32 rows IN ORDER (no
+// permutation, unlike the q4 kernel), and per K block:
+//   y[r] += scale[kb][r] * 2^-s[kb] * part[r]   (bf16 hi/lo split)
+// Runtime kt/first, noinline + inline (COMDAT): one body in program memory.
+#if LMHEAD_SCALES_F32
+// f32 plane -> bf16 lanes, round-to-nearest-even in INTEGER ops ((u + 0x7FFF +
+// ((u>>16) & 1)) >> 16, the same law q4nx_file.hpp's f32_to_bf16 uses). The
+// accum-roundtrip float convert mis-schedules inside this kernel's kb loop.
+static inline aie::vector<bfloat16, kRows> load_scale(const float *__restrict p) {
+  const aie::vector<uint32_t, kRows> w = aie::load_v<kRows>((const uint32_t *)p);
+  // The round-to-nearest-even bit is the retained BF16 LSB, i.e. bit 16 of the
+  // f32 word, taken as 0/1. Masking with 0x10000 and adding that would bias the
+  // sum by 65536 instead of 1, so downshift first and then mask.
+  const aie::vector<uint32_t, kRows> lsb = aie::bit_and((uint32_t)1, aie::downshift(w, 16));
+  const aie::vector<uint32_t, kRows> r = aie::add(w, aie::add((uint32_t)0x7FFF, lsb));
+  return aie::pack(aie::downshift(r, 16)).template cast_to<bfloat16>();
+}
+#else
+static inline aie::vector<bfloat16, kRows> load_scale(const bfloat16 *__restrict p) {
+  return aie::load_v<kRows>(p);
+}
+#endif
+
+static constexpr unsigned kK = LMHEAD_K;
+__attribute__((noinline)) inline void gemv_q8_tile(const uint8_t *__restrict tile,
+                                                   const uint8_t *__restrict tab,
+                                                   unsigned kt, bool first,
+                                                   float *__restrict y) {
+  event0();
+  aie::set_rounding(aie::rounding_mode::conv_even);
+
+#if LMHEAD_SCALES_F32
+  const float *__restrict s = (const float *)tile;
+#else
+  const bfloat16 *__restrict s = (const bfloat16 *)tile;
+#endif
+  const uint8_t *__restrict c0 = tile + kScaleBytes;              // rows 0..15: byte k*16 + r
+  const uint8_t *__restrict c1 = c0 + kRowBlockStride;            // rows 16..31
+  const int16_t *__restrict xi = (const int16_t *)tab + kt * kTileK;
+  const int32_t *__restrict sh = (const int32_t *)(tab + 2 * kK) + kt * kKBlocks;
+
+  aie::accum<accfloat, kRows> acc;
+  if (first)
+    acc = aie::zeros<accfloat, kRows>();
+  else
+    acc.from_vector(aie::load_v<kRows>(y));
+
+#pragma clang loop unroll(disable)
+  for (unsigned kb = 0; kb < kKBlocks; ++kb) {
+    aie::vector<int32_t, 8> v[4];
+#pragma clang loop unroll(full)
+    for (unsigned rb = 0; rb < 2; ++rb) {
+      const uint8_t *__restrict src = (rb == 0 ? c0 : c1) + kb * kKInBlock * 16;
+      aie::mmul<4, 8, 8, int16_t, int8_t> Clo, Chi;
+#pragma clang loop unroll(full)
+      for (unsigned oc = 0; oc < 4; ++oc) {
+        const aie::vector<int16_t, 32> A =
+            aie::load_v<8>(xi + kb * kKInBlock + oc * 8).template grow_replicate<32>();
+        const aie::vector<int8_t, 64> q0 = aie::load_v<64>((const int8_t *)src + oc * 128);
+        const aie::vector<int8_t, 64> q1 = aie::load_v<64>((const int8_t *)src + oc * 128 + 64);
+        auto [lo, hi] = aie::interleave_unzip(q0, q1, 8);   // rows 0..7 / 8..15 at k 0..7
+        if (oc == 0) {
+          Clo.mul(A, lo);
+          Chi.mul(A, hi);
+        } else {
+          Clo.mac(A, lo);
+          Chi.mac(A, hi);
+        }
+      }
+      v[2 * rb] = Clo.template to_vector<int32_t>().template extract<8>(0);
+      v[2 * rb + 1] = Chi.template to_vector<int32_t>().template extract<8>(0);
+    }
+    const aie::vector<int32_t, kRows> vi = aie::concat(v[0], v[1], v[2], v[3]);   // rows 0..31
+    aie::accum<accfloat, kRows> part;
+    part.from_vector(aie::to_float<float>(vi, sh[kb]));
+    const aie::vector<bfloat16, kRows> hi = part.template to_vector<bfloat16>();
+    const aie::vector<bfloat16, kRows> lo = aie::sub(part, hi).template to_vector<bfloat16>();
+    const aie::vector<bfloat16, kRows> sv = load_scale(s + kb * kRows);
+    acc = aie::mac(acc, hi, sv);
+    acc = aie::mac(acc, lo, sv);
+  }
+
+  aie::store_v(y, acc.template to_vector<float>());
+  event1();
+}
