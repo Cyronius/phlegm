@@ -1,10 +1,23 @@
 # Provenance — open_kernels/
 
-Vendored from **phlegm** (https://github.com/, local: `c:\code\phlegm`),
-`tools/open-kernels/`, at commit `710c233ae95f43262c7a9bf8b4d8dee905b79c25`
-(2026-09-03), on 2026-09-04.
+## Where this tree lives
 
-Author: Cyrus Attoun. MIT — see `LICENSE`.
+phlegm (https://github.com/Cyronius/phlegm) is the canonical home of `open_kernels/` from 2026-10-19 on. Work flows
+out to openflowlm-next (https://github.com/Atomic-Germ/openflowlm-next) as pull requests; `UPSTREAM.md` is the
+ledger of what went each way.
+
+The history:
+
+1. 2026-09-02 to 2026-09-03: written in phlegm as `tools/open-kernels/` (to commit
+   `710c233ae95f43262c7a9bf8b4d8dee905b79c25`, tagged `pre-monorepo`).
+2. 2026-09-04 to 2026-10-19: vendored into openflowlm-next as `open_kernels/` and developed there. The sections
+   below this one were written in that tree and describe it.
+3. 2026-10-19: brought back into phlegm with its openflowlm-next history (`git filter-repo` over openflowlm-next
+   `main` at `c05b00fd66fe16f2cbb03f2894c49cf5aea61d4a`, plus open PRs #209, #184 and #203). The commit SHAs in
+   phlegm are rewritten; cite openflowlm-next SHAs when you refer to its history.
+
+Authors in that history: Cyrus Attoun (also as Cyronius), Vegard Berget (vegah), Atomic-Germ, IvGeniy04, PRIHLOP, D-revv. MIT — see
+`LICENSE`. The third-party code below keeps its own licenses.
 
 ## What this is
 
