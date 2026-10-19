@@ -147,6 +147,23 @@
 #if ATTN_BLOCK_ONLY && (ATTN_RB < 2 || !ATTN_VEXP)
 #error "attn.h: ATTN_BLOCK_ONLY needs the block kernel (ATTN_RB > 1) on the vector-softmax path (ATTN_VEXP)"
 #endif
+#ifndef ATTN_BLOCK_WIN
+// 1: the block-only walk in the order the merged dense layer image streams it
+// (designs/layer_x/dux.py, whose attention cores take the cached window BEFORE the new
+// position's k and v, so the window streams while the main cores are still on gate | k | v).
+// ATTN_BLOCK_ONLY's peeled last block cannot run in that order: its fifo rows sit in front
+// of k and v in the stream, while its final slot needs the k'/v' they produce. Here instead
+//   * the window is whole blocks of kRB rows: the host streams kRB * max(1, ceil(pos / kRB))
+//     rows (stream_patch::attn_apply, manifest `rb_win`), the ones at or past `pos` padding
+//     that attn_stepb masks -- and at position 0 that one block is all padding and skipped;
+//   * the new position's row is a block of its own (attn_stepb_nr): the new row in the final
+//     slot, the slots before it masked.
+// The single-row kernel is not built. 0 = the path every other family compiles.
+#define ATTN_BLOCK_WIN 0
+#endif
+#if ATTN_BLOCK_WIN && (ATTN_RB < 2 || !ATTN_VEXP || ATTN_BLOCK_ONLY)
+#error "attn.h: ATTN_BLOCK_WIN needs the block kernel (ATTN_RB > 1) on the vector-softmax path, and not ATTN_BLOCK_ONLY"
+#endif
 #ifndef ATTN_NHL
 #define ATTN_NHL ATTN_NH     // heads THIS core owns; < ATTN_NH splits attention over several cores
 #endif
@@ -418,6 +435,11 @@ static inline void attn_meta_impl(const uint8_t *__restrict m0, const uint8_t *_
   // divide with its sign correction -- pb[0] is a row count and never negative.
   // pb[1] (the unpadded nf) and pb[5] are unused here: nothing counts single rows.
   pb[4] = (int32_t)((uint32_t)p[0] / kRB);
+#elif ATTN_BLOCK_WIN
+  // The window's blocks: ceil(pos / kRB), and one all-padding block at position 0 (a fill
+  // cannot be empty). The host streams exactly kRB times this many rows.
+  const uint32_t nb = ((uint32_t)p[0] + kRB - 1u) / kRB;
+  pb[4] = (int32_t)(nb ? nb : 1u);
 #elif ATTN_RB > 1
   // How the nf streamed rows divide into whole blocks and a remainder. When the
   // window carries a dummy row -- only at position 0, where nf is 1 and pos is 0 --
@@ -832,6 +854,11 @@ __attribute__((noinline)) inline void attn_row_impl(const bfloat16 *__restrict K
 #if ATTN_BLOCK_ONLY
 #define ATTN_NV_PARM , unsigned nv
 #define ATTN_NV_ARG , nv
+#elif ATTN_BLOCK_WIN
+// slots [m_lo, m_hi) of the block are padding: a window block's tail past `pos` (m_hi = kRB),
+// or every slot before the new row in its own block (m_lo = 0, m_hi = kRB - 1)
+#define ATTN_NV_PARM , unsigned m_lo, unsigned m_hi
+#define ATTN_NV_ARG , m_lo, m_hi
 #else
 #define ATTN_NV_PARM
 #define ATTN_NV_ARG
@@ -1015,14 +1042,24 @@ __attribute__((noinline)) inline void attn_rowb_impl(const bfloat16 *const *__re
   // i + step within an item, halving, which is what aie::reduce_add does inside one
   // vector: the same additions in the same order, so the same scores to the bit. One
   // vector add per level per pair instead of five serial steps per (row, head).
-  static_assert(kNHL == 4 && kNL == 8 && (kRB == 2 || kRB == 4) && (kNH / kKVH) % kNHL == 0,
-                "attn.h ATTN_TREE: written for 4 heads a core sharing one kv head, RB 2 or 4");
+  // Each level-1 pair (heads 2hp, 2hp + 1 of the core) shares ONE kv head: the core's first
+  // head is a multiple of kNHL = 4 and a kv head spans an even number of q heads, so a pair
+  // never straddles two. When a kv head spans a multiple of 4 (the 35B: 8) the whole core
+  // shares one; Ternary Bonsai 2 (6 q heads a kv head) has cores whose two pairs read
+  // different ones, so the kv head is taken per pair there.
+  static_assert(kNHL == 4 && kNL == 8 && (kRB == 2 || kRB == 4) && (kNH / kKVH) % 2 == 0,
+                "attn.h ATTN_TREE: written for 4 heads a core, pairs sharing a kv head, RB 2 or 4");
   {
     const unsigned hb = kSplit ? (unsigned)h0 : 0u;
+#if (ATTN_NH / ATTN_KVH) % ATTN_NHL == 0
     const unsigned kvh = hb / (kNH / kKVH);         // one kv head for all of the core's heads
+#endif
     const bfloat16 *q0 = qs + hb * kHD;
     v32f z[2 * kRB];                                // level 1: [row r: heads 0,1 | heads 2,3]
     for (unsigned hp = 0; hp < 2; ++hp) {
+#if (ATTN_NH / ATTN_KVH) % ATTN_NHL != 0
+      const unsigned kvh = (hb + 2 * hp) / (kNH / kKVH);   // this pair's kv head
+#endif
       AIE_LOOP_UNROLL_FULL
       for (unsigned r = 0; r < kRB; ++r)
         z[2 * r + hp] = attn_score2(Kb[r] + kvh * kHD, q0 + 2 * hp * kHD, q0 + (2 * hp + 1) * kHD);
@@ -1140,6 +1177,14 @@ __attribute__((noinline)) inline void attn_rowb_impl(const bfloat16 *const *__re
   // not a NaN. The loop stops one short of kRB: the last slot is the new position's
   // row. Taken only on the last call of a token, and at kRB 2 it is one compare.
   for (unsigned r = nv; r + 1 < kRB; ++r)
+    aie::store_v(sv + r * kNL, aie::broadcast<float, kNL>(-1e30f));
+#elif ATTN_BLOCK_WIN
+  // The padding slots, masked as above (ATTN_BLOCK_ONLY): -1e30 never wins the max and
+  // exponentiates to zero. Every block that reaches here holds at least one real row (the
+  // all-padding window block at position 0 is skipped by attn_stepb), so the max is real and
+  // a padding slot's weight is an exact zero; its K / V are cache rows at or past `pos`
+  // (written by an earlier token or zeroed at allocation) or the new row itself, never NaN.
+  for (unsigned r = m_lo; r < m_hi; ++r)
     aie::store_v(sv + r * kNL, aie::broadcast<float, kNL>(-1e30f));
 #endif
 

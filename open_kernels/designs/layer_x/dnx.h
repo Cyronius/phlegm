@@ -35,6 +35,11 @@
 #define DNX_ROWS 20
 #endif
 static constexpr unsigned kD = 128;          // head dim
+#ifndef DNX_ROW_UPDATE
+// 1: pass 2 one row per half-row call (Ternary Bonsai 2, xcommon.py DN_FLAGS: the smaller code its main
+// core needs, and the result fifo drains while the core computes); 0: the whole slice at the first call
+#define DNX_ROW_UPDATE 0
+#endif
 static constexpr unsigned kRowsX = DNX_ROWS; // rows of S per streamed element
 // kPad is NOT the slice count times kRowsX (that is `Common.DN_PAD`, the padded S row count
 // of the state buffer: 140 at 20 rows, 130 at 10). It is the hi/lo RECORD STRIDE inside ds,
@@ -171,6 +176,51 @@ static inline void dnx_delta_head(float *__restrict ds) {
   }
 }
 
+#if DNX_ROW_UPDATE
+// ---- pass 2 for ONE row i of the slice, in place: S'[i] = decay * S[i] + k[i] * delta, then
+// o += S'[i] * q[i] -- per element the operations of dnx_slice_update, in its order (each o column
+// vector still takes the slice's rows 0, 1, 2, ... in turn; o lives in ds between rows, and the
+// accumulator's fp32 store / reload is exact). Called on the row's first half-row, so a row's
+// update sits between the previous row's two copy-outs and its own, and the result fifo (two
+// 256 B elements) drains while the core computes instead of after a whole slice's update.
+static inline void dnx_row_update(float *__restrict S, float *__restrict ds, unsigned blk, unsigned i) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  float *__restrict o = ds + DS_O;
+  const bfloat16 *__restrict k_hl = (const bfloat16 *)(ds + DS_KHL);
+  const bfloat16 *__restrict q_hl = (const bfloat16 *)(ds + DS_QHL);
+  const bfloat16 *__restrict delta_hl = (const bfloat16 *)(ds + DS_DHL);
+  const bfloat16 *__restrict dd = (const bfloat16 *)(ds + DS_DD);
+  const bfloat16 dh = dd[0], dl = dd[1];
+  const unsigned r = blk * kRowsX + i;
+  const bfloat16 kh = k_hl[r], kl = k_hl[kPad + r], qh = q_hl[r], ql = q_hl[kPad + r];
+  float *__restrict Sr = S + i * kD;
+#pragma clang loop unroll(disable)
+  for (unsigned jv = 0; jv < kHalf; jv += kV) {
+    const unsigned ja = jv, jb = kHalf + jv;               // the same column vector in each half
+    accf16 sa = aie::zeros<accfloat, kV>();
+    sa = mac_split(sa, aie::load_v<kV>(Sr + ja), dh, dl);
+    sa = aie::mac(sa, aie::load_v<kV>(delta_hl + ja), kh);
+    sa = aie::mac(sa, aie::load_v<kV>(delta_hl + ja), kl);
+    sa = aie::mac(sa, aie::load_v<kV>(delta_hl + kD + ja), kh);
+    accf16 sb = aie::zeros<accfloat, kV>();
+    sb = mac_split(sb, aie::load_v<kV>(Sr + jb), dh, dl);
+    sb = aie::mac(sb, aie::load_v<kV>(delta_hl + jb), kh);
+    sb = aie::mac(sb, aie::load_v<kV>(delta_hl + jb), kl);
+    sb = aie::mac(sb, aie::load_v<kV>(delta_hl + kD + jb), kh);
+    const vf va = sa.template to_vector<float>(), vb2 = sb.template to_vector<float>();
+    aie::store_v(Sr + ja, va);
+    aie::store_v(Sr + jb, vb2);
+    accf16 oa, ob;
+    oa.from_vector(aie::load_v<kV>(o + ja));
+    ob.from_vector(aie::load_v<kV>(o + jb));
+    oa = mac_split(oa, va, qh, ql);
+    ob = mac_split(ob, vb2, qh, ql);
+    aie::store_v(o + ja, oa.template to_vector<float>());
+    aie::store_v(o + jb, ob.template to_vector<float>());
+  }
+}
+
+#else
 // ---- pass 2 for a whole slice, in place: S'[i] = decay * S[i] + k[i] * delta over the element's
 // rows, o += S'[i] * q[i]. The element is the core's own copy of the slice (the fifo refills it
 // from DDR next time), so S' overwrites S and the half-row calls below just copy out.
@@ -240,14 +290,21 @@ static inline void dnx_slice_update(float *__restrict S, float *__restrict ds, u
   }
 }
 
-// ---- pass 2, the half-row call (row i of the slice at S, half hf): the slice's first call does
-// the whole update in place, then every call copies its updated half row out to ye.
+#endif
+
+// ---- pass 2, the half-row call (row i of the slice at S, half hf): the slice's first call does the
+// whole update in place (dnx_slice_update), or each row's first half-row call does its row's
+// (dnx_row_update), then every call copies its updated half row out to ye.
 static inline void dnx_row_half(float *__restrict S, float *__restrict ds, float *__restrict ye,
                                 unsigned blk, unsigned i, unsigned hf) {
 #ifdef LX_NULL_DN
   return;                                    // timing ablation: the streams stay, the maths goes
 #endif
+#if DNX_ROW_UPDATE
+  if (hf == 0) dnx_row_update(S, ds, blk, i);
+#else
   if (i == 0 && hf == 0) dnx_slice_update(S, ds, blk);
+#endif
   const float *__restrict src = S + i * kD + hf * kHalf;
 #pragma clang loop unroll(full)
   for (unsigned j = 0; j < kHalf; j += kV) aie::store_v(ye + j, aie::load_v<kV>(src + j));

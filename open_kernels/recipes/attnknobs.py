@@ -248,9 +248,15 @@ def knobs(spec: ModelSpec, nh: int, hpo: int) -> AttnKnobs:
         # (__mulsf3 / __divsf3 for three scalar operations) went to attn.h ATTN_INTFP's
         # integer routines, bit-identical, which is what makes RB 4 fit with room to spare.
         # An unmeasured gated family keeps 1.
+        # ... except Ternary Bonsai 2 27B (the all-t2 spec, whose layer kernels are the merged
+        # image designs/layer_x/dux.py): FOUR, with the single-row kernel retired there too, as
+        # attn.h ATTN_BLOCK_WIN (the window in whole blocks, the new row in a block of its own --
+        # the block-only walk reordered for dux.py, whose attention cores take the window before the
+        # new row's k and v). Measured against RB 1 on the greedy gates (OPEN-ATTN-CONTEXT).
         gated256 = spec.head_dim >= 256 and spec.attn_gate
         block_ok = gated256 and spec.family in BLOCK_ONLY_MEASURED
-        cap = 4 if (spec.head_dim < 256 or block_ok) else (1 if (spec.attn_gate or nhl > 2) else 2)
+        t2 = bool(spec.quant_map) and all(f == "t2" for f in spec.quant_map.values())
+        cap = 4 if (spec.head_dim < 256 or block_ok or (spec.attn_gate and t2)) else (1 if (spec.attn_gate or nhl > 2) else 2)
         rb = max((r for r in (4, 2, 1) if r <= cap and (r * block_lanes(nhl)) in (8, 16, 32)), default=1)
         if spec.family in BLOCK8_MEASURED and rb == 4 and nhl == 8 and spec.head_dim == 64:
             rb = 8

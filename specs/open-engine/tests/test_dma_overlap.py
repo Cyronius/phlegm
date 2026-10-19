@@ -46,7 +46,7 @@ def test_head_major_schedule_preserves_padded_state_and_endpoint_order(heads):
         def drain(self, ep, tensor, tap): events.append(('drain', ep, tensor, tap))
     per_core = heads//8
     rec, ohb, stride, state_off = 2048, 512, 140*128*4, 61440
-    ns = dict(N_CORES=8, DN_HEADS_PC=per_core, CALL_BYTES=4096,
+    ns = dict(N_CORES=8, DN_HEADS_PC=per_core, CALL_BYTES=4096, DN_SLICE=4096, DN_SLICES=1, TensorAccessPattern=object,
               R=SimpleNamespace(linear=SimpleNamespace(RECORD_BYTES=rec, O_HEAD_BYTES=ohb)),
               bt=lambda total, off, size: (total, off, size))
     sequence = extract(ROOT/'open_kernels/designs/layer_x/xcommon.py', 'dn_sequence', ns)

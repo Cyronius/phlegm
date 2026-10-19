@@ -21,8 +21,16 @@ void attn_stepb(const bfloat16 *__restrict K0, const bfloat16 *__restrict V0,
 #else
 #error "attn_stepb.cc: ATTN_RB must be 2 or 4"
 #endif
+#if ATTN_BLOCK_WIN
+  // a window block: the real rows left are pos - (rows already taken); the rest is padding
+  const int32_t left = pb[0] - pb[2];
+#endif
   pb[2] += (int32_t)kRB;
 #if !ATTN_NULL
+#if ATTN_BLOCK_WIN
+  if (left <= 0) return;       // position 0's all-padding block: nothing to add
+  const unsigned m_lo = left < (int32_t)kRB ? (unsigned)left : kRB, m_hi = kRB;
+#endif
 #if ATTN_BLOCK_ONLY
   const unsigned nv = kRB;     // a full block off the fifo: every slot is a real cached row
 #endif

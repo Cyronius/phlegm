@@ -31,7 +31,7 @@ LAYER_TYPES = (LINEAR, FULL, DENSE, DENSE_LOCAL, SHORT_CONV)   # dense_local: a 
 # MoE / qwen35 recipes pack it with `lmhead_q8`, the dense recipes with `std_perm`), so
 # putting it in the map would move every shipped model's spec_hash for no kernel change.
 QUANT_ROLES = ("attn", "linear", "linear_out", "shared", "ffn", "experts")
-QUANT_FORMATS = ("q4_1", "q4_1_f32", "q8", "mxfp4")
+QUANT_FORMATS = ("q4_1", "q4_1_f32", "q8", "mxfp4", "t2")   # t2: 2-bit ternary chunks (OPEN-QUANT-T2), repacked from exact q4_1
 DEFAULT_QUANT = "q4_1"
 NORM_GROUPS = (1, 2, 4)   # the GroupRMSNorm counts the `ln` kernels build (ln.h LN_GROUPS)
 CHUNK_FORMAT = {5120: "q4_1", 8704: "q8"}
@@ -91,6 +91,14 @@ class ModelSpec:
     # carrying only the roles that differ from it (`{"attn": "q8"}`). QUANT_ROLES above.
     quant: str | dict = DEFAULT_QUANT
     extra: dict = field(default_factory=dict)   # informational (model name, source)
+    # Activation-side Walsh-Hadamard (PrismML's rotated-basis ternary models, Ternary Bonsai 2):
+    # {"block": 1024, "og_signs": [+-1 x attention-output width]}. Every projection input goes
+    # through H/sqrt(block) per block before its GEMV; the converter folded every other sign
+    # into weights (OPEN-HADAMARD). None for every other model, and then absent from to_dict(),
+    # so no shipped spec_hash moves. "lm_head": "rotated" when the container's head is the
+    # rotated ternary weight itself (its input goes through the transform too; the recipe runs
+    # it as t2) -- absent for a container whose head was un-rotated to q8 at conversion.
+    hadamard: dict | None = None
 
     # ---- derived
     @property
@@ -162,9 +170,15 @@ class ModelSpec:
         """A short stable hash of the quant map; "" when nothing is at q8. Build directory
         names carry it so a q8 variant is a different kernel set without renaming the
         directories every shipped model already builds into."""
+        q = self.canonical_quant()
+        if self.hadamard:
+            # a rotated-basis model is a different kernel set at either weight format
+            # (OPEN-HADAMARD): its preps carry the transform and the og sign table
+            key = {"quant": q, "hadamard": self.hadamard["block"],
+                   "og": hashlib.sha256(bytes(v < 0 for v in self.hadamard["og_signs"])).hexdigest()[:16]}
+            return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:8]
         if not self.q8_roles:
             return ""
-        q = self.canonical_quant()
         return hashlib.sha256(json.dumps(q, sort_keys=True).encode()).hexdigest()[:8]
 
     def rope_inv_freq(self, local: bool = False, ctx: int | None = None) -> list[float]:
@@ -227,6 +241,8 @@ class ModelSpec:
         d = asdict(self)
         d["layer_types"] = list(self.layer_types)
         d["quant"] = self.canonical_quant()
+        if d.get("hadamard") is None:
+            d.pop("hadamard", None)
         if d["norm_groups"] == 1:
             del d["norm_groups"]   # what every shipped spec serialised before the field existed
         return d
@@ -455,10 +471,33 @@ def _qwen35_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
     d.update(family="qwen35", intermediate=_need(tc, "intermediate_size"),
              activation="silu" if tc.get("hidden_act", "silu") == "silu" else tc["hidden_act"])
     d["extra"] = {"model_type": cfg.get("model_type", tc.get("model_type")), "source": "hf_config"}
+    ph = cfg.get("prism_hadamard")
+    if ph is not None:
+        d["hadamard"] = _prism_hadamard(ph, spec_width=d["lin_value_heads"] * d["lin_value_dim"]
+                                        or d["num_heads"] * d["head_dim"])
     spec = ModelSpec.from_dict(d)
     if spec.activation != "silu":
         raise SpecError(f"qwen3_5: hidden_act {spec.activation!r} is not silu")
     return spec
+
+
+def _prism_hadamard(ph: Mapping[str, Any], spec_width: int) -> dict:
+    """The container's `prism_hadamard` block (q4nx-build's Bonsai path) -> ModelSpec.hadamard.
+    Only the 1024 block the kernels implement, and an og sign vector as wide as the attention
+    output, are accepted -- anything else is a different model than the one this was built for."""
+    block = int(ph.get("block_size", 0))
+    if block != 1024:
+        raise SpecError(f"prism_hadamard.block_size {block}: only 1024 is implemented")
+    signs = [int(v) for v in ph.get("og_signs", [])]
+    if len(signs) != spec_width or any(v not in (1, -1) for v in signs):
+        raise SpecError(f"prism_hadamard.og_signs: want {spec_width} values of +-1, got {len(signs)}")
+    hd = {"block": block, "og_signs": signs}
+    head = ph.get("lm_head", "unrotated")
+    if head == "rotated":
+        hd["lm_head"] = "rotated"            # OPEN-QUANT-T2: the head runs as t2 (lm_head_t2)
+    elif head != "unrotated":
+        raise SpecError(f"prism_hadamard.lm_head {head!r}: 'rotated' or 'unrotated'")
+    return hd
 
 
 def _qwen35_gguf(md: Mapping[str, Any]) -> ModelSpec:
@@ -505,6 +544,41 @@ def _qwen3_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
         norm_eps=float(cfg.get("rms_norm_eps", 1e-6)),
         quant="q4_1",
         extra={"model_type": cfg["model_type"], "source": "hf_config"},
+    )
+
+
+def _dflash2_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+    """A DFlash 2 block drafter (q4nx-build --dflash2-drafter): five Qwen3 layers in the 1024-block
+    Hadamard basis, every matrix ternary. The kernels see only the matrix shapes; the drafter's own
+    constants (taps, conv, selector, mask id) ride in `extra` for the engine (OPEN-DRAFT-DFLASH2)."""
+    n = _need(cfg, "num_hidden_layers")
+    hd = _need(cfg, "head_dim")
+    vocab = _need(cfg, "vocab_size")
+    hb = _need(cfg, "hadamard")
+    if int(hb.get("block_size", 0)) != 1024:
+        raise SpecError(f"dflash2: hadamard.block_size {hb.get('block_size')} (the kernels' transform is 1024-wide)")
+    return ModelSpec(
+        family="dflash2",
+        hidden=_need(cfg, "hidden_size"),
+        num_layers=n,
+        layer_types=tuple([DENSE] * n),
+        vocab=vocab,
+        real_vocab=real_vocab if real_vocab is not None else vocab,
+        num_heads=_need(cfg, "num_attention_heads"),
+        num_kv_heads=_need(cfg, "num_key_value_heads"),
+        head_dim=hd,
+        rotary_dim=hd,
+        rope_theta=float(_need(cfg, "rope_theta")),
+        sliding_window=int(cfg.get("sliding_window", 0)),
+        qk_norm=True,
+        attn_gate=False,
+        intermediate=_need(cfg, "intermediate_size"),
+        norm_eps=float(cfg.get("rms_norm_eps", 1e-6)),
+        quant="q4_1",
+        hadamard={"block": 1024, "og_signs": []},
+        extra={"model_type": cfg["model_type"], "source": "hf_config",
+               "dflash2": {k: cfg[k] for k in ("target_layer_ids", "conv_kernel_size", "conv_group_size",
+                                               "selector_rank", "selector_top_k", "mask_token_id")}},
     )
 
 
@@ -1459,7 +1533,7 @@ HF_FAMILIES = {"qwen3_5_moe": _qwen36moe_hf, "qwen3_5_moe_text": _qwen36moe_hf,
                "qwen2_5_vl": _qwen25vl_hf, "qwen2_5_vl_text": _qwen25vl_hf,
                "gemma3_text": _gemma3_hf, "gemma3": _gemma3_hf, "hunyuan_v1_dense": _hunyuan_hf,
                "granite": _granite_hf, "phi3": _phi3_hf, "lfm2": _lfm2_hf,
-               "gpt_oss": _gptoss_hf, "k2_horizon": _k2_hf}
+               "gpt_oss": _gptoss_hf, "k2_horizon": _k2_hf, "dflash2": _dflash2_hf}
 GGUF_FAMILIES = {"qwen35moe": _qwen36moe_gguf, "qwen3next": _qwen36moe_gguf, "qwen35": _qwen35_gguf, "qwen3": _qwen3_gguf, "llama": _llama3_gguf,
                  "gemma3": _gemma3_gguf, "hunyuan-dense": _hunyuan_gguf, "granite": _granite_gguf}
 _FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen35_hf: "qwen35",
@@ -1469,7 +1543,7 @@ _FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen35_
               _llama3_hf: "llama3", _llama3_gguf: "llama3", _gemma3_hf: "gemma3", _gemma3_gguf: "gemma3",
               _hunyuan_hf: "hunyuan", _hunyuan_gguf: "hunyuan",
               _granite_hf: "granite", _granite_gguf: "granite", _phi3_hf: "phi3",
-              _lfm2_hf: "lfm2", _gptoss_hf: "gptoss", _k2_hf: "k2"}
+              _lfm2_hf: "lfm2", _gptoss_hf: "gptoss", _k2_hf: "k2", _dflash2_hf: "dflash2"}
 
 
 def hf_model_types(family: str) -> list[str]:
@@ -1512,6 +1586,8 @@ for _f in ("qwen3", "llama3", "gemma3", "hunyuan", "granite", "phi3", "qwen2", "
 # (utilities/q4nx-build/configs/gpt-oss.json). No shared expert and no dense FFN.
 # The split names are what a GGUF source carries; q4nx-build's post_gpt_oss_process deletes
 # all three and writes the fused tensor, so a real container only ever shows the last one.
+# the DFlash 2 drafter: every matrix is exact-ternary q4_1 and runs as t2, no role at another format
+ROLE_TENSORS["dflash2"] = {}
 ROLE_TENSORS["gptoss"] = {**_ATTN_HF, "ffn_up_exps.weight": "experts",
                           "ffn_gate_exps.weight": "experts", "ffn_down_exps.weight": "experts",
                           "ffn_gate_up_down_exps.weight": "experts"}
