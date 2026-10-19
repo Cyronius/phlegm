@@ -1,0 +1,20 @@
+[package]
+name = "phlegm-tray"
+description = "phlegm system tray app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# A distinct lib name avoids the Windows bin/lib name clash (rust-lang/cargo#8519).
+name = "phlegm_tray_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

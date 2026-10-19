@@ -1,0 +1,8 @@
+{
+  "name": "phlegm",
+  "private": true,
+  "scripts": {
+    "tray": "pnpm --filter phlegm-tray tauri dev",
+    "site": "pnpm --filter website dev"
+  }
+}
