@@ -1,0 +1,15 @@
+[package]
+name = "phlegm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "phlegm"
+path = "src/main.rs"
+
+[features]
+npu = ["phlegm-core/npu"]
+
+[dependencies]
+phlegm-core = { path = "../phlegm-core" }

@@ -1,11 +1,19 @@
 # Rust / C++ build
-npu-engine/target/
+target/
 **/*.obj
 **/*.exe
 **/*.lib
 **/*.exp
 **/*.dll
 **/*.pdb
+phlegm-core/xrt-shim/out/
+phlegm-core/deps/XRT/.git-not-a-repo/
+
+# Node
+node_modules/
+dist/
+.astro/
+phlegm-tray/src-tauri/gen/
 
 # Python
 __pycache__/
@@ -21,30 +29,27 @@ __pycache__/
 *.i64
 *.safetensors
 m3out/
-out/
-tools/kernel-interp/hf_ref/
-tools/kernel-interp/*.npy
 caps/
+xdna-dump/tools/kernel-interp/hf_ref/
+xdna-dump/tools/q4nx/reference/
 
-# Vendored reference converter (clone it yourself; see tools/q4nx-convert/README.md)
-tools/q4nx-convert/reference/
+# Small golden fixtures that ARE committed
+!xdna-dump/tools/kernel-interp/rust_ref/
+!xdna-dump/tools/kernel-interp/rust_ref/*.f32
+!xdna-dump/tools/kernel-interp/rust_ref/*.i64
+
+# open_kernels build output, run configs and logs
+open_kernels/designs/*/build*/
+open_kernels/designs/*/out*.bin
+open_kernels/designs/*/in.bin
+open_kernels/designs/*/run*.cfg
+open_kernels/designs/*/big.bin
+open_kernels/designs/*/*.log
+open_kernels/model/out*/
+open_kernels/harness/out/
 
 # Editor / tooling / index artifacts
 .claude/
 lancedb/
 .codegraph/
 .DS_Store
-
-# Keep small golden test fixtures that ARE committed:
-!tools/kernel-interp/rust_ref/
-!tools/kernel-interp/rust_ref/*.f32
-!tools/kernel-interp/rust_ref/*.i64
-kernels/
-tools/open-kernels/designs/*/build*/
-tools/open-kernels/designs/*/out*.bin
-tools/open-kernels/designs/*/in.bin
-tools/open-kernels/designs/*/run*.cfg
-tools/open-kernels/designs/*/big.bin
-
-# open-kernels run logs
-tools/open-kernels/designs/*/*.log

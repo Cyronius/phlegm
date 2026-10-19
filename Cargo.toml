@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["phlegm-core", "phlegm-cli", "phlegm-tray/src-tauri"]
+# The tray needs its web UI built first, so plain `cargo build` leaves it out.
+default-members = ["phlegm-core", "phlegm-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Cyronius/phlegm"
+
+[profile.release]
+debug = true
