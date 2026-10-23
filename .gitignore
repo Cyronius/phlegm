@@ -49,6 +49,7 @@ open_kernels/model/out*/
 open_kernels/harness/out/
 
 # Editor / tooling / index artifacts
+.kernel-import/
 .claude/
 lancedb/
 .codegraph/

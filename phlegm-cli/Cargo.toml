@@ -13,3 +13,4 @@ npu = ["phlegm-core/npu"]
 
 [dependencies]
 phlegm-core = { path = "../phlegm-core" }
+serde_json = "1"

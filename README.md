@@ -6,15 +6,15 @@ phlegm started as a fix for FastFlowLM, which silently skips the full-attention 
 outputs garbage. It went on to replace FastFlowLM's closed NPU kernels with open ones, written with the IRON /
 mlir-aie toolchain. Those kernels now run whole models on the NPU, through the openflowlm-next engine.
 
-> **Status (2026-10-19):** this repo is being restructured as a monorepo, and the engine is being rebuilt in Rust.
-> The kernels work today; the phlegm engine, CLI and tray app do not run models yet.
+> **Status (2026-10-22):** C++ remains the inference engine for now; the native Rust engine port comes last.
+> The benchmark adapter runs real models through C++. Normal CLI/server generation and the tray's model flows still need integration.
 
 ## Layout
 
 | dir | what | state |
 |---|---|---|
-| [`phlegm-core/`](phlegm-core/) | The Rust engine: GGUF reader, kernel manifest, weight packing, XRT, decode, tokenizer, sampler, OpenAI server | server, tokenizer, sampler and XRT bindings salvaged; the engine port is next |
-| [`phlegm-cli/`](phlegm-cli/) | The `phlegm` command: `run`, `serve`, `pull`, `bench` | `serve` with a mock backend |
+| [`phlegm-core/`](phlegm-core/) | Rust runtime support: tokenizer, sampler, OpenAI server, XRT bindings and C++ benchmark adapter | C++ benchmark inference works; native Rust engine port deferred until last |
+| [`phlegm-cli/`](phlegm-cli/) | The `phlegm` command: `run`, `serve`, `pull`, `bench` | real C++ benchmarks; `serve` still uses a mock backend |
 | [`phlegm-tray/`](phlegm-tray/) | Windows tray app (Tauri v2): model library, downloads, chat, a local OpenAI endpoint | tray icon and window only |
 | [`open_kernels/`](open_kernels/) | The open AIE kernels, their recipes per model family, the build harness and the fp64 replicas | working; see its README |
 | [`specs/open-engine/`](specs/open-engine/) | Requirements and tests for the kernels and recipes (`OPEN-*`) | imported with the kernels |
@@ -32,6 +32,13 @@ Rust (stable) and MSVC on Windows:
 cargo build                          # phlegm-core + phlegm-cli
 cargo run -p phlegm-cli -- serve     # mock OpenAI server on :52625
 ```
+
+The [Phlegm Bench protocol](specs/bench/spec.md) measures prefill and decode at
+512, 1024, 2048, and 4096 input tokens, with JSON reports restricted to clean,
+optimized builds from matching release tags. Machine metadata collection and
+report validation work now (`phlegm bench --help`). A [temporary C++ reference
+adapter](benchmarks/reference/README.md) runs the suite against an external
+OpenFlowLM checkout, explicitly labeling its results as reference-engine runs.
 
 NPU support needs the XRT import lib once, then the `npu` feature:
 

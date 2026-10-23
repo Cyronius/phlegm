@@ -4,7 +4,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod build_release;
+
 fn main() {
+    build_release::emit();
     // Only build the shim when the npu feature is enabled.
     if std::env::var("CARGO_FEATURE_NPU").is_err() {
         return;

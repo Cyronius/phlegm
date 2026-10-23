@@ -2815,6 +2815,7 @@ name = "phlegm-cli"
 version = "0.1.0"
 dependencies = [
  "phlegm-core",
+ "serde_json",
 ]
 
 [[package]]
@@ -2823,7 +2824,9 @@ version = "0.1.0"
 dependencies = [
  "minijinja",
  "minijinja-contrib",
+ "serde",
  "serde_json",
+ "sha2",
  "tiny_http",
  "tokenizers",
 ]

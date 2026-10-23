@@ -1,10 +1,10 @@
 pub mod backend;
+pub mod bench;
 pub mod mock_backend;
 pub mod placeholder_tokenizer;
 pub mod sampler;
 pub mod server;
 pub mod tokenizer;
-#[cfg(feature = "npu")]
 pub mod npu_lock;
 #[cfg(feature = "npu")]
 pub mod xrt;

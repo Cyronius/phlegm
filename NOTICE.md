@@ -20,6 +20,10 @@ shim over XRT.
 
 ## FastFlowLM
 
+`benchmarks/reference/bridge.cpp` can be built against the caller's external
+OpenFlowLM open engine (MIT, OpenFlowLM Community contributors). The engine is
+not vendored here; its sources retain the license and notices in that checkout.
+
 phlegm began as an open host for FastFlowLM's (https://github.com/FastFlowLM/FastFlowLM) kernels, and its findings
 about FastFlowLM's file formats and kernels are in `xdna-dump/`. FastFlowLM's source is MIT (Copyright © 2026
 Advanced Micro Devices, Inc.).
