@@ -1,0 +1,195 @@
+# Phlegm integration and kernel work plan
+
+Updated: 2026-10-23. Status: planned work, with existing results noted below.
+
+This is the project handoff plan for continuing on another machine. Paths are
+relative to the repository root. Check the current checkout and later result
+entries before resuming: several older plan headers predate completed work.
+
+## Direction and priority
+
+Keep C++ as the inference engine while completing normal generation, model
+onboarding and the tray. The native Rust inference engine port comes last.
+The next product milestone is real `phlegm run` and `phlegm serve` through the
+existing C++ process adapter. The immediate kernel task is hardware validation
+of the combined kernel tree with a compatible C++ runtime.
+
+The implementation order above follows the 2026-10-22 override in
+[the monorepo plan](.claude/plans/phlegm-monorepo.md). Its older P1/P2/P3 order
+does not override that decision. The kernel items below are separate workstreams;
+their order after combined-tree validation is a proposed priority, not a claim
+that they all block CLI/server integration.
+
+## Starting point
+
+- The C++ reference benchmark adapter runs real models. Normal serving still
+  uses a mock backend; the tray currently provides its shell.
+- The 2026-10-23 kernel sync and worktree recovery are recorded in
+  [UPSTREAM.md](open_kernels/UPSTREAM.md). The audited kernel imports are present.
+- That ledger records an offline suite result of 1793 passed, 58 skipped and
+  8 deselected. This is historical evidence, not a check performed by this plan.
+- No fresh NPU build or hardware acceptance has been established for the combined
+  tree. Earlier measurements remain tied to their original revisions/artifacts.
+- C++ runtime companion patches are retained in
+  [open_kernels/upstream-patches](open_kernels/upstream-patches/). They are separate
+  diffs against recorded source heads, not a combined runtime or a patch series.
+
+## 1. Connect CLI and server generation to C++
+
+- [ ] Extend the existing process adapter from benchmark calls to normal model
+  loading, prefill and decode.
+- [ ] Connect `phlegm run` and `phlegm serve` to that adapter.
+- [ ] Support sampling, model-specific chat templates and EOS handling.
+- [ ] Support streaming and request isolation; validate context capacity and
+  request parameters before dispatch.
+- [ ] Return useful model/kernel loading errors and handle worker failures.
+- [ ] Verify OpenAI chat/model responses, finish reasons, streamed/non-streamed
+  behavior and NPU hold/release against the intended API contracts.
+
+Completion: real prompts work through both CLI and server, including sampled,
+streamed and multi-turn requests; the mock backend is no longer the normal
+inference path. Preserve C++ as the reference for the later Rust port.
+
+Sources: [current direction](.claude/plans/phlegm-monorepo.md),
+[adapter build/protocol notes](benchmarks/reference/README.md),
+[project status](README.md).
+
+## 2. Validate the combined kernels and runtime
+
+- [ ] Prepare an external C++ reference checkout at a recorded revision.
+- [ ] Reconcile the required companion changes against that checkout. Use
+  [sources.json](open_kernels/upstream-patches/sources.json) for patch bases.
+- [ ] Ensure the runtime implements every selected manifest feature, including
+  the local version-7 `bfp16_dit` mapping.
+- [ ] Preserve the paired precision/state/KV contracts and Bonsai/Hadamard ABI
+  choices documented in the sync ledger. Llama batched attention requires the
+  companion high/low softmax-probability fix.
+- [ ] Build fresh kernel sets for the selected validation models and run the
+  applicable recipe/manifest, numerical, full-model and serving checks.
+- [ ] Record source revisions, build settings, artifact hashes, model identity
+  and hardware conditions with the results. Report untested routes explicitly.
+
+Completion: the selected combined kernel/runtime routes pass their documented
+acceptance checks on hardware. Offline success alone does not close this task.
+
+Source: [sync ledger and recovery notes](open_kernels/UPSTREAM.md).
+
+## 3. Finish model and kernel onboarding
+
+- [ ] Derive `ModelSpec` and `spec_hash` using the Python recipes.
+- [ ] Find matching local kernels and fetch published sets through an index
+  mapping model specs to build keys, artifact URLs and checksums.
+- [ ] Complete model download and loading flows against the C++ engine.
+- [ ] Add kernel list/fetch/build commands and clear progress/error reporting.
+- [ ] Follow with direct GGUF integration where needed, local builds on a cache
+  miss, and validation against the family's reference before accepting a new
+  parameter point.
+
+Completion: a supported model with a published matching set can be added and
+run without manual kernel installation. Local compilation and self-validation
+are later onboarding milestones.
+
+Source: [monorepo plan, P4](.claude/plans/phlegm-monorepo.md).
+
+## 4. Complete tray and visualization integration
+
+- [ ] Implement the tray's model library, download progress, deletion and
+  load/unload flows, with one model on the NPU at a time.
+- [ ] Add chat, an OpenAI server toggle, logs and start-on-login behavior.
+- [ ] Run inference in a managed `phlegm serve` child process so an NPU fault
+  can be recovered by restarting that process.
+- [ ] Expose the existing decode visualization through the Phlegm CLI.
+- [ ] Later add prefill visualization and optional measured timing traces.
+
+Completion: the tray can add/load a model, chat and manage its inference server;
+the CLI can open a model's decode visualization. Track prefill and measured
+timing as separate follow-ups.
+
+Sources: [monorepo plan, P5](.claude/plans/phlegm-monorepo.md),
+[visualization plan](specs/viz/plans/flow-viz.md).
+
+## 5. Kernel correctness and performance backlog
+
+### Qwen3.8-27B prefill accuracy
+
+- [ ] Evaluate combined entry/output/up-gate precision in a private CLI with a
+  fresh post-merge control and independent full-depth references.
+- [ ] Resolve inherited cross-layer drift and rerun full-model/long-prefix gates.
+- [ ] Promote arithmetic changes only after the existing acceptance bars pass.
+
+Latest recorded checkpoint: isolated projection improvements pass, but L53/P17
+still exceeds the 0.005 residual bound and retained full residual acceptance is
+3974/4032, FAIL. The 2026-10-23 host/build merge checks do not resolve that failure.
+
+Source: [Qwen3.8 validation report](specs/open-engine/plans/qwen38-main-rebaseline.md).
+
+### Prefill pipeline stages 2-4
+
+- [ ] Overlap expert gather/scatter and execution while preserving per-token
+  expert order and safe instruction-buffer patching.
+- [ ] Measure GEMM efficiency by shape; optimize output layout, split readback
+  and q8 arithmetic where the measurements justify them.
+- [ ] Then evaluate CPU/NPU placement for stages with available kernels and
+  independent accuracy gates.
+
+Stage 1 is done. Preserve byte-identical logits when arithmetic order is
+unchanged; use the route's documented numerical gate when arithmetic changes.
+Measure prefill before and after under comparable conditions.
+
+Source: [prefill pipeline plan](specs/open-engine/plans/prefill-pipeline.md).
+
+### K2 Uno speed
+
+- [ ] Add exact/fast mode and block-size selection with documented fallback.
+- [ ] Prototype cheaper multirow GEMV before committing to a full pass layout.
+- [ ] Build and validate fast 4/8-row passes; consider the 16-core exact variant
+  if the prototype measurements justify it.
+- [ ] Measure short and long outputs and longer contexts before choosing defaults.
+
+Base K2/Uno and row-parallel attention are already implemented. The remaining
+speed plan covers phases 3-7; projected gains are not measured results.
+
+Source: [K2 Uno speed plan](specs/open-engine/plans/k2-uno-speed.md).
+
+### MoE speculative decoding and expert quantization
+
+- [ ] Finish and hardware-validate the MoE verify pass, feature taps and block
+  head, followed by the NPU drafter and serving accept/rollback loop.
+- [ ] Validate greedy/distribution correctness and measure end-to-end speed
+  before enabling speculation by default.
+- [ ] Extend ternary and 2-bit affine formats to routed expert gate/up projections
+  in decode and batched kernels; keep down projections at q4_1 per the plan.
+- [ ] Validate conversion/packing, logits and model/tool quality. Resolve the
+  ternary weight source and any training requirements before that model work.
+
+These are distinct from the imported dense Bonsai ternary/DFlash work. Recheck
+current implementation and upstream status before following old PR milestones.
+
+Sources: [speculative decoding](specs/open-engine/plans/spec-decode.md),
+[expert quantization](specs/open-engine/plans/expert-quant-2bit.md),
+[drafter/model work](specs/open-engine/plans/dflash-drafters.md).
+
+## 6. Port inference to Rust last
+
+- [ ] Port container reads/packing, manifest handling, XRT dispatch and stream
+  patches, kernel lookup, decode and block prefill in testable slices.
+- [ ] Match reference packing bytes and greedy tokens on the MoE model and a
+  dense family before broadening coverage.
+- [ ] Verify request isolation, state reset, errors and performance against C++.
+- [ ] Switch user-facing flows after the required parity and performance gates.
+
+This work does not gate the C++-backed CLI, server, onboarding or tray milestones.
+
+## Resume on another machine
+
+1. Transfer this file with the matching repository revision. It is a tracked-file
+   candidate; creating it locally does not commit or push it.
+2. Read this plan, the latest sync ledger and the result entries for the chosen
+   workstream. Do not treat old "not built" headers as authoritative status.
+3. For C++/NPU work, obtain the external reference checkout, model weights and
+   compatible XRT/toolchain dependencies. Generated binaries and model data are
+   not included in the source import.
+4. Start with CLI/server integration and combined-tree hardware validation.
+   Record new evidence beside the relevant spec/report and update this checklist.
+5. Keep published benchmark reports restricted to matching clean, optimized
+   release tags, as required by [Phlegm Bench](specs/bench/spec.md).
