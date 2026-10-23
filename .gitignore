@@ -34,6 +34,7 @@ xdna-dump/tools/kernel-interp/hf_ref/
 xdna-dump/tools/q4nx/reference/
 
 # Small golden fixtures that ARE committed
+!specs/viz/tests/fixtures/mlir/lx0/insts.bin
 !xdna-dump/tools/kernel-interp/rust_ref/
 !xdna-dump/tools/kernel-interp/rust_ref/*.f32
 !xdna-dump/tools/kernel-interp/rust_ref/*.i64

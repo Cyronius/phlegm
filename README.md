@@ -17,6 +17,7 @@ mlir-aie toolchain. Those kernels now run whole models on the NPU, through the o
 | [`phlegm-cli/`](phlegm-cli/) | The `phlegm` command: `run`, `serve`, `pull`, `bench` | real C++ benchmarks; `serve` still uses a mock backend |
 | [`phlegm-tray/`](phlegm-tray/) | Windows tray app (Tauri v2): model library, downloads, chat, a local OpenAI endpoint | tray icon and window only |
 | [`open_kernels/`](open_kernels/) | The open AIE kernels, their recipes per model family, the build harness and the fp64 replicas | working; see its README |
+| [`viz/`](viz/) | Animated NPU decode flow, with topology and timing explanations | Python exporter and HTML viewer; CLI integration pending |
 | [`npu_offload/`](npu_offload/) | Embedding GEMM sources and block-attention build dependencies | source imported; embedding runtime port pending |
 | [`specs/open-engine/`](specs/open-engine/) | Requirements and tests for the kernels and recipes (`OPEN-*`) | imported with the kernels |
 | [`website/`](website/) | The project site (Astro + Starlight), for GitHub Pages | skeleton |
@@ -58,6 +59,18 @@ pnpm site      # website on http://localhost:4321/phlegm
 
 Kernels build with mlir-aie 1.4.2 + Peano, natively on Windows or in WSL: see
 [`open_kernels/README.md`](open_kernels/README.md).
+
+The [flow visualization](specs/viz/spec.md) models one decode step from an exported
+kernel set. The kernel exporter writes `viz.json` automatically when the build
+metadata is available. From the repository root, generate or render it with:
+
+```sh
+python -m open_kernels.viz <kernel-set-dir>
+python -m open_kernels.viz.page <kernel-set-dir> -o decode.html
+python -m pytest specs/viz/tests
+```
+
+Open `decode.html` in a browser to play the step and inspect its tiles and streams.
 
 ## License
 
