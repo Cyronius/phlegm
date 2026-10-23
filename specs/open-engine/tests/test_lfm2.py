@@ -178,6 +178,9 @@ def test_no_shipped_models_hash_moved():
 
     from recipes.load import load_spec
     frozen = {
+        "qwen3-0.6b.json": "sha256:940adeebeea9138ec2b179544c42db59c57f029440d7ffe5a863a4fac1d4615e",
+        "llama32-3b.json": "sha256:557fcf71747d606e5bc23aaf26ea287f46d06fe58c70ace11d465ae7b9c5c427",
+        "llama32-1b.json": "sha256:131a7093af07c5af73222e02979def3fcf66e28ef05a77ba7d35a61240fbf96b",
         "gemma3-12b.json": "sha256:df7005de2191d524c50ed90b8bb41f92ff222d2699a532652689a5fbdce21c46",
         "gemma3-4b.json": "sha256:3496169f71a4b2d6679065fb35888493ccf695084625797ce8f200e6f0d84681",
         "granite42-3b.json": "sha256:695134de825eb93e39a7b31008bb5791d2e27c8744c0980c2ed8edbe083b5656",
@@ -186,6 +189,7 @@ def test_no_shipped_models_hash_moved():
         "phi4-mini-4b.json": "sha256:76d8c86eaad5a6e5f5853a47a293cf196dc971455df8d9406d8fbcdbda3f4860",
         "qwen25-3b.json": "sha256:e32bfd7e950ccd7b304aa530cb87d2fe903a41c4e3df9e634588354dfd4a8953",
         "qwen3-4b.json": "sha256:602fa1836b218cfd17b8a11628cde954587cd53ad3345a04ef1d998d23951dfd",
+        "qwen3-8b.json": "sha256:04374f23aede126f34237de4e298a9d385dd36eb6041723032de14884648bab5",
         "qwen35-9b.json": "sha256:4105149d2111c0c7e208e1a6c6f8273064394bfb2b5f010fa0fe5c0dfbc6711c",
         "qwen36-35b-a3b.json": "sha256:32e980528551df6ae76741cce159c2e79a7a7daa6b0d01d78f665a1164b9f780",
         "lfm2-1.2b.json": "sha256:fd500fa0be3851a42ecd72a97346ef21f5df2c63866d0f6196a4bf3ed6aeabb8",
@@ -194,7 +198,11 @@ def test_no_shipped_models_hash_moved():
         "k2-horizon-3.7b.json": "sha256:18952d15a05780550c7d469b728fd6c686b6cb4c23635257e82c842aecd8e50a",
         "k2-horizon-7b.json": "sha256:d6ee7f414ae5095551075722947ce8122f01b2d1e8c5be7c721ea5f0ba1b9778",
         "qwen35-27b.json": "sha256:2a510346192e7ae9fbf24417c61fd7f6e90905c807ecd1fe444a4da7333f3458",
-        "qwen3-8b.json": "sha256:04374f23aede126f34237de4e298a9d385dd36eb6041723032de14884648bab5",
+        "qwen35-0.8b.json": "sha256:f898e975f56aa24616a8841a31085c52a16d7215e681e1542d80dff57e856155",
+        "qwen35-2b.json": "sha256:619eb2dae91329a88a725bedffcbcc32a1050cca5d9836ceedc237d8b36404a7",
+        "qwen35-4b.json": "sha256:06e3163fc4e66163c1e2ee7ea97759f1dc7ce23cfa3440c4969418d2f06af7e5",
+        "qwen3-1.7b.json": "sha256:46183f28f630e6904f71c1877be03c01f024f887dd6c62babe29c7132c218dbe",
+        "qwen3-14b.json": "sha256:ef8f338475ded20a00dc13a4ac568a50d03e90e9aed842a104d8e4e00b214502",
     }
     specs = pathlib.Path(__file__).resolve().parents[3] / "open_kernels" / "recipes" / "specs"
     assert {p.name for p in specs.glob("*.json")} == set(frozen), "a new shipped spec wants a hash here"

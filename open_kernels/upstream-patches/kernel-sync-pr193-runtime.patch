@@ -1,0 +1,678 @@
+diff --git a/src/open_qwen36/core.cpp b/src/open_qwen36/core.cpp
+index 6284b74..425a783 100644
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -388,6 +388,10 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
+     if (host_attn_decode_on_)
+         log("decode route: HOST (OFLM_OPEN_HOST_ATTN_DECODE=1; the 2.5 gemm-block chain at T=1 "
+             "with host attention; the NPU GEMMs run padded at the kernel set's compiled T)");
++    // OPEN-PREFILL-GEMM8: the 8-bit route's blocks are wider than the dxB scratch, so its attention is the products
++    if (gemm_block_t_ && types_[0]->gemm_block.gemm == "dit" && (!attn_block_on_ || host_attn_on_ || host_attn_decode_on_))
++        throw std::runtime_error("open_qwen36: the 8-bit prefill route runs its attention as NPU products; "
++                                 "OFLM_OPEN_ATTN_BLOCK=0, OFLM_OPEN_HOST_ATTN and OFLM_OPEN_HOST_ATTN_DECODE need --prefill-mode lean");
+     // Stage 2.7 Gate A: the runtime decode route selector. The env above only
+     // picks the INITIAL route (compat/debug); set_decode_route() overrides it
+     // at any moment, which is what the one-process mid-stream switch needs.
+@@ -2483,7 +2487,9 @@ void Core::dense_attention_block(int l, const std::vector<float>& y_qkv3, size_t
+     // columns; on this route the GEMM column is the five projections and the attention column
+     // (route_ms, below) holds all of the attention, so the stage line compares with the dxB loop's
+     const double p0 = timing_.part0_ms, p1 = timing_.part1_ms;
+-    attention_npu(l, g, Q, nullptr, st.map<uint16_t*>(), row / 2, og.data());
++    // the products cover ab.m rows, a group of query heads over `sub` tokens; the 8-bit route's wider block runs several
++    const size_t sub = ab.m / (g.nh / g.kvh);
++    attention_npu(l, g, Q, nullptr, st.map<uint16_t*>(), row / 2, og.data(), sub);
+     timing_.part0_ms = p0;
+     timing_.part1_ms = p1;
+     tt = std::chrono::steady_clock::now();
+@@ -2541,9 +2547,40 @@ void Core::step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, siz
+         timing_.gemm_tr_ms += ms_since(tt);
+         return static_cast<size_t>(gb.t);
+     };
++    // dit_gemm (OPEN-PREFILL-GEMM8): x [T, K] as bf16 rows in, bf16 [gb.t, N] rows back, args (x, weight, y)
++    auto dit_dispatch = [&](size_t idx, const std::vector<float>& x, size_t K, size_t N) -> const uint16_t* {
++        const Step& s = gb.program[idx];
++        auto tt = std::chrono::steady_clock::now();
++        xrt::bo& ab = buffer(s.args[1], 0);
++        xrt::bo& cb = buffer(s.args[2], 0);
++        if (T > gb.t || ab.size() < gb.t * K * 2 || cb.size() < gb.t * N * 2)
++            throw std::runtime_error("open_qwen36: dit gemm " + s.kernel + ": T " + std::to_string(T) + " or its buffers do not fit");
++        uint16_t* a = ab.map<uint16_t*>();
++#pragma omp parallel for
++        for (long long i = 0; i < static_cast<long long>(T * K); ++i) a[i] = f32_to_bf16(x[static_cast<size_t>(i)]);
++        if (T < gb.t) std::memset(a + T * K, 0, (gb.t - T) * K * 2);
++        ab.sync(XCL_BO_SYNC_BO_TO_DEVICE, gb.t * K * 2, 0);
++        timing_.gemm_tile_ms += ms_since(tt);
++        timing_.part0_ms += run(kerns_.at(s.kernel), {s.args[1], s.args[0], s.args[2]}, l);
++        tt = std::chrono::steady_clock::now();
++        read_back(cb, gb.t * N * 2, 0);
++        timing_.gemm_tr_ms += ms_since(tt);
++        return cb.map<const uint16_t*>();
++    };
++    const bool dit = gb.gemm == "dit";
+     // The output as the kernel wrote it, [N, T]: the fused input projection, whose three parts
+     // the attention paths split by row range.
+     auto run_gemm = [&](size_t idx, const std::vector<float>& x, size_t K, size_t N, std::vector<float>& y_out) {
++        if (dit) {
++            const uint16_t* c = dit_dispatch(idx, x, K, N);
++            auto tt = std::chrono::steady_clock::now();
++            y_out.resize(N * T);
++#pragma omp parallel for
++            for (long long n = 0; n < static_cast<long long>(N); ++n)
++                for (size_t t = 0; t < T; ++t) y_out[static_cast<size_t>(n) * T + t] = bf16_to_f32(c[t * N + static_cast<size_t>(n)]);
++            timing_.gemm_tr_ms += ms_since(tt);
++            return;
++        }
+         const size_t Tk = gemm_dispatch(idx, x, K, N);
+         auto tt = std::chrono::steady_clock::now();
+         const float* y = buffer(gb.program[idx].args[2], 0).map<float*>();
+@@ -2559,6 +2596,15 @@ void Core::step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, siz
+     // The output as token rows, [T, N] (rows past T are padding): everything after the attention
+     // reads a token's row at a time, which over [N, T] is a T-float stride per element.
+     auto run_gemm_rows = [&](size_t idx, const std::vector<float>& x, size_t K, size_t N, std::vector<float>& out) {
++        if (dit) {
++            const uint16_t* c = dit_dispatch(idx, x, K, N);
++            auto tt = std::chrono::steady_clock::now();
++            float* o = BlockScratch::fit(out, gb.t * N);
++#pragma omp parallel for
++            for (long long i = 0; i < static_cast<long long>(gb.t * N); ++i) o[i] = bf16_to_f32(c[static_cast<size_t>(i)]);
++            timing_.gemm_tr_ms += ms_since(tt);
++            return;
++        }
+         const size_t Tk = gemm_dispatch(idx, x, K, N);
+         auto tt = std::chrono::steady_clock::now();
+         host::transpose(buffer(gb.program[idx].args[2], 0).map<float*>(), N, Tk, BlockScratch::fit(out, Tk * N));
+@@ -3113,109 +3159,135 @@ void Core::block_layer_linear(int l, float* xres, size_t T, size_t t_real, size_
+ }
+ 
+ void Core::attention_npu(int l, const host::AttnGeom& g, const float* Q, const float* gate, const uint16_t* kv,
+-                         size_t kv_row_elems, float* og) {
++                         size_t kv_row_elems, float* og, size_t sub) {
+     const AttnBlock& ab = types_[l]->gemm_block.attn_block;
+-    const size_t T = g.T, hd = g.hd, grp = g.nh / g.kvh, M = grp * T, qw = g.nh * hd, kvw = g.kvh * hd;
++    const size_t S = sub ? sub : g.T, hd = g.hd, grp = g.nh / g.kvh, M = grp * S, qw = g.nh * hd, kvw = g.kvh * hd;
+     if (M != ab.m || hd != ab.hd)
+         throw std::runtime_error("open_qwen36: attn_block was built for " + std::to_string(ab.m) + " rows of head dim " +
+                                  std::to_string(ab.hd) + ", this layer has " + std::to_string(M) + " of " + std::to_string(hd));
++    if (g.T % S) throw std::runtime_error("open_qwen36: a block of " + std::to_string(g.T) + " is not whole " +
++                                          std::to_string(S) + "-token sub-blocks of the attention products");
++    const size_t nsb = (g.t_real + S - 1) / S;              // the sub-blocks holding real tokens
+     const size_t rows = g.pos0 + g.t_real;                  // the window: every cached row and the block's own
++    // a window past the widest stream takes the chunked loop below, one sub-block at a time
++    if (nsb > 1 && rows > ab.l_max) {
++        for (size_t t0 = 0; t0 < g.t_real; t0 += S) {
++            host::AttnGeom gs = g;
++            gs.T = S; gs.t_real = std::min(S, g.t_real - t0); gs.pos0 = g.pos0 + t0;
++            attention_npu(l, gs, Q + t0 * qw, gate ? gate + t0 * qw : nullptr, kv, kv_row_elems, og + t0 * qw);
++        }
++        return;
++    }
+     xrt::bo& ba = buffer(ab.args[0], 0);
+     xrt::bo& bb = buffer(ab.args[1], 0);
+     xrt::bo& bc = buffer(ab.args[2], 0);
+     if (ba.size() < M * ab.l_max * 2 || bb.size() < ab.l_max * hd * 2 || bc.size() < M * ab.l_max * 4)
+         throw std::runtime_error("open_qwen36: the attn_block globals are smaller than the widest window");
+-    // row r of a product is query head r / T of the group at token r % T
+-    size_t* pos = BlockScratch::fit(bs_.pos, M);
+-    for (size_t r = 0; r < M; ++r) pos[r] = g.pos0 + r % T;
++    // row r of sub-block sb's products is query head r / S of the group at token sb * S + r % S
++    size_t* pos = BlockScratch::fit(bs_.pos, nsb * M);
++    for (size_t sb = 0; sb < nsb; ++sb)
++        for (size_t r = 0; r < M; ++r) pos[sb * M + r] = g.pos0 + sb * S + r % S;
+     uint16_t* qb = BlockScratch::fit(bs_.qb, M * hd);
+     float* acc = BlockScratch::fit(bs_.acc, M * hd);
+-    std::fill(og, og + T * qw, 0.f);
+-    // The kv group's queries as the scores' A operand: row hl * T + t is query head hl of the group
+-    auto group_queries = [&](size_t gh) {
++    std::fill(og, og + g.T * qw, 0.f);
++    // The kv group's queries as the scores' A operand: row hl * S + t is query head hl of the group
++    auto group_queries = [&](size_t sb, size_t gh) {
+         for (size_t hl = 0; hl < grp; ++hl)
+-            for (size_t t = 0; t < T; ++t) {
+-                const float* src = Q + t * qw + (gh * grp + hl) * hd;
+-                uint16_t* dst = qb + (hl * T + t) * hd;
++            for (size_t t = 0; t < S; ++t) {
++                const float* src = Q + (sb * S + t) * qw + (gh * grp + hl) * hd;
++                uint16_t* dst = qb + (hl * S + t) * hd;
+                 for (size_t j = 0; j < hd; ++j) dst[j] = f32_to_bf16(src[j]);
+             }
+     };
+     // og for the group's real tokens: the merged sum over the denominator, gated when the layer is
+-    auto group_out = [&](size_t gh, const float* lsum_g) {
++    auto group_out = [&](size_t sb, size_t gh, const float* lsum_g) {
++        const size_t t_real = std::min(S, g.t_real - sb * S);
+         for (size_t hl = 0; hl < grp; ++hl)
+-            for (size_t t = 0; t < g.t_real; ++t) {
+-                const size_t r = hl * T + t, h = gh * grp + hl;
++            for (size_t t = 0; t < t_real; ++t) {
++                const size_t r = hl * S + t, h = gh * grp + hl, row = sb * S + t;
+                 const float inv = 1.0f / lsum_g[r];
+-                float* out = og + t * qw + h * hd;
++                float* out = og + row * qw + h * hd;
+                 if (!gate) {
+                     for (size_t j = 0; j < hd; ++j) out[j] = acc[r * hd + j] * inv;
+                     continue;
+                 }
+-                const float* gt = gate + t * qw + h * hd;
++                const float* gt = gate + row * qw + h * hd;
+                 for (size_t j = 0; j < hd; ++j) out[j] = acc[r * hd + j] * inv / (1.0f + std::exp(-gt[j]));
+             }
+     };
+-    // A window that fits the widest stream is one chunk: every group's scores, then every group's
+-    // values. Per group this is the chunked loop below with one chunk, so the output is the same
+-    // bit for bit; only the dispatch order differs. It matters where the two products sit on
+-    // different xclbins (a dense head dim of 128: scores 8 columns wide, values 4), which the
++    // A window that fits the widest stream is one chunk: every sub-block's and group's scores, then
++    // every one's values. Per group this is the chunked loop below with one chunk, so the output is
++    // the same bit for bit; only the dispatch order differs. It matters where the two products sit
++    // on different xclbins (a dense head dim of 128: scores 8 columns wide, values 4), which the
+     // per-group order switches between twice a group.
+     if (rows <= ab.l_max) {
+-        const size_t L = (rows + 255) / 256 * 256;
+-        float* m_all = BlockScratch::fit(bs_.m, g.kvh * M);
+-        float* l_all = BlockScratch::fit(bs_.lsum, g.kvh * M);
+-        uint16_t* p_all = BlockScratch::fit(bs_.p_all, g.kvh * M * L);
+-        for (size_t gh = 0; gh < g.kvh; ++gh) {
+-            auto th = std::chrono::steady_clock::now();
+-            group_queries(gh);
+-            std::fill(m_all + gh * M, m_all + (gh + 1) * M, -std::numeric_limits<float>::infinity());
+-            std::fill(l_all + gh * M, l_all + (gh + 1) * M, 0.f);
+-            std::memcpy(ba.map<uint16_t*>(), qb, M * hd * 2);
+-            host::tile_rows_as_bt(kv + gh * hd, kv_row_elems, rows, L, hd, bb.map<uint16_t*>());
+-            ba.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * hd * 2, 0);
+-            bb.sync(XCL_BO_SYNC_BO_TO_DEVICE, hd * L * 2, 0);
+-            timing_.mid_ms += ms_since(th);
+-            timing_.part1_ms += ms_since(th);
+-            timing_.part0_ms += run(kerns_.at(ab.kernels_s.at(L)), ab.args, l);
+-            th = std::chrono::steady_clock::now();
+-            read_back(bc, M * L * 4, 0);
+-            timing_.sync_ms += ms_since(th);
+-            timing_.part1_ms += ms_since(th);
+-            th = std::chrono::steady_clock::now();
+-            // acc only takes a rescale from an earlier chunk, and there is none
+-            host::softmax_chunk(M, L, hd, 0, bc.map<float*>(), pos, m_all + gh * M, l_all + gh * M, acc,
+-                                p_all + gh * M * L);
+-            timing_.mid_ms += ms_since(th);
+-            timing_.part1_ms += ms_since(th);
+-        }
+-        for (size_t gh = 0; gh < g.kvh; ++gh) {
+-            auto th = std::chrono::steady_clock::now();
+-            std::memcpy(ba.map<uint16_t*>(), p_all + gh * M * L, M * L * 2);
+-            host::tile_rows_as_b(kv + kvw + gh * hd, kv_row_elems, rows, L, hd, bb.map<uint16_t*>());
+-            ba.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * L * 2, 0);
+-            bb.sync(XCL_BO_SYNC_BO_TO_DEVICE, L * hd * 2, 0);
+-            timing_.mid_ms += ms_since(th);
+-            timing_.part1_ms += ms_since(th);
+-            timing_.part0_ms += run(kerns_.at(ab.kernels_pv.at(L)), ab.args, l);
+-            th = std::chrono::steady_clock::now();
+-            read_back(bc, M * hd * 4, 0);
+-            timing_.sync_ms += ms_since(th);
+-            timing_.part1_ms += ms_since(th);
+-            th = std::chrono::steady_clock::now();
+-            std::fill(acc, acc + M * hd, 0.f);
+-            const float* c = bc.map<float*>();
+-            for (size_t i = 0; i < M * hd; ++i) acc[i] += c[i];
+-            group_out(gh, l_all + gh * M);
+-            timing_.mid_ms += ms_since(th);
+-            timing_.part1_ms += ms_since(th);
+-        }
++        std::vector<size_t> Ls(nsb), win(nsb), poff(nsb);
++        size_t ptot = 0;
++        for (size_t sb = 0; sb < nsb; ++sb) {
++            win[sb] = g.pos0 + sb * S + std::min(S, g.t_real - sb * S);   // up to the sub-block's last real token
++            Ls[sb] = (win[sb] + 255) / 256 * 256;
++            poff[sb] = ptot;
++            ptot += g.kvh * M * Ls[sb];
++        }
++        float* m_all = BlockScratch::fit(bs_.m, nsb * g.kvh * M);
++        float* l_all = BlockScratch::fit(bs_.lsum, nsb * g.kvh * M);
++        uint16_t* p_all = BlockScratch::fit(bs_.p_all, ptot);
++        for (size_t sb = 0; sb < nsb; ++sb)
++            for (size_t gh = 0; gh < g.kvh; ++gh) {
++                const size_t L = Ls[sb], i = sb * g.kvh + gh;
++                auto th = std::chrono::steady_clock::now();
++                group_queries(sb, gh);
++                std::fill(m_all + i * M, m_all + (i + 1) * M, -std::numeric_limits<float>::infinity());
++                std::fill(l_all + i * M, l_all + (i + 1) * M, 0.f);
++                std::memcpy(ba.map<uint16_t*>(), qb, M * hd * 2);
++                host::tile_rows_as_bt(kv + gh * hd, kv_row_elems, win[sb], L, hd, bb.map<uint16_t*>());
++                ba.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * hd * 2, 0);
++                bb.sync(XCL_BO_SYNC_BO_TO_DEVICE, hd * L * 2, 0);
++                timing_.mid_ms += ms_since(th);
++                timing_.part1_ms += ms_since(th);
++                timing_.part0_ms += run(kerns_.at(ab.kernels_s.at(L)), ab.args, l);
++                th = std::chrono::steady_clock::now();
++                read_back(bc, M * L * 4, 0);
++                timing_.sync_ms += ms_since(th);
++                timing_.part1_ms += ms_since(th);
++                th = std::chrono::steady_clock::now();
++                // acc only takes a rescale from an earlier chunk, and there is none
++                host::softmax_chunk(M, L, hd, 0, bc.map<float*>(), pos + sb * M, m_all + i * M, l_all + i * M, acc,
++                                    p_all + poff[sb] + gh * M * L);
++                timing_.mid_ms += ms_since(th);
++                timing_.part1_ms += ms_since(th);
++            }
++        for (size_t sb = 0; sb < nsb; ++sb)
++            for (size_t gh = 0; gh < g.kvh; ++gh) {
++                const size_t L = Ls[sb], i = sb * g.kvh + gh;
++                auto th = std::chrono::steady_clock::now();
++                std::memcpy(ba.map<uint16_t*>(), p_all + poff[sb] + gh * M * L, M * L * 2);
++                host::tile_rows_as_b(kv + kvw + gh * hd, kv_row_elems, win[sb], L, hd, bb.map<uint16_t*>());
++                ba.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * L * 2, 0);
++                bb.sync(XCL_BO_SYNC_BO_TO_DEVICE, L * hd * 2, 0);
++                timing_.mid_ms += ms_since(th);
++                timing_.part1_ms += ms_since(th);
++                timing_.part0_ms += run(kerns_.at(ab.kernels_pv.at(L)), ab.args, l);
++                th = std::chrono::steady_clock::now();
++                read_back(bc, M * hd * 4, 0);
++                timing_.sync_ms += ms_since(th);
++                timing_.part1_ms += ms_since(th);
++                th = std::chrono::steady_clock::now();
++                std::fill(acc, acc + M * hd, 0.f);
++                const float* c = bc.map<float*>();
++                for (size_t k = 0; k < M * hd; ++k) acc[k] += c[k];
++                group_out(sb, gh, l_all + i * M);
++                timing_.mid_ms += ms_since(th);
++                timing_.part1_ms += ms_since(th);
++            }
+         return;
+     }
++    // one sub-block from here (nsb == 1, the chunked case above sends wider blocks back one at a time)
+     float* m = BlockScratch::fit(bs_.m, M);
+     float* lsum = BlockScratch::fit(bs_.lsum, M);
+     for (size_t gh = 0; gh < g.kvh; ++gh) {
+         auto th = std::chrono::steady_clock::now();
+-        group_queries(gh);
++        group_queries(0, gh);
+         std::fill(m, m + M, -std::numeric_limits<float>::infinity());
+         std::fill(lsum, lsum + M, 0.f);
+         std::fill(acc, acc + M * hd, 0.f);
+@@ -3256,7 +3328,7 @@ void Core::attention_npu(int l, const host::AttnGeom& g, const float* Q, const f
+             timing_.part1_ms += ms_since(th);
+         }
+         th = std::chrono::steady_clock::now();
+-        group_out(gh, lsum);
++        group_out(0, gh, lsum);
+         timing_.mid_ms += ms_since(th);
+         timing_.part1_ms += ms_since(th);
+     }
+diff --git a/src/open_qwen36/core.hpp b/src/open_qwen36/core.hpp
+index c885872..0b2475b 100644
+--- a/src/open_qwen36/core.hpp
++++ b/src/open_qwen36/core.hpp
+@@ -641,9 +641,9 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
+     /// per kv head, the group's queries against the window's K rows for the scores, the row
+     /// softmax on the host, then against the V rows. Q [T, nh*hd] as attention_prep leaves it,
+     /// kv the layer's cache with the block's rows already written; og [T, nh*hd] out, gated by
+-    /// sigmoid(gate) -- or ungated when gate is null (a dense layer).
++    /// sigmoid(gate) -- or ungated when gate is null (a dense layer). `sub` (0 = g.T): tokens per product row block.
+     void attention_npu(int l, const host::AttnGeom& g, const float* Q, const float* gate, const uint16_t* kv,
+-                       size_t kv_row_elems, float* og);
++                       size_t kv_row_elems, float* og, size_t sub = 0);
+ };
+ 
+ }  // namespace open_qwen36
+diff --git a/src/open_qwen36/manifest.cpp b/src/open_qwen36/manifest.cpp
+index ae6f5e7..e236797 100644
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -71,15 +71,15 @@ PackOp parse_op(const json& j, const std::string& where) {
+             if (v == 0) fail(where, p.op + " " + (p.tensor.empty() ? p.up : p.tensor) + " without " + name);
+     };
+     if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm" ||
+-        p.op == "put" || p.op == "expert_down" || p.op == "conv_transpose" || p.op == "lmhead_q8" ||
+-        p.op == "transpose" || p.op == "transpose_banked") {
++        p.op == "bfp16_dit" || p.op == "put" || p.op == "expert_down" || p.op == "conv_transpose" ||
++        p.op == "lmhead_q8" || p.op == "transpose" || p.op == "transpose_banked") {
+         if (p.tensor.empty()) fail(where, p.op + " without a tensor");
+     } else if (p.op == "expert_stripes") {
+         if (p.up.empty() || p.gate.empty()) fail(where, "expert_stripes without up / gate");
+     } else {
+         fail(where, "unknown pack op '" + p.op + "'");
+     }
+-    if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm")
++    if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm" || p.op == "bfp16_dit")
+         need_all({{"nch", p.nch}, {"in_dim", p.in_dim}});
+     else if (p.op == "std_fuse") need_all({{"nch", p.nch}, {"in_dim", p.in_dim}, {"src_dim", p.src_dim}, {"rg", p.rg}});
+     else if (p.op == "transpose" || p.op == "transpose_banked")
+@@ -146,8 +146,9 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+     // ignore `split` and use the hi half of each such weight, so the recipe writes 2 exactly when
+     // a step is split, and an older engine refuses the set by name instead of misreading it.
+     // 3 adds the bf16_gemm pack op, which an engine that reads 2 cannot pack.
+-    if (m.version < 1 || m.version > 3)
+-        fail(where, "manifest_version " + std::to_string(m.version) + " (this engine reads 1 to 3)");
++    // 4 adds bfp16_dit (OPEN-PREFILL-GEMM8), likewise.
++    if (m.version < 1 || m.version > 4)
++        fail(where, "manifest_version " + std::to_string(m.version) + " (this engine reads 1 to 4)");
+     m.family = get<std::string>(j, "family", where);
+     m.spec_hash = j.value("spec_hash", "");
+     m.build_key = j.value("build_key", "");
+@@ -250,8 +251,8 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+                         // one format per weight: the q4_1 band law, or one GEMM pool the kernel was built for
+                         const std::string& kind = w.pack.front().op;
+                         for (const auto& o : w.pack)
+-                            if (o.op != "std_perm" && o.op != "bf16_gemm")
+-                                fail(gw, "weight " + name + ": a packed weight is std_perm or bf16_gemm ops, not " + o.op);
++                            if (o.op != "std_perm" && o.op != "bf16_gemm" && o.op != "bfp16_dit")
++                                fail(gw, "weight " + name + ": a packed weight is std_perm, bf16_gemm or bfp16_dit ops, not " + o.op);
+                         for (const auto& o : w.pack)
+                             if (o.op != kind)
+                                 fail(gw, "weight " + name + " mixes " + kind + " and " + o.op + " ops; the GEMM reads one format");
+@@ -321,6 +322,8 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+                 g.attn_args = gj.value("attn_args", std::vector<std::string>{"pool", "xres", "consts", "state", "act", "ptab"});
+                 g.sandwich = gj.value("sandwich", false);
+                 g.act = gj.value("act", std::string("silu"));
++                g.gemm = gj.value("gemm", std::string("q4"));
++                if (g.gemm != "q4" && g.gemm != "dit") fail(gw, "gemm must be q4 or dit, is " + g.gemm);
+                 if (g.attn_args.size() != 6) fail(gw, "attn_args wants exactly 6 buffer names, has " + std::to_string(g.attn_args.size()));
+                 auto ak = m.kernels.find(g.attn_kernel);
+                 if (ak == m.kernels.end()) fail(gw, "gemm_block present but this manifest declares no " + g.attn_kernel + " kernel");
+@@ -330,6 +333,16 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+                 if (g.weights.empty())
+                     g.weights = {{"gqkv3_w", {"pool", {0, 1, 2}}}, {"go_w", {"pool", {3}}}, {"gup_w", {"pool", {4}}},
+                                  {"ggate_w", {"pool", {5}}}, {"gdown_w", {"pool", {6}}}};
++                if (g.gemm == "dit") {
++                    // the products are built for 256-row blocks; the engine runs t / 256 of them a block
++                    if (!g.attn_block.present() || g.attn_block.prep.empty() || g.t % 256)
++                        fail(gw, "a dit route needs the attention products (attn_block with prep) and t a multiple of 256");
++                    for (const auto& s : g.program) {
++                        auto w = g.weights.find(s.args[0]);
++                        if (w == g.weights.end() || w->second.from != "pack" || w->second.pack.front().op != "bfp16_dit")
++                            fail(gw, "dit step " + s.kernel + ": its weight " + s.args[0] + " is not packed by bfp16_dit");
++                    }
++                }
+             } else if (g.kind == "linear" || g.kind == "full") {
+                 if (g.program.size() != 2)
+                     fail(gw, "a " + g.kind + " route has exactly 2 steps (the fused input projection, the output projection), has " +
+@@ -498,6 +511,11 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+                                      " without `split`");
+                 }
+             };
++            // the 9-bit dit_gemm layout is read by nothing but a dense dit route; the q4 and bf16 GEMMs would misread it
++            for (const auto* ws : {&g.weights, &g.shared_weights, &g.ffn_weights})
++                for (const auto& [wn, w] : *ws)
++                    if (w.from == "pack" && w.pack.front().op == "bfp16_dit" && !(g.kind == "dense" && g.gemm == "dit"))
++                        fail(gw, "weight " + wn + " packs bfp16_dit, which only a dense route with gemm \"dit\" reads");
+             check_split(g.program, g.weights, "program");
+             check_split(g.shared_program, g.shared_weights, "shared");
+             check_split(g.ffn_program, g.ffn_weights, "ffn");
+@@ -510,8 +528,9 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+                 const std::string vw = tw + " gemm_block_variants." + vname;
+                 GemmBlockProgram g;
+                 parse_gemm_block(vj, vw, g);
+-                // the host stages and every buffer around the GEMMs are sized for gemm_block's
+-                if (g.t != t.gemm_block.t || g.kind != t.gemm_block.kind)
++                // the buffers around the GEMMs are sized for gemm_block's, except a dense dit route's own
++                const bool dit = g.kind == "dense" && (g.gemm == "dit" || t.gemm_block.gemm == "dit");
++                if ((g.t != t.gemm_block.t && !dit) || g.kind != t.gemm_block.kind)
+                     fail(vw, "is a " + g.kind + " route at t " + std::to_string(g.t) + ", gemm_block a " +
+                                  t.gemm_block.kind + " route at t " + std::to_string(t.gemm_block.t));
+                 t.gemm_block_variants[vname] = std::move(g);
+@@ -524,10 +543,14 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+         for (const auto* ws : {&g->weights, &g->shared_weights, &g->ffn_weights})
+             for (const auto& [name, w] : *ws) {
+                 if (w.from == "pack") {
+-                    for (const auto& o : w.pack)
++                    for (const auto& o : w.pack) {
+                         if (o.op == "bf16_gemm" && m.version < 3)
+                             fail(tw, "gemm_block weight " + name + " packs " + o.op + " in a manifest_version " +
+                                          std::to_string(m.version) + " manifest; an engine that reads 2 cannot pack it, so it needs version 3");
++                        if (o.op == "bfp16_dit" && m.version < 4)
++                            fail(tw, "gemm_block weight " + name + " packs " + o.op + " in a manifest_version " +
++                                         std::to_string(m.version) + " manifest; an engine that reads 3 cannot pack it, so it needs version 4");
++                    }
+                     continue;
+                 }
+                 const size_t n = w.from == "pool" ? t.pool.size() : t.consts.size();
+diff --git a/src/open_qwen36/manifest.hpp b/src/open_qwen36/manifest.hpp
+index c5abcec..4f81b54 100644
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -130,6 +130,8 @@ struct GemmBlockProgram {
+     std::vector<std::string> attn_args = {"pool", "xres", "consts", "state", "act", "ptab"};
+     bool sandwich = false;
+     std::string act = "silu";
++    // dense: "q4" (gemm_q4_prefill) or "dit" (dit_gemm: bf16 rows in and out, kernel args x, weight, y)
++    std::string gemm = "q4";
+     // >1: the route's HOST norms split each row into `norm_groups` equal groups and
+     // RMS each group separately (K2's GroupRMSNorm(2)), the same split the `ln`
+     // design's LN_GROUPS bakes into the NPU kernel -- 1 is the plain whole-row
+diff --git a/src/open_qwen36/manifest_test.cpp b/src/open_qwen36/manifest_test.cpp
+index 40156e9..e0cff1c 100644
+--- a/src/open_qwen36/manifest_test.cpp
++++ b/src/open_qwen36/manifest_test.cpp
+@@ -248,12 +248,12 @@ int main(int argc, char** argv) {
+     refused(m, bad, "num_hidden_layers", "a 24-layer slice config is refused (the manifest is the 40-layer set)");
+ 
+     // ---- a broken manifest
+-    json j = json::parse(std::string("{\"manifest_version\": 4}"));
++    json j = json::parse(std::string("{\"manifest_version\": 5}"));
+     try {
+         Manifest::parse(j, "broken");
+-        check(false, "manifest_version 4 is refused");
++        check(false, "manifest_version 5 is refused");
+     } catch (const std::runtime_error& e) {
+-        check(std::string(e.what()).find("manifest_version 4") != std::string::npos, std::string("manifest_version 4 is refused: ") + e.what());
++        check(std::string(e.what()).find("manifest_version 5") != std::string::npos, std::string("manifest_version 5 is refused: ") + e.what());
+     }
+     // OPEN-MANIFEST: the bf16 GEMM pool op needs version 3, and one weight reads one format
+     auto bf16_weight = [](json& j, int version, bool mixed) {
+@@ -276,6 +276,17 @@ int main(int argc, char** argv) {
+         try { Manifest::parse(g, "q8 gemm"); } catch (const std::runtime_error& e) { ok = false; std::printf("      %s\n", e.what()); }
+         check(ok, "a version 3 manifest with a bf16_gemm weight loads");
+     }
++    // OPEN-PREFILL-GEMM8: the dit_gemm weight op needs version 4
++    auto dit_weight = [](json& j, int version) {
++        j["manifest_version"] = version;
++        j["layer_types"]["linear_attention"]["gemm_block"]["weights"]["gout_w"] = {
++            {"from", "pack"},
++            {"pack", json::array({{{"op", "bfp16_dit"}, {"tensor", "model.layer.{l}.linear_attn.ssm_out_proj.weight"},
++                                   {"nch", 1024}, {"in_dim", 4096}, {"dst", 0}}})}};
++    };
++    // the 9-bit layout is read only by a dense dit route; a linear route would run it through the q4 / bf16 GEMM
++    refused_manifest(argv[1], "only a dense route", "a bfp16_dit weight on a linear route is refused at load",
++                     [&](json& j) { dit_weight(j, 4); });
+     // OPEN-PREFILL-MODE: a whole route the engine loads in place of gemm_block, and drops otherwise
+     auto with_lean = [](json& j) {
+         j["kernels"]["gemm_lean"] = {{"context", "gemm"}, {"insts", "gemm_lean/insts.bin"}};
+@@ -296,14 +307,14 @@ int main(int argc, char** argv) {
+         check(both.layer_types.at("linear_attention").gemm_block_variants.count("lean") &&
+                   std::find(files.begin(), files.end(), "gemm_lean/insts.bin") != files.end(),
+               "a lean variant parses, and the set's files include its streams");
+-        Manifest fast = both;
++        Manifest fast = Manifest::parse(g, "lean");   // Manifest is move-only (its gguf twin)
+         const bool fast_found = fast.select_prefill_route("");
+         check(!fast_found && fast.layer_types.at("linear_attention").gemm_block.program[0].kernel == "gemm_n12288_k2048" &&
+                   fast.layer_types.at("full_attention").gemm_block.program[0].kernel == "gemm_n9216_k2048" &&
+                   fast.layer_types.at("linear_attention").gemm_block_variants.empty() &&
+                   !fast.globals.count("gemm_y_lean") && fast.globals.count("gemm_y_n12288"),
+               "fast keeps gemm_block and drops the variant and the globals only it names");
+-        Manifest lean = both;
++        Manifest lean = Manifest::parse(g, "lean");
+         const bool lean_found = lean.select_prefill_route("lean");
+         check(lean_found && lean.layer_types.at("linear_attention").gemm_block.program[0].kernel == "gemm_lean" &&
+                   lean.layer_types.at("full_attention").gemm_block.program[0].kernel == "gemm_lean" &&
+@@ -468,6 +479,56 @@ int main(int argc, char** argv) {
+                                  j["manifest_version"] = 2;
+                                  j["layer_types"]["dense"]["gemm_block"]["program"][0]["split"] = true;
+                              });
++            // OPEN-PREFILL-GEMM8: the fixture's route made an 8-bit one at t 1024, the q4 route kept as lean
++            auto with_dit = [](json& j) {
++                j["manifest_version"] = 4;
++                json& lt = j["layer_types"]["dense"];
++                json q4 = lt["gemm_block"], d = q4;
++                d["t"] = 1024;
++                d["gemm"] = "dit";
++                for (auto& [name, w] : d["weights"].items())
++                    w = {{"from", "pack"}, {"pack", json::array({{{"op", "bfp16_dit"}, {"tensor", "model.layers.{l}.mlp.up_proj.weight"},
++                                                                  {"nch", 4}, {"in_dim", 256}, {"dst", 0}}})}};
++                for (auto& s : d["program"]) s["args"] = {"g8" + s["args"][0].get<std::string>().substr(1), "g8_a", "g8_c"};
++                json w8 = json::object();
++                for (auto& [name, w] : d["weights"].items()) w8["g8" + name.substr(1)] = w;
++                d["weights"] = w8;
++                j["globals"]["g8_a"] = 4096;
++                j["globals"]["g8_c"] = 4096;
++                lt["gemm_block"] = d;
++                lt["gemm_block_variants"]["lean"] = q4;
++            };
++            {
++                std::ifstream f(argv[2]);
++                json g = json::parse(f);
++                with_dit(g);
++                Manifest fast = Manifest::parse(g, "dit"), lean = Manifest::parse(g, "dit");
++                fast.select_prefill_route("");
++                lean.select_prefill_route("lean");
++                const auto& fg = fast.layer_types.at("dense").gemm_block;
++                const auto& lg = lean.layer_types.at("dense").gemm_block;
++                check(fg.gemm == "dit" && fg.t == 1024 && lg.gemm == "q4" && lg.t == 256 &&
++                          fast.globals.count("g8_a") && !lean.globals.count("g8_a"),
++                      "qwen3: an 8-bit route at t 1024 parses beside a q4 lean at 256; each mode keeps its own route and globals");
++            }
++            refused_manifest(argv[2], "needs version 4", "qwen3: a bfp16_dit weight in a version 3 manifest is refused at load",
++                             [&](json& j) { with_dit(j); j["manifest_version"] = 3; });
++            refused_manifest(argv[2], "only a dense route", "qwen3: a bfp16_dit weight on a q4 dense route is refused",
++                             [&](json& j) { with_dit(j); j["layer_types"]["dense"]["gemm_block"].erase("gemm"); });
++            refused_manifest(argv[2], "needs the attention products", "qwen3: an 8-bit route without the products' prep is refused",
++                             [&](json& j) { with_dit(j); j["layer_types"]["dense"]["gemm_block"]["attn_block"].erase("prep"); });
++            refused_manifest(argv[2], "is not packed by bfp16_dit", "qwen3: an 8-bit step reading the q4 pool is refused",
++                             [&](json& j) {
++                                 with_dit(j);
++                                 j["layer_types"]["dense"]["gemm_block"]["weights"]["g8o_w"] = {{"from", "pool"}, {"ops", {3}}};
++                             });
++            refused_manifest(argv[2], "at t 512", "qwen3: a q4 lean variant at another t than a q4 route is still refused",
++                             [&](json& j) {
++                                 json& lt = j["layer_types"]["dense"];
++                                 json v = lt["gemm_block"];
++                                 v["t"] = 512;
++                                 lt["gemm_block_variants"]["lean"] = v;
++                             });
+         } catch (const std::exception& e) {
+             check(false, std::string("qwen3 fixture: ") + e.what());
+         }
+@@ -667,7 +728,7 @@ int main(int argc, char** argv) {
+                 check(false, std::string("qwen35: a split out projection parses: ") + e.what());
+             }
+         }
+-        refused_manifest(argv[5], "std_perm or bf16_gemm ops", "qwen35: a packed weight that is not std_perm is refused",
++        refused_manifest(argv[5], "std_perm, bf16_gemm or bfp16_dit ops", "qwen35: a packed weight that is not std_perm is refused",
+                          [&](json& j) {
+                              split_out(j);
+                              json& o = j["layer_types"]["linear_attention"]["gemm_block"]["weights"]["gout_w"]["pack"][1];
+diff --git a/src/open_qwen36/pools.cpp b/src/open_qwen36/pools.cpp
+index 8c3c85b..cea65e1 100644
+--- a/src/open_qwen36/pools.cpp
++++ b/src/open_qwen36/pools.cpp
+@@ -335,7 +335,49 @@ void bf16_gemm_pack(const uint8_t* src, bool q8, size_t rows, size_t cols, uint1
+     }
+ }
+ 
++namespace {
++// 8 values sharing their largest exponent, 8-bit two's-complement mantissas, rounded as pack.py's encoder
++void bfp16_encode8(const float* x, uint8_t* out) {
++    uint32_t b[8];
++    int e[8], mx = 0;
++    for (int i = 0; i < 8; ++i) {
++        std::memcpy(&b[i], &x[i], 4);
++        e[i] = static_cast<int>((b[i] >> 23) & 0xFF);
++        mx = std::max(mx, e[i]);
++    }
++    out[0] = static_cast<uint8_t>(mx);
++    for (int i = 0; i < 8; ++i) {
++        const int64_t mant = static_cast<int64_t>(b[i] & 0x7FFFFF) | (e[i] ? (int64_t{1} << 23) : 0);
++        const int64_t s = (b[i] >> 31) ? -mant : mant;
++        const int sh = 17 + std::min(mx - e[i], 31);
++        const int64_t v = std::clamp<int64_t>((s + (int64_t{1} << (sh - 1))) >> sh, -128, 127);
++        out[1 + i] = static_cast<uint8_t>(static_cast<int8_t>(v));
++    }
++}
++}  // namespace
++
++void bfp16_dit_pack(const uint8_t* src, size_t rows, size_t cols, uint8_t* dst) {
++    if (rows % 128 || cols % 256) fail("bfp16_dit: [" + std::to_string(rows) + ", " + std::to_string(cols) +
++                                       "] is not 128-row tiles of 256-wide chunks");
++    const size_t ncol = cols / 256, nkt = cols / 64;
++    // tile (n tile, k tile) of 128 x 64, then [n-block 16][k-block 8][n 8], a block being 8 k of one row
++#pragma omp parallel for
++    for (long long nt = 0; nt < static_cast<long long>(rows / 128); ++nt)
++        for (size_t kt = 0; kt < nkt; ++kt) {
++            uint8_t* tile = dst + (static_cast<size_t>(nt) * nkt + kt) * 9216;
++            float v[8];
++            for (size_t nb = 0; nb < 16; ++nb)
++                for (size_t kb = 0; kb < 8; ++kb)
++                    for (size_t ni = 0; ni < 8; ++ni) {
++                        const size_t n = static_cast<size_t>(nt) * 128 + nb * 8 + ni, k0 = kt * 64 + kb * 8;
++                        for (size_t i = 0; i < 8; ++i) v[i] = q4_1_value(src, ncol, n, k0 + i);
++                        bfp16_encode8(v, tile + ((nb * 8 + kb) * 8 + ni) * 9);
++                    }
++        }
++}
++
+ uint64_t op_bytes(const PackOp& op, size_t chunk_bytes) {
++    if (op.op == "bfp16_dit") return op.nch * 9216;      // a 32 x 256 chunk's 8192 values at 9 bits
+     return op.op == "bf16_gemm" ? op.nch * 2 * 8192 : op.nch * chunk_bytes;
+ }
+ 
+@@ -638,6 +680,17 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+             std::vector<uint8_t> tmp;
+             bf16_gemm_pack(q4_source(m, name, op.chunk0, op.nch, Q4_CHUNK, tmp), false, rows, op.in_dim, out);
+         }
++    } else if (op.op == "bfp16_dit") {
++        // `nch` SOURCE chunks from `chunk0`, as the q4 ops read them (OPEN-PREFILL-GEMM8)
++        const std::string name = with_layer(op.tensor, layer);
++        if (op.nch == 0 || op.in_dim == 0 || op.in_dim % 256) fail("bfp16_dit " + name + " without nch / in_dim");
++        const size_t ncol = op.in_dim / 256;
++        if (op.nch % ncol || (op.nch / ncol) % 4)
++            fail("bfp16_dit " + name + ": " + std::to_string(op.nch) + " chunks is not whole 128-row tiles of a " +
++                 std::to_string(op.in_dim) + "-wide tensor");
++        bounds(op, op_bytes(op, ch), dst_bytes);
++        std::vector<uint8_t> tmp;
++        bfp16_dit_pack(q4_source(m, name, op.chunk0, op.nch, Q4_CHUNK, tmp), op.nch / ncol * 32, op.in_dim, dst + op.dst);
+     } else if (op.op == "q8_perm") {
+         // The projection stays at q8: `nch` counts POOL half-tiles (5120 B each, twice the
+         // q4_1 bytes of the same tensor) and `chunk0` is a SOURCE file-chunk offset, as it
+diff --git a/src/open_qwen36/pools.hpp b/src/open_qwen36/pools.hpp
+index 85b5bba..7a665f4 100644
+--- a/src/open_qwen36/pools.hpp
++++ b/src/open_qwen36/pools.hpp
+@@ -81,6 +81,8 @@ void requant_q4_1_chunks(const uint8_t* src, size_t nch, uint8_t* dst);
+ void split_q4_1_chunks(const uint8_t* src, size_t nch, bool hi, uint8_t* dst);
+ /// q8 (code * scale) or q4_1 (m + n * d) chunks, 32-row blocks major -> the bf16 GEMM pool (twin: recipes/pack.py)
+ void bf16_gemm_pack(const uint8_t* src, bool q8, size_t rows, size_t cols, uint16_t* dst);
++/// q4_1 chunks of a [rows, cols] projection -> dit_gemm's bfp16ebs8 B for its transpose (twin: pack.py pack_b)
++void bfp16_dit_pack(const uint8_t* src, size_t rows, size_t cols, uint8_t* dst);
+ /// Bytes `op` writes at its dst: `nch` chunks of the pool's format, or of the GEMM pool it builds.
+ uint64_t op_bytes(const PackOp& op, size_t chunk_bytes);
+ /// `nch` Q4_K chunks (4736 B each) -> `nch` q4_1 chunks (5120 B each), in the SAME chunk
+diff --git a/src/open_qwen36/pools_test.cpp b/src/open_qwen36/pools_test.cpp
+index 353eeb5..5a7f11b 100644
+--- a/src/open_qwen36/pools_test.cpp
++++ b/src/open_qwen36/pools_test.cpp
+@@ -850,6 +850,29 @@ int main() {
+         check(g8 == 0xa1e333116f424dafull && g4 == 0x7018cee99915f0b9ull, "bf16_gemm: byte-identical to the NumPy packer");
+     }
+ 
++    // ---- bfp16_dit: 24 shared chunks at q4_1 as a [128, 1536] projection, dit_gemm's B (OPEN-PREFILL-GEMM8)
++    {
++        const size_t C24 = 24, R = 128, K = 1536, NCOL = K / 256;
++        std::vector<uint8_t> s24 = q8_vector(C24), q24(C24 * 5120), b(R * K * 9 / 8);
++        requant_q4_1_chunks(s24.data(), C24, q24.data());
++        open_qwen36::pools::bfp16_dit_pack(q24.data(), R, K, b.data());
++        bool within = true;
++        for (size_t n = 0; n < R && within; ++n)
++            for (size_t k = 0; k < K && within; ++k) {
++                const uint8_t* blk = b.data() + ((n / 128) * (K / 64) + k / 64) * 9216 +
++                                     ((((n % 128) / 8) * 8 + (k % 64) / 8) * 8 + n % 8) * 9;
++                const double scale = std::ldexp(1.0, static_cast<int>(blk[0]) - 127) / 64.0;
++                const double got = static_cast<int8_t>(blk[1 + k % 8]) * scale;
++                const double want = q4_read(q24.data() + ((n / 32) * NCOL + k / 256) * 5120, static_cast<unsigned>(n % 32),
++                                            static_cast<unsigned>((k % 256) / 32), static_cast<unsigned>(k % 32));
++                within = std::abs(got - want) <= scale;
++            }
++        check(within, "bfp16_dit: every value decodes within one mantissa step of its q4_1 reading, at W^T's place");
++        const uint64_t g = fnv1a(b.data(), b.size());
++        std::printf("      bfp16_dit fnv1a = 0x%016llx\n", static_cast<unsigned long long>(g));
++        check(g == 0xf9c5bb308b534125ull, "bfp16_dit: byte-identical to dit_gemm's pack_b");
++    }
++
+     // ---- transpose: [32, 64] of 2-byte values
+     std::vector<uint8_t> t_src(32 * 64 * 2), t_dst(32 * 64 * 2);
+     for (size_t i = 0; i < t_src.size(); ++i) t_src[i] = static_cast<uint8_t>((i * 37 + 11) & 0xFF);

@@ -1,0 +1,80 @@
+{
+  "date": "2026-10-22",
+  "purpose": "Public container headers inspected for issue #212; no model weights downloaded",
+  "models": [
+    {
+      "model": "Qwen3.5-0.8B-NPU2",
+      "header_bytes": 40888,
+      "quantized_chunk_bytes": [
+        5120,
+        8704
+      ],
+      "label": "Q4_1 + Q8",
+      "source": "https://huggingface.co/Atomic-Germ/Qwen3.5-0.8B-NPU2/resolve/main/model.q4nx"
+    },
+    {
+      "model": "Qwen3.5-2B-NPU2",
+      "header_bytes": 41408,
+      "quantized_chunk_bytes": [
+        5120,
+        8704
+      ],
+      "label": "Q4_1 + Q8",
+      "source": "https://huggingface.co/Atomic-Germ/Qwen3.5-2B-NPU2/resolve/main/model.q4nx"
+    },
+    {
+      "model": "Qwen3.5-4B-NPU2",
+      "header_bytes": 55432,
+      "quantized_chunk_bytes": [
+        5120,
+        8704
+      ],
+      "label": "Q4_1 + Q8",
+      "source": "https://huggingface.co/Atomic-Germ/Qwen3.5-4B-NPU2/resolve/main/model.q4nx"
+    },
+    {
+      "model": "Qwen3.5-9B-NPU2",
+      "header_bytes": 55496,
+      "quantized_chunk_bytes": [
+        5120,
+        8704
+      ],
+      "label": "Q4_1 + Q8",
+      "source": "https://huggingface.co/Atomic-Germ/Qwen3.5-9B-NPU2/resolve/main/model.q4nx"
+    },
+    {
+      "model": "Qwen3.6-35B-A3B-NPU2",
+      "header_bytes": 85552,
+      "quantized_chunk_bytes": [
+        5120,
+        8704
+      ],
+      "label": "Q4_1 + Q8",
+      "source": "https://huggingface.co/Atomic-Germ/Qwen3.6-35B-A3B-NPU2/resolve/main/model.q4nx"
+    },
+    {
+      "model": "Qwen3.8-27B-NPU2",
+      "header_bytes": 111624,
+      "quantized_chunk_bytes": [
+        5120,
+        8704
+      ],
+      "label": "Q4_1 + Q8",
+      "source": "https://huggingface.co/Atomic-Germ/Qwen3.8-27B-NPU2/resolve/main/model.q4nx"
+    }
+  ],
+  "llama_tokenizer_files": {
+    "chat_template.jinja": {
+      "type": "file",
+      "oid": "33089ace1be88f22a10fe861ad49718d5d886090",
+      "size": 4614,
+      "path": "chat_template.jinja"
+    },
+    "tokenizer_config.json": {
+      "type": "file",
+      "oid": "72f138ab40e9c48724f5e94eb77f2b524d50559b",
+      "size": 185,
+      "path": "tokenizer_config.json"
+    }
+  }
+}

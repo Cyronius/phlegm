@@ -1,0 +1,744 @@
+diff --git a/src/model_info.json b/src/model_info.json
+index 2bf9d9b430f72e30a018a3986cc91ee253239fe9..2f6cd6e0874e7b1079e62a59e5120fe02f5e9326 100644
+--- a/src/model_info.json
++++ b/src/model_info.json
+@@ -2136,9 +2136,15 @@
+         },
+         {
+             "type": "file",
+-            "oid": "95b50010ae5a56e85b1152e09e23e413ed0aaf40",
+-            "size": 4331,
+-            "path": "tokenizer_config.json"
++            "oid": "72f138ab40e9c48724f5e94eb77f2b524d50559b",
++            "size": 185,
++            "path": "tokenizer_config.json"
++        },
++        {
++            "type": "file",
++            "oid": "33089ace1be88f22a10fe861ad49718d5d886090",
++            "size": 4614,
++            "path": "chat_template.jinja"
+         }
+     ],
+     "deepseek-r1:8b": [
+diff --git a/src/model_list.json b/src/model_list.json
+index 8373d06e81bf327257d3bad164f03e2561af8ba7..0ca2bbd21f820d5dd47c6b821e19a6252d17f10e 100644
+--- a/src/model_list.json
++++ b/src/model_list.json
+@@ -196,7 +196,7 @@
+                     "family": "qwen3.5",
+                     "think": true,
+                     "parameter_size": "0.8B",
+-                    "quantization_level": "Q4_K"
++                    "quantization_level": "Q4_1 + Q8"
+                 },
+                 "label": [
+                     "vision",
+@@ -227,7 +227,7 @@
+                     "family": "qwen3.5",
+                     "think": true,
+                     "parameter_size": "2B",
+-                    "quantization_level": "Q4_K"
++                    "quantization_level": "Q4_1 + Q8"
+                 },
+                 "label": [
+                     "vision",
+@@ -259,7 +259,7 @@
+                     "family": "qwen3.5",
+                     "think": true,
+                     "parameter_size": "4B",
+-                    "quantization_level": "Q4_K"
++                    "quantization_level": "Q4_1 + Q8"
+                 },
+                 "label": [
+                     "vision",
+@@ -291,7 +291,7 @@
+                     "family": "qwen3.5",
+                     "think": true,
+                     "parameter_size": "9B",
+-                    "quantization_level": "Q4_K"
++                    "quantization_level": "Q4_1 + Q8"
+                 },
+                 "label": [
+                     "vision",
+@@ -325,7 +325,7 @@
+                     "family": "qwen3.6-moe",
+                     "think": true,
+                     "parameter_size": "35B",
+-                    "quantization_level": "Q4_K"
++                    "quantization_level": "Q4_1 + Q8"
+                 },
+                 "label": [
+                     "vision",
+@@ -358,7 +358,7 @@
+                     "family": "qwen3.5",
+                     "think": true,
+                     "parameter_size": "27B",
+-                    "quantization_level": "Q4_K"
++                    "quantization_level": "Q4_1 + Q8"
+                 },
+                 "label": [
+                     "reasoning",
+@@ -824,7 +824,8 @@
+                     "config.json",
+                     "model.q4nx",
+                     "tokenizer.json",
+-                    "tokenizer_config.json"
++                    "tokenizer_config.json",
++                    "chat_template.jinja"
+                 ],
+                 "default_context_length": 16384,
+                 "max_prefill_len": 4096,
+diff --git a/src/open_qwen36/CMakeLists.txt b/src/open_qwen36/CMakeLists.txt
+index 801d64362f16beea2a5a1ffe6cb7ba63105eea87..9ec13c8b878a341cdf0d5d262afe700589ef42c2 100644
+--- a/src/open_qwen36/CMakeLists.txt
++++ b/src/open_qwen36/CMakeLists.txt
+@@ -38,8 +38,17 @@
+ target_include_directories(open_qwen36_cli PRIVATE "${XRT_INCLUDE_DIR}" ${_inc})
+ target_link_directories(open_qwen36_cli PRIVATE "${XRT_LIB_DIR}")
+ target_link_libraries(open_qwen36_cli PRIVATE xrt_coreutil)
++if(MSVC)
++    # Core sets OMP_WAIT_POLICY before the first parallel region. Delay the DLL
++    # so MSVC's runtime does not freeze its policy before main() reaches Core.
++    target_link_options(open_qwen36_cli PRIVATE /DELAYLOAD:VCOMP140.DLL)
++    target_link_libraries(open_qwen36_cli PRIVATE delayimp)
++endif()
+ 
+ add_executable(manifest_test manifest_test.cpp manifest.cpp gguf_file.cpp q4nx_file.cpp)
++add_executable(q4nx_file_test q4nx_file_test.cpp q4nx_file.cpp)
++target_include_directories(q4nx_file_test PRIVATE ${_inc})
++
+ add_executable(gguf_pack_test gguf_pack_test.cpp gguf_file.cpp pools.cpp manifest.cpp q4nx_file.cpp)
+ foreach(t gguf_pack_test)
+     target_include_directories(${t} PRIVATE ${_inc})
+@@ -69,7 +78,7 @@
+     endif()
+ endforeach()
+ 
+-foreach(t open_qwen36_cli manifest_test gguf_pack_test vit_test block_host_test)
++foreach(t open_qwen36_cli manifest_test gguf_pack_test vit_test block_host_test q4nx_file_test)
+     if(MSVC)
+         target_compile_options(${t} PRIVATE /EHsc /Zc:__cplusplus /bigobj)
+         target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
+@@ -80,6 +89,7 @@
+ add_test(NAME OPEN-VISION-VIT-CONFIG COMMAND vit_test --configs
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures")
+ add_test(NAME OPEN-VISION-VIT-WINDOWED COMMAND vit_test --window-index)
++add_test(NAME Q4NX-EMBED COMMAND q4nx_file_test)
+ add_test(NAME GGUF-PACK COMMAND gguf_pack_test)
+ add_test(NAME OPEN-MANIFEST COMMAND manifest_test
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures/manifest_qwen36.json"
+diff --git a/src/open_qwen36/README.md b/src/open_qwen36/README.md
+index 121f1c7100a84e8ff45f82c9054cea66e803e345..b0d047df5eaa8962e6866ddc6ad982b819f4087c 100644
+--- a/src/open_qwen36/README.md
++++ b/src/open_qwen36/README.md
+@@ -635,3 +635,23 @@
+ The same prompt twice in one server session gives the same answer (state reset
+ through the app's checkpoint/restore path). Prompt cache, sampler, chat
+ template, tool parsing — all the app's, unchanged.
++
++
++### Issue 212: dense prefill and container compatibility
++
++Llama's full-rotary dense prefill now uses the NPU block-attention products with
++its scaled RoPE frequencies. Both queries and softmax probabilities retain a
++BF16 high part and remainder; dropping the probability remainder failed the
++longer-prompt accuracy check. Contiguous prefill weights share the immutable
++decode pool through XRT views. The load log separates shared weight bytes from
++new allocations and the fixed-capacity KV reservation.
++
++The default export includes Llama 3.2 1B/3B and Qwen3 0.6B. Q4NX embedding lookup
++accepts both BF16 rows and native Q8 tiles; layer-major and L-row paths use the
++same lookup. This removes the upstream Qwen 27B Q8 embedding restriction, but a
++complete upstream-model run is still a separate integration check.
++
++See [the issue 212 validation report](../../specs/open-engine/issue-212-validation.md)
++for measured performance, accuracy results (including near-tie failures), exact
++inputs, build commands and remaining work. Decode context scaling and paged KV
++are not solved by these prefill/allocation changes.
+diff --git a/src/open_qwen36/block_host.cpp b/src/open_qwen36/block_host.cpp
+index 36e3c15f734b1577732a40b27422af590d35dbf2..59277bd573ebb0f3f90013d59c6ffc5693ca00ea 100644
+--- a/src/open_qwen36/block_host.cpp
++++ b/src/open_qwen36/block_host.cpp
+@@ -527,7 +527,7 @@
+ }
+ 
+ void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, const size_t* pos, float* m, float* l,
+-                   float* acc, uint16_t* p) {
++                   float* acc, uint16_t* p, uint16_t* p_lo) {
+ #pragma omp parallel for
+     for (long long rr = 0; rr < static_cast<long long>(M); ++rr) {
+         const size_t r = static_cast<size_t>(rr);
+@@ -536,6 +536,7 @@
+         const size_t valid = pos[r] >= c0 ? std::min(L, pos[r] - c0 + 1) : 0;
+         if (valid == 0) {                       // the whole chunk is past this row's position
+             std::fill(pr, pr + L, uint16_t{0});
++            if (p_lo) std::fill(p_lo + r * L, p_lo + (r + 1) * L, uint16_t{0});
+             continue;
+         }
+         float mc = -std::numeric_limits<float>::infinity();
+@@ -549,11 +550,19 @@
+         }
+         double sum = 0;
+         for (size_t j = 0; j < valid; ++j) {
+-            const uint16_t b = f32_to_bf16(std::exp(sr[j] - m_new));
++            const float e = std::exp(sr[j] - m_new);
++            const uint16_t b = f32_to_bf16(e);
+             pr[j] = b;
+-            sum += bf16_to_f32(b);
++            float value = bf16_to_f32(b);
++            if (p_lo) {
++                const uint16_t lo = f32_to_bf16(e - value);
++                p_lo[r * L + j] = lo;
++                value += bf16_to_f32(lo);
++            }
++            sum += value;
+         }
+         std::fill(pr + valid, pr + L, uint16_t{0});
++        if (p_lo) std::fill(p_lo + r * L + valid, p_lo + (r + 1) * L, uint16_t{0});
+         l[r] += static_cast<float>(sum);
+         m[r] = m_new;
+     }
+diff --git a/src/open_qwen36/block_host.hpp b/src/open_qwen36/block_host.hpp
+index c16cb26c38203d784083a18bc8814c4a8d63aa4b..8781f91c798c9c3ac45c3fd9c354d260f1dd1027 100644
+--- a/src/open_qwen36/block_host.hpp
++++ b/src/open_qwen36/block_host.hpp
+@@ -118,9 +118,11 @@
+ /// s [M, L] fp32 scores whose column 0 is window row c0; row r's query sits at pos[r], so columns
+ /// c0 + j > pos[r] are masked. Writes p [M, L] bf16 = exp(s - m_new) (zero where masked), scales
+ /// acc [M, hd] and l [M] by exp(m_old - m_new), and folds the bf16-rounded p into l -- what the
+-/// kernel will multiply is what the denominator counts. Start with m = -inf, l = 0, acc = 0.
++/// kernel will multiply is what the denominator counts. Optional p_lo retains the bf16
++/// remainder of each probability; the denominator then counts hi + lo. Start with
++/// m = -inf, l = 0, acc = 0.
+ void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, const size_t* pos, float* m, float* l,
+-                   float* acc, uint16_t* p);
++                   float* acc, uint16_t* p, uint16_t* p_lo = nullptr);
+ 
+ /// The MoE router over a block: softmax of xm [T, hid] @ Wr [hid, E] into probs [T, E], the
+ /// top-k by probability (lowest index on a tie, as the kernel's router_fin picks) into
+diff --git a/src/open_qwen36/block_host_test.cpp b/src/open_qwen36/block_host_test.cpp
+index 7c8593e67033b3f2efe8c528af43048f7ea088aa..e936e824722d67e6a76a14a451bf752d21c2cbc3 100644
+--- a/src/open_qwen36/block_host_test.cpp
++++ b/src/open_qwen36/block_host_test.cpp
+@@ -423,6 +423,40 @@
+         check(ok, "transpose: [N, T] -> [T, N]");
+     }
+ 
++    // Llama attention must retain the probability remainder before P @ V.
++    // Compare to independent scalar exponentials, including causal/padded rows.
++    {
++        const float scores[12] = {0.2f, .9f, 1.8f, -.4f, .1f, -.1f, -.4f, -.01f, 1.f, 2.f, 3.f, 4.f};
++        const size_t positions[3] = {1, 4, 0};
++        float m[3] = {-INFINITY, -INFINITY, -INFINITY}, l[3] = {}, acc[6] = {};
++        uint16_t hi[12], lo[12];
++        std::fill(lo, lo + 12, uint16_t{0xbeef});
++        host::softmax_chunk(3, 4, 2, 1, scores, positions, m, l, acc, hi, lo);
++        bool ok = true, improved = false;
++        for (size_t r = 0; r < 3; ++r) {
++            const size_t valid = r == 0 ? 1 : r == 1 ? 4 : 0;
++            double sum = 0;
++            for (size_t j = 0; j < 4; ++j) {
++                const float h = bf16_to_f32(hi[4*r+j]), v = h + bf16_to_f32(lo[4*r+j]);
++                const double expected = j < valid ? std::exp(double(scores[4*r+j] - m[r])) : 0.;
++                ok = ok && std::abs(v - expected) < 1e-5;
++                if (j >= valid) ok = ok && hi[4*r+j] == 0 && lo[4*r+j] == 0;
++                improved = improved || std::abs(v - expected) < std::abs(h - expected) * .01;
++                sum += v;
++            }
++            ok = ok && std::abs(l[r] - sum) < 1e-6;
++        }
++        check(ok && improved, "split probabilities: scalar exp, denominator, causal mask, empty row");
++        // A later window chunk beats the running maximum: rescale old PV and denominator.
++        const float next[4] = {2.f, 1.f, 0.f, -1.f}; const size_t pos[1] = {6};
++        float cm = 0.f, cl = 3.f, ca[2] = {2.f, 4.f}; uint16_t ph[4], pl[4];
++        host::softmax_chunk(1, 4, 2, 5, next, pos, &cm, &cl, ca, ph, pl);
++        check(std::abs(ca[0] - 2.f * std::exp(-2.f)) < 1e-6 &&
++              std::abs(ca[1] - 4.f * std::exp(-2.f)) < 1e-6 &&
++              std::abs(cl - (3.f * std::exp(-2.f) + 1.f + std::exp(-1.f))) < 1e-5 &&
++              ph[2] == 0 && pl[2] == 0, "split probabilities: merge rescales old PV and sum");
++    }
++
+     std::printf("%s\n", failures ? "FAIL" : "PASS");
+     return failures ? 1 : 0;
+ }
+diff --git a/src/open_qwen36/core.cpp b/src/open_qwen36/core.cpp
+index 3ed9c64a054f6e1df0459706c1798371134d6183..c913179b64316e25228de287a8f96ae4a2ac35f1 100644
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -557,8 +557,10 @@
+         hc_.resize(nl_);
+     }
+     // the block route's per-layer weight buffers: each a contiguous run of pack ops of
+-    // the freshly packed host bytes (pool or consts), copied before that buffer's upload
+-    auto build_weights = [&](const LayerType& lt, int l, const std::string& from, const uint8_t* host) {
++    // the freshly packed pool or consts. Views retain their parent allocation;
++    // decode and prefill read the same immutable bytes without a second weight copy.
++    uint64_t prefill_owned_bytes = 0, prefill_view_bytes = 0;
++    auto build_weights = [&](const LayerType& lt, int l, const std::string& from, const xrt::bo* parent) {
+         if (!(gemm_block_t_ && lt.gemm_block.t)) return;
+         std::map<std::string, GemmWeight> all = lt.gemm_block.weights;
+         all.insert(lt.gemm_block.shared_weights.begin(), lt.gemm_block.shared_weights.end());
+@@ -574,6 +576,7 @@
+                 std::memset(w.map<uint8_t*>(), 0, padup(bytes));
+                 for (const PackOp& o : gw.pack) pools::apply(o, *file_, l, w.map<uint8_t*>(), bytes, w_->chunk_bytes);
+                 w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
++                prefill_owned_bytes += w.size();
+                 v[l] = std::move(w);
+                 continue;
+             }
+@@ -583,13 +586,13 @@
+                 if (i == 0) off0 = off;
+                 else if (off != off0 + total)
+                     throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": the " + from + " ops of " + name +
+-                                             " are not contiguous -- the route needs one memcpy per weight buffer");
++                                             " are not contiguous -- the route needs one view per weight buffer");
+                 total += bytes;
+             }
+-            xrt::bo w = xrt::ext::bo(*dev_, padup(total));
+-            std::memcpy(w.map<uint8_t*>(), host + off0, total);
+-            w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+-            v[l] = std::move(w);
++            if (!parent || off0 > parent->size() || total > parent->size() - off0)
++                throw std::runtime_error("open_qwen36: prefill weight view exceeds its " + from + " pool");
++            v[l] = xrt::bo(*parent, total, off0);
++            prefill_view_bytes += total;
+         }
+     };
+     for (int l = 0; l < nl_; ++l) {
+@@ -597,14 +600,14 @@
+         xrt::bo pool = xrt::ext::bo(*dev_, w_->pool_bytes);
+         uint8_t* pool_host = pool.map<uint8_t*>();
+         pools::pack_pool(*w_, lt, *file_, l, pool_host);
+-        build_weights(lt, l, "pool", pool_host);
++        build_weights(lt, l, "pool", &pool);
+         pool.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+         pools_.push_back(std::move(pool));
+         xrt::bo c = xrt::ext::bo(*dev_, padup(lt.consts_bytes));
+         std::memset(c.map<uint8_t*>(), 0, padup(lt.consts_bytes));
+         uint8_t* c_host = c.map<uint8_t*>();
+         pools::pack_consts(*w_, lt, *file_, l, c_host);
+-        build_weights(lt, l, "consts", c_host);
++        build_weights(lt, l, "consts", &c);
+         build_weights(lt, l, "pack", nullptr);
+         if (gemm_block_t_ && lt.gemm_block.t) {
+             if (lt.gemm_block.kind == "dense") {
+@@ -794,6 +797,25 @@
+                 std::to_string(uno_noise_bound()) + ")");
+         }
+     }
++    // Physical allocations, excluding aliased prefill views: make the fixed-context
++    // KV reservation and the expanded/repacked weights visible independently.
++    auto total_bytes = [](const std::vector<xrt::bo>& v) {
++        uint64_t n = 0; for (const auto& b : v) n += b.size(); return n;
++    };
++    uint64_t head_bytes = 0, scratch_bytes = total_bytes(act_), ptab_bytes = 0;
++    for (const auto& [name, b] : globals_) {
++        if (name == "lmpool") head_bytes += b.size();
++        else if (w_->per_row_globals.count(name)) ptab_bytes += b.size();
++        else scratch_bytes += b.size();
++    }
++    log("buffer bytes: weights=" + std::to_string(total_bytes(pools_) + head_bytes) +
++        " prefill_extra=" + std::to_string(prefill_owned_bytes) +
++        " prefill_shared=" + std::to_string(prefill_view_bytes) +
++        " state=" + std::to_string(total_bytes(state_)) +
++        " constants=" + std::to_string(total_bytes(consts_)) +
++        " scratch=" + std::to_string(scratch_bytes) +
++        " position_tables=" + std::to_string(ptab_bytes) +
++        " context=" + std::to_string(cfg_.max_ctx));
+     file_->drop_pages();  // the packers are done with the container; keep only what the steps touch
+     if (progress) progress(nl_ + 1, nl_ + 1);
+     weights_loaded_ = true;
+@@ -2145,7 +2167,7 @@
+             for (size_t c = 0; c < hid; ++c) xres[c] = static_cast<double>(x[c]);
+         } else {
+             std::vector<float> row(hid);
+-            file_->bf16_row(w_->embed_tensor, static_cast<size_t>(token), hid, row.data());
++            file_->embed_row(w_->embed_tensor, static_cast<size_t>(token), hid, row.data());
+             for (size_t c = 0; c < hid; ++c) xres[c] = static_cast<double>(row[c]);
+         }
+         timing_.embed_ms += ms_since(te);
+@@ -2982,7 +3004,7 @@
+     auto tsetup = std::chrono::steady_clock::now();
+     std::vector<float> xres(TOT * hid);
+     for (size_t t = 0; t < TOT; ++t)
+-        file_->bf16_row(w_->embed_tensor, static_cast<size_t>(ids[std::min(t, N - 1)]), hid, xres.data() + t * hid);
++        file_->embed_row(w_->embed_tensor, static_cast<size_t>(ids[std::min(t, N - 1)]), hid, xres.data() + t * hid);
+     moe_stage_resize(TOT);
+     timing_.setup_ms += ms_since(tsetup);
+     timing_.part1_ms += ms_since(tsetup);
+@@ -3183,6 +3205,7 @@
+     if (M != ab.m || hd != ab.hd)
+         throw std::runtime_error("open_qwen36: attn_block was built for " + std::to_string(ab.m) + " rows of head dim " +
+                                  std::to_string(ab.hd) + ", this layer has " + std::to_string(M) + " of " + std::to_string(hd));
++    const bool split_probs = man_.family == "llama3"; // decode uses hi + lo probabilities, not bf16 alone
+     const size_t rows = g.pos0 + g.t_real;                  // the window: every cached row and the block's own
+     xrt::bo& ba = buffer(ab.args[0], 0);
+     xrt::bo& bb = buffer(ab.args[1], 0);
+@@ -3253,6 +3276,7 @@
+         float* m_all = BlockScratch::fit(bs_.m, g.kvh * M);
+         float* l_all = BlockScratch::fit(bs_.lsum, g.kvh * M);
+         uint16_t* p_all = BlockScratch::fit(bs_.p_all, g.kvh * M * L);
++        uint16_t* p_lo = split_probs ? BlockScratch::fit(bs_.p_all_lo, g.kvh * M * L) : nullptr;
+         for (size_t gh = 0; gh < g.kvh; ++gh) {
+             auto th = std::chrono::steady_clock::now();
+             group_queries(gh);
+@@ -3272,7 +3296,7 @@
+             const float* s = with_lo(L);
+             th = std::chrono::steady_clock::now();
+             // acc only takes a rescale from an earlier chunk, and there is none
+-            host::softmax_chunk(M, L, hd, 0, s, pos, m_all + gh * M, l_all + gh * M, acc, p_all + gh * M * L);
++            host::softmax_chunk(M, L, hd, 0, s, pos, m_all + gh * M, l_all + gh * M, acc, p_all + gh * M * L, p_lo ? p_lo + gh * M * L : nullptr);
+             timing_.mid_ms += ms_since(th);
+             timing_.part1_ms += ms_since(th);
+         }
+@@ -3293,6 +3317,16 @@
+             std::fill(acc, acc + M * hd, 0.f);
+             const float* c = bc.map<float*>();
+             for (size_t i = 0; i < M * hd; ++i) acc[i] += c[i];
++            if (p_lo) {
++                std::memcpy(ba.map<uint16_t*>(), p_lo + gh * M * L, M * L * 2);
++                ba.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * L * 2, 0);
++                const double r = run(kerns_.at(ab.kernels_pv.at(L)), ab.args, l);
++                timing_.part0_ms += r;
++                timing_.mid_ms -= r; timing_.part1_ms -= r; // enclosing host interval excludes device time
++                read_back(bc, M * hd * 4, 0);
++                const float* lo = bc.map<float*>();
++                for (size_t i = 0; i < M * hd; ++i) acc[i] += lo[i];
++            }
+             group_out(gh, l_all + gh * M);
+             timing_.mid_ms += ms_since(th);
+             timing_.part1_ms += ms_since(th);
+@@ -3327,7 +3361,8 @@
+             timing_.part1_ms += ms_since(th);
+             const float* s = with_lo(L);
+             th = std::chrono::steady_clock::now();
+-            host::softmax_chunk(M, L, hd, c0, s, pos, m, lsum, acc, ba.map<uint16_t*>());
++            uint16_t* p_lo = split_probs ? BlockScratch::fit(bs_.p_all_lo, M * L) : nullptr;
++            host::softmax_chunk(M, L, hd, c0, s, pos, m, lsum, acc, ba.map<uint16_t*>(), p_lo);
+             host::tile_rows_as_b(kv + c0 * kv_row_elems + kvw + gh * hd, kv_row_elems, lreal, L, hd, bb.map<uint16_t*>());
+             ba.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * L * 2, 0);
+             bb.sync(XCL_BO_SYNC_BO_TO_DEVICE, L * hd * 2, 0);
+@@ -3341,6 +3376,16 @@
+             th = std::chrono::steady_clock::now();
+             const float* c = bc.map<float*>();
+             for (size_t i = 0; i < M * hd; ++i) acc[i] += c[i];
++            if (p_lo) {
++                std::memcpy(ba.map<uint16_t*>(), p_lo, M * L * 2);
++                ba.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * L * 2, 0);
++                const double r = run(kerns_.at(ab.kernels_pv.at(L)), ab.args, l);
++                timing_.part0_ms += r;
++                timing_.mid_ms -= r; timing_.part1_ms -= r; // enclosing host interval excludes device time
++                read_back(bc, M * hd * 4, 0);
++                const float* lo = bc.map<float*>();
++                for (size_t i = 0; i < M * hd; ++i) acc[i] += lo[i];
++            }
+             timing_.mid_ms += ms_since(th);
+             timing_.part1_ms += ms_since(th);
+         }
+@@ -3841,7 +3886,7 @@
+     for (size_t j = 0; j < L; ++j) {
+         if (ids[j] < 0 || static_cast<size_t>(ids[j]) >= w_->vocab)
+             throw std::runtime_error("open_qwen36: step_rows token id out of range");
+-        file_->bf16_row(w_->embed_tensor, static_cast<size_t>(ids[j]), hid, x + j * hid);
++        file_->embed_row(w_->embed_tensor, static_cast<size_t>(ids[j]), hid, x + j * hid);
+     }
+     xr.sync(XCL_BO_SYNC_BO_TO_DEVICE, L * hid * 4, 0);
+     Kern& k = kerns_.at(draft ? man_.rows.lora_kernel : man_.rows.kernel);
+diff --git a/src/open_qwen36/core.hpp b/src/open_qwen36/core.hpp
+index 2ebf5ca80deb20c3f16e316521e6306ffbd56999..2dffb7c629f8a7ea9b9e8398a668443261972670 100644
+--- a/src/open_qwen36/core.hpp
++++ b/src/open_qwen36/core.hpp
+@@ -433,6 +433,7 @@
+         std::vector<uint16_t> qb;       ///< attention_npu: one KV group's queries as bf16
+         std::vector<float> m, lsum, acc;///< attention_npu: the merged softmax's running state
+         std::vector<uint16_t> p_all;    ///< attention_npu, one chunk: every kv group's P between the two passes
++        std::vector<uint16_t> p_all_lo; ///< Llama: softmax probability remainder, matching decode precision
+         std::vector<uint16_t> qlo;      ///< attention_npu at prep rope: Q's bf16 remainder
+         std::vector<float> s_hi;        ///< attention_npu at prep rope: the scores summed over both halves
+         /// the dense route's token rows: o / gate / up / down outputs, silu(gate) * up, the residual
+diff --git a/src/open_qwen36/manifest_test.cpp b/src/open_qwen36/manifest_test.cpp
+index 84a367dce4b765ce5f452cc0ead1d2b522be0dd6..fe39817cbb984aec29468c92fa1e195ea0e9d503 100644
+--- a/src/open_qwen36/manifest_test.cpp
++++ b/src/open_qwen36/manifest_test.cpp
+@@ -808,14 +808,16 @@
+             check(!why.empty() && why.find("'" + f.family + "'") != std::string::npos,
+                   "host attention: " + f.family + " is refused by name");
+             if (f.family == "qwen3") {
+-                Manifest k = f;
++                Manifest k = Manifest::load(argv[i]);
+                 k.family = "k2";
+                 check(k.host_attention_refusal().empty(), "host attention: K2's shape (qwen3_4b's geometry, family k2) is accepted");
+-                Manifest half = k;
++                Manifest half = Manifest::load(argv[i]);
++                half.family = "k2";
+                 half.rotary_dim = half.rotary_dim / 2;
+                 check(half.host_attention_refusal().find("geometry") != std::string::npos,
+                       "host attention: a K2 manifest with a partial rotation is refused on geometry");
+-                Manifest odd = k;
++                Manifest odd = Manifest::load(argv[i]);
++                odd.family = "k2";
+                 const size_t hd = odd.hf_config_check["head_dim"].get<size_t>() - 1;
+                 odd.hf_config_check["head_dim"] = hd;
+                 odd.rotary_dim = hd;
+@@ -826,7 +828,8 @@
+                 }
+                 check(odd.host_attention_refusal().find("geometry") != std::string::npos,
+                       "host attention: a K2 manifest with an odd head_dim is refused on geometry");
+-                Manifest wide = k;
++                Manifest wide = Manifest::load(argv[i]);
++                wide.family = "k2";
+                 wide.layer_types.begin()->second.gemm_block.qw += 1;
+                 check(wide.host_attention_refusal().find("geometry") != std::string::npos,
+                       "host attention: a K2 manifest whose layer qw disagrees with heads * head_dim is refused");
+diff --git a/src/open_qwen36/q4nx_file.cpp b/src/open_qwen36/q4nx_file.cpp
+index a135f8782222e8a43cad4414db2118eb043feacd..37bdafd0a43d303c27f5ded59e66d2b05a83f8fc 100644
+--- a/src/open_qwen36/q4nx_file.cpp
++++ b/src/open_qwen36/q4nx_file.cpp
+@@ -65,7 +65,7 @@
+         for (const auto& d : v.at("shape")) t.shape.push_back(d.get<size_t>());
+         t.start = v.at("data_offsets")[0].get<size_t>();
+         t.end = v.at("data_offsets")[1].get<size_t>();
+-        if (data_base_ + t.end > map_size_) throw std::runtime_error("q4nx: tensor " + it.key() + " past EOF");
++        if (t.start > t.end || t.end > map_size_ - data_base_) throw std::runtime_error("q4nx: tensor " + it.key() + " past EOF");
+         tensors_.emplace(it.key(), std::move(t));
+     }
+     // No file-level quant check: the chunk format is per tensor (see the header), and
+@@ -138,6 +138,38 @@
+     std::vector<float> out((t.end - t.start) / 4);
+     std::memcpy(out.data(), map_ + data_base_ + t.start, out.size() * 4);
+     return out;
++}
++
++void Q4nxFile::embed_row(const std::string& name, size_t row, size_t dim, float* out) const {
++    const TensorMeta& t = meta(name);
++    if (t.dtype == "BF16") { bf16_row(name, row, dim, out); return; }
++    // Q4NX Q8 is a raster of 32-row x 256-column tiles: 256 bf16 scales,
++    // then 8192 signed codes in the same 16-lane raster as the linear pools.
++    // Decode only the requested row, directly from the mapping, never the table.
++    if (t.dtype != "I8" || t.shape.size() != 3 || t.shape[2] != 8704 || !t.shape[0] || !t.shape[1])
++        throw std::runtime_error("q4nx: " + name + " embedding needs BF16 rows or Q8 [row_tiles, col_tiles, 8704]");
++    const size_t cols = t.shape[1], bytes = t.end - t.start;
++    if (cols > bytes / 8704 || bytes % 8704 || bytes / 8704 / cols != t.shape[0] ||
++        bytes / 8704 % cols || cols > dim / 256)
++        throw std::runtime_error("q4nx: " + name + " Q8 embedding shape/payload or requested width disagrees");
++    if (row / 32 >= t.shape[0])
++        throw std::runtime_error("q4nx: row " + std::to_string(row) + " past " + name);
++    const size_t rr = row % 32;
++    for (size_t c = 0; c < cols; ++c) {
++        const uint8_t* chunk = map_ + data_base_ + t.start + ((row / 32) * cols + c) * 8704;
++        for (size_t b = 0; b < 8; ++b) {
++            uint16_t scale;
++            std::memcpy(&scale, chunk + 2 * (b * 32 + rr), 2);
++            const float d = bf16_to_f32(scale);
++            for (size_t i = 0; i < 32; ++i) {
++                const size_t code = (rr / 16) * 4096 + b * 512 + i * 16 + rr % 16;
++                int8_t q;
++                std::memcpy(&q, chunk + 512 + code, 1);
++                out[c * 256 + b * 32 + i] = d * static_cast<float>(q);
++            }
++        }
++    }
++    for (size_t i = cols * 256; i < dim; ++i) out[i] = 0.f;
+ }
+ 
+ void Q4nxFile::bf16_row(const std::string& name, size_t row, size_t dim, float* out) const {
+@@ -156,7 +188,7 @@
+         throw std::runtime_error("q4nx: " + name + " stores " + std::to_string(src) +
+                                  " values per row and only " + std::to_string(dim) +
+                                  " were asked for; that would drop the rest of the row");
+-    if ((row + 1) * src * 2 > t.end - t.start)
++    if (src > (t.end - t.start) / 2 || row >= (t.end - t.start) / (src * 2))
+         throw std::runtime_error("q4nx: row " + std::to_string(row) + " past " + name);
+     const uint8_t* p = map_ + data_base_ + t.start + row * src * 2;
+     for (size_t i = 0; i < src; ++i) {
+diff --git a/src/open_qwen36/q4nx_file.hpp b/src/open_qwen36/q4nx_file.hpp
+index e8b26df7c14e2a78a8f63975800814641766f3e2..42926c326269a34d195ac72786d812c22928c18d 100644
+--- a/src/open_qwen36/q4nx_file.hpp
++++ b/src/open_qwen36/q4nx_file.hpp
+@@ -49,9 +49,8 @@
+     std::vector<float> f32(const std::string& name) const override;
+     /// One row of a BF16 [rows, dim] tensor as f32 (the embedding lookup).
+     void bf16_row(const std::string& name, size_t row, size_t dim, float* out) const override;
+-    void embed_row(const std::string& name, size_t row, size_t dim, float* out) const override {
+-        bf16_row(name, row, dim, out);
+-    }
++    /// BF16 or native Q8 embedding row, widened without requantization; zero-extends padding.
++    void embed_row(const std::string& name, size_t row, size_t dim, float* out) const override;
+ 
+     /// Release the mapping's resident pages (unmap + map again). After the
+     /// pools are packed, ~22 GB of file pages sit in the working set with no
+diff --git a/src/open_qwen36/q4nx_file_test.cpp b/src/open_qwen36/q4nx_file_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..1303ad498358eba217d9eaf20aa981e9ebb234cf
+--- /dev/null
++++ b/src/open_qwen36/q4nx_file_test.cpp
+@@ -0,0 +1,73 @@
++// Issue #212: native Q8 embedding rows must equal the stored values, not a requantized pool.
++#include "open_qwen36/q4nx_file.hpp"
++#include "nlohmann/json.hpp"
++#include <chrono>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++using namespace open_qwen36;
++namespace fs = std::filesystem;
++static const std::string name = "model.embed_tokens.weight";
++static void require(bool ok) { if (!ok) throw std::runtime_error("Q4NX embedding test failed"); }
++static float scale(size_t row, size_t col) { return float(1 + row % 5) / 8 + float((col % 256) / 32) / 16 + float(col / 256) / 32; }
++static int code(size_t row, size_t col) { return int((row * 17 + col * 3) % 255) - 127; }
++static fs::path make_file(const fs::path& dir, const std::string& label, const std::string& dtype,
++                          std::vector<size_t> shape, const std::vector<uint8_t>& bytes) {
++    nlohmann::json h;
++    h[name] = {{"dtype", dtype}, {"shape", shape}, {"data_offsets", {0, bytes.size()}}};
++    const auto text = h.dump(); const uint64_t size = text.size();
++    const auto path = dir / (label + ".q4nx");
++    std::ofstream f(path, std::ios::binary);
++    f.write(reinterpret_cast<const char*>(&size), 8); f << text;
++    f.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
++    return path;
++}
++template<class F> static void refuses(F f) { bool bad = false; try { f(); } catch (const std::runtime_error&) { bad = true; } require(bad); }
++int main() {
++    const auto dir = fs::temp_directory_path() / ("oflm-embed-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
++    fs::create_directories(dir);
++    std::vector<uint8_t> q8(4 * 8704);
++    for (size_t rt = 0; rt < 2; ++rt) for (size_t ct = 0; ct < 2; ++ct) {
++        auto* chunk = q8.data() + (rt * 2 + ct) * 8704;
++        for (size_t rr = 0; rr < 32; ++rr) for (size_t b = 0; b < 8; ++b) {
++            const uint16_t d = f32_to_bf16(scale(rt * 32 + rr, ct * 256 + b * 32));
++            std::memcpy(chunk + 2 * (b * 32 + rr), &d, 2);
++            for (size_t i = 0; i < 32; ++i) {
++                const auto q = static_cast<int8_t>(code(rt * 32 + rr, ct * 256 + b * 32 + i));
++                std::memcpy(chunk + 512 + (rr / 16) * 4096 + b * 512 + i * 16 + rr % 16, &q, 1);
++            }
++        }
++    }
++    const auto path = make_file(dir, "q8", "I8", {2, 2, 8704}, q8);
++    {
++        Q4nxFile f(path.string()); std::vector<float> out(576);
++        for (size_t row = 0; row < 64; ++row) {
++            f.embed_row(name, row, out.size(), out.data());
++            for (size_t c = 0; c < 512; ++c) require(out[c] == scale(row, c) * code(row, c));
++            for (size_t c = 512; c < out.size(); ++c) require(out[c] == 0.f);
++        }
++        refuses([&]{f.embed_row(name, 64, 576, out.data());});
++        refuses([&]{f.embed_row(name, std::numeric_limits<size_t>::max(), 576, out.data());});
++        refuses([&]{f.embed_row(name, 0, 511, out.data());});
++    }
++    for (const auto& shape : {std::vector<size_t>{2, 3, 8704}, {2, 2, 5120}, {0, 2, 8704}}) {
++        const auto bad = make_file(dir, "bad" + std::to_string(shape[0]) + std::to_string(shape[1]) + std::to_string(shape[2]), "I8", shape, q8);
++        Q4nxFile f(bad.string()); std::vector<float> out(1024);
++        refuses([&]{f.embed_row(name, 0, out.size(), out.data());});
++    }
++    std::vector<uint8_t> bf(16);
++    for (size_t i = 0; i < 8; ++i) { const uint16_t b = f32_to_bf16(float(i)); std::memcpy(bf.data() + i * 2, &b, 2); }
++    const auto bpath = make_file(dir, "bf16", "BF16", {2, 4}, bf);
++    {
++        Q4nxFile f(bpath.string()); float out[8];
++        f.embed_row(name, 1, 8, out); for (int i = 0; i < 8; ++i) require(out[i] == (i < 4 ? float(i + 4) : 0.f));
++        refuses([&]{f.embed_row(name, 2, 8, out);});
++        refuses([&]{f.embed_row(name, std::numeric_limits<size_t>::max(), 8, out);});
++    }
++    for (const auto& p : fs::directory_iterator(dir)) fs::remove(p.path());
++    fs::remove(dir);
++    std::cout << "Q4NX embedding rows: PASS (Q8 exact, BF16, padding, tile boundaries, refusals)\n";
++}
+diff --git a/specs/open-engine/tests/test_artlite_catalog.py b/specs/open-engine/tests/test_artlite_catalog.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2de3e85dce6e204d2a1ca4e2494d6b5f1f66cc14
+--- /dev/null
++++ b/specs/open-engine/tests/test_artlite_catalog.py
+@@ -0,0 +1,41 @@
++"""Issue #212 catalog checks against inspected public container headers."""
++import json
++from pathlib import Path
++ROOT = Path(__file__).resolve().parents[3]
++
++def test_catalog_quantization_matches_inspected_container_formats():
++    fixtures = json.loads((Path(__file__).parent / "fixtures/artlite_catalog_headers.json").read_text())
++    catalog = json.loads((ROOT / "src/model_list.json").read_text())
++    by_name = {m["name"]: m for sizes in catalog["models"].values() for m in sizes.values()}
++    for model in fixtures["models"]:
++        assert model["quantized_chunk_bytes"] == [5120, 8704]
++        assert by_name[model["model"]]["details"]["quantization_level"] == "Q4_1 + Q8"
++
++def test_llama_tokenizer_and_external_template_ship_together():
++    catalog = json.loads((ROOT / "src/model_list.json").read_text())
++    files = json.loads((ROOT / "src/model_info.json").read_text())["llama3.1:8b"]
++    by_path = {f["path"]: f for f in files}
++    assert "chat_template.jinja" in catalog["models"]["llama3.1"]["8b"]["files"]
++    assert by_path["tokenizer_config.json"]["size"] == 185
++    assert by_path["tokenizer_config.json"]["oid"] == "72f138ab40e9c48724f5e94eb77f2b524d50559b"
++    assert by_path["chat_template.jinja"]["oid"] == "33089ace1be88f22a10fe861ad49718d5d886090"
++
++
++def test_small_catalog_models_have_complete_default_export_specs(monkeypatch):
++    # Do not bypass the catalog's numerical-validation boundary to make an export pass.
++    monkeypatch.delenv("OPEN_KERNELS_UNVALIDATED", raising=False)
++    from recipes.load import load_spec
++    from recipes.manifest import manifest
++
++    catalog = json.loads((ROOT / "src/model_list.json").read_text())
++    for family, size, filename in (("llama3.2", "1b", "llama32-1b"),
++                                   ("llama3.2", "3b", "llama32-3b"),
++                                   ("qwen3", "0.6b", "qwen3-0.6b")):
++        spec = load_spec(ROOT / "open_kernels/recipes/specs" / (filename + ".json"))
++        assert spec.extra["model"] == catalog["models"][family][size]["name"]
++        m = manifest(spec)
++        assert len(m["layers"]) == spec.num_layers
++        assert {"dx", "ln", "lm_head_q4", "dx_f32", "lm_head_q4_f32", "dx_attn"} <= m["builds"].keys()
++        for kernel in m["kernels"].values():
++            assert kernel["build"] in m["builds"]
++        assert m["layer_types"]["dense"]["gemm_block"]["program"]
+diff --git a/.agents/skills/open-artlite-regressions/SKILL.md b/.agents/skills/open-artlite-regressions/SKILL.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb102e85e5cc1c882116f7045d059917cc48def8
+--- /dev/null
++++ b/.agents/skills/open-artlite-regressions/SKILL.md
+@@ -0,0 +1,42 @@
++---
++name: open-artlite-regressions
++description: Rebuild and validate the dense-model fixes from OpenFlowLM issue 212, including missing small-model exports, Llama batched attention, Q8 embedding rows and shared prefill weight buffers. Use for regressions or follow-up measurements on these paths.
++---
++
++Use [the validation report](../../../specs/open-engine/issue-212-validation.md) for measured limits and the fixed prompt inputs. Do not infer a full model or release-package pass from a kernel compile.
++
++The release exporter discovers every JSON file under `open_kernels/recipes/specs`.
++The added specs are `llama32-1b`, `llama32-3b` and `qwen3-0.6b`; their `extra.model` must match `model_list.json` exactly. Frozen hashes and model-name tests need entries when adding another spec.
++
++On native Windows, activate the installed IRON environment (locally `C:/dev/mlir-aie/iron_env.ps1`: mlir-aie 1.4.2, Peano 21.0.0.2026080301+c9c5ecb7). Keep Peano's bin off PATH. Build each **complete** model set, including GGUF twins and all attention tiers:
++
++```powershell
++python open_kernels/export_qwen36_kernels.py --spec open_kernels/recipes/specs/llama32-1b.json -j4
++python open_kernels/export_qwen36_kernels.py --spec open_kernels/recipes/specs/llama32-3b.json -j4
++python open_kernels/export_qwen36_kernels.py --spec open_kernels/recipes/specs/qwen3-0.6b.json -j4
++python open_kernels/export_qwen36_kernels.py --spec open_kernels/recipes/specs/llama31-8b.json -j4
++```
++
++This produced complete `manifest.json` + `toolchain.json` exports on Windows on 2026-10-22. Do not use `--only` or `OPEN_KERNELS_UNVALIDATED` to declare a packaged model complete. On Linux the full default CMake preset/export remains the release authority; that aggregate Linux package was not built in this Windows run. Built xclbins stay ignored.
++
++Standalone native host build:
++
++```powershell
++cmake -S src/open_qwen36 -B build-issue212 -G "Visual Studio 17 2022" -A x64 -DXRT_INCLUDE_DIR=C:/dev/XRT/src/runtime_src/core/include -DXRT_LIB_DIR=C:/dev/xrtNPUfromDLL
++cmake --build build-issue212 --config Release --target open_qwen36_cli manifest_test q4nx_file_test block_host_test -j4
++ctest --test-dir build-issue212 -C Release -R "Q4NX-EMBED|OPEN-MANIFEST" --output-on-failure
++python open_kernels/model/replica_block.py --fixture build-issue212/block-fixture
++build-issue212/Release/block_host_test.exe build-issue212/block-fixture
++```
++
++The standalone CLI delay-loads VCOMP140 so Core can set passive OpenMP waiting before runtime initialization. For matched runs also set `OMP_WAIT_POLICY=PASSIVE` in the parent environment. Use `python -X utf8 utilities/generate-registry.py ...` on Windows to avoid a spurious generated-header encoding change.
++
++Llama prefill uses `prep=rope`, the manifest's scaled inverse frequencies, and two score **and probability** passes (BF16 high + remainder). A single BF16 probability pass failed the longer-prompt gate; do not remove the remainder to improve the timing. K2/Qwen keep their existing probability route.
++
++Use `OFLM_OPEN_ATTN_BLOCK=0` for the per-token attention control and `=1` for batched attention. This switches attention only; both use batched projection GEMMs. `compare-open-logits.py --exact` is appropriate for buffer sharing. Route changes also need `prefill-ref-q4nx.py`: the old NPU route itself differs from the CPU oracle at near ties. Preserve failing short-prompt results when adding a broader sample.
++
++`benchmark-open-cli.py` interleaves builds/routes on identical token IDs, rejects failed or mismatched runs, saves executable/model/manifest hashes and raw logs, excludes warmups, and reports medians/ranges. These are engine prefill/decode timings, not HTTP TTFT or a Linux Strix Halo comparison. Avoid overlapping other NPU work with measurements.
++
++Shared weight views retain their XRT parent allocation. Never alias a `from=pack` weight: it has a distinct layout and still needs storage. The allocation log separates shared bytes from new allocations; do not add `prefill_shared` to the physical total. It excludes instruction buffers, XRT internals and host scratch.
++
++Q8 embeddings are `I8 [row_tiles, col_tiles, 8704]`, with 32x256 tiles, BF16 scales and signed codes. Decode only the requested row without requantizing. Keep all engine embedding call sites on `WeightFile::embed_row`, including layer-major and L-row paths. The upstream 27B header was inspected; full upstream-model inference remains a separate integration gate.

@@ -1,0 +1,112 @@
+{
+  "bonsai": {
+    "source_head": "f92ac640343d198332f0015b851e3b0b13521392",
+    "patch": "bonsai-runtime.patch",
+    "files": [
+      "src/open_qwen36/block_host.cpp",
+      "src/open_qwen36/block_host.hpp",
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp",
+      "src/open_qwen36/pools.cpp"
+    ],
+    "scope": "OFLM runtime/catalog companion only; no q4nx-build converter"
+  },
+  "issue212": {
+    "source_head": "478dbea3f00f868ac58205803cc537b402c6cad5",
+    "patch": "issue212-runtime.patch",
+    "files": [
+      "src/model_info.json",
+      "src/model_list.json",
+      "src/open_qwen36/CMakeLists.txt",
+      "src/open_qwen36/README.md",
+      "src/open_qwen36/block_host.cpp",
+      "src/open_qwen36/block_host.hpp",
+      "src/open_qwen36/block_host_test.cpp",
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/manifest_test.cpp",
+      "src/open_qwen36/q4nx_file.cpp",
+      "src/open_qwen36/q4nx_file.hpp",
+      "src/open_qwen36/q4nx_file_test.cpp",
+      "specs/open-engine/tests/test_artlite_catalog.py",
+      ".agents/skills/open-artlite-regressions/SKILL.md"
+    ],
+    "scope": "OFLM runtime/catalog companion only; no q4nx-build converter"
+  },
+  "kernel_sync_pr193": {
+    "source_head": "ca2cd600793d52a348a849a4512772c6f6d55faf",
+    "base": "99fe7e4de47094ac1b08450c62112e34d2bc62a4",
+    "patch": "kernel-sync-pr193-runtime.patch",
+    "files": [
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp",
+      "src/open_qwen36/manifest_test.cpp",
+      "src/open_qwen36/pools.cpp",
+      "src/open_qwen36/pools.hpp",
+      "src/open_qwen36/pools_test.cpp"
+    ],
+    "scope": "OFLM runtime companion; standalone diff against base, not a sequential patch series"
+  },
+  "kernel_sync_pr194": {
+    "source_head": "394f663d89b16e07e438cda1181296a44b220c5a",
+    "base": "99fe7e4de47094ac1b08450c62112e34d2bc62a4",
+    "patch": "kernel-sync-pr194-runtime.patch",
+    "files": [
+      "src/open_qwen36/block_host.cpp",
+      "src/open_qwen36/block_host.hpp",
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest_test.cpp"
+    ],
+    "scope": "OFLM runtime companion; standalone diff against base, not a sequential patch series"
+  },
+  "kernel_sync_pr207": {
+    "source_head": "ed5e3c6e1cadbe8974493aa04bb3873ae0753644",
+    "base": "3d3696763bc4d641559c38d23cb294c4b5f839d4",
+    "patch": "kernel-sync-pr207-runtime.patch",
+    "files": [
+      "src/open_qwen36/manifest_test.cpp",
+      "src/open_qwen36/pools_test.cpp"
+    ],
+    "scope": "OFLM runtime companion; standalone diff against base, not a sequential patch series"
+  },
+  "kernel_sync_pr213": {
+    "source_head": "5eda57ee98556df439c91e44c334325a82ab3362",
+    "base": "478dbea3f00f868ac58205803cc537b402c6cad5",
+    "patch": "kernel-sync-pr213-runtime.patch",
+    "files": [
+      "src/open_qwen36/CMakeLists.txt",
+      "src/open_qwen36/block_host.cpp",
+      "src/open_qwen36/block_host.hpp",
+      "src/open_qwen36/block_host_test.cpp",
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/engine.cpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp",
+      "src/open_qwen36/manifest_test.cpp"
+    ],
+    "scope": "OFLM runtime companion; standalone diff against base, not a sequential patch series"
+  },
+  "kernel_sync_pr223": {
+    "source_head": "0c22864a5258019b7a885fb4be962ec62e3cc276",
+    "base": "478dbea3f00f868ac58205803cc537b402c6cad5",
+    "patch": "kernel-sync-pr223-runtime.patch",
+    "files": [
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/engine.cpp",
+      "src/open_qwen36/gguf_file.cpp",
+      "src/open_qwen36/gguf_file.hpp",
+      "src/open_qwen36/gguf_pack_test.cpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp",
+      "src/open_qwen36/manifest_test.cpp",
+      "src/open_qwen36/pools.cpp"
+    ],
+    "scope": "OFLM runtime companion; standalone diff against base, not a sequential patch series"
+  }
+}

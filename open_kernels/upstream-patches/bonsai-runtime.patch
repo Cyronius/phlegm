@@ -1,0 +1,205 @@
+diff --git a/src/open_qwen36/block_host.cpp b/src/open_qwen36/block_host.cpp
+index f53f4961b163256f1df2fcdd2149772a52664322..4154edef47aa5e9e6d50509dd719cb1dac616693 100644
+--- a/src/open_qwen36/block_host.cpp
++++ b/src/open_qwen36/block_host.cpp
+@@ -136,6 +136,27 @@
+         const size_t chunk = (q.width / 8 + nthr - 1) / nthr * 8;
+         const size_t a = std::min(static_cast<size_t>(i) * chunk, q.width);
+         transpose_range(y + q.off * T, T, q.width, a, std::min(a + chunk, q.width), q.dst);
++    }
++}
++
++void hadamard_rows(float* x, size_t T, size_t K, size_t block, const float* signs) {
++    const float scale = 1.0f / std::sqrt(static_cast<float>(block));   // 1/32 for 1024: exact
++#pragma omp parallel for
++    for (long long t = 0; t < static_cast<long long>(T); ++t) {
++        float* row = x + static_cast<size_t>(t) * K;
++        if (signs)
++            for (size_t j = 0; j < K; ++j) row[j] *= signs[j];
++        for (size_t b0 = 0; b0 + block <= K; b0 += block) {
++            float* v = row + b0;
++            for (size_t h = 1; h < block; h <<= 1)
++                for (size_t i = 0; i < block; i += 2 * h)
++                    for (size_t j = i; j < i + h; ++j) {
++                        const float a = v[j], c = v[j + h];
++                        v[j] = a + c;
++                        v[j + h] = a - c;
++                    }
++            for (size_t j = 0; j < block; ++j) v[j] *= scale;
++        }
+     }
+ }
+ 
+diff --git a/src/open_qwen36/block_host.hpp b/src/open_qwen36/block_host.hpp
+index c4c2a770146085dbc2ccbd661f3b1160ea9e654c..fb65948ffc2f950dc0b2b022c501dd76663fe8d7 100644
+--- a/src/open_qwen36/block_host.hpp
++++ b/src/open_qwen36/block_host.hpp
+@@ -35,6 +35,11 @@
+ /// x [T, K] fp32 -> the GEMM's tiled bf16 activation layout ([K, T] "k,n" order, 64 x 32
+ /// tiles of 8 x 8 MAC sub-tiles, gemm_q4_prefill.py); out holds K * T bf16 bits.
+ void tile_x(const float* x, size_t T, size_t K, uint16_t* out);
++/// The activation side of a rotated-basis ternary model (OPEN-HADAMARD, Ternary Bonsai 2): every
++/// `block`-wide run of each row of x [T, K] becomes H(signs * run) / sqrt(block) in place, H the
++/// Sylvester Walsh-Hadamard matrix. `signs` (K values of +-1) may be null. The NPU preps do the
++/// same per 4 KB element (open_kernels/designs/gemv_q4/wht.h); this is the block route's copy.
++void hadamard_rows(float* x, size_t T, size_t K, size_t block, const float* signs);
+ 
+ struct DeltaGeom {
+     size_t T = 0, t_real = 0, hid = 0;
+diff --git a/src/open_qwen36/core.cpp b/src/open_qwen36/core.cpp
+index b7101b8219691913e1bd18f7e556d7e356d85930..bc564d057a27fd0b8670e84d996bdeb0ad85ec74 100644
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -1856,6 +1856,15 @@
+         throw std::runtime_error("open_qwen36: gemm " + s.kernel + ": the x / y globals are smaller than [" +
+                                  std::to_string(K) + "] x " + std::to_string(T) + " -> [" + std::to_string(N) + "]");
+     auto t0 = std::chrono::steady_clock::now();
++    if (man_.hadamard_block) {
++        // OPEN-HADAMARD: the rotated-basis weights want H(x)/32 per 1024 block, the attention
++        // output (the only input that wide) sign-flipped first -- what the lx / ax preps do.
++        if (xh_buf_.size() < T * K) xh_buf_.resize(T * K);
++        std::copy(x, x + T * K, xh_buf_.begin());
++        const bool og = K == man_.hadamard_og_signs.size();
++        host::hadamard_rows(xh_buf_.data(), T, K, man_.hadamard_block, og ? man_.hadamard_og_signs.data() : nullptr);
++        x = xh_buf_.data();
++    }
+     host::tile_x(x, T, K, xb.map<uint16_t*>());          // straight into the mapped buffer
+     timing_.part1_ms += ms_since(t0);
+     timing_.gemm_tile_ms += ms_since(t0);
+diff --git a/src/open_qwen36/core.hpp b/src/open_qwen36/core.hpp
+index eab93e3684072458b358c3ad3a47dec5aafd6c18..46bdc25518d36d3efe3ddda43e79a2b4bf56a55a 100644
+--- a/src/open_qwen36/core.hpp
++++ b/src/open_qwen36/core.hpp
+@@ -402,6 +402,7 @@
+     std::vector<std::vector<float>> block_logits_;     ///< per real token of the last block, when asked
+ 
+     std::vector<float> logits_host_;
++    std::vector<float> xh_buf_;           ///< gemm_run's rotated copy of x (OPEN-HADAMARD models only)
+     StepTiming timing_;
+     /// det_step: every router record route() read this step (probs, idx, weights), per layer
+     /// in walk order. Off (and empty) outside det_step.
+diff --git a/src/open_qwen36/manifest.cpp b/src/open_qwen36/manifest.cpp
+index 46b49712249bc68010f71a7fa9fe60e904dc9cc0..9483c5d7baa9a1ad88906fd461deb686d967a2b9 100644
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -65,7 +65,7 @@
+         for (const auto& [name, v] : fs)
+             if (v == 0) fail(where, p.op + " " + (p.tensor.empty() ? p.up : p.tensor) + " without " + name);
+     };
+-    if (p.op == "std_perm" || p.op == "q8_perm" || p.op == "put" || p.op == "expert_down" ||
++    if (p.op == "std_perm" || p.op == "q8_perm" || p.op == "t2_perm" || p.op == "put" || p.op == "expert_down" ||
+         p.op == "conv_transpose" || p.op == "lmhead_q8" || p.op == "transpose") {
+         if (p.tensor.empty()) fail(where, p.op + " without a tensor");
+     } else if (p.op == "expert_stripes") {
+@@ -73,7 +73,7 @@
+     } else {
+         fail(where, "unknown pack op '" + p.op + "'");
+     }
+-    if (p.op == "std_perm" || p.op == "q8_perm") need_all({{"nch", p.nch}, {"in_dim", p.in_dim}});
++    if (p.op == "std_perm" || p.op == "q8_perm" || p.op == "t2_perm") need_all({{"nch", p.nch}, {"in_dim", p.in_dim}});
+     else if (p.op == "std_fuse") need_all({{"nch", p.nch}, {"in_dim", p.in_dim}, {"src_dim", p.src_dim}, {"rg", p.rg}});
+     else if (p.op == "transpose") need_all({{"rows", p.rows}, {"cols", p.cols}, {"elem", p.elem}});
+     else if (p.op == "expert_stripes") need_all({{"stripe_bytes", p.stripe_bytes}, {"stripes", p.stripes}, {"experts", p.experts}, {"in_dim", p.in_dim}});
+@@ -132,6 +132,13 @@
+     m.spec_hash = j.value("spec_hash", "");
+     m.build_key = j.value("build_key", "");
+     m.max_ctx_default = j.value("max_ctx_default", 4096ull);
++    if (j.contains("spec") && j["spec"].is_object() && j["spec"].contains("hadamard") &&
++        j["spec"]["hadamard"].is_object()) {
++        const json& hd = j["spec"]["hadamard"];
++        m.hadamard_block = hd.value("block", 0ull);
++        if (m.hadamard_block != 1024) fail(where, "spec.hadamard.block must be 1024");
++        for (const auto& v : hd.at("og_signs")) m.hadamard_og_signs.push_back(v.get<float>());
++    }
+ 
+     const json& lay = need(j, "layout", where);
+     const std::string lw = where + " layout";
+diff --git a/src/open_qwen36/manifest.hpp b/src/open_qwen36/manifest.hpp
+index 9ee23c8c67fc3be2dad5dbad92de8c874c30b34f..6435d21d0a0d1077c1a4a8f0f55be0c974d5e46e 100644
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -208,6 +208,12 @@
+     std::map<std::string, uint64_t> globals;          ///< fixed-size global buffers (bytes)
+     std::map<std::string, RowGlobal> per_row_globals; ///< globals sized max_ctx x row (the ptab(s))
+     std::string embed_tensor, norm_tensor;
++    /// spec.hadamard (OPEN-HADAMARD): 0 for every model but a rotated-basis ternary one; then every
++    /// projection input goes through H/sqrt(block) per block, and the inputs as wide as
++    /// hadamard_og_signs (the attention output) through those signs first. The kernels do it
++    /// themselves; the host does it for the block route's GEMMs (Core::gemm_run).
++    size_t hadamard_block = 0;
++    std::vector<float> hadamard_og_signs;
+     std::vector<PackOp> lmhead_ops;          ///< pack.lm_head.ops into the lmpool global
+     size_t norm_bytes = 0;
+     nlohmann::json hf_config_check;
+diff --git a/src/open_qwen36/pools.cpp b/src/open_qwen36/pools.cpp
+index fdd37f49776c945a846e76f1907ae6093f925b6b..8c8db07a362829b0804b7b67d301db2be3fe4343 100644
+--- a/src/open_qwen36/pools.cpp
++++ b/src/open_qwen36/pools.cpp
+@@ -352,6 +352,41 @@
+             std::memcpy(dst + (c * dst_rows + r) * elem, src + (r * cols + c) * elem, elem);
+ }
+ 
++/// OPEN-QUANT-T2: one exact-ternary q4_1 chunk (q = code in 0..2, m = -d, one d per 128 K) ->
++/// the 2-bit chunk gemv_q4/gemv_t2.h reads: [s 2 x 32 bf16 | 2048 B of codes | pad to 2560].
++/// Byte (k8, kk, p) of the codes holds rows 8j + p (j = 0..3, bits 2j) at k = 8 k8 + kk.
++/// Returns false when the chunk is not ternary in that exact form.
++constexpr size_t T2_CHUNK = 2560;
++bool t2_chunk(const uint8_t* s, uint8_t* o) {
++    bool ok = true;
++    std::memset(o, 0, T2_CHUNK);
++    uint16_t d[256], mm[256];
++    std::memcpy(d, s, 512);
++    std::memcpy(mm, s + 512, 512);
++    uint16_t sc[64];
++    for (unsigned g = 0; g < 2; ++g)
++        for (unsigned r = 0; r < 32; ++r) {
++            const uint16_t v = d[(4 * g) * 32 + r];
++            for (unsigned kb = 4 * g; kb < 4 * g + 4; ++kb)
++                if (d[kb * 32 + r] != v || mm[kb * 32 + r] != static_cast<uint16_t>(v ^ 0x8000u)) ok = false;
++            sc[g * 32 + r] = v;
++        }
++    std::memcpy(o, sc, 128);
++    const uint8_t* nib = s + 1024;
++    for (unsigned k = 0; k < 256; ++k)
++        for (unsigned p = 0; p < 8; ++p) {
++            unsigned b = 0;
++            for (unsigned j = 0; j < 4; ++j) {
++                const unsigned r = 8 * j + p, idx = (r >> 4) * 4096 + k * 16 + (r & 15);
++                const unsigned q = (nib[idx >> 1] >> ((idx & 1) * 4)) & 15u;
++                if (q > 2) ok = false;
++                b |= q << (2 * j);
++            }
++            o[128 + (k >> 3) * 64 + (k & 7) * 8 + p] = static_cast<uint8_t>(b);
++        }
++    return ok;
++}
++
+ void apply(const PackOp& op, const Q4nxFile& m, int layer, uint8_t* dst, size_t dst_bytes, size_t ch) {
+     if (op.op == "std_perm") {
+         const std::string name = with_layer(op.tensor, layer);
+@@ -421,6 +456,25 @@
+                                                      : zero.data();
+             fuse_chunk(lo, hi, dst + op.dst + c * ch);
+         }
++    } else if (op.op == "t2_perm") {
++        // OPEN-QUANT-T2: the std_perm band order, each pool chunk the 2-bit twin of the
++        // container's exact-ternary q4_1 chunk (q4nx-build's Bonsai path writes those).
++        const std::string name = with_layer(op.tensor, layer);
++        if (op.nch == 0 || op.in_dim == 0) fail("t2_perm " + name + " without nch / in_dim");
++        if (m.chunk_bytes(name) != Q4_CHUNK)
++            fail("t2_perm " + name + ": the source must be q4_1 (" + std::to_string(Q4_CHUNK) + " B chunks), not " +
++                 std::to_string(m.chunk_bytes(name)));
++        bounds(op, op.nch * T2_CHUNK, dst_bytes);
++        std::vector<uint8_t> tmp;
++        const uint8_t* src = q4_source(m, name, op.chunk0, op.nch, Q4_CHUNK, tmp);
++        const auto perm = std_perm(op.nch, op.in_dim);
++        long long bad = -1;
++#pragma omp parallel for
++        for (long long c = 0; c < static_cast<long long>(op.nch); ++c)
++            if (!t2_chunk(src + perm[c] * Q4_CHUNK, dst + op.dst + c * T2_CHUNK)) bad = c;
++        if (bad >= 0)
++            fail("t2_perm " + name + ": chunk " + std::to_string(bad) + " is not exact ternary q4_1 "
++                 "(q in 0..2, m = -d, one d per 128 columns) -- not a q4nx-build ternary container");
+     } else if (op.op == "q8_perm") {
+         // The projection stays at q8: `nch` counts POOL half-tiles (5120 B each, twice the
+         // q4_1 bytes of the same tensor) and `chunk0` is a SOURCE file-chunk offset, as it

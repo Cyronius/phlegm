@@ -17,6 +17,7 @@ mlir-aie toolchain. Those kernels now run whole models on the NPU, through the o
 | [`phlegm-cli/`](phlegm-cli/) | The `phlegm` command: `run`, `serve`, `pull`, `bench` | real C++ benchmarks; `serve` still uses a mock backend |
 | [`phlegm-tray/`](phlegm-tray/) | Windows tray app (Tauri v2): model library, downloads, chat, a local OpenAI endpoint | tray icon and window only |
 | [`open_kernels/`](open_kernels/) | The open AIE kernels, their recipes per model family, the build harness and the fp64 replicas | working; see its README |
+| [`npu_offload/`](npu_offload/) | Embedding GEMM sources and block-attention build dependencies | source imported; embedding runtime port pending |
 | [`specs/open-engine/`](specs/open-engine/) | Requirements and tests for the kernels and recipes (`OPEN-*`) | imported with the kernels |
 | [`website/`](website/) | The project site (Astro + Starlight), for GitHub Pages | skeleton |
 | [`xdna-dump/`](xdna-dump/) | What we know about the XDNA2 NPU, its toolchain and FastFlowLM, plus the tools that found it | raw sources; synthesis pending |

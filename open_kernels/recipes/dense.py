@@ -39,13 +39,14 @@ from __future__ import annotations
 import copy
 
 import os
+from dataclasses import dataclass
 
-from dataclasses import dataclass, replace
-
+from . import gguf as GGUF
 from .catalogue import LIMITS, OpRangeError, check_buffer_args, require
 from .qwen36moe import ATTN_LMAX  # Path A: the widest attention GEMM stream (window chunk)
-from .qwen36moe import (BAND_ROWS, CHUNK, ELEM, GEMM_T, MB, _op_index, band_bytes, chunk_bytes, q4_bytes,
-                        proj_op, q4_chunks, mixed_check, quant_check, require_gemv, role_bytes, roundup, tab_bytes)
+from .qwen36moe import (BAND_ROWS, CHUNK, ELEM, GEMM_T, MB, _op_index, band_bytes, chunk_bytes, core_l1,
+                        down_split, norm_split, q4_bytes, proj_op, q4_chunks, mixed_check, quant_check,
+                        require_gemv, role_bytes, roundup, tab_bytes)
 from .spec import DENSE, DENSE_LOCAL, ModelSpec
 
 
@@ -57,7 +58,7 @@ class DenseLayout:
     CD_QB: int; CD_KB: int; CD_VB: int; CD_BYTES: int
     # act: the DDR bounce between stages (T / T2: the sandwich norms' outputs, f32 HID)
     AD_XN: int; AD_Q: int; AD_KVN: int; AD_OG: int; AD_OUT: int; AD_RES: int; AD_XM: int
-    AD_H: int; AD_OUT2: int; AD_JUNK: int; AD_T: int; AD_T2: int; AD_BYTES: int
+    AD_H: int; AD_OUT2: int; AD_OUT2B: int; AD_JUNK: int; AD_T: int; AD_T2: int; AD_BYTES: int
     # pool
     POOL_Q: int; POOL_K: int; POOL_V: int; POOL_O: int; POOL_UP: int; POOL_GATE: int; POOL_DOWN: int; POOL_BYTES: int
     # KV / ptab / lm_head
@@ -87,6 +88,8 @@ class DenseGeometry:
     MS_U: int; MS_G: int; MS_FLOATS: int                            # the up / gate band scratch
     VEXP: int; MLS: int                                             # batched softmax exponentials; ml stride
     ACORES: int; NHL: int; RB: int                                  # attention cores; heads each owns; rows per call
+    DOWN_SPLIT: tuple = ()                                          # the down GEMV's K pieces; () when the FF fits whole
+    NORM_SPLIT: bool = False                                        # the norm helper streams instead of holding five elements
 
 
 @dataclass(frozen=True)
@@ -109,13 +112,16 @@ QKNORM_POST_ROPE = ("hunyuan",)
 # guess: a dense attn_block without it is left to the dxB route.
 BLOCK_ATTN_QKNORM_ROPE = ("qwen3",)
 # the same with no q/k norm: the rotation alone (attn_block.prep "rope")
-BLOCK_ATTN_ROPE = ("k2",)
+BLOCK_ATTN_ROPE = ("k2", "llama3")
 # families whose block attention is one causal flash-attention dispatch a block (OPEN-PREFILL-ATTN-FA,
 # designs/attn_fa: head dim 64, full rotary, no q/k norm, no gate, no window), by measurement
 # against their host attention
 BLOCK_ATTN_FA = ("granite",)
 # Q as a bf16 hi / lo pair; AF_QSPLIT=0 exports the single-bf16 Q experiment (its own kernel set)
-AF_QSPLIT = os.environ.get("AF_QSPLIT", "1") != "0"# families whose q/k/v projections carry a per-channel bias. Like the post-RoPE norm this
+AF_QSPLIT = os.environ.get("AF_QSPLIT", "1") != "0"
+# OPEN-PREFILL-GEMM8: the 8-bit route's block (designs/dit_gemm streams are built per M)
+DIT_T = 1024
+# families whose q/k/v projections carry a per-channel bias. Like the post-RoPE norm this
 # is a family property, not a spec field: every Qwen2 has it, and spec_hash() covers every
 # field, so a field would move every shipped model's hash.
 # o_proj and the FFN have none on the families listed here. GPT-OSS breaks both halves of
@@ -226,7 +232,10 @@ def _check(spec: ModelSpec) -> None:
     require_gemv(spec, "attn", spec.hidden, spec.attn_q_width // n, pc)
     require_gemv(spec, "attn", spec.attn_q_width, spec.hidden // n, pc)
     require_gemv(spec, "ffn", spec.hidden, spec.intermediate // n, pc)
-    require_gemv(spec, "ffn", spec.intermediate, spec.hidden // n, pc)
+    # The down GEMV reduces over FF: with the split (down_split) it runs as one GEMV per
+    # K piece, and each piece is the width the core actually runs -- not the whole FF.
+    for k in _ffn_split(spec) or (spec.intermediate,):
+        require_gemv(spec, "ffn", k, spec.hidden // n, pc)
     require("lm_head_q4", K=spec.hidden, vocab=lm_rows(spec))
 
 
@@ -234,18 +243,43 @@ L1_BUDGET = 60 * 1024      # a main core's 64 KB data memory less IRON's own boo
 STACK = 0x1800
 
 
+def _ffn_split(spec: ModelSpec) -> tuple[int, ...]:
+    """The down GEMV's K pieces for this spec (empty when the FF's table fits whole).
+
+    The chunk size and the stack are the build's own -- the f32-scale build's chunk
+    is 6 KB, not 5 -- so the decision and the L1 budget it is measured against agree.
+
+    DENSE_DOWN_SPLIT forces the pieces (a probe: it lets the split be compared against
+    the whole path on a model that is already tested end to end).
+    """
+    forced = os.environ.get("DENSE_DOWN_SPLIT")
+    if forced:
+        pieces = tuple(int(x) for x in forced.replace("+", ",").split(",") if x.strip())
+        if len(pieces) != 2 or sum(pieces) != spec.intermediate:
+            raise OpRangeError(f"dense: DENSE_DOWN_SPLIT={forced!r} must be two widths that sum "
+                               f"to the FF ({spec.intermediate})")
+        return pieces
+    ch = chunk_bytes(pool_quant(spec))
+    stack = 0x1400 if pool_quant(spec) == "q4_1_f32" else STACK
+    return down_split(spec, ch, stack)
+
+
 def per_call(spec: ModelSpec) -> int:
     """Chunks per weight element: 2 (10 KB, as the MoE designs) unless the widest activation table
-    leaves no room for two of them beside the x elements -- then 1 (Llama 3 8B: K = 14336 -> 32 KB)."""
-    wide = max(spec.hidden, spec.attn_q_width, spec.intermediate)
+    leaves no room for two of them beside the x elements -- then 1 (Llama 3 8B: K = 14336 -> 32 KB).
+
+    The widest table is the widest activation the main cores prepare: with the down GEMV
+    split (down_split) that is the widest PIECE of the FF, not the FF itself -- which is
+    what lets a family with an FF of 17408 (Qwen3-14B) build on a core whose L1 holds 60 KB.
+    """
+    wide = max(spec.hidden, spec.attn_q_width, *(_ffn_split(spec) or (spec.intermediate,)))
+    ch = chunk_bytes(pool_quant(spec))
+    # Gemma 3 12B's f32-scale twin is 768 B over physical tile memory with
+    # the ordinary 6 KiB stack. The generated main-core body fits the 5 KiB
+    # stack used by dx.py for f32 builds, retaining the 4 KiB safety margin.
+    stack = 0x1400 if pool_quant(spec) == "q4_1_f32" else STACK
     for pc in (2, 1):
-        ch = chunk_bytes(pool_quant(spec))
-        # Gemma 3 12B's f32-scale twin is 768 B over physical tile memory with
-        # the ordinary 6 KiB stack. The generated main-core body fits the 5 KiB
-        # stack used by dx.py for f32 builds, retaining the 4 KiB safety margin.
-        stack = 0x1400 if pool_quant(spec) == "q4_1_f32" else STACK
-        l1 = tab_bytes(wide) + 2 * pc * ch + 2 * ELEM + 2 * BAND_ROWS * 4 + 2 * BAND_ROWS * 4 + stack
-        if l1 <= L1_BUDGET:
+        if core_l1(tab_bytes(wide), 2 * BAND_ROWS, 0, pc, chunk=ch, stack=stack) <= L1_BUDGET:
             return pc
     raise OpRangeError(f"dense: a {wide}-wide activation table does not leave room for the streams in a core's L1")
 
@@ -254,7 +288,7 @@ def per_call(spec: ModelSpec) -> int:
 # MoE / Qwen3.5 recipe, which compiles the same attn.h); re-exported here because the
 # dense recipe is where they were first exposed and where cache.py and the tests look.
 from .attnknobs import (PROBE_VARS, RB_SUPPORTED, FAST_ATTENTION, MAX_ATTN_CORES,  # noqa: E402,F401
-                        probe_env, fast_attention, attn_cores, knobs as attn_knobs, kvslice as attn_kvslice,
+                        fast_attention, attn_cores, knobs as attn_knobs, kvslice as attn_kvslice,
                         dxl_kvslice)
 
 # OPEN-DECODE-STREAM: families measured on dx's memtile weight ring and early weight issue (bit-identical).
@@ -281,6 +315,27 @@ def one_context(spec: ModelSpec) -> bool:
     on = forced == "1" if forced is not None else spec.family in ONE_CTX_MEASURED
     return on and spec.quant == "q4_1" and not spec.sandwich_norms and not qkv_bias(spec)
 
+from .attnknobs import probe_env as attn_knobs_probe_env
+
+# The dense recipe's own probe variables. They change the COMPILED kernel, so they
+# belong in the build key (recipes/cache.py reads probe_env() off the family module):
+#   DENSE_DOWN_SPLIT  "4096+5632" -- force the down GEMV's K pieces on a width whose
+#                    FF fits whole, so the split can be compared against the whole path
+#                    on a model that is already tested end to end.
+#   DENSE_NORM_SPLIT  "1" -- force the streaming norm helper (the same, for the norm).
+DENSE_PROBE_VARS = ("DENSE_DOWN_SPLIT", "DENSE_NORM_SPLIT")
+
+
+def probe_env() -> dict[str, str]:
+    """The probe variables that are set, for the build key: the attention ones and the
+    dense ones. A probe build must not share a key with a real one -- that is how a probe
+    would ship as if it were a model."""
+    env = dict(attn_knobs_probe_env())
+    for k in DENSE_PROBE_VARS:
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    return env
+
 
 def geometry(spec: ModelSpec) -> DenseGeometry:
     n = cores_for(spec)
@@ -290,7 +345,8 @@ def geometry(spec: ModelSpec) -> DenseGeometry:
     _ptab_check(spec, e_a)
     hpe = e_a // (hd * 4)                     # q/k/v heads (f32) per ain element = KVH/2
     hpo = e_a // (hd * 2)                     # og heads (bf16) per aout element = KVH
-    wide = max(hid, qw, ff)
+    split = _ffn_split(spec)                  # the down GEMV's K pieces; () when the FF fits whole
+    wide = max(hid, qw, *(split or (ff,)))
     pc = per_call(spec)
     ch = chunk_bytes(pool_quant(spec))
     # The fast attention path (recipes/attnknobs.py): only for the families measured on
@@ -315,7 +371,36 @@ def geometry(spec: ModelSpec) -> DenseGeometry:
         TAB_BYTES=tab_bytes(wide), KWIDE=wide,
         MS_U=0, MS_G=BAND_ROWS, MS_FLOATS=2 * BAND_ROWS,
         VEXP=vexp, MLS=mls, ACORES=acores, NHL=nhl, RB=rb,
+        DOWN_SPLIT=split,
+        NORM_SPLIT=os.environ.get("DENSE_NORM_SPLIT") == "1" or norm_split(spec),
     )
+
+
+def attn_flags(G: DenseGeometry, probe_env=()) -> list[str]:
+    """The compile-time macros attn.h is built with for this geometry.
+
+    One list, two callers: the layer design (designs/dense/dx.py) and the attention
+    gate (designs/attn/probe_dense.py) that validates a geometry without a model.
+    The gate has to build the SHIPPED kernel's configuration, so the flags live
+    here rather than in the design that happens to use them today -- a second copy
+    would drift, and a drifted gate validates a kernel nobody ships.
+
+    `probe_env` are the probe overrides (ATTN_NULL / ATTN_ABL / ...): they change
+    the compiled kernel, so they belong in the build key, not in a default.
+    """
+    flags = [f"-DATTN_NH={G.NH}", f"-DATTN_KVH={G.KVH}", f"-DATTN_HD={G.HD}", f"-DATTN_ROT={G.ROT}", "-DATTN_GATE=0",
+             f"-DATTN_QKNORM={1 if G.QKNORM else 0}", f"-DATTN_QKNORM_POST={1 if G.QKNORM_POST else 0}",
+             f"-DATTN_EPS={G.EPS:g}f", f"-DATTN_VEXP={G.VEXP}", f"-DATTN_NHL={G.NHL}"]
+    if G.RB > 1:                                           # attn.h defaults it to 1; adding the flag
+        flags.append(f"-DATTN_RB={G.RB}")                 # would change every other family's build line
+    if G.QKVB:                                            # same: only a family that has a bias sees the flag
+        flags.append("-DATTN_QKV_BIAS=1")
+    if G.PTAB_ELEMS > 1:                                 # the position record spans two elements
+        flags.append("-DATTN_PTAB_SPLIT=1")
+    for k, v in probe_env:
+        if k not in ("ATTN_RB", "ATTN_FAST"):             # RB is in the flags above via G.RB; FAST picks G itself.
+            flags.append(f"-D{k}={v}")                    # In the build key -- recipes/cache.py.
+    return flags
 
 
 def layout(spec: ModelSpec, max_ctx: int = 4096) -> DenseLayout:
@@ -344,7 +429,8 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> DenseLayout:
     off = 0
     for name, size in (("xn", G.XN_ELEMS * ELEM), ("q", G.QW * 4), ("kvn", 2 * G.KVW * 4), ("og", G.QW * 2),
                        ("out", hid * 4), ("res", hid * 4), ("xm", G.XM_ELEMS * ELEM), ("h", G.H_ELEMS * ELEM),
-                       ("out2", hid * 4), ("junk", eln), ("t", hid * 4), ("t2", hid * 4)):
+                       ("out2", hid * 4), ("out2b", hid * 4 if G.DOWN_SPLIT else 0),
+                       ("junk", eln), ("t", hid * 4), ("t2", hid * 4)):
         a[name] = off
         off += size
     ad_bytes = roundup(off, ELEM)
@@ -366,7 +452,8 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> DenseLayout:
         CD_LNW=c["lnw"], CD_POSTLN=c["postln"], CD_META=c["meta"], CD_PREFFN=c["preffn"], CD_POSTFFN=c["postffn"],
         CD_QB=c["qb"], CD_KB=c["kb"], CD_VB=c["vb"], CD_BYTES=cd_bytes,
         AD_XN=a["xn"], AD_Q=a["q"], AD_KVN=a["kvn"], AD_OG=a["og"], AD_OUT=a["out"], AD_RES=a["res"], AD_XM=a["xm"],
-        AD_H=a["h"], AD_OUT2=a["out2"], AD_JUNK=a["junk"], AD_T=a["t"], AD_T2=a["t2"], AD_BYTES=ad_bytes,
+        AD_H=a["h"], AD_OUT2=a["out2"], AD_OUT2B=a["out2b"], AD_JUNK=a["junk"], AD_T=a["t"], AD_T2=a["t2"],
+        AD_BYTES=ad_bytes,
         POOL_Q=p["q"], POOL_K=p["k"], POOL_V=p["v"], POOL_O=p["o"], POOL_UP=p["up"], POOL_GATE=p["gate"],
         POOL_DOWN=p["down"], POOL_BYTES=pool_bytes,
         KV_ROW=kv_row, PTAB_ROW=ptab_row, MAX_CTX=max_ctx, KV_BYTES=max_ctx * kv_row, PTAB_BYTES=max_ctx * ptab_row,
@@ -477,7 +564,8 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
     if (spec.family in BLOCK_ATTN_QKNORM_ROPE and spec.qk_norm and spec.family not in QKNORM_POST_ROPE
             and not spec.attn_gate):
         prep = "qknorm_rope"
-    elif spec.family in BLOCK_ATTN_ROPE and not spec.qk_norm and not spec.attn_gate:
+    elif (spec.family in BLOCK_ATTN_ROPE and not spec.qk_norm and not spec.attn_gate
+          and spec.rotary_dim == spec.head_dim):
         prep = "rope"
     # without a prep the engine never reads it, and its products need not even tile (Granite's 5 row blocks)
     if prep and set(spec.layer_types) == {DENSE} and ag_m % 256 == 0 and spec.head_dim % 64 == 0:
@@ -598,12 +686,16 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
         # serves every tier. ag_s / ag_pv, each kernel wired to its family.
         out["contexts"]["ag_s"] = f"ag_s{ag_tiers[0]}/final.xclbin"
         out["contexts"]["ag_pv"] = f"ag_pv{ag_tiers[0]}/final.xclbin"
+        # Both row count and head width shape this image. Llama 1B and Qwen3 4B
+        # share M=1024 but have different head widths (64 and 128); M alone
+        # would let their score/pv builds overwrite each other.
+        msfx = f"_m{ag_m}_h{hd}"
         for Lw in ag_tiers:
             for tag, K, N, cols in (("s", hd, Lw, 8), ("pv", Lw, hd, pv_cols)):
                 name = f"ag_{tag}{Lw}"
                 out["kernels"][name] = {"context": f"ag_{tag}", "insts": f"{name}/insts.bin", "build": name}
                 out["builds"][name] = {"design": "attn_block/attn_gemm.py",
-                                       "build_dir": f"attn_block/build_{tag}{Lw}{sfx}",
+                                       "build_dir": f"attn_block/build_{tag}{Lw}{msfx}{sfx}",
                                        "env": {"AG_M": str(ag_m), "AG_K": str(K),
                                                 "AG_N": str(N), "AG_COLS": str(cols)}}
         # a: the Q or P rows [M, K] bf16 (plain, the design streams A); b: the tiled
@@ -616,7 +708,8 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
         # (s)), so the block's chunk loop never switches hardware context between the
         # scores and pv dispatches (~2.5 ms each today). Off by default: AG16=1 swaps
         # the two-context set above for the unified one -- the canonical export is unchanged.
-        if os.environ.get("AG16") == "1":
+        # The 16-row/8-column experiment cannot tile a 64-wide Llama 1B head.
+        if os.environ.get("AG16") == "1" and hd % 128 == 0:
             for Lw in ag_tiers:
                 for tag in ("s", "pv"):
                     out["kernels"].pop(f"ag_{tag}{Lw}", None)
@@ -636,7 +729,7 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
                     name = f"ag16_{tag}{Lw}"
                     out["kernels"][name] = {"context": "ag16", "insts": f"{name}/insts.bin", "build": name}
                     out["builds"][name] = {"design": "attn_block/attn_gemm.py",
-                                       "build_dir": f"attn_block/build16_{tag}{Lw}{sfx}",
+                                       "build_dir": f"attn_block/build16_{tag}{Lw}{msfx}{sfx}",
                                        "env": {"AG_M": str(ag_m), "AG_K": str(K),
                                                 "AG_N": str(N), "AG_COLS": "8", "AG_N_TILE": "16"}}
 
@@ -649,6 +742,58 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
         out["builds"][name] = {"design": "gemm_q4_prefill/gemm_q4_prefill.py",
                                "build_dir": f"gemm_q4_prefill/build_n{N}_k{K}_t{T}",
                                "env": {"GQP_N": str(N), "GQP_K": str(K), "GQP_T": str(T)}}
+    dit = dit_route(spec, out, plans)
+    if dit:
+        # the 8-bit route is the default (`fast`); this one stays as `lean`, without its weight copy
+        out["variants"] = {"lean": out["layer_types"]}
+        out["layer_types"] = dit["layer_types"]
+        for k in ("contexts", "kernels", "builds"):
+            out[k].update(dit[k])
+        out["globals"].update(dit["globals"])
+    return out
+
+
+def dit_route(spec: ModelSpec, q4: dict, plans: dict) -> dict | None:
+    """The q4_1 route's projections on dit_gemm at DIT_T (OPEN-PREFILL-GEMM8), or None where it cannot run."""
+    hid, ff = spec.hidden, spec.intermediate
+    out: dict = {"layer_types": {}, "contexts": {}, "kernels": {}, "builds": {}, "globals": {}}
+    for lt, gb in q4["layer_types"].items():
+        # The DIT route was measured on q/k-normalized attention. Importing
+        # Llama's rope-only attention must not also opt it into this new route.
+        if gb.get("attn_block", {}).get("prep") != "qknorm_rope":
+            return None
+        qw, kvw = gb["qw"], gb["kvw"]
+        shapes = [(qw + 2 * kvw, hid), (hid, qw), (ff, hid), (ff, hid), (hid, ff)]
+        if any(K % 512 or N % 1024 for N, K in shapes):
+            return None
+        pool = plans[lt]["pool"]
+        program, weights = [], {}
+        for st, (N, K) in zip(gb["program"], shapes):
+            name = f"dit_n{N}_k{K}"
+            wname = "g8" + st["args"][0][1:]
+            ops, n0 = [], 0
+            for i in gb["weights"][st["args"][0]]["ops"]:
+                src = pool[i]
+                rows = src["nch"] // (src["in_dim"] // 256) * 32
+                if rows % 128 or src["in_dim"] != K:
+                    return None
+                op = {"op": "bfp16_dit", "tensor": src["tensor"], "dst": n0 * K * 9 // 8,
+                      "nch": src["nch"], "in_dim": K}
+                if src.get("chunk0"):
+                    op["chunk0"] = src["chunk0"]
+                ops.append(op)
+                n0 += rows
+            if n0 != N:
+                return None
+            weights[wname] = {"from": "pack", "pack": ops}
+            program.append({"op": "run", "kernel": name, "args": [wname, "g8_a", "g8_c"]})
+            out["contexts"].setdefault("dit", f"{name}/final.xclbin")
+            out["kernels"][name] = {"context": "dit", "insts": f"{name}/insts.bin", "build": name}
+            out["builds"][name] = {"design": "dit_gemm/dit_gemm.py", "build_dir": f"dit_gemm/build_m{DIT_T}_n{N}_k{K}",
+                                   "env": {"DG_M": str(DIT_T), "DG_K": str(K), "DG_N": str(N), "DG_LAYOUT": "{}"}}
+            out["globals"]["g8_a"] = max(out["globals"].get("g8_a", 0), DIT_T * K * 2)   # bf16 [T, K] row-major
+            out["globals"]["g8_c"] = max(out["globals"].get("g8_c", 0), DIT_T * N * 2)   # bf16 [T, N] row-major
+        out["layer_types"][lt] = {**gb, "t": DIT_T, "gemm": "dit", "program": program, "weights": weights}
     return out
 
 
@@ -815,19 +960,33 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
                 out[k].update(bf[k])
             for lt, gb in bf["layer_types"].items():
                 out["layer_types"][lt].setdefault("gemm_block_variants", {})["bfp16"] = gb
+        for name, types in r.get("variants", {}).items():
+            for lt, gb in types.items():
+                out["layer_types"][lt].setdefault("gemm_block_variants", {})[name] = gb
     rr = None if f32 else rows_route(spec)
     if rr:
         out["contexts"].update(rr["contexts"])
         out["kernels"].update(rr["kernels"])
         out["rows"] = rr["rows"]
-    if spec.quant == "q4_1":
+    sec = GGUF.section(spec, max_ctx, programs, twins_built=f32_twin_fits(spec))
+    if sec:
         # the export also builds the f32-scale twins (dx_f32, lm_head_q4_f32); the engine
         # swaps this section in for GGUF-direct models (same weight file family, f32-scale
         # pool chunks, open_kernels/gguf_pool.py)
-        f32 = programs(replace(spec, quant="q4_1_f32"), max_ctx)
-        out["gguf"] = {"contexts": f32["contexts"], "kernels": f32["kernels"],
-                       "layer_types": f32["layer_types"], "tail": f32["tail"], "globals": f32["globals"]}
+        out["gguf"] = sec
     return out
+
+
+def f32_twin_fits(spec: ModelSpec) -> bool:
+    """Whether the f32-scale twin of the layer design fits a core at this shape.
+
+    It does not at a wide FF: the split's piece table plus the wider weight
+    elements overflow a main core's allocation ("allocated buffers exceeded
+    available memory"), and without the split the f32 build is 36 B of program
+    memory over at HID 5120. So a split FF has no twin -- and then the
+    manifest must not advertise a "gguf" section that names one (the engine
+    would look for a kernel that was never built)."""
+    return not geometry(spec).DOWN_SPLIT
 
 
 # Only families whose L-row pass (OPEN-DECODE-ROWS) has run on hardware get one.
@@ -926,6 +1085,18 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
     if one_context(spec):
         b["dxh"] = {"design": "dense/dx.py", "build_dir": f"dense/build_{spec.family}_h{spec.hidden}{sfx}_head",
                     "env": {"DX_HEAD": "1"}}
+    if not f32_twin_fits(spec):
+        # The GGUF-direct twin (the f32-scale chunks) is NOT built for a split FF: the
+        # piece's table plus the wider weight elements overflow a main core's allocation
+        # (aiecc: "allocated buffers exceeded available memory"). It does not fit at this
+        # HID either way -- without the split the f32 build is 36 B of program memory over
+        # at HID 5120 -- so the shape has never been built that way (the qwen35 family at
+        # HID 5120 has no twin at all). The q4_1 set is the one a converted container uses
+        # today, so the twin is left out; say so, rather than leaving a silent gap.
+        print(f"-- {spec.extra.get('model', spec.family)}: no GGUF-direct twin (dx_f32): the "
+              f"f32-scale build does not fit a core at this shape", flush=True)
+        del b["dx_f32"]
+        del b["lm_head_q4_f32"]     # the head's twin has no section to serve either
     r = gemm_route(spec)
     if r:
         b.update(r["builds"])
@@ -1041,6 +1212,8 @@ KERNEL_SOURCES = [
     "designs/gemm_bfp16/*.py", "designs/gemm_bfp16/*.cc",
     "designs/attn_block/attn_gemm.py", "../npu_offload/gemm_rtp/gemm_pretiled.py", "../npu_offload/gemm_rtp/npue.py",
     "designs/attn_fa/attn_fa.py", "designs/attn_fa/attn_fa.cc",
+    # the 8-bit prefill route (dit_route): the GEMM design, its microkernel and the layout its weights are packed to
+    "designs/dit_gemm/dit_gemm.py", "designs/dit_gemm/mm_dit.cc", "designs/dit_gemm/pack.py",
     "include/vecmath.h", "include/scalar_fp.h", "ironutil.py", "build_design.py",
 ]
 KERNEL_SOURCES_Q8 = ["designs/gemv_q4/gemv_q8.h"]

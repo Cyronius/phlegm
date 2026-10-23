@@ -1,0 +1,1257 @@
+diff --git a/src/open_qwen36/core.cpp b/src/open_qwen36/core.cpp
+index 3ed9c64..d44993f 100644
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -12,6 +12,7 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <set>
+ #include <functional>
+ #include <limits>
+ #include <map>
+@@ -179,6 +180,49 @@ nlohmann::json derive_config(const GgufFile& g) {
+     else c["head_dim"] = u("embedding_length") / u("attention.head_count");
+     if (g.kv_has(arch + ".attention.sliding_window"))
+         c["sliding_window"] = g.kv_u64(arch + ".attention.sliding_window");
++    // The layer types (the hybrid families): the manifest names the per-layer
++    // list, and the FILE's tensors are what decide it -- a linear layer
++    // carries the fused attn_qkv, a full one the separate attn_q / attn_k /
++    // attn_v. The header's full_attention_interval describes the pattern
++    // llama.cpp assumed, and a fine-tune can differ (the Qwen3.8-9B distill
++    // ends in two full attention layers where the interval says one).
++    {
++        // The MTP head is a whole extra block whose regular tensors look like a
++        // full attention layer's: exclude every block that carries a nextn
++        // tensor before classifying the rest.
++        std::set<int> nextn;
++        for (const auto& name : g.tensor_names())
++            if (name.find(".nextn.") != std::string::npos && name.rfind("blk.", 0) == 0)
++                nextn.insert(std::atoi(name.c_str() + 4));
++        std::set<int> linear, full;
++        for (const auto& name : g.tensor_names()) {
++            if (name.rfind("blk.", 0) != 0) continue;
++            const int l = std::atoi(name.c_str() + 4);
++            if (nextn.count(l)) continue;
++            const size_t d = name.find(".attn_qkv.");
++            const size_t q = name.find(".attn_q.");
++            if (d != std::string::npos) linear.insert(l);
++            else if (q != std::string::npos) full.insert(l);
++        }
++        if (!linear.empty() || !full.empty()) {
++            int n = 0;
++            for (int l : linear) n = std::max(n, l + 1);
++            for (int l : full) n = std::max(n, l + 1);
++            nlohmann::json lt = nlohmann::json::array();
++            for (int l = 0; l < n; ++l)
++                lt.push_back(linear.count(l) ? "linear_attention"
++                                              : (full.count(l) ? "full_attention" : "full_attention"));
++            c["layer_types"] = lt;
++            c["num_hidden_layers"] = n;
++        } else if (g.kv_has(arch + ".full_attention_interval")) {
++            const int iv = static_cast<int>(g.kv_u64(arch + ".full_attention_interval"));
++            const int n = static_cast<int>(g.kv_u64(arch + ".block_count"));
++            nlohmann::json lt = nlohmann::json::array();
++            for (int l = 0; l < n; ++l)
++                lt.push_back((l + 1) % iv == 0 ? "full_attention" : "linear_attention");
++            c["layer_types"] = lt;
++        }
++    }
+     return c;
+ }
+ 
+@@ -220,6 +264,84 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
+     if (gguf_ && !w_)
+         throw std::runtime_error("open_qwen36: model.gguf needs the kernel set's GGUF-direct build "
+                                  "(manifest.json has no gguf section; re-export the kernels)");
++    // ---- OFLM_GGUF_POOL_Q41: run the GGUF-sourced weights through the q4_1
++    // twin instead of the f32-scale one. Every shipped q4nx model runs on the
++    // q4_1 builds, so this separates the f32-scale CHUNK handling in the
++    // layer_x builds from everything else: same source file, same family
++    // geometry, the same kernels the q4nx model answers on. The two sections'
++    // pack ops pair one to one (the same tensors, the same chunk counts --
++    // only the byte offsets move with the chunk law), so each op takes the
++    // base section's geometry under the GGUF packing kind, and the base
++    // section's chunk / pool / lx / ax: the packed slots land where the q4_1
++    // designs read them. Whatever still misbehaves is then not the f32 chunk.
++    if (const char* q = std::getenv("OFLM_GGUF_POOL_Q41"); gguf_ && w_ && q && *q && *q != '0') {
++        Manifest& m = *man_.gguf;
++        const Manifest& b = man_;
++        auto merge = [](std::vector<PackOp>& go, const std::vector<PackOp>& bo,
++                        const std::string& lt) {
++            if (go.size() != bo.size())
++                throw std::runtime_error("OFLM_GGUF_POOL_Q41: layer type " + lt +
++                                         ": the sections' pack ops do not pair (" +
++                                         std::to_string(go.size()) + " vs " + std::to_string(bo.size()) + ")");
++            for (size_t i = 0; i < go.size(); ++i) {
++                if (go[i].tensor != bo[i].tensor)
++                    throw std::runtime_error("OFLM_GGUF_POOL_Q41: layer type " + lt + " op " + std::to_string(i) +
++                                             ": tensors differ (" + go[i].tensor + " vs " + bo[i].tensor + ")");
++                // Only the projection pairs move: the base's std_perm becomes the
++                // GGUF-reading kind under the base's geometry. The ops whose kind
++                // is NOT a chunk law question (put, conv, lm head...) stay exactly
++                // as the GGUF section has them -- they work there today.
++                if (bo[i].op != "std_perm" || go[i].op != "std_perm_gguf") continue;
++                go[i].nch = bo[i].nch;
++                go[i].in_dim = bo[i].in_dim;
++                go[i].chunk0 = bo[i].chunk0;
++                go[i].dst = bo[i].dst;
++                go[i].split.clear();
++                go[i].via.clear();
++            }
++        };
++        for (auto& [lt, g] : m.layer_types) {
++            const auto it = b.layer_types.find(lt);
++            if (it == b.layer_types.end())
++                throw std::runtime_error("OFLM_GGUF_POOL_Q41: layer type " + lt + " is not in the base section");
++            const LayerType& bl = it->second;
++            merge(g.pool, bl.pool, lt);
++            merge(g.consts, bl.consts, lt);
++            g.consts_bytes = bl.consts_bytes;
++            g.act_bytes = bl.act_bytes;
++            g.state_kind = bl.state_kind;
++            g.state_bytes = bl.state_bytes;
++            g.state_row = bl.state_row;
++            g.program = bl.program;                  // the base builds' step
++            g.gemm_block = GemmBlockProgram{};       // the q4nx prefill route stays off for a GGUF
++        }
++        m.chunk_bytes = b.chunk_bytes;
++        m.pool_bytes = b.pool_bytes;
++        // the decode builds: name lx / ax through the base section's kernels;
++        // the head (lm) and the norm (ln) stay the GGUF section's f32 ones
++        // the kernels to swap are whatever the LAYER programs name -- derived,
++        // not a list: the steps' kernels pair one to one across the sections,
++        // and anything else (the tail's norm and head, the prefill GEMM route
++        // this section does not have) stays what the GGUF section names. When a
++        // name exists in both sections and its context differs, it drives the
++        // pool slot law, so it takes the base section's build.
++        std::set<std::string> swap_names;
++        for (const auto& name_step : m.layer_types)
++            for (const auto& s : name_step.second.program)
++                swap_names.insert(s.kernel);
++        for (const std::string& n : swap_names) {
++            const auto kt = m.kernels.find(n);
++            if (kt == m.kernels.end()) continue;
++            const auto bt = b.kernels.find(n);
++            if (bt == b.kernels.end()) continue;
++            m.contexts[bt->second.context] = b.contexts.at(bt->second.context);
++            kt->second = bt->second;             // the base's context and instruction stream
++        }
++        merged_q41_ = true;
++        log("OFLM_GGUF_POOL_Q41: GGUF weights on the q4_1 twin (chunk " +
++            std::to_string(m.chunk_bytes) + ", pool " + std::to_string(m.pool_bytes >> 20) + " MB) "
++            "for the f32-numerics bisect");
++    }
+     // ---- the model's config: from the model dir when it ships one, else
+     // derived from the GGUF metadata (the shapes the manifest checks are all
+     // there); anything GGUF does not carry is refused with its name.
+@@ -232,9 +354,15 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
+         j = nlohmann::json::parse(cf, nullptr, false);
+         if (!j.is_object()) throw std::runtime_error("open_qwen36: bad config.json in " + cfg_.model_dir);
+         if (gguf_) {
++            // The GGUF is the model: its OWN metadata is the geometry the
++            // manifest must match. The config.json beside it is a claim about
++            // the model the repo was built from, and for a fine-tune that is
++            // often the BASE (a distill's repo ships no config.json at all,
++            // and the one its README names says 32 layers where the file has
++            // 33). So the file's geometry wins over the config's.
+             const auto derived = derive_config(*static_cast<GgufFile*>(file_.get()));
+             for (const auto& [key, value] : derived.items())
+-                if (!j.contains(key)) j[key] = value;
++                if (key != "model_type") j[key] = value;
+         }
+     } else if (gguf_) {
+         j = derive_config(*static_cast<GgufFile*>(file_.get()));
+@@ -242,7 +370,10 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
+     } else {
+         throw std::runtime_error("open_qwen36: no config.json in " + cfg_.model_dir);
+     }
+-    w_->check_model(j, md.filename().string());
++    // A GGUF's architecture is not an HF model_type (the manifest was built
++    // for a family, and the file's arch is what named that family), so the
++    // model_type comparison is for the q4nx container's config.json only.
++    w_->check_model(j, md.filename().string(), !gguf_);
+     // The VLM bits: the image token the app expands per merged patch, and how the
+     // rotary pairs split over (t, h, w). Absent on text-only models.
+     image_token_id_ = j.value("image_token_id", -1);
+@@ -422,6 +553,8 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
+     if (const char* env = std::getenv("OFLM_OPEN_ROUTE_SENTINEL")) route_sentinel_ = std::atoi(env) != 0;
+     if (const char* env = std::getenv("OFLM_OPEN_READ_FENCE")) g_read_fence = std::atoi(env) != 0;
+     if (const char* env = std::getenv("OFLM_OPEN_STEP_TRACE")) step_trace_ = std::atoi(env);
++    if (const char* env = std::getenv("OFLM_OPEN_LAYER_NAN")) layer_nan_ = std::atoi(env) != 0;
++    dump_pools_ = std::getenv("OFLM_OPEN_DUMP_POOLS") != nullptr;
+     if (const char* env = std::getenv("OFLM_OPEN_SPIN_US")) spin_us_ = std::atoi(env);
+     // OPEN-DECODE-PIPELINE. Level 1 keeps the next layer's first dispatch in flight behind
+     // this layer's last one only when the two share a hardware context; level 2 crosses
+@@ -600,11 +733,29 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
+         build_weights(lt, l, "pool", pool_host);
+         pool.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+         pools_.push_back(std::move(pool));
++        if (dump_pools_ && l == 0) {
++            const char* d = std::getenv("OFLM_OPEN_DUMP_POOLS");
++            const std::string dir = d && *d ? d : "/tmp/opencode";
++            fs::path out(dir);
++            out /= law_tag() + std::string("_pool0.bin");
++            std::ofstream f(out, std::ios::binary);
++            f.write(reinterpret_cast<const char*>(pool_host), w_->pool_bytes);
++            log("dumped layer-0 pool, " + std::to_string((w_->pool_bytes >> 20)) + " MB -> " + out.string());
++        }
+         xrt::bo c = xrt::ext::bo(*dev_, padup(lt.consts_bytes));
+         std::memset(c.map<uint8_t*>(), 0, padup(lt.consts_bytes));
+         uint8_t* c_host = c.map<uint8_t*>();
+         pools::pack_consts(*w_, lt, *file_, l, c_host);
+         build_weights(lt, l, "consts", c_host);
++        if (dump_pools_ && l == 0) {
++            const char* d = std::getenv("OFLM_OPEN_DUMP_POOLS");
++            const std::string dir = d && *d ? d : "/tmp/opencode";
++            fs::path out(dir);
++            out /= law_tag() + std::string("_consts0.bin");
++            std::ofstream f(out, std::ios::binary);
++            f.write(reinterpret_cast<const char*>(c_host), lt.consts_bytes);
++            log("dumped layer-0 consts, " + std::to_string(lt.consts_bytes) + " B -> " + out.string());
++        }
+         build_weights(lt, l, "pack", nullptr);
+         if (gemm_block_t_ && lt.gemm_block.t) {
+             if (lt.gemm_block.kind == "dense") {
+@@ -644,10 +795,9 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
+                 // file, by the names the consts plan carries (no consts layout knowledge here)
+                 const GemmBlockProgram& gb = lt.gemm_block;
+                 HostConsts& h = hc_[l];
+-                auto* qf = dynamic_cast<Q4nxFile*>(file_.get());
+-                if (!qf)
+-                    throw std::runtime_error("open_qwen36: GGUF-direct block prefill is not implemented for MoE models");
+-                auto bf = [&](const char* suffix) { return qf->bf16(const_tensor(lt, suffix, l)); };
++                // The file may be a q4nx container or a GGUF: both decode these small
++                // tensors to f32 (the container's bf16, the GGUF's f32 or quantized).
++                auto bf = [&](const char* suffix) { return file_->bf16(const_tensor(lt, suffix, l)); };
+                 auto want = [&](const std::vector<float>& v, size_t n, const char* what) {
+                     if (v.size() != n)
+                         throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": " + what + " has " +
+@@ -1834,6 +1984,26 @@ void Core::write_record(size_t row, const double pos[3]) {
+     if (row + 1 > ptab_dirty_) ptab_dirty_ = row + 1;
+ }
+ 
++std::string Core::law_tag() const {
++    if (!gguf_) return "q4nx";
++    return merged_q41_ ? "q41" : "f32";
++}
++
++void Core::layer_nan_check(xrt::bo& xres, int layer) {
++    xres.sync(XCL_BO_SYNC_BO_FROM_DEVICE, w_->hidden * 4, 0);
++    const float* x = xres.map<float*>();
++    int nnan = 0;
++    float mx = 0.f;
++    for (size_t i = 0; i < w_->hidden; ++i) {
++        if (!std::isfinite(x[i])) ++nnan;
++        else mx = std::max(mx, std::fabs(x[i]));
++    }
++    char detail[24] = "";
++    if (nnan == 0 && mx < 1.f) std::snprintf(detail, sizeof detail, " (small)");
++    log("layer " + std::to_string(layer) + " (" + types_[layer]->name + ") xres nan=" +
++        std::to_string(nnan) + " maxabs=" + std::to_string(mx) + detail);
++}
++
+ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
+                      const float* deepstack, int n_deepstack) {
+     if (!weights_loaded_) throw std::runtime_error("open_qwen36: step before load_weights");
+@@ -1925,7 +2095,7 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
+     //
+     // Deepstack (Qwen3-VL) reads xres back between layers, which needs the layer's last
+     // dispatch to have landed; the pipeline is off for that path rather than special-cased.
+-    const bool pipe = submit_ahead_ > 0 && !deepstack;
++    const bool pipe = submit_ahead_ > 0 && !deepstack && !layer_nan_;
+     Inflight head, tail_in;                 // layer l's first dispatch; layer l - 1's last
+     for (int l = 0; l < nl_; ++l) {
+         const std::vector<Step>& prog = types_[l]->program;
+@@ -1955,6 +2125,7 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
+                 for (size_t i = 0; i < w_->hidden; ++i) r[i] += f[i];
+                 xres.sync(XCL_BO_SYNC_BO_TO_DEVICE, w_->hidden * 4, 0);
+             }
++            if (layer_nan_) layer_nan_check(xres, l);
+             continue;
+         }
+         // (1) the previous layer's last dispatch, so its instruction BO is free to patch and
+diff --git a/src/open_qwen36/core.hpp b/src/open_qwen36/core.hpp
+index 2ebf5ca..fa0e08b 100644
+--- a/src/open_qwen36/core.hpp
++++ b/src/open_qwen36/core.hpp
+@@ -350,6 +350,11 @@ private:
+     /// OFLM_OPEN_SUBMIT_AHEAD sets it.
+     int submit_ahead_ = 0;
+     int step_trace_ = 0;                       ///< OFLM_OPEN_STEP_TRACE (2 also prints one step dispatch by dispatch)
++    bool layer_nan_ = false;                   ///< OFLM_OPEN_LAYER_NAN: after each layer, count NaN / maxabs in xres
++    bool dump_pools_ = false;                  ///< OFLM_OPEN_DUMP_POOLS (<dir>): dump layer 0's packed pool + consts
++    bool merged_q41_ = false;                  ///< the OFLM_GGUF_POOL_Q41 bisect rewrote the gguf section
++    void layer_nan_check(xrt::bo& xres, int layer);
++    std::string law_tag() const;
+     /// OFLM_OPEN_SPIN_US: poll a command's state for this long before blocking on it. A PROBE,
+     /// off by default -- it trades a scheduler wake-up for a busy core, and a busy core pulls
+     /// this box's NPU clock down through the shared package budget.
+diff --git a/src/open_qwen36/engine.cpp b/src/open_qwen36/engine.cpp
+index 054e903..d3ee0d5 100644
+--- a/src/open_qwen36/engine.cpp
++++ b/src/open_qwen36/engine.cpp
+@@ -75,7 +75,9 @@ Engine::Engine(const LM_Config& config, oflm_rt::device* dev, int MAX_L) : dev_(
+     cfg_.kernel_dir = find_kernels(config, &how);
+     if (cfg_.kernel_dir.empty())
+         throw std::runtime_error("open_qwen36: no open kernels found for " + config.model_name +
+-                                 " (set OFLM_OPEN_KERNELS_DIR or install xclbins/" + config.model_name + "/open_kernels)");
++                                 " (set OFLM_OPEN_KERNELS_DIR or install xclbins/" + config.model_name + "/open_kernels). "
++                                 "The kernel sets are per model SIZE: build this one from the repo with "
++                                 "`python utilities/build-new-spec.py --repo <owner/name>`.");
+     cfg_.max_ctx = MAX_L > 0 ? static_cast<size_t>(MAX_L) : 4096;
+     if (const char* tm = std::getenv("OFLM_OPEN_TIMEOUT_MS")) cfg_.timeout_ms = static_cast<unsigned>(std::strtoul(tm, nullptr, 10));
+     cfg_.verbose = std::getenv("OFLM_OPEN_QUIET") == nullptr;
+diff --git a/src/open_qwen36/gguf_file.cpp b/src/open_qwen36/gguf_file.cpp
+index a6975ef..f494f62 100644
+--- a/src/open_qwen36/gguf_file.cpp
++++ b/src/open_qwen36/gguf_file.cpp
+@@ -86,10 +86,19 @@ uint64_t gguf_type_bytes(uint32_t t, uint64_t values) {
+         case 8: return values / 32 * 34;                  // q8_0
+         case 12: return values / 256 * 144;               // q4_k
+         case 14: return values / 256 * 210;               // q6_k
++        case 13: return values / 256 * 176;               // q5_k
++        case 20: return values / 32 * 18;                 // iq4_nl
++        case 23: return values / 256 * 136;               // iq4_xs
+         default: return 0;                                // unsupported
+     }
+ }
+ 
++// llama.cpp's iq4_nl codebook: the sixteen values a 4-bit code indexes. iq4_xs
++// uses the same table (it is a finer-grained scale on top of it).
++static const int8_t kIQ4NLValues[16] = {
++    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
++};
++
+ inline float bf16_to_f32(uint16_t u) {
+     uint32_t w = static_cast<uint32_t>(u) << 16;
+     float f;
+@@ -185,6 +194,9 @@ GgufFile::GgufFile(const std::string& path) : path_(path) {
+             tensors_.emplace(name, std::move(t));
+         }
+         sandwich_ = tensors_.count("blk.0.post_ffw_norm.weight") != 0;
++        // The pre-FFN norm: llama.cpp calls it ffn_norm (llama, qwen3) or
++        // post_attention_norm (gemma, qwen35) -- the file says which.
++        post_norm_ = tensors_.count("blk.0.post_attention_norm.weight") != 0;
+         // Alignment is not stored in the header for either version: GGUF v2 and
+         // v3 both take it from the optional `general.alignment` metadata key and
+         // default to 32. (Only v1 carried a trailing alignment word.) Validate
+@@ -242,7 +254,7 @@ void GgufFile::drop_pages() {
+ #endif
+ }
+ 
+-std::string GgufFile::gguf_name(const std::string& name, bool sandwich) {
++std::string GgufFile::gguf_name(const std::string& name, bool sandwich, bool post_norm) {
+     // The manifest's packing plan names tensors the q4nx/HF way; a GGUF uses
+     // llama.cpp's conventions (utilities/q4nx-build/configs/*.json hold the
+     // same map on the conversion side).
+@@ -265,8 +277,25 @@ std::string GgufFile::gguf_name(const std::string& name, bool sandwich) {
+         dot("self_attn.q_norm", ".attn_q_norm");
+         dot("self_attn.k_norm", ".attn_k_norm");
+         dot("input_layernorm", ".attn_norm");
+-        // HF's post_attention_layernorm is the pre-FFN norm in Llama but the real post-attention norm in Gemma
+-        dot("post_attention_layernorm", sandwich ? ".post_attention_norm" : ".ffn_norm");
++        // The qwen35 family's linear attention (Gated DeltaNet), which llama.cpp
++        // names ssm_*/attn_qkv (the map the conversion side holds in
++        // utilities/q4nx-build/configs/qwen3.5_*.json). The .bf16 spelling is
++        // the container's own (the tensor is bf16 there), so it is mapped first.
++        dot("linear_attn.qkv_proj", ".attn_qkv");
++        dot("self_attn.gate_proj", ".attn_gate");
++        dot("linear_attn.ssm_alpha_proj.bf16", ".ssm_alpha");
++        dot("linear_attn.ssm_alpha_proj", ".ssm_alpha");
++        dot("linear_attn.ssm_beta_proj.bf16", ".ssm_beta");
++        dot("linear_attn.ssm_beta_proj", ".ssm_beta");
++        dot("linear_attn.ssm_a", ".ssm_a");
++        dot("linear_attn.ssm_dt.bias", ".ssm_dt.bias");
++        dot("linear_attn.ssm_conv1d.weight", ".ssm_conv1d.weight");
++        dot("linear_attn.ssm_norm.weight", ".ssm_norm.weight");
++        dot("linear_attn.ssm_out_proj.weight", ".ssm_out.weight");
++        // HF's post_attention_layernorm is the pre-FFN norm in Llama, but the
++        // real post-attention norm in Gemma and in qwen35 -- the file says
++        // which (it has one name or the other, never both).
++        dot("post_attention_layernorm", (post_norm || sandwich) ? ".post_attention_norm" : ".ffn_norm");
+         dot("pre_feedforward_layernorm", ".ffn_norm");
+         dot("post_feedforward_layernorm", ".post_ffw_norm");
+         dot("mlp.gate_proj", ".ffn_gate");
+@@ -277,7 +306,7 @@ std::string GgufFile::gguf_name(const std::string& name, bool sandwich) {
+ }
+ 
+ const GgufFile::TensorInfo& GgufFile::tensor(const std::string& name) const {
+-    std::string n = gguf_name(name, sandwich_);
++    std::string n = gguf_name(name, sandwich_, post_norm_);
+     auto it = tensors_.find(n);
+     if (it == tensors_.end() && n == "output.weight") {
+         // tied embeddings: the GGUF has no output.weight; the (untied) rows
+@@ -296,6 +325,13 @@ const uint8_t* GgufFile::raw(const std::string& name, size_t* nbytes) const {
+     return map_ + data_base_ + t.offset;
+ }
+ 
++std::vector<std::string> GgufFile::tensor_names() const {
++    std::vector<std::string> out;
++    out.reserve(tensors_.size());
++    for (const auto& [name, info] : tensors_) out.push_back(name);
++    return out;
++}
++
+ const TensorMeta& GgufFile::meta(const std::string& name) const {
+     auto cached = meta_cache_.find(name);
+     if (cached != meta_cache_.end()) return cached->second;
+@@ -440,6 +476,44 @@ void GgufFile::embed_row(const std::string& name, size_t row, size_t dim, float*
+             }
+             break;
+         }
++        case Type::Q5_K: {
++            // super-block of 256: fp16 d, fp16 dmin, 12 B of 6-bit scales (eight
++            // scale/min pairs over eight blocks of 32), 32 B of the FIFTH bit (one
++            // per value), then 128 B of 4-bit codes. The value is
++            // d*scale*(nibble | fifth<<4) - dmin*min.
++            const uint8_t* p = base + row * (dim / 256) * 176;
++            for (size_t sb = 0; sb < dim / 256; ++sb, p += 176) {
++                uint16_t ud, um;
++                std::memcpy(&ud, p, 2);
++                std::memcpy(&um, p + 2, 2);
++                const float d = fp16_to_f32(ud), min = fp16_to_f32(um);
++                const uint8_t* scales = p + 4;
++                const uint8_t* qh = p + 16;                 // the fifth bit, one per value
++                const uint8_t* qs = p + 48;                 // the 4-bit codes
++                float* y = out + sb * 256;
++                int is = 0;
++                for (int j = 0; j < 256; j += 64) {
++                    uint8_t sc, m;
++                    get_scale_min_k4(is + 0, scales, &sc, &m);
++                    const float d1 = d * sc, m1 = min * m;
++                    get_scale_min_k4(is + 1, scales, &sc, &m);
++                    const float d2 = d * sc, m2 = min * m;
++                    for (int l = 0; l < 32; ++l) {
++                        const int v0 = j + l, v1 = j + 32 + l;
++                        const uint8_t byte = qs[j / 2 + l];
++                        const uint8_t n0 = byte & 0xF, n1 = byte >> 4;
++                        // the fifth bit: byte (v % 32) holds the bits of the values
++                        // v, v+32, v+64, ... -- bit (v / 32) of it
++                        const uint8_t h0 = (qh[v0 % 32] >> (v0 / 32)) & 1;
++                        const uint8_t h1 = (qh[v1 % 32] >> (v1 / 32)) & 1;
++                        y[v0] = d1 * static_cast<float>(n0 | (h0 << 4)) - m1;
++                        y[v1] = d2 * static_cast<float>(n1 | (h1 << 4)) - m2;
++                    }
++                    is += 2;
++                }
++            }
++            break;
++        }
+         case Type::Q6_K: {
+             // super-block of 256: 128 B lower nibbles, 64 B upper 2 bits,
+             // 16 int8 scales (per 16 values), fp16 super-block scale
+@@ -471,9 +545,55 @@ void GgufFile::embed_row(const std::string& name, size_t row, size_t dim, float*
+             }
+             break;
+         }
++        case Type::IQ4_NL: {
++            // 4-bit "nibble lookup" (llama.cpp's iq4_nl): each code indexes the
++            // sixteen-entry codebook, scaled by the block's fp16 d. 18 B per 32 values.
++            const uint8_t* p = base + row * (dim / 32) * 18;
++            for (size_t b = 0; b < dim / 32; ++b, p += 18) {
++                uint16_t u;
++                std::memcpy(&u, p, 2);
++                const float d = fp16_to_f32(u);
++                for (size_t j = 0; j < 16; ++j) {
++                    out[b * 32 + j] = d * kIQ4NLValues[p[2 + j] & 0xF];
++                    out[b * 32 + 16 + j] = d * kIQ4NLValues[p[2 + j] >> 4];
++                }
++            }
++            break;
++        }
++        case Type::IQ4_XS: {
++            // llama.cpp's iq4_xs: a super-block of 256 values in 136 B --
++            //   fp16 d | 2 B of 2-bit scale highs | 4 B of 4-bit scale lows | 128 B of codes
++            // Eight groups of 32 values, each with a signed 6-bit scale (the low nibble
++            // | the high two bits << 4, minus 32) times d; the codes index the same
++            // sixteen-entry codebook as iq4_nl.
++            const uint8_t* p = base + row * (dim / 256) * 136;
++            for (size_t sb = 0; sb < dim / 256; ++sb, p += 136) {
++                uint16_t ud, sh;
++                std::memcpy(&ud, p, 2);
++                std::memcpy(&sh, p + 2, 2);
++                const float d = fp16_to_f32(ud);
++                const uint8_t* sl = p + 4;               // four bytes: eight scale lows
++                const uint8_t* qs = p + 8;               // 128 bytes: 256 codes
++                float* y = out + sb * 256;
++                for (int g = 0; g < 8; ++g) {
++                    const uint8_t lo = (g & 1) ? static_cast<uint8_t>(sl[g / 2] >> 4)
++                                               : static_cast<uint8_t>(sl[g / 2] & 0xF);
++                    const uint8_t hi = static_cast<uint8_t>((sh >> (2 * g)) & 0x3);
++                    const float dl = d * static_cast<float>(static_cast<int>(lo | (hi << 4)) - 32);
++                    const uint8_t* q = qs + g * 16;
++                    float* yg = y + g * 32;
++                    for (int j = 0; j < 16; ++j) {
++                        yg[j] = dl * kIQ4NLValues[q[j] & 0xF];
++                        yg[j + 16] = dl * kIQ4NLValues[q[j] >> 4];
++                    }
++                }
++            }
++            break;
++        }
+         default:
+             fail(std::string("the embedding is ") + type_name(t.type) +
+-                 "; this reader dequantizes F32/F16/BF16/Q4_0/Q4_1/Q8_0/Q4_K/Q6_K rows "
++                 "; this reader dequantizes F32/F16/BF16/Q4_0/Q4_1/Q8_0/Q4_K/Q5_K/Q6_K/"
++                 "IQ4_NL/IQ4_XS rows "
+                  "(convert the model with q4nx-build, or quantize the embedding to a supported type)");
+     }
+ }
+diff --git a/src/open_qwen36/gguf_file.hpp b/src/open_qwen36/gguf_file.hpp
+index 093ec4b..99d917a 100644
+--- a/src/open_qwen36/gguf_file.hpp
++++ b/src/open_qwen36/gguf_file.hpp
+@@ -50,7 +50,7 @@ public:
+     GgufFile(const GgufFile&) = delete;
+     GgufFile& operator=(const GgufFile&) = delete;
+ 
+-    bool has(const std::string& name) const override { return tensors_.count(gguf_name(name, sandwich_)) != 0; }
++    bool has(const std::string& name) const override { return tensors_.count(gguf_name(name, sandwich_, post_norm_)) != 0; }
+     /// Raw bytes of a tensor (the GGUF's own block layout; a view into the mapping).
+     const uint8_t* raw(const std::string& name, size_t* nbytes = nullptr) const override;
+     /// One embedding row as f32, dequantized from whatever type stores it.
+@@ -60,6 +60,8 @@ public:
+     std::vector<float> f32(const std::string& name) const override;
+     /// The tensor's row-major [rows, cols] shape (GGUF stores it fastest-first).
+     const TensorMeta& meta(const std::string& name) const override;
++    /// The file's tensor names (llama.cpp's conventions).
++    std::vector<std::string> tensor_names() const;
+     /// One row of a [rows, dim] tensor as f32 (alias of embed_row).
+     void bf16_row(const std::string& name, size_t row, size_t dim, float* out) const override {
+         embed_row(name, row, dim, out);
+@@ -71,7 +73,8 @@ public:
+     /// HF-style name -> GGUF name (the manifest speaks the q4nx/HF convention;
+     /// a GGUF speaks llama.cpp's blk.N.attn_q one). Unknown names pass through.
+     /// `sandwich`: the GGUF has Gemma's post_ffw_norm, which changes one norm's meaning.
+-    static std::string gguf_name(const std::string& name, bool sandwich = false);
++    static std::string gguf_name(const std::string& name, bool sandwich = false,
++                                  bool post_norm = false);
+     /// GGUF metadata: string / u64 accessors (the config derivation's source).
+     bool kv_has(const std::string& key) const { return meta_.count(key) != 0; }
+     std::string kv_str(const std::string& key) const;
+@@ -87,6 +90,7 @@ private:
+     size_t data_base_ = 0;
+     std::map<std::string, TensorInfo> tensors_;
+     bool sandwich_ = false;
++    bool post_norm_ = false;
+     mutable std::map<std::string, TensorMeta> meta_cache_;  // row-major shapes, built on demand
+     std::map<std::string, std::string> meta_;       // everything as strings (the derivation's view)
+ #ifdef _WIN32
+diff --git a/src/open_qwen36/gguf_pack_test.cpp b/src/open_qwen36/gguf_pack_test.cpp
+index 57d2802..ceb37e8 100644
+--- a/src/open_qwen36/gguf_pack_test.cpp
++++ b/src/open_qwen36/gguf_pack_test.cpp
+@@ -144,6 +144,182 @@ BlocksQ6K make_blocks_q6k(unsigned rows, unsigned cols, std::mt19937_64& rng) {
+     return b;
+ }
+ 
++/// Q5_K tensor blocks and the reference dequant (llama.cpp's q5_k: a
++/// super-block of 256 values in 176 B -- fp16 d, fp16 dmin, 12 B of 6-bit
++/// scales, 32 B of the fifth bit, 128 B of 4-bit codes).
++struct BlocksQ5K {
++    unsigned rows, cols;
++    std::vector<uint8_t> bytes;          // rows * (cols/256) * 176
++    std::vector<float> values;           // rows * cols
++};
++
++BlocksQ5K make_blocks_q5k(unsigned rows, unsigned cols, std::mt19937_64& rng) {
++    const unsigned nbs = cols / 256;
++    BlocksQ5K b;
++    b.rows = rows;
++    b.cols = cols;
++    b.bytes.assign(static_cast<size_t>(rows) * nbs * 176, 0);
++    b.values.resize(static_cast<size_t>(rows) * cols);
++    const uint16_t dh = f32_to_f16(0.5f);            // exactly representable
++    const uint16_t mh = f32_to_f16(0.01f);           // exactly representable
++    for (unsigned r = 0; r < rows; ++r) {
++        for (unsigned sb = 0; sb < nbs; ++sb) {
++            uint8_t* p = b.bytes.data() + (static_cast<size_t>(r) * nbs + sb) * 176;
++            std::memcpy(p, &dh, 2);
++            std::memcpy(p + 2, &mh, 2);
++            // the 4-bit codes: per 64-value half, the low nibbles of 32 bytes then the high
++            for (int h = 0; h < 4; ++h)
++                for (int l = 0; l < 32; ++l) {
++                    const uint8_t q = static_cast<uint8_t>(rng() % 16);
++                    p[48 + h * 32 + l] |= (h & 1) ? static_cast<uint8_t>(q << 4) : q;
++                }
++            // the fifth bit: byte (v % 32) holds the bits of the values v, v+32, v+64, ...
++            for (int v = 0; v < 256; ++v)
++                if (rng() % 2) p[16 + v % 32] |= static_cast<uint8_t>(1u << (v / 32));
++            // the scales: eight 6-bit pairs, packed as the reader unpacks them
++            // (the first four pairs in the low six bits of bytes 0..3 (scale) and 4..7
++            // (min); the last four split a byte's high nibbles and top two bits)
++            for (int j = 0; j < 8; ++j) {
++                const uint8_t sc = static_cast<uint8_t>(rng() % 64), m = static_cast<uint8_t>(rng() % 64);
++                if (j < 4) {
++                    p[4 + j] |= static_cast<uint8_t>(sc & 63);                  // the scales array is p+4
++                    p[8 + j] |= static_cast<uint8_t>(m & 63);
++                } else {
++                    const int j4 = j - 4;
++                    p[12 + j4] |= static_cast<uint8_t>(sc & 0x0F);             // the scale's low four bits
++                    p[4 + j4] |= static_cast<uint8_t>((sc >> 4) & 0x03) << 6;  // its top two bits
++                    p[12 + j4] |= static_cast<uint8_t>((m & 0x0F) << 4);      // the min's low four bits
++                    p[8 + j4] |= static_cast<uint8_t>((m >> 4) & 0x03) << 6;   // its top two bits
++                }
++            }
++            // the reference, from the bytes that hit the file
++            float* y = b.values.data() + static_cast<size_t>(r) * cols + sb * 256;
++            for (int v = 0; v < 256; ++v) {
++                const int h = (v / 64) * 64;
++                const uint8_t byte = p[48 + h / 2 + (v % 32)];
++                const uint8_t nib = (v % 64) < 32 ? (byte & 0xF) : (byte >> 4);
++                const uint8_t fifth = (p[16 + v % 32] >> (v / 32)) & 1;
++                const int j = v / 32;
++                uint8_t sc, m;
++                if (j < 4) {
++                    sc = p[4 + j] & 63;
++                    m = p[8 + j] & 63;
++                } else {
++                    const int j4 = j - 4;
++                    sc = static_cast<uint8_t>((p[12 + j4] & 0x0F) | ((p[4 + j4] >> 6) << 4));
++                    m = static_cast<uint8_t>(((p[12 + j4] >> 4) & 0x0F) | ((p[8 + j4] >> 6) << 4));
++                }
++                // the exact fp16 values that hit the file (f32_to_f16 truncates)
++                y[v] = fp16_to_f32(dh) * sc * (nib | (fifth << 4)) - fp16_to_f32(mh) * m;
++            }
++        }
++    }
++    return b;
++}
++
++/// A one-tensor GGUF carrying a single Q5_K tensor (rows x 256).
++std::string write_gguf_q5k(const fs::path& dir, const BlocksQ5K& b) {
++    std::vector<uint8_t> f;
++    f.insert(f.end(), {'G', 'G', 'U', 'F'});
++    put_u32(f, 3);
++    put_u64(f, 1);                                    // tensors
++    put_u64(f, 1);                                    // kv pairs
++    put_kv_str(f, "general.architecture", "llama");
++    const auto align32 = [](size_t n) { return (n + 31) / 32 * 32; };
++    put_str(f, "blk.0.attn_q.weight");
++    put_u32(f, 2);
++    put_u64(f, b.cols);                               // cols (fastest)
++    put_u64(f, b.rows);
++    put_u32(f, 13);                                   // GGML_TYPE_Q5_K
++    put_u64(f, 0);
++    const size_t data_off = align32(f.size());
++    while (f.size() < data_off) f.push_back(0);
++    f.insert(f.end(), b.bytes.begin(), b.bytes.end());
++    const fs::path out = dir / "test-q5k.gguf";
++    std::ofstream of(out, std::ios::binary);
++    of.write(reinterpret_cast<const char*>(f.data()), static_cast<std::streamsize>(f.size()));
++    return out.string();
++}
++
++/// IQ4_XS tensor blocks and the reference dequant (llama.cpp's iq4_xs: a
++/// super-block of 256 values in 136 B -- fp16 d, 2 B of 2-bit scale highs, 4 B
++/// of 4-bit scale lows, 128 B of 4-bit codes; eight groups of 32 values, each
++/// with a signed 6-bit scale, and the same sixteen-entry codebook as iq4_nl).
++struct BlocksIQ4XS {
++    unsigned rows, cols;
++    std::vector<uint8_t> bytes;          // rows * (cols/256) * 136
++    std::vector<float> values;           // rows * cols
++};
++
++BlocksIQ4XS make_blocks_iq4xs(unsigned rows, unsigned cols, std::mt19937_64& rng) {
++    static const int8_t kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
++                                  1, 13, 25, 38, 53, 69, 89, 113};
++    const unsigned nbs = cols / 256;
++    BlocksIQ4XS b;
++    b.rows = rows;
++    b.cols = cols;
++    b.bytes.assign(static_cast<size_t>(rows) * nbs * 136, 0);
++    b.values.resize(static_cast<size_t>(rows) * cols);
++    const uint16_t dh = f32_to_f16(0.25f);            // exactly representable
++    for (unsigned r = 0; r < rows; ++r) {
++        for (unsigned sb = 0; sb < nbs; ++sb) {
++            uint8_t* p = b.bytes.data() + (static_cast<size_t>(r) * nbs + sb) * 136;
++            std::memcpy(p, &dh, 2);                    // d
++            // the codes: 16 bytes per group of 32 values
++            for (int g = 0; g < 8; ++g)
++                for (int j = 0; j < 16; ++j) p[8 + g * 16 + j] = static_cast<uint8_t>(rng() % 256);
++            // the scales: eight signed 6-bit values, the low four bits in scales_l
++            // (two per byte) and the high two bits in scales_h (two bits per group)
++            uint8_t sc[8];
++            for (int g = 0; g < 8; ++g) sc[g] = static_cast<uint8_t>(rng() % 64);
++            for (int g = 0; g < 8; ++g) {
++                const uint8_t lo = sc[g] & 0xF, hi = (sc[g] >> 4) & 0x3;
++                if (g & 1) p[4 + g / 2] |= static_cast<uint8_t>(lo << 4);
++                else p[4 + g / 2] |= lo;
++                p[2] |= static_cast<uint8_t>(hi << (2 * g));
++            }
++            // the reference, from the bytes that hit the file
++            float* y = b.values.data() + static_cast<size_t>(r) * cols + sb * 256;
++            for (int g = 0; g < 8; ++g) {
++                const uint8_t lo = (g & 1) ? static_cast<uint8_t>(p[4 + g / 2] >> 4)
++                                           : static_cast<uint8_t>(p[4 + g / 2] & 0xF);
++                const uint8_t hi = static_cast<uint8_t>((p[2] >> (2 * g)) & 0x3);
++                const float dl = 0.25f * static_cast<float>(static_cast<int>(lo | (hi << 4)) - 32);
++                for (int j = 0; j < 16; ++j) {
++                    const uint8_t q = p[8 + g * 16 + j];
++                    y[g * 32 + j] = dl * kv[q & 0xF];
++                    y[g * 32 + 16 + j] = dl * kv[q >> 4];
++                }
++            }
++        }
++    }
++    return b;
++}
++
++/// A one-tensor GGUF carrying a single IQ4_XS tensor (rows x 256).
++std::string write_gguf_iq4xs(const fs::path& dir, const BlocksIQ4XS& b) {
++    std::vector<uint8_t> f;
++    f.insert(f.end(), {'G', 'G', 'U', 'F'});
++    put_u32(f, 3);
++    put_u64(f, 1);                                    // tensors
++    put_u64(f, 1);                                    // kv pairs
++    put_kv_str(f, "general.architecture", "llama");
++    const auto align32 = [](size_t n) { return (n + 31) / 32 * 32; };
++    put_str(f, "blk.0.attn_q.weight");
++    put_u32(f, 2);
++    put_u64(f, b.cols);                               // cols (fastest)
++    put_u64(f, b.rows);
++    put_u32(f, 23);                                   // GGML_TYPE_IQ4_XS
++    put_u64(f, 0);                                    // RELATIVE offset (0: data sits at the data base)
++    const size_t data_off = align32(f.size());        // == the GGUF's data base
++    while (f.size() < data_off) f.push_back(0);
++    f.insert(f.end(), b.bytes.begin(), b.bytes.end());
++    const fs::path out = dir / "test-iq4xs.gguf";
++    std::ofstream of(out, std::ios::binary);
++    of.write(reinterpret_cast<const char*>(f.data()), static_cast<std::streamsize>(f.size()));
++    return out.string();
++}
++
+ /// A one-tensor GGUF carrying a single Q6_K tensor (rows x 256).
+ std::string write_gguf_q6k(const fs::path& dir, const BlocksQ6K& b) {
+     std::vector<uint8_t> f;
+@@ -410,6 +586,46 @@ int main() {
+         if (bad6) return 1;
+     }
+ 
++    // ---- embed_row (IQ4_XS: the 6-bit group scales and the codebook)
++    {
++        BlocksIQ4XS iq = make_blocks_iq4xs(4, 512, rng);      // 4 rows x 2 super-blocks
++        GgufFile giq(write_gguf_iq4xs(dir, iq));
++        std::vector<float> row(512);
++        bool badiq = false;
++        for (unsigned r = 0; r < 4 && !badiq; ++r) {
++            giq.embed_row("blk.0.attn_q.weight", r, 512, row.data());
++            for (size_t i = 0; i < 512; ++i)
++                if (f32_bits(row[i]) != f32_bits(iq.values[static_cast<size_t>(r) * 512 + i])) {
++                    std::printf("FAIL embed_row(IQ4_XS)[r%u i%zu]: got %.9g want %.9g\n", r, i, row[i],
++                                iq.values[static_cast<size_t>(r) * 512 + i]);
++                    badiq = true;
++                    break;
++                }
++        }
++        std::printf("%s embed_row IQ4_XS (group scales and codebook bit-exact)\n", badiq ? "FAIL" : "ok");
++        if (badiq) return 1;
++    }
++
++    // ---- embed_row (Q5_K: the sixth-bit codes and the five-bit values)
++    {
++        BlocksQ5K q5 = make_blocks_q5k(4, 512, rng);      // 4 rows x 2 super-blocks
++        GgufFile g5(write_gguf_q5k(dir, q5));
++        std::vector<float> row(512);
++        bool bad5 = false;
++        for (unsigned r = 0; r < 4 && !bad5; ++r) {
++            g5.embed_row("blk.0.attn_q.weight", r, 512, row.data());
++            for (size_t i = 0; i < 512; ++i)
++                if (f32_bits(row[i]) != f32_bits(q5.values[static_cast<size_t>(r) * 512 + i])) {
++                    std::printf("FAIL embed_row(Q5_K)[r%u i%zu]: got %.9g want %.9g\n", r, i, row[i],
++                                q5.values[static_cast<size_t>(r) * 512 + i]);
++                    bad5 = true;
++                    break;
++                }
++        }
++        std::printf("%s embed_row Q5_K (the fifth bit and the 6-bit scales bit-exact)\n", bad5 ? "FAIL" : "ok");
++        if (bad5) return 1;
++    }
++
+     std::printf("GGUF-PACK OK\n");
+     return 0;
+ }
+diff --git a/src/open_qwen36/manifest.cpp b/src/open_qwen36/manifest.cpp
+index cacf565..59548cd 100644
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -717,34 +717,51 @@ std::string Manifest::host_attention_refusal() const {
+     return "";
+ }
+ 
+-void Manifest::check_model(const json& config, const std::string& where) const {
++void Manifest::check_model(const json& config, const std::string& where, bool model_type) const {
+     if (!config.is_object()) fail(where, "config.json is not an object");
+     auto lacks = [&](const std::string& key) { fail(where, "config.json lacks '" + key + "'"); };
++    // A VLM config nests the text tower's fields under "text_config" (Qwen3.5's
++    // published form: the model_type says qwen3_5, the tower says qwen3_5_text).
++    // The recipes read both forms, so the check does too: the field is looked up
++    // at the top level first, then in the text tower.
++    const json* text = (config.contains("text_config") && config["text_config"].is_object())
++                           ? &config["text_config"] : nullptr;
++    auto find = [&](const std::string& key) -> const json* {
++        if (config.contains(key)) return &config[key];
++        if (text && text->contains(key)) return &(*text)[key];
++        return nullptr;
++    };
+     for (const auto& [key, want] : hf_config_check.items()) {
++        const json* got_ptr = find(key);
+         if (key == "model_type") {
+-            if (!config.contains(key)) lacks(key);
++            if (!model_type) continue;                 // a GGUF's arch is not a model_type
++            if (!got_ptr) lacks(key);
+             bool ok = false;
+-            for (const auto& t : want) ok |= (config[key] == t);
+-            if (!ok) fail(where, "config.json model_type " + config[key].dump() + " is not one this kernel set serves (" + want.dump() + ")");
++            for (const auto& t : want) ok |= (*got_ptr == t);
++            if (!ok) fail(where, "config.json model_type " + got_ptr->dump() + " is not one this kernel set serves (" + want.dump() + ")");
+         } else if (key == "layer_types") {
+             std::vector<std::string> got;
+-            if (config.contains("layer_types")) {
+-                got = config["layer_types"].get<std::vector<std::string>>();
+-            } else if (config.contains("full_attention_interval") && config.contains("num_hidden_layers")) {
+-                int iv = config["full_attention_interval"].get<int>(), n = config["num_hidden_layers"].get<int>();
+-                if (iv <= 0) fail(where, "config.json full_attention_interval must be positive");
+-                for (int l = 0; l < n; ++l) got.push_back((l + 1) % iv == 0 ? "full_attention" : "linear_attention");
++            if (got_ptr) {
++                got = got_ptr->get<std::vector<std::string>>();
+             } else {
+-                lacks("layer_types");
++                const json* iv_j = find("full_attention_interval");
++                const json* n_j = find("num_hidden_layers");
++                if (iv_j && n_j) {
++                    int iv = iv_j->get<int>(), n = n_j->get<int>();
++                    if (iv <= 0) fail(where, "config.json full_attention_interval must be positive");
++                    for (int l = 0; l < n; ++l) got.push_back((l + 1) % iv == 0 ? "full_attention" : "linear_attention");
++                } else {
++                    lacks("layer_types");
++                }
+             }
+             if (got != want.get<std::vector<std::string>>())
+                 fail(where, "config.json layer_types differ from the kernel set's (" + std::to_string(got.size()) + " layers)");
+         } else {
+             // an absent key means its default when the manifest names one (Phi-3's optional
+             // fields); the comparison is the same either way, so the check stays two-way
+-            const bool present = config.contains(key);
++            const bool present = got_ptr != nullptr;
+             if (!present && !hf_config_defaults.contains(key)) lacks(key);
+-            const json& got = present ? config[key] : hf_config_defaults[key];
++            const json& got = present ? *got_ptr : hf_config_defaults[key];
+             if (got != want)
+                 fail(where, "config.json " + key + " = " + got.dump() + (present ? "" : " (absent: its default)") +
+                                  ", the kernel set was built for " + want.dump());
+diff --git a/src/open_qwen36/manifest.hpp b/src/open_qwen36/manifest.hpp
+index d7804d8..b2271ab 100644
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -261,7 +261,8 @@ struct Manifest {
+     /// Throws naming the first key of config.json that disagrees with the manifest. A key
+     /// config.json lacks takes its hf_config_defaults value when there is one, and is
+     /// refused as lacking otherwise.
+-    void check_model(const nlohmann::json& config, const std::string& where) const;
++    void check_model(const nlohmann::json& config, const std::string& where,
++                   bool model_type = true) const;
+     const LayerType& layer_type(size_t layer) const;
+     /// Why the host attention (OPEN-HOST-ATTN-GUARD) cannot compute this model, or "" when it can.
+     /// It implements K2's attention only; any other family is refused by name.
+diff --git a/src/open_qwen36/manifest_test.cpp b/src/open_qwen36/manifest_test.cpp
+index 84a367d..59519c1 100644
+--- a/src/open_qwen36/manifest_test.cpp
++++ b/src/open_qwen36/manifest_test.cpp
+@@ -185,9 +185,11 @@ int main(int argc, char** argv) {
+           m.globals.at("gemm_x_k2048") == 2048 * 256 * 2 && m.globals.at("gemm_y_n12288") == 12288 * 256 * 4 &&
+           m.globals.at("gemm_x_k512") == 512 * 256 * 2 && m.globals.at("gemm_y_n1024") == 1024 * 256 * 4,
+           "route contexts, kernels and globals");
+-    check(m.files().size() == 59, "59 files named (8 xclbin + 51 insts: the route adds one GEMM context whatever K, the MoE one, seven "
+-                                  "streams, the token-batched expert kernel one context and six streams, and the attention GEMM one "
+-                                  "context and 32 streams)");
++    // the q4_1 set: 8 xclbin + 51 insts (the route adds one GEMM context whatever K, the MoE
++    // one, seven streams, the token-batched expert kernel one context and six streams, and
++    // the attention GEMM one context and 32 streams). The MoE family ships no GGUF-direct
++    // twin (its expert pack ops have no GGUF form yet), so the count is the set's own.
++    check(m.files().size() == 59, "59 files named (8 xclbin + 51 insts)");
+     // the attention products on the NPU (OPEN-PREFILL-ATTN): a stream per 256 rows of window, both
+     // products, on one xclbin; full attention only
+     const auto& ab = fg.attn_block;
+@@ -808,14 +810,18 @@ int main(int argc, char** argv) {
+             check(!why.empty() && why.find("'" + f.family + "'") != std::string::npos,
+                   "host attention: " + f.family + " is refused by name");
+             if (f.family == "qwen3") {
+-                Manifest k = f;
++                // A Manifest holds a unique_ptr (the GGUF-direct twin), so it is not
++                // copyable: each variant is a fresh load of the same file.
++                Manifest k = Manifest::load(argv[i]);
+                 k.family = "k2";
+                 check(k.host_attention_refusal().empty(), "host attention: K2's shape (qwen3_4b's geometry, family k2) is accepted");
+-                Manifest half = k;
++                Manifest half = Manifest::load(argv[i]);
++                half.family = "k2";
+                 half.rotary_dim = half.rotary_dim / 2;
+                 check(half.host_attention_refusal().find("geometry") != std::string::npos,
+                       "host attention: a K2 manifest with a partial rotation is refused on geometry");
+-                Manifest odd = k;
++                Manifest odd = Manifest::load(argv[i]);
++                odd.family = "k2";
+                 const size_t hd = odd.hf_config_check["head_dim"].get<size_t>() - 1;
+                 odd.hf_config_check["head_dim"] = hd;
+                 odd.rotary_dim = hd;
+@@ -826,7 +832,8 @@ int main(int argc, char** argv) {
+                 }
+                 check(odd.host_attention_refusal().find("geometry") != std::string::npos,
+                       "host attention: a K2 manifest with an odd head_dim is refused on geometry");
+-                Manifest wide = k;
++                Manifest wide = Manifest::load(argv[i]);
++                wide.family = "k2";
+                 wide.layer_types.begin()->second.gemm_block.qw += 1;
+                 check(wide.host_attention_refusal().find("geometry") != std::string::npos,
+                       "host attention: a K2 manifest whose layer qw disagrees with heads * head_dim is refused");
+diff --git a/src/open_qwen36/pools.cpp b/src/open_qwen36/pools.cpp
+index 8c3c85b..be25869 100644
+--- a/src/open_qwen36/pools.cpp
++++ b/src/open_qwen36/pools.cpp
+@@ -100,6 +100,7 @@ const uint8_t* raw(const WeightFile& m, const std::string& name, size_t need, si
+ 
+ constexpr size_t Q8_CHUNK = 8704;    // 256 bf16 scales then 8192 int8 codes
+ constexpr size_t Q4_CHUNK = 5120;    // 256 bf16 d, 256 bf16 m, then 4096 B of nibbles
++constexpr size_t GGUF_CHUNK = 6144;  // the GGUF-direct twin's f32-scale law: 1024 B d, 1024 B m, codes
+ constexpr size_t Q4_HALF = 2560;     // GPT-OSS's chunk: the same layout over 32 rows x 128 columns
+ constexpr size_t Q4K_CHUNK = 4736;   // 256 uint8 scales, 256 uint8 mins, 4096 B of nibbles, 32 bf16 S, 32 bf16 M
+ constexpr size_t Q8H_SCALES = 256;   // a half-tile's 128 bf16 scales
+@@ -252,9 +253,29 @@ void split_q4_1_chunks(const uint8_t* src, size_t nch, bool hi, uint8_t* dst) {
+     }
+ }
+ 
++/// A consts tensor's values as bf16, decoded from whatever the file holds.
++///
++/// The q4nx container stores these weights bf16 (the kernel's layout), so the
++/// bytes are read in place. A GGUF stores them f32 -- or, for the SSM
++/// projections, quantized (llama.cpp quantizes what it quantizes) -- so they
++/// are decoded and converted to the same bf16 values the container holds.
++/// Returns false when the file's bytes are already the wanted ones.
++bool consts_as_bf16(const WeightFile& f, const std::string& name, size_t count, std::vector<uint8_t>& out) {
++    size_t n = 0;
++    f.raw(name, &n);                                  // the file's own bytes: a quantized
++    if (n == count * 2) return false;                // tensor is shorter than its bf16 form
++    const std::vector<float> v = f.f32(name);
++    if (v.size() != count)
++        fail(name + " is " + std::to_string(v.size()) + " values, not " + std::to_string(count));
++    out.resize(count * 2);
++    for (size_t i = 0; i < count; ++i) {
++        const uint16_t b = f32_to_bf16(v[i]);
++        std::memcpy(out.data() + 2 * i, &b, 2);
++    }
++    return true;
++}
++
+ void pack_norm(const WeightFile& f, const std::string& name, size_t bytes, uint8_t* dst) {
+-    // A small weight (a layernorm) as bf16: the q4nx container stores it bf16;
+-    // a GGUF may store it f32 / f16 / bf16 -- convert exactly as the container does.
+     size_t n = 0;
+     const uint8_t* src = raw(f, name, 0, &n);
+     auto* g = dynamic_cast<const GgufFile*>(&f);
+@@ -281,6 +302,11 @@ void pack_norm(const WeightFile& f, const std::string& name, size_t bytes, uint8
+             break;
+         }
+         case GgufFile::Type::F32: {
++            if (n == bytes) {
++                // The slot holds f32 values (the SSM's per-head scalars): copy them.
++                std::memcpy(dst, src, n);
++                break;
++            }
+             if (n != 2 * bytes) fail(name + " is " + std::to_string(n) + " B of f32, the slot holds " + std::to_string(bytes) + " B of bf16");
+             for (size_t i = 0; i < bytes / 2; ++i) {
+                 float v;
+@@ -527,22 +553,40 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+         if (op.nch == 0 || op.in_dim == 0) fail("std_perm_gguf " + name + " without nch / in_dim");
+         const GgufFile& g = dynamic_cast<const GgufFile&>(m);
+         const GgufFile::TensorInfo& t = g.tensor(name);
+-        // Q8_0 / K-quant tensors (typical GGUF lm_head / tied embeddings) are
+-        // dequantized per row and re-quantized here to the pool's q4 layout
+-        // with fp16 scales -- the same conversion q4nx-build does offline. The
+-        // matmul body of the repo stays untouched (Q4_1 etc. go through the
+-        // byte-exact path below).
++        // Q8_0 / K-quant / i-quant tensors (typical GGUF lm_head / tied embeddings, and
++        // the IQ4_XS weights most GGUF downloads ship) are dequantized per row and
++        // re-quantized here to the pool's q4 layout with fp16 scales -- the same
++        // conversion q4nx-build does offline. The matmul body of the repo stays
++        // untouched (Q4_1 etc. go through the byte-exact path below).
+         const bool kq = t.type == GgufFile::Type::Q8_0 || t.type == GgufFile::Type::Q4_K ||
+-                        t.type == GgufFile::Type::Q6_K;
++                        t.type == GgufFile::Type::Q5_K || t.type == GgufFile::Type::Q6_K ||
++                        t.type == GgufFile::Type::IQ4_NL || t.type == GgufFile::Type::IQ4_XS;
+         if (!kq && t.type != GgufFile::Type::Q4_0 && t.type != GgufFile::Type::Q4_1)
+             fail(name + " is " + GgufFile::type_name(t.type) + "; std_perm_gguf packs Q4_0/Q4_1 and "
+-                 "requantizes Q8_0/Q4_K/Q6_K (convert K-quants with q4nx-build otherwise)");
++                 "requantizes Q8_0/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS (convert the others with q4nx-build)");
+         const bool has_min = t.type == GgufFile::Type::Q4_1 || kq;
+         const size_t blk = has_min ? 20 : 18;
++        // Which chunk law the POOL wants (m.chunk_bytes): the GGUF-direct twin
++        // widens the block scales exactly to f32 (planes of 1024 B, codes at
++        // 2048), and the q4_1 twin this file also serves for the f32-numerics
++        // bisect keeps the q4nx law -- the same codes with the scales rounded
++        // to bf16 (planes of 512 B, codes at 1024). The GGUF scale was fp16 to
++        // begin with, so the bf16 rounding is the only quality step, and the
++        // twin that reads it is the one every shipped q4nx model runs on.
++        if (ch != Q4_CHUNK && ch != GGUF_CHUNK)
++            fail("std_perm_gguf " + name + ": pool chunk " + std::to_string(ch) +
++                 " is neither the q4_1 law nor the GGUF-direct twin's f32 one");
++        const bool f32_law = ch == GGUF_CHUNK;
++        const size_t M_OFF = f32_law ? 1024 : 512, CODES = f32_law ? 2048 : 1024,
++                     SD = f32_law ? 4 : 2;
+         const size_t nb = op.in_dim / 32;                        // k blocks per row
+         size_t n = 0;
+         const uint8_t* src = raw(m, name, 0, &n);
+-        const uint64_t out_dim = op.nch / (op.in_dim / 256) * 32;
++        // The tensor's rows: the file holds the whole projection, and the plan
++        // may read a piece of it (the qwen35 family's gated q is two halves of
++        // one tensor, the second op's chunk0 pointing at the second half).
++        const uint64_t rows = t.dims.size() > 1 ? t.dims[1] : (t.dims.empty() ? 0 : t.dims[0]);
++        const uint64_t out_dim = op.chunk0 ? rows : (op.nch / (op.in_dim / 256) * 32);
+         if (!kq && n < static_cast<size_t>(out_dim) * nb * blk)
+             fail(name + " is " + std::to_string(n) + " B, the plan needs " +
+                  std::to_string(static_cast<uint64_t>(out_dim) * nb * blk));
+@@ -552,11 +596,14 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+         std::vector<float> rd(kq ? op.in_dim : 0);
+         for (size_t c = 0; c < op.nch; ++c) {
+             uint8_t* d = dst + op.dst + c * ch;
+-            const size_t row0 = 32 * (perm[c] / ncol);           // rows
+-            const size_t blk0 = (perm[c] % ncol) * 8;            // k blocks (32 values each)
++            // the file's chunk this pool chunk reads: the op's range (chunk0)
++            // and the permutation inside it
++            const size_t fc = op.chunk0 + perm[c];
++            const size_t row0 = 32 * (fc / ncol);                 // rows
++            const size_t blk0 = (fc % ncol) * 8;                  // k blocks (32 values each)
+             for (size_t r = 0; r < 32; ++r) {
+                 const uint64_t row = row0 + r;
+-                if (row >= out_dim) break;                       // padded rows: zeroed scales/codes
++                if (row >= rows) break;                           // padded rows: zeroed scales/codes
+                 const uint8_t* srow = src + row * nb * blk;
+                 const uint8_t rb = static_cast<uint8_t>(r / 16), rl = static_cast<uint8_t>(r % 16);
+                 if (kq) g.embed_row(name, row, op.in_dim, rd.data());   // exact f32 row, once
+@@ -578,8 +625,14 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+                         um = f32_to_fp16(mraw);
+                         const float df = fp16_to_f32(ud), mf = fp16_to_f32(um);
+                         const float inv = df > 0.f ? 1.f / df : 0.f;
+-                        std::memcpy(d + 4 * (kb * 32 + r), &df, 4);
+-                        std::memcpy(d + 1024 + 4 * (kb * 32 + r), &mf, 4);
++                        if (f32_law) {
++                            std::memcpy(d + SD * (kb * 32 + r), &df, 4);
++                            std::memcpy(d + M_OFF + SD * (kb * 32 + r), &mf, 4);
++                        } else {
++                            const uint16_t db = f32_to_bf16(df), mb = f32_to_bf16(mf);
++                            std::memcpy(d + SD * (kb * 32 + r), &db, 2);
++                            std::memcpy(d + M_OFF + SD * (kb * 32 + r), &mb, 2);
++                        }
+                         // codes: value i at nibble (kb*32+i, r), i+16 at (p0+256)
+                         uint8_t nib[16];
+                         for (size_t i = 0; i < 16; ++i) {
+@@ -590,10 +643,10 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+                         }
+                         for (size_t i = 0; i < 16; ++i) {
+                             const size_t p0 = rb * 4096 + (kb * 32 + i) * 16 + rl;
+-                            d[2048 + (p0 >> 1)] |= (p0 & 1) ? static_cast<uint8_t>(nib[i] << 4)
+-                                                            : (nib[i] & 0xF);
++                            d[CODES + (p0 >> 1)] |= (p0 & 1) ? static_cast<uint8_t>(nib[i] << 4)
++                                                             : (nib[i] & 0xF);
+                             const size_t p1 = p0 + 256;              // i + 16: the block's high half
+-                            d[2048 + (p1 >> 1)] |= (p1 & 1) ? (nib[i] & 0xF0) : (nib[i] >> 4);
++                            d[CODES + (p1 >> 1)] |= (p1 & 1) ? (nib[i] & 0xF0) : (nib[i] >> 4);
+                         }
+                         continue;
+                     }
+@@ -601,16 +654,22 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+                     if (has_min) std::memcpy(&um, b + 2, 2);
+                     const float df = fp16_to_f32(ud);
+                     const float mf = has_min ? fp16_to_f32(um) : -8.f * df;
+-                    std::memcpy(d + 4 * (kb * 32 + r), &df, 4);
+-                    std::memcpy(d + 1024 + 4 * (kb * 32 + r), &mf, 4);
++                    if (f32_law) {
++                        std::memcpy(d + SD * (kb * 32 + r), &df, 4);
++                        std::memcpy(d + M_OFF + SD * (kb * 32 + r), &mf, 4);
++                    } else {
++                        const uint16_t db = f32_to_bf16(df), mb = f32_to_bf16(mf);
++                        std::memcpy(d + SD * (kb * 32 + r), &db, 2);
++                        std::memcpy(d + M_OFF + SD * (kb * 32 + r), &mb, 2);
++                    }
+                     // codes: block nibbles (two K per byte) -> two rows per byte at one K
+                     for (size_t i = 0; i < 16; ++i) {
+                         const uint8_t byte = b[(has_min ? 4 : 2) + i];
+                         const uint8_t lo = byte & 0xF, hi = byte >> 4;   // GGUF: value i | value i+16
+                         const size_t p0 = rb * 4096 + (kb * 32 + i) * 16 + rl;
+-                        d[2048 + (p0 >> 1)] |= (p0 & 1) ? lo << 4 : lo;   // value j = lo
++                        d[CODES + (p0 >> 1)] |= (p0 & 1) ? lo << 4 : lo;   // value j = lo
+                         const size_t p1 = p0 + 256;              // i + 16: the block's high half
+-                        d[2048 + (p1 >> 1)] |= (p1 & 1) ? hi << 4 : hi;   // value j + 16 = hi
++                        d[CODES + (p1 >> 1)] |= (p1 & 1) ? hi << 4 : hi;   // value j + 16 = hi
+                     }
+                 }
+             }
+@@ -723,13 +782,123 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+         if (!nk) fail("lmhead_q8 " + name + ": in_dim " + std::to_string(op.in_dim) + " is under one 256-wide k-tile");
+         size_t n = 0;
+         const uint8_t* src = raw(m, name, 0, &n);
+-        size_t nch = n / CH8;
+-        bounds(op, nch * CH8, dst_bytes);
+-        for (size_t k = 0; k < nch; ++k) {
+-            size_t s = k / per_band, r = k % per_band;
+-            size_t fch = (4 * s + r % 4) * nk + r / 4;
+-            std::memcpy(dst + op.dst + k * CH8, src + fch * CH8, CH8);
++        if (const auto* q = dynamic_cast<const Q4nxFile*>(&m)) {
++            // A q4nx container stores the head already in the engine's q8 chunk
++            // raster (Q8NX layout: 256 bf16 scales then 8192 int8 codes, in the
++            // supertile order mapped below) -- a straight copy with the supertile
++            // permutation is all that is needed.
++            size_t nch = n / CH8;
++            if (n % CH8)
++                fail(name + " is " + std::to_string(n) + " B, not a whole number of " +
++                     std::to_string(CH8) + "-byte q8 chunks");
++            bounds(op, nch * CH8, dst_bytes);
++            for (size_t k = 0; k < nch; ++k) {
++                size_t s = k / per_band, r = k % per_band;
++                size_t fch = (4 * s + r % 4) * nk + r / 4;
++                std::memcpy(dst + op.dst + k * CH8, src + fch * CH8, CH8);
++            }
++        } else {
++            // A raw GGUF stores the head row-major in its own quant. Two cases:
++            //   - Q8_0: the source already carries per-32-block int8 codes and an
++            //     fp16 scale, so this is a pure remap -- widen the scale to bf16
++            //     (the cast the converter does) and permute into the supertile
++            //     raster. No requantization, so the head is bit-identical to a
++            //     q4nx-build conversion of the same Q8_0 tensor.
++            //   - anything else (Q6_K, Q4_K, Q4_0, ...): dequantize each row to
++            //     f32 and requantize to int8 + bf16 scale per 32-value group,
++            //     matching the pool ops' kq path.
++            const GgufFile& g = dynamic_cast<const GgufFile&>(m);
++            const GgufFile::TensorInfo& t = g.tensor(name);
++            const uint64_t rows = t.dims.size() > 1 ? t.dims[1]
++                                : (t.dims.empty() ? 0 : t.dims[0]);
++            const size_t ncol = op.in_dim / 256;   // ktiles per row
++            if (rows == 0 || ncol == 0) fail(name + " has no rows / ktiles");
++            const bool q8_0 = (t.type == GgufFile::Type::Q8_0);
++            std::vector<float> rowbuf(op.in_dim);
++            // Q8_0 raw block size: 2 B fp16 d + 32 B int8 codes = 34 B per 32 values.
++            const size_t q8blk = 34, blocks_per_row = op.in_dim / 32;
++            for (uint64_t row = 0; row < rows; ++row) {
++                if (q8_0) {
++                    // read the raw Q8_0 blocks directly (embed_row would discard codes)
++                    const uint8_t* base = g.raw(name, nullptr);
++                    // offset into the tensor's data: row * blocks_per_row * 34
++                    const uint8_t* rp = base + row * blocks_per_row * q8blk;
++                    for (size_t kt = 0; kt < ncol; ++kt) {
++                        // raw GGUF is row-major: the pool reads chunks in plain
++                        // raster order, so no supertile permutation is applied
++                        // (the memcpy path above permutes because the q4nx
++                        // container stores the head in supertile order).
++                        const size_t k = (row / 32) * ncol + kt;
++                        if (k * CH8 + CH8 > dst_bytes) continue;
++                        const size_t base_col = kt * 256;
++                        const unsigned rr = static_cast<unsigned>(row % 32);
++                        for (unsigned b = 0; b < 8; ++b) {
++                            const uint8_t* blk = rp + (base_col / 32 + b) * q8blk;
++                            uint16_t d16;
++                            std::memcpy(&d16, blk, 2);
++                            // widen fp16 -> bf16 via RNE (the converter's cast)
++                            const float dval = [&](){ uint32_t u = d16; u = (u & 0x7FFFu) << 13; // approximate
++                                // use proper fp16->f32 then bf16_rne
++                                float f; uint32_t fu;
++                                // fp16 to f32
++                                uint32_t sign = (d16 & 0x8000u) << 16;
++                                uint32_t exp = (d16 >> 10) & 0x1Fu;
++                                uint32_t mant = d16 & 0x3FFu;
++                                if (exp == 0) { if (mant) { exp = 1; while (!(mant & 0x400u)) { mant <<= 1; exp--; } mant &= 0x3FFu; } }
++                                else if (exp == 31) { exp = 255; }
++                                else exp += 112;
++                                fu = sign | (exp << 23) | (mant << 13);
++                                memcpy(&f, &fu, 4);
++                                return f;
++                            }();
++                            uint16_t scale = bf16_rne(dval);
++                            std::memcpy(dst + op.dst + k * CH8 + 2 * (b * 32 + rr), &scale, 2);
++                            for (unsigned i = 0; i < 32; ++i) {
++                                int code = static_cast<int8_t>(blk[2 + i]);
++                                const unsigned ci = code_index(rr, b, i);
++                                dst[op.dst + k * CH8 + 512 + ci] = static_cast<uint8_t>(code);
++                            }
++                        }
++                    }
++                } else {
++                    g.embed_row(name, row, op.in_dim, rowbuf.data());
++                    for (size_t kt = 0; kt < ncol; ++kt) {
++                        // raw GGUF is row-major: the pool reads chunks in plain
++                        // raster order, so no supertile permutation is applied
++                        // (the memcpy path above permutes because the q4nx
++                        // container stores the head in supertile order).
++                        const size_t k = (row / 32) * ncol + kt;
++                        if (k * CH8 + CH8 > dst_bytes) continue;
++                        const size_t base_col = kt * 256;
++                        const unsigned rr = static_cast<unsigned>(row % 32);
++                        for (unsigned b = 0; b < 8; ++b) {
++                            float vals[32];
++                            float mx = 0.f;
++                            bool finite = true;
++                            for (unsigned i = 0; i < 32; ++i) {
++                                vals[i] = rowbuf[base_col + b * 32 + i];
++                                if (!std::isfinite(vals[i])) { finite = false; break; }
++                                const float a = vals[i] < 0.f ? -vals[i] : vals[i];
++                                if (a > mx) mx = a;
++                            }
++                            if (!finite) continue;
++                            uint16_t scale = (mx > 0.f) ? bf16_rne(mx / 127.f) : 0;
++                            const float sf = bf16_to_f32(scale);
++                            const float inv = (sf > 0.f) ? 1.f / sf : 0.f;
++                            std::memcpy(dst + op.dst + k * CH8 + 2 * (b * 32 + rr), &scale, 2);
++                            for (unsigned i = 0; i < 32; ++i) {
++                                int q = (int)std::lround(vals[i] * inv);
++                                if (q < -127) q = -127;
++                                if (q > 127) q = 127;
++                                const unsigned ci = code_index(rr, b, i);
++                                dst[op.dst + k * CH8 + 512 + ci] = static_cast<uint8_t>(q);
++                            }
++                        }
++                    }
++                }
++            }
+         }
++
+     } else if (op.op == "transpose_banked") {
+         const std::string name = with_layer(op.tensor, layer);
+         const uint64_t rows = op.rows, cols = op.cols, elem = op.elem;
+@@ -757,10 +926,15 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+         if (dr < rows) fail("transpose " + name + ": dst_rows " + std::to_string(dr) +
+                             " is narrower than rows " + std::to_string(rows));
+         size_t n = 0;
+-        const uint8_t* src = raw(m, name, rows * cols * elem, &n);
+-        if (n != rows * cols * elem)
+-            fail(name + " is " + std::to_string(n) + " B, not a [" + std::to_string(rows) + ", " +
+-                 std::to_string(cols) + "] tensor of " + std::to_string(elem) + "-byte values");
++        const uint8_t* src = nullptr;
++        std::vector<uint8_t> tmp;
++        if (elem == 2 && consts_as_bf16(m, name, rows * cols, tmp)) src = tmp.data();
++        if (!src) {
++            src = raw(m, name, rows * cols * elem, &n);
++            if (n != rows * cols * elem)
++                fail(name + " is " + std::to_string(n) + " B, not a [" + std::to_string(rows) + ", " +
++                     std::to_string(cols) + "] tensor of " + std::to_string(elem) + "-byte values");
++        }
+         bounds(op, cols * dr * elem, dst_bytes);
+         transpose_bytes(src, rows, cols, elem, dr, dst + op.dst);
+     } else if (op.op == "conv_transpose") {
+@@ -769,9 +943,14 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+         const uint64_t taps = op.taps, groups = op.groups, width = op.width;
+         if (!taps || !groups || !width) fail("conv_transpose without taps / groups / width");
+         size_t n = 0;
+-        const uint8_t* src = raw(m, name, taps * groups * width * 2, &n);
+-        if (n != taps * groups * width * 2) fail(name + " is not bf16[" + std::to_string(taps) + ", " + std::to_string(groups * width) + "]");
+-        bounds(op, n, dst_bytes);
++        const uint8_t* src = nullptr;
++        std::vector<uint8_t> tmp;
++        if (consts_as_bf16(m, name, taps * groups * width, tmp)) src = tmp.data();
++        if (!src) {
++            src = raw(m, name, taps * groups * width * 2, &n);
++            if (n != taps * groups * width * 2) fail(name + " is not bf16[" + std::to_string(taps) + ", " + std::to_string(groups * width) + "]");
++        }
++        bounds(op, taps * groups * width * 2, dst_bytes);
+         for (uint64_t g = 0; g < groups; ++g)
+             for (uint64_t t = 0; t < taps; ++t)
+                 std::memcpy(dst + op.dst + (g * taps + t) * width * 2, src + (t * groups * width + g * width) * 2, width * 2);

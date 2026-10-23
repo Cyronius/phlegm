@@ -13,6 +13,14 @@ PRIHLOP and D-revv. `open_kernels/PROVENANCE.md` has the full history and the pe
 - **Xilinx/mlir-air**, MIT, and **Xilinx/mlir-aie**, Apache-2.0 WITH LLVM-exception: parts of
   `open_kernels/designs/whisper_fa/`, attributed at the point of use.
 
+## npu_offload/ and kernel validation tools
+
+Source imported from OpenFlowLM-Next, with original per-file notices retained.
+The NpuEmbeddings GEMM and elementwise additions identify MIT licensing;
+`npu_offload/gemm_rtp/gemm_pretiled.py` also credits AMD's mlir-aie whole-array
+example under Apache-2.0 WITH LLVM-exception. See `npu_offload/PROVENANCE.md`
+and `utilities/kernel-sync-sources.json` for source revisions and file hashes.
+
 ## phlegm-core/deps/XRT/
 
 Headers from **Xilinx/XRT** (https://github.com/Xilinx/XRT), Apache-2.0. phlegm-core uses them to build its C-ABI

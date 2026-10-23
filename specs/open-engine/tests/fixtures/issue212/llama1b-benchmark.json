@@ -1,0 +1,408 @@
+{
+  "hardware": "AMD Ryzen AI 9 HX PRO 370 / Strix NPU",
+  "context_capacity": 8192,
+  "pmode": "performance",
+  "warmups_per_size_variant": 1,
+  "repetitions_per_size_variant": 3,
+  "model_sha256": "80a05efc90c54839e3ba6badc4988048fe5854de7c49fc1abfd86a61792c0448",
+  "ids_sha256": "5e2c26b3f95173fae56eaeb0e8b205e073161de5d13ccbc4cfbfc46f9a03e777",
+  "env": {
+    "OMP_WAIT_POLICY": "PASSIVE"
+  },
+  "variants": {
+    "reference": {
+      "cli_sha256": "a78e481a587b74517e6c5cfd92e5450cc8942b30a707b27adb72b0165eeaabec",
+      "manifest_sha256": "158e7b28e8e441696247f40728b2ff9ad8246008c588c57b5fc207d6011a9758",
+      "attention_override": null
+    },
+    "candidate": {
+      "cli_sha256": "f3253b14125f207af9094434dfcb325b14673c3b7196f806611baaf32475a733",
+      "manifest_sha256": "ffc5d56cea0ffe93f2f77ef019b75707b7c12ed56b22e6224f6eab4b0428c5d5",
+      "attention_override": null
+    }
+  },
+  "summary": [
+    {
+      "variant": "reference",
+      "prompt_tokens": 1024,
+      "prefill_ms": {
+        "median": 8158.0,
+        "min": 8142.0,
+        "max": 8328.0
+      },
+      "prefill_tps": {
+        "median": 125.52096101985781,
+        "min": 122.95869356388089,
+        "max": 125.76762466224515
+      },
+      "decode_tps": {
+        "median": 36.07,
+        "min": 36.07,
+        "max": 36.37
+      }
+    },
+    {
+      "variant": "candidate",
+      "prompt_tokens": 1024,
+      "prefill_ms": {
+        "median": 3155.0,
+        "min": 3127.0,
+        "max": 3444.0
+      },
+      "prefill_tps": {
+        "median": 324.56418383518223,
+        "min": 297.32868757259,
+        "max": 327.4704189318836
+      },
+      "decode_tps": {
+        "median": 36.19,
+        "min": 36.16,
+        "max": 36.36
+      }
+    },
+    {
+      "variant": "reference",
+      "prompt_tokens": 2048,
+      "prefill_ms": {
+        "median": 24644.0,
+        "min": 24600.0,
+        "max": 24697.0
+      },
+      "prefill_tps": {
+        "median": 83.10339230644377,
+        "min": 82.92505162570353,
+        "max": 83.2520325203252
+      },
+      "decode_tps": {
+        "median": 27.96,
+        "min": 27.61,
+        "max": 28.03
+      }
+    },
+    {
+      "variant": "candidate",
+      "prompt_tokens": 2048,
+      "prefill_ms": {
+        "median": 7792.0,
+        "min": 7769.0,
+        "max": 8076.0
+      },
+      "prefill_tps": {
+        "median": 262.8336755646817,
+        "min": 253.59088657751363,
+        "max": 263.61179044922125
+      },
+      "decode_tps": {
+        "median": 28.1,
+        "min": 28.07,
+        "max": 28.13
+      }
+    },
+    {
+      "variant": "reference",
+      "prompt_tokens": 4096,
+      "prefill_ms": {
+        "median": 82651.0,
+        "min": 82599.0,
+        "max": 83653.0
+      },
+      "prefill_tps": {
+        "median": 49.55777909523176,
+        "min": 48.96417343071976,
+        "max": 49.588978074795094
+      },
+      "decode_tps": {
+        "median": 19.32,
+        "min": 18.77,
+        "max": 19.34
+      }
+    },
+    {
+      "variant": "candidate",
+      "prompt_tokens": 4096,
+      "prefill_ms": {
+        "median": 22063.0,
+        "min": 21487.0,
+        "max": 22254.0
+      },
+      "prefill_tps": {
+        "median": 185.650183565245,
+        "min": 184.05679877774782,
+        "max": 190.62689067808444
+      },
+      "decode_tps": {
+        "median": 19.32,
+        "min": 19.08,
+        "max": 19.37
+      }
+    }
+  ],
+  "samples": [
+    {
+      "prompt_tokens": 1024,
+      "prefill_ms": 3664.0,
+      "prefill_tps": 279.4759825327511,
+      "decode_tps": 35.9,
+      "allocation_log": [
+        "open_qwen36: buffer bytes: weights=785383424 prefill_extra=0 prefill_shared=608174080 state=268435456 constants=16777216 scratch=94371840 position_tables=8388608 context=8192"
+      ],
+      "variant": "candidate",
+      "repetition": -1,
+      "warmup": true
+    },
+    {
+      "prompt_tokens": 1024,
+      "prefill_ms": 8256.0,
+      "prefill_tps": 124.03100775193798,
+      "decode_tps": 36.14,
+      "allocation_log": [],
+      "variant": "reference",
+      "repetition": -1,
+      "warmup": true
+    },
+    {
+      "prompt_tokens": 1024,
+      "prefill_ms": 8158.0,
+      "prefill_tps": 125.52096101985781,
+      "decode_tps": 36.07,
+      "allocation_log": [],
+      "variant": "reference",
+      "repetition": 0,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 1024,
+      "prefill_ms": 3127.0,
+      "prefill_tps": 327.4704189318836,
+      "decode_tps": 36.36,
+      "allocation_log": [
+        "open_qwen36: buffer bytes: weights=785383424 prefill_extra=0 prefill_shared=608174080 state=268435456 constants=16777216 scratch=94371840 position_tables=8388608 context=8192"
+      ],
+      "variant": "candidate",
+      "repetition": 0,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 1024,
+      "prefill_ms": 3155.0,
+      "prefill_tps": 324.56418383518223,
+      "decode_tps": 36.16,
+      "allocation_log": [
+        "open_qwen36: buffer bytes: weights=785383424 prefill_extra=0 prefill_shared=608174080 state=268435456 constants=16777216 scratch=94371840 position_tables=8388608 context=8192"
+      ],
+      "variant": "candidate",
+      "repetition": 1,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 1024,
+      "prefill_ms": 8142.0,
+      "prefill_tps": 125.76762466224515,
+      "decode_tps": 36.37,
+      "allocation_log": [],
+      "variant": "reference",
+      "repetition": 1,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 1024,
+      "prefill_ms": 8328.0,
+      "prefill_tps": 122.95869356388089,
+      "decode_tps": 36.07,
+      "allocation_log": [],
+      "variant": "reference",
+      "repetition": 2,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 1024,
+      "prefill_ms": 3444.0,
+      "prefill_tps": 297.32868757259,
+      "decode_tps": 36.19,
+      "allocation_log": [
+        "open_qwen36: buffer bytes: weights=785383424 prefill_extra=0 prefill_shared=608174080 state=268435456 constants=16777216 scratch=94371840 position_tables=8388608 context=8192"
+      ],
+      "variant": "candidate",
+      "repetition": 2,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 2048,
+      "prefill_ms": 7737.0,
+      "prefill_tps": 264.7020809099134,
+      "decode_tps": 28.08,
+      "allocation_log": [
+        "open_qwen36: buffer bytes: weights=785383424 prefill_extra=0 prefill_shared=608174080 state=268435456 constants=16777216 scratch=94371840 position_tables=8388608 context=8192"
+      ],
+      "variant": "candidate",
+      "repetition": -1,
+      "warmup": true
+    },
+    {
+      "prompt_tokens": 2048,
+      "prefill_ms": 24741.0,
+      "prefill_tps": 82.77757568408714,
+      "decode_tps": 27.94,
+      "allocation_log": [],
+      "variant": "reference",
+      "repetition": -1,
+      "warmup": true
+    },
+    {
+      "prompt_tokens": 2048,
+      "prefill_ms": 24600.0,
+      "prefill_tps": 83.2520325203252,
+      "decode_tps": 27.61,
+      "allocation_log": [],
+      "variant": "reference",
+      "repetition": 0,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 2048,
+      "prefill_ms": 7769.0,
+      "prefill_tps": 263.61179044922125,
+      "decode_tps": 28.07,
+      "allocation_log": [
+        "open_qwen36: buffer bytes: weights=785383424 prefill_extra=0 prefill_shared=608174080 state=268435456 constants=16777216 scratch=94371840 position_tables=8388608 context=8192"
+      ],
+      "variant": "candidate",
+      "repetition": 0,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 2048,
+      "prefill_ms": 7792.0,
+      "prefill_tps": 262.8336755646817,
+      "decode_tps": 28.1,
+      "allocation_log": [
+        "open_qwen36: buffer bytes: weights=785383424 prefill_extra=0 prefill_shared=608174080 state=268435456 constants=16777216 scratch=94371840 position_tables=8388608 context=8192"
+      ],
+      "variant": "candidate",
+      "repetition": 1,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 2048,
+      "prefill_ms": 24644.0,
+      "prefill_tps": 83.10339230644377,
+      "decode_tps": 27.96,
+      "allocation_log": [],
+      "variant": "reference",
+      "repetition": 1,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 2048,
+      "prefill_ms": 24697.0,
+      "prefill_tps": 82.92505162570353,
+      "decode_tps": 28.03,
+      "allocation_log": [],
+      "variant": "reference",
+      "repetition": 2,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 2048,
+      "prefill_ms": 8076.0,
+      "prefill_tps": 253.59088657751363,
+      "decode_tps": 28.13,
+      "allocation_log": [
+        "open_qwen36: buffer bytes: weights=785383424 prefill_extra=0 prefill_shared=608174080 state=268435456 constants=16777216 scratch=94371840 position_tables=8388608 context=8192"
+      ],
+      "variant": "candidate",
+      "repetition": 2,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 4096,
+      "prefill_ms": 21548.0,
+      "prefill_tps": 190.08724707629477,
+      "decode_tps": 19.25,
+      "allocation_log": [
+        "open_qwen36: buffer bytes: weights=785383424 prefill_extra=0 prefill_shared=608174080 state=268435456 constants=16777216 scratch=94371840 position_tables=8388608 context=8192"
+      ],
+      "variant": "candidate",
+      "repetition": -1,
+      "warmup": true
+    },
+    {
+      "prompt_tokens": 4096,
+      "prefill_ms": 82683.0,
+      "prefill_tps": 49.53859922837827,
+      "decode_tps": 19.3,
+      "allocation_log": [],
+      "variant": "reference",
+      "repetition": -1,
+      "warmup": true
+    },
+    {
+      "prompt_tokens": 4096,
+      "prefill_ms": 82651.0,
+      "prefill_tps": 49.55777909523176,
+      "decode_tps": 19.32,
+      "allocation_log": [],
+      "variant": "reference",
+      "repetition": 0,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 4096,
+      "prefill_ms": 21487.0,
+      "prefill_tps": 190.62689067808444,
+      "decode_tps": 19.08,
+      "allocation_log": [
+        "open_qwen36: buffer bytes: weights=785383424 prefill_extra=0 prefill_shared=608174080 state=268435456 constants=16777216 scratch=94371840 position_tables=8388608 context=8192"
+      ],
+      "variant": "candidate",
+      "repetition": 0,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 4096,
+      "prefill_ms": 22254.0,
+      "prefill_tps": 184.05679877774782,
+      "decode_tps": 19.32,
+      "allocation_log": [
+        "open_qwen36: buffer bytes: weights=785383424 prefill_extra=0 prefill_shared=608174080 state=268435456 constants=16777216 scratch=94371840 position_tables=8388608 context=8192"
+      ],
+      "variant": "candidate",
+      "repetition": 1,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 4096,
+      "prefill_ms": 83653.0,
+      "prefill_tps": 48.96417343071976,
+      "decode_tps": 18.77,
+      "allocation_log": [],
+      "variant": "reference",
+      "repetition": 1,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 4096,
+      "prefill_ms": 82599.0,
+      "prefill_tps": 49.588978074795094,
+      "decode_tps": 19.34,
+      "allocation_log": [],
+      "variant": "reference",
+      "repetition": 2,
+      "warmup": false
+    },
+    {
+      "prompt_tokens": 4096,
+      "prefill_ms": 22063.0,
+      "prefill_tps": 185.650183565245,
+      "decode_tps": 19.37,
+      "allocation_log": [
+        "open_qwen36: buffer bytes: weights=785383424 prefill_extra=0 prefill_shared=608174080 state=268435456 constants=16777216 scratch=94371840 position_tables=8388608 context=8192"
+      ],
+      "variant": "candidate",
+      "repetition": 2,
+      "warmup": false
+    }
+  ],
+  "shared_weight_payload_bytes": 608174080,
+  "removed_aligned_weight_allocation_bytes": 620756992
+}

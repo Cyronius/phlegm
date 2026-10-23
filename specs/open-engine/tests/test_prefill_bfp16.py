@@ -132,4 +132,8 @@ def test_other_families_carry_no_bfp16_variant(name):
     spec = ModelSpec.from_dict(json.loads((ROOT / "open_kernels" / "recipes" / "specs" / f"{name}.json").read_text()))
     m = manifest(spec)
     assert all("bfp16" not in (lt.get("gemm_block_variants") or {}) for lt in m["layer_types"].values())
-    assert m["manifest_version"] < 4
+    # DIT (version 7) is a separate format; it does not advertise a bfp16 variant.
+    assert not any(op.get('op') == 'bfp16_gemm'
+                   for lt in m['layer_types'].values()
+                   for weight in (lt.get('gemm_block') or {}).get('weights', {}).values()
+                   for op in weight.get('pack', []))

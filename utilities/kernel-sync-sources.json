@@ -1,0 +1,1074 @@
+{
+  "imported_on": "2026-10-23",
+  "repository": "https://github.com/Atomic-Germ/OpenFlowLM-Next",
+  "scope": "Kernel build and validation tools, embedding/probe sources; no converter or model data",
+  "files": {
+    "utilities/attention-entry-replay/build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "e5a945f10a8ff1159b7116eb271bc3977591402935a76e6a88942eea9b25d360",
+      "local_sha256": "e5a945f10a8ff1159b7116eb271bc3977591402935a76e6a88942eea9b25d360"
+    },
+    "utilities/attention-entry-replay/entry_check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "9ed653c7b79aa7df734edf1a36bf8b96eee7c3c940a6ef47da2051f7d18992fc",
+      "local_sha256": "9ed653c7b79aa7df734edf1a36bf8b96eee7c3c940a6ef47da2051f7d18992fc"
+    },
+    "utilities/attention-entry-replay/entry_common.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "adc984570cad260199e994fc680edcd08fbaece1fe8c80825c47da555bc0ed42",
+      "local_sha256": "adc984570cad260199e994fc680edcd08fbaece1fe8c80825c47da555bc0ed42"
+    },
+    "utilities/attention-entry-replay/entry_compare.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "19b41d2d81a24c31ee8a69ea0547b5080fb99bf36f8ad3e1a48fd41702e51e50",
+      "local_sha256": "19b41d2d81a24c31ee8a69ea0547b5080fb99bf36f8ad3e1a48fd41702e51e50"
+    },
+    "utilities/attention-entry-replay/entry_worker.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "6e658c51dab930f95da2950afe137247033bdb7d7ad16854278db83248a0f0a5",
+      "local_sha256": "6e658c51dab930f95da2950afe137247033bdb7d7ad16854278db83248a0f0a5"
+    },
+    "utilities/attention-entry-replay/resources.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "7afea196bbf803a7d74b06a3c4ebd8a63342471b9d47661f209c0f707e2bf766",
+      "local_sha256": "7afea196bbf803a7d74b06a3c4ebd8a63342471b9d47661f209c0f707e2bf766"
+    },
+    "utilities/attention-kv-replay/kv_attention.h": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "0168802aa60e8202ce80f616f15e11728afca119ed54656feab75905e5aa8a44",
+      "local_sha256": "0168802aa60e8202ce80f616f15e11728afca119ed54656feab75905e5aa8a44"
+    },
+    "utilities/attention-kv-replay/kv_build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "8879bbd03f0daed09fd0ff3ec3b4b84cfdb4a64ef6df52e85151894a1e64421a",
+      "local_sha256": "8879bbd03f0daed09fd0ff3ec3b4b84cfdb4a64ef6df52e85151894a1e64421a"
+    },
+    "utilities/attention-kv-replay/kv_check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "89e9b3b3becd28e544d2d4bd3b1e050769d7c1d35b91e3bc6453e0891c303cb6",
+      "local_sha256": "89e9b3b3becd28e544d2d4bd3b1e050769d7c1d35b91e3bc6453e0891c303cb6"
+    },
+    "utilities/attention-kv-replay/kv_common.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "80435f622bf6c39542077a063e3dfd303b4a7892b01f9650054ee33816d880f9",
+      "local_sha256": "80435f622bf6c39542077a063e3dfd303b4a7892b01f9650054ee33816d880f9"
+    },
+    "utilities/attention-kv-replay/kv_compare.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "bd21e240c4ad502539ed7f90228f5a26d8eb329539d6cb02632eadb7de37d9ed",
+      "local_sha256": "bd21e240c4ad502539ed7f90228f5a26d8eb329539d6cb02632eadb7de37d9ed"
+    },
+    "utilities/attention-kv-replay/kv_k.cc": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "58fe694207f4f5bf8222b6b99c5a66fefe8948a4ff237c2462b3348e35856efc",
+      "local_sha256": "58fe694207f4f5bf8222b6b99c5a66fefe8948a4ff237c2462b3348e35856efc"
+    },
+    "utilities/attention-kv-replay/kv_probe.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "27c7ef58dbd0beabc184304ceafe32662b6f2d8fddc768ab166eb7723696c558",
+      "local_sha256": "27c7ef58dbd0beabc184304ceafe32662b6f2d8fddc768ab166eb7723696c558"
+    },
+    "utilities/attention-kv-replay/kv_resources.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "aa139341ee539794a8cdc7ae89e5645b70a54b37c0740bb894ed159bd8198d0a",
+      "local_sha256": "aa139341ee539794a8cdc7ae89e5645b70a54b37c0740bb894ed159bd8198d0a"
+    },
+    "utilities/attention-kv-replay/kv_step.cc": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "8895a64cf039bd48d23747ae34364b9fa161e5fd30b6a0facab4784ecc970e05",
+      "local_sha256": "8895a64cf039bd48d23747ae34364b9fa161e5fd30b6a0facab4784ecc970e05"
+    },
+    "utilities/attention-kv-replay/kv_step_new.cc": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "befa9ca0c92213dde492a5fd32b608f7e44f33984d4b0734b875b30dd643f4c4",
+      "local_sha256": "befa9ca0c92213dde492a5fd32b608f7e44f33984d4b0734b875b30dd643f4c4"
+    },
+    "utilities/attention-kv-replay/kv_v.cc": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "0100b411232dc60209325358f4300e5a842599183d5ffa1bbada93c4981e2b43",
+      "local_sha256": "0100b411232dc60209325358f4300e5a842599183d5ffa1bbada93c4981e2b43"
+    },
+    "utilities/attention-replay/build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "93867caca4f22100e395a063dae7acb2e098cb5df8504f1d811f1109ac405b28",
+      "local_sha256": "93867caca4f22100e395a063dae7acb2e098cb5df8504f1d811f1109ac405b28"
+    },
+    "utilities/attention-replay/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "410e1454b04543801ba117aba551d4653946f05ca43365071c2a90418554f14e",
+      "local_sha256": "410e1454b04543801ba117aba551d4653946f05ca43365071c2a90418554f14e"
+    },
+    "utilities/attention-replay/probe.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "33383e15486cfd0f07e95e1ceeeec5c6ef4f59a63aaba5d3b978d9bcd8b236bd",
+      "local_sha256": "33383e15486cfd0f07e95e1ceeeec5c6ef4f59a63aaba5d3b978d9bcd8b236bd"
+    },
+    "utilities/attention-replay/probe_debug.cc": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "6a881ab21087aca905511a6c4385305c6e0ef379cdfee5b22c140c2979befff9",
+      "local_sha256": "6a881ab21087aca905511a6c4385305c6e0ef379cdfee5b22c140c2979befff9"
+    },
+    "utilities/attention-replay/probe_fin.cc": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "d206fa94542d33066ee4a9fe101465d6c3db7f99131de2365ef9d195832c9255",
+      "local_sha256": "d206fa94542d33066ee4a9fe101465d6c3db7f99131de2365ef9d195832c9255"
+    },
+    "utilities/attention-replay/replay_common.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "5b1e2bfc07e1fa2bbdb5c02462713b8f66d4ca8402d06003288b33434a055298",
+      "local_sha256": "5b1e2bfc07e1fa2bbdb5c02462713b8f66d4ca8402d06003288b33434a055298"
+    },
+    "utilities/audit-consistent-sum.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "b8a791d28670e8857d70d9dd640c8f40a34eae5ae6df82c20574bd35db8f828a",
+      "local_sha256": "4de28da123c24e1545d9d5ee0e4a90daa426d7f800b4ac6c16edfdf6c59e7abd"
+    },
+    "utilities/audit-kernel-export.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "b7200cb3b54c74242c4eab1d8be554830a304c1d100317fbc63c05d5c3832a08",
+      "local_sha256": "b7200cb3b54c74242c4eab1d8be554830a304c1d100317fbc63c05d5c3832a08"
+    },
+    "utilities/benchmark-q4-decode.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "1a01961f794b48d66837c849867efe15c9a0295c87f9ac26df9675a6fd2be856",
+      "local_sha256": "1a01961f794b48d66837c849867efe15c9a0295c87f9ac26df9675a6fd2be856"
+    },
+    "utilities/check-open-model.cpp": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "85b5c06e76536a01d7422d01f352dad16dee8585b81b3b825d4a6ea669433c8b",
+      "local_sha256": "85b5c06e76536a01d7422d01f352dad16dee8585b81b3b825d4a6ea669433c8b"
+    },
+    "utilities/conv-history-replay/build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "28071d62ecc5e469c9cac9ed4968a87eb26195674c24ecf296c44fb4a61ddece",
+      "local_sha256": "28071d62ecc5e469c9cac9ed4968a87eb26195674c24ecf296c44fb4a61ddece"
+    },
+    "utilities/conv-history-replay/compare.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "43bd2d193e8251ba41506386d2c3510f4c170ae449ad5781e1b20674090862b6",
+      "local_sha256": "43bd2d193e8251ba41506386d2c3510f4c170ae449ad5781e1b20674090862b6"
+    },
+    "utilities/conv-history-replay/history_check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "e556c5bc57131c7f55aa5f5bfb1894cd5eb0004b21af1d81a72f485dd30477ef",
+      "local_sha256": "e556c5bc57131c7f55aa5f5bfb1894cd5eb0004b21af1d81a72f485dd30477ef"
+    },
+    "utilities/conv-history-replay/history_common.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "7b7b05e71d150cbc626e189350cfa0637ede981aa80d74b52390e0ab8dc74e0f",
+      "local_sha256": "7b7b05e71d150cbc626e189350cfa0637ede981aa80d74b52390e0ab8dc74e0f"
+    },
+    "utilities/conv-history-replay/history_conv.cc": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "2672c8a06c85afa845112cc1381faf2c6420a26afc04eceb0099faa71e93b93b",
+      "local_sha256": "2672c8a06c85afa845112cc1381faf2c6420a26afc04eceb0099faa71e93b93b"
+    },
+    "utilities/conv-history-replay/history_worker.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "0c458659aba8a2663a91531d8d5ae438d4c17fff877c176ae2738ea1179cb971",
+      "local_sha256": "0c458659aba8a2663a91531d8d5ae438d4c17fff877c176ae2738ea1179cb971"
+    },
+    "utilities/deltanet-replay/build_full_layer.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "22de20b3928039ee36ed68a0c104be2ff9903b42ff498c70d57dec5f1deff8b6",
+      "local_sha256": "c6b59b55c25874802925ac587a76c40921564478941cd7fd809806b37711a030"
+    },
+    "utilities/deltanet-replay/build_recurrence.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "b67ec74b98b930b153f164c92e46a02ff5acf55f3340bf52bdb2c65a91452021",
+      "local_sha256": "b67ec74b98b930b153f164c92e46a02ff5acf55f3340bf52bdb2c65a91452021"
+    },
+    "utilities/deltanet-replay/design.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "c8d5e87a7ed318ce40feaf3fed2e292d4d96ee1d1d110485163751e338e799d1",
+      "local_sha256": "c8d5e87a7ed318ce40feaf3fed2e292d4d96ee1d1d110485163751e338e799d1"
+    },
+    "utilities/deltanet-replay/factored.h": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "2bbe01a39dca7df9f8e2d9bb76fcbeb265818293124844c913eab6aa8cb0e436",
+      "local_sha256": "2bbe01a39dca7df9f8e2d9bb76fcbeb265818293124844c913eab6aa8cb0e436"
+    },
+    "utilities/deltanet-replay/full_layer_common.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "be2e974fad39172d383540144681491f2aa48c51f9ce61efe5529a322dc50c23",
+      "local_sha256": "be2e974fad39172d383540144681491f2aa48c51f9ce61efe5529a322dc50c23"
+    },
+    "utilities/deltanet-replay/full_layer_replay.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "81a54aa1a80b3f8ce5b616fdb850f53cb794d508029bc00ed57c40f5cfa8438d",
+      "local_sha256": "81a54aa1a80b3f8ce5b616fdb850f53cb794d508029bc00ed57c40f5cfa8438d"
+    },
+    "utilities/deltanet-replay/precise.h": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "5417e9f09638663b27f42d130230dce18bc91bf04d92f10ee49b7378faa465e8",
+      "local_sha256": "5417e9f09638663b27f42d130230dce18bc91bf04d92f10ee49b7378faa465e8"
+    },
+    "utilities/deltanet-replay/recurrence_common.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "ac8e072b3c56f0885e7d3085873c3f446cac4a71634ce0efadd2280612cbb6b0",
+      "local_sha256": "ac8e072b3c56f0885e7d3085873c3f446cac4a71634ce0efadd2280612cbb6b0"
+    },
+    "utilities/deltanet-replay/recurrence_replay.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "9ff5a78ada0fc602e98bceb1bb4dc9bd82aeef3dc1a6066fc13b8869c466a4f4",
+      "local_sha256": "9ff5a78ada0fc602e98bceb1bb4dc9bd82aeef3dc1a6066fc13b8869c466a4f4"
+    },
+    "utilities/deltanet_projection.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "26f84722251f81800eadd2c321f0447506f653ac2f5056b8324cddf31e11f5e1",
+      "local_sha256": "26f84722251f81800eadd2c321f0447506f653ac2f5056b8324cddf31e11f5e1"
+    },
+    "utilities/deltanet_readout.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "9f59c0c1eab82f7b27e6294862317c40eeeb3964cecb6c8b2d326177860c78c7",
+      "local_sha256": "9f59c0c1eab82f7b27e6294862317c40eeeb3964cecb6c8b2d326177860c78c7"
+    },
+    "utilities/ffn-front-replay/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "0beadb833b5e5ce18b70f0c81460c89c807e8ffb00a232ac1bd094724c2f1b44",
+      "local_sha256": "0beadb833b5e5ce18b70f0c81460c89c807e8ffb00a232ac1bd094724c2f1b44"
+    },
+    "utilities/ffn-front-replay/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "1705a46304ee486305a486aceefac28a7e662ab209b5d56e46bc29350f11f00c",
+      "local_sha256": "1705a46304ee486305a486aceefac28a7e662ab209b5d56e46bc29350f11f00c"
+    },
+    "utilities/ffn-front-replay/front_build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "f5e6e161c263d18b0c72894a9991ff405ab7a03642b0331482dd3587da89ff95",
+      "local_sha256": "09b7c8e88d4aaab07528fa00fec2101da8befa0f0231b5f7a74dc4559e0f0209"
+    },
+    "utilities/ffn-front-replay/front_emit.cc": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "2f8911aa6569c3226a754d0dfb9d39febf998caf3b456270b72498a7c01b1e17",
+      "local_sha256": "2f8911aa6569c3226a754d0dfb9d39febf998caf3b456270b72498a7c01b1e17"
+    },
+    "utilities/ffn-front-replay/front_gms.cc": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "79a3f2fb54147a39e2370a91f88fa168288b48226850fdb65251323cb6719711",
+      "local_sha256": "79a3f2fb54147a39e2370a91f88fa168288b48226850fdb65251323cb6719711"
+    },
+    "utilities/ffn-front-replay/front_prep.cc": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "6e384f61553df39b48be907d31ac46c12f65fb4bd0b7f18cbabf524dba985ca5",
+      "local_sha256": "6e384f61553df39b48be907d31ac46c12f65fb4bd0b7f18cbabf524dba985ca5"
+    },
+    "utilities/ffn-front-replay/probe.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "4bbe5181e589682ad5f1a9edddf1b8af84210fa7f1321960cf5b94202b41e838",
+      "local_sha256": "4bbe5181e589682ad5f1a9edddf1b8af84210fa7f1321960cf5b94202b41e838"
+    },
+    "utilities/ffn-front-replay/sweep.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "af198b9d57d12d04d05a20280ecc889831f81f22e00c087d23d448def91b9efb",
+      "local_sha256": "af198b9d57d12d04d05a20280ecc889831f81f22e00c087d23d448def91b9efb"
+    },
+    "utilities/gemv-fp32-prep/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "29f0e0a6d220ac3ffc89ecdda12a4e14a61e8f441f853b6c45a08ba6c0099f77",
+      "local_sha256": "29f0e0a6d220ac3ffc89ecdda12a4e14a61e8f441f853b6c45a08ba6c0099f77"
+    },
+    "utilities/gemv-fp32-prep/probe.cc": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "d944a5f8f7a8d61566838dda969434f28401e295c6ec08dfa9a6c8da5cfdf909",
+      "local_sha256": "d944a5f8f7a8d61566838dda969434f28401e295c6ec08dfa9a6c8da5cfdf909"
+    },
+    "utilities/gemv-fp32-prep/probe.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "4d0918fc83c9678d9e9fbe0bc313877c4483cdba633954339d4600688a642ccc",
+      "local_sha256": "4d0918fc83c9678d9e9fbe0bc313877c4483cdba633954339d4600688a642ccc"
+    },
+    "utilities/gemv-fp32-prep/sweep.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "8e264d369d31c59e11cfb8240948bce512cb8bd9095f661e1bc70e4a7ce6e1de",
+      "local_sha256": "8e264d369d31c59e11cfb8240948bce512cb8bd9095f661e1bc70e4a7ce6e1de"
+    },
+    "utilities/linear-entry-replay/ab_fp32.cc": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "95d14ba639a54661c538ccca55b1e675ad437a072f7f6a0cff5738f4cc214c27",
+      "local_sha256": "95d14ba639a54661c538ccca55b1e675ad437a072f7f6a0cff5738f4cc214c27"
+    },
+    "utilities/linear-entry-replay/build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "c775c53c4e594b7e20131edfa1320c17633c1ed2c8c5d361670a0a0ed1a56d1b",
+      "local_sha256": "c775c53c4e594b7e20131edfa1320c17633c1ed2c8c5d361670a0a0ed1a56d1b"
+    },
+    "utilities/linear-entry-replay/compare.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "43bd2d193e8251ba41506386d2c3510f4c170ae449ad5781e1b20674090862b6",
+      "local_sha256": "43bd2d193e8251ba41506386d2c3510f4c170ae449ad5781e1b20674090862b6"
+    },
+    "utilities/linear-entry-replay/copy_fp32.cc": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "dfdcb4868772984c6bd51e23da45e6ea9afbe9dc44fe803d03f5fdf8c428fb01",
+      "local_sha256": "dfdcb4868772984c6bd51e23da45e6ea9afbe9dc44fe803d03f5fdf8c428fb01"
+    },
+    "utilities/linear-entry-replay/linear_check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "ffffc387d9f2a88cd858916c9d6b07587c42a9c6f853606cfb942043a0a9a58c",
+      "local_sha256": "ffffc387d9f2a88cd858916c9d6b07587c42a9c6f853606cfb942043a0a9a58c"
+    },
+    "utilities/linear-entry-replay/linear_common.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "273e0745949d75e9fcea7085f7ab326a62440940dfd2c906ea8d5c6d19186cc3",
+      "local_sha256": "ba2271bbd129cf14c7413f5e91052b2d8c56e9ce9cb0e70c6720767077642725"
+    },
+    "utilities/linear-entry-replay/linear_worker.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "cdaa4994dd8ce144203658e52775b711cfbf4e27de78fdcbac3a798ddfe82d6b",
+      "local_sha256": "cdaa4994dd8ce144203658e52775b711cfbf4e27de78fdcbac3a798ddfe82d6b"
+    },
+    "utilities/prefill-boundaries/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "8df42f8705e999e4250155ad4255550cc6676bc40fb2a91456ac4b5704af2807",
+      "local_sha256": "8df42f8705e999e4250155ad4255550cc6676bc40fb2a91456ac4b5704af2807"
+    },
+    "utilities/prefill-boundaries/bridge.cpp": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "a8b864d213c7248dc6aed6592e374c55c10add4588f8f0ad84812785386704b1",
+      "local_sha256": "a8b864d213c7248dc6aed6592e374c55c10add4588f8f0ad84812785386704b1"
+    },
+    "utilities/prefill-boundaries/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "43212559b99844a6c6106fe2f67f8514be86b3068480cebc5e6255e2d194c50b",
+      "local_sha256": "43212559b99844a6c6106fe2f67f8514be86b3068480cebc5e6255e2d194c50b"
+    },
+    "utilities/prefill-entry-replay/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "47a9ed77c600bf347df8f1203d4529030a3889b6d14b92faccc3c5013a132733",
+      "local_sha256": "47a9ed77c600bf347df8f1203d4529030a3889b6d14b92faccc3c5013a132733"
+    },
+    "utilities/prefill-entry-replay/build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "c6b1bf25d7da332c91bad29ce0ce0fd3b70e134c524686161d02cd14dbfaaea3",
+      "local_sha256": "c6b1bf25d7da332c91bad29ce0ce0fd3b70e134c524686161d02cd14dbfaaea3"
+    },
+    "utilities/prefill-entry-replay/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "54bd51a7d77ad21191233a8f86381a21bf0cbcd9ba613122010980e229970b8a",
+      "local_sha256": "54bd51a7d77ad21191233a8f86381a21bf0cbcd9ba613122010980e229970b8a"
+    },
+    "utilities/prefill-ffn-replay/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "6188b48492bd951367f431f413725c4876029a9231113fdb16551e2b2b9fcbdb",
+      "local_sha256": "6188b48492bd951367f431f413725c4876029a9231113fdb16551e2b2b9fcbdb"
+    },
+    "utilities/prefill-ffn-replay/bridge.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "c718123eca8dcff668fdfcda12ae4102a3488477fb8fc0c288ee10c062f1fcc0",
+      "local_sha256": "c718123eca8dcff668fdfcda12ae4102a3488477fb8fc0c288ee10c062f1fcc0"
+    },
+    "utilities/prefill-ffn-replay/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "daa770e1a3e6cb020f3ba137546db732f70d08d36d4727cc020a8526f043fb38",
+      "local_sha256": "daa770e1a3e6cb020f3ba137546db732f70d08d36d4727cc020a8526f043fb38"
+    },
+    "utilities/prefill-ffn-replay/sweep.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "39c2ca3c1b94bb503c03c53521340b3c58259c63a506b870306907ce9ae2aec1",
+      "local_sha256": "39c2ca3c1b94bb503c03c53521340b3c58259c63a506b870306907ce9ae2aec1"
+    },
+    "utilities/prefill-out-replay/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "12dea52b1187e89cceb78d1a1d96f455e3af6cef9b1e6393a9fcfba1a1ea1379",
+      "local_sha256": "12dea52b1187e89cceb78d1a1d96f455e3af6cef9b1e6393a9fcfba1a1ea1379"
+    },
+    "utilities/prefill-out-replay/build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "5c4581524fcc76119f6847d0a298c3cf9d54b67dee5729ddbf8a46538dc63fce",
+      "local_sha256": "5c4581524fcc76119f6847d0a298c3cf9d54b67dee5729ddbf8a46538dc63fce"
+    },
+    "utilities/prefill-out-replay/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "68fc75ea3838e09b6131a926675fcb9a8ee7cbdead480a320a15481d197b0ab4",
+      "local_sha256": "68fc75ea3838e09b6131a926675fcb9a8ee7cbdead480a320a15481d197b0ab4"
+    },
+    "utilities/prefill-paired-input/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "965053b175eca226a8417e81f9887062c9f2de05a053bff1775dcb7220294681",
+      "local_sha256": "965053b175eca226a8417e81f9887062c9f2de05a053bff1775dcb7220294681"
+    },
+    "utilities/prefill-paired-input/audit.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "071f55211c3dde10504f7f334f02bace46af1d202d9186560b4b8376af26f0ad",
+      "local_sha256": "071f55211c3dde10504f7f334f02bace46af1d202d9186560b4b8376af26f0ad"
+    },
+    "utilities/prefill-paired-input/build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "1c1a9f56192c30e7be34d42546b5dc8ff0f24ca24772fef8e64ee2f2619bc159",
+      "local_sha256": "1c1a9f56192c30e7be34d42546b5dc8ff0f24ca24772fef8e64ee2f2619bc159"
+    },
+    "utilities/prefill-paired-input/paired_gemm.hpp": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "8b07a9b07e2c3cadc0441fc67ee567b334c1e658d2ffcf26adfa4518a6bed779",
+      "local_sha256": "8b07a9b07e2c3cadc0441fc67ee567b334c1e658d2ffcf26adfa4518a6bed779"
+    },
+    "utilities/prefill-paired-weights/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "3c7552a86dc017d6fefa4f910cd1152e11f4d36bf044906b862a79c14ff18141",
+      "local_sha256": "3c7552a86dc017d6fefa4f910cd1152e11f4d36bf044906b862a79c14ff18141"
+    },
+    "utilities/prefill-paired-weights/build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "f3680b4e0a29de1b3195cf09d1fe7f424c820dbda57c0a144fe9ce70b9d7bf62",
+      "local_sha256": "f3680b4e0a29de1b3195cf09d1fe7f424c820dbda57c0a144fe9ce70b9d7bf62"
+    },
+    "utilities/prefill-paired-weights/run.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "c6d1d21b901b34ddb4a44d06d8636aaee097d6018c3f4cdfa6cda93e5cfb9697",
+      "local_sha256": "c6d1d21b901b34ddb4a44d06d8636aaee097d6018c3f4cdfa6cda93e5cfb9697"
+    },
+    "utilities/prefill-prefix-replay/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "822a0f271de4d31966183e900716fafe54b294ef353b1f6c7f08513e096df421",
+      "local_sha256": "822a0f271de4d31966183e900716fafe54b294ef353b1f6c7f08513e096df421"
+    },
+    "utilities/prefill-prefix-replay/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "fc0537fbcb5869111137cd730e216adea2ad3b5651b0d9bc8c0b6aa2c01ceff8",
+      "local_sha256": "fc0537fbcb5869111137cd730e216adea2ad3b5651b0d9bc8c0b6aa2c01ceff8"
+    },
+    "utilities/prefill-prefix-scan/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "8aced3d57f96c6041864dd8a5d8987286feabfcc64622262ee053749e1e053b4",
+      "local_sha256": "8aced3d57f96c6041864dd8a5d8987286feabfcc64622262ee053749e1e053b4"
+    },
+    "utilities/prefill-prefix-scan/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "3377bb05dc9503161d444db0ba045757a1a071c681fc438b92a73847f6bcf5fc",
+      "local_sha256": "3377bb05dc9503161d444db0ba045757a1a071c681fc438b92a73847f6bcf5fc"
+    },
+    "utilities/prefill-prefix-sublayers/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "eab084decb1e3da376561a462a5990965ba92942783f837ef60adac29e0a7e7a",
+      "local_sha256": "eab084decb1e3da376561a462a5990965ba92942783f837ef60adac29e0a7e7a"
+    },
+    "utilities/prefill-prefix-sublayers/build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "6819d69a2925b9d4de3dfcc6eb8e8e1223b742b438b9de3d1cc5bbb220b37904",
+      "local_sha256": "6819d69a2925b9d4de3dfcc6eb8e8e1223b742b438b9de3d1cc5bbb220b37904"
+    },
+    "utilities/prefill-prefix-sublayers/capture.hpp": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "8cee4ba6732c93d290372d366817c42153a90e9a8114ae42290311de7bc17932",
+      "local_sha256": "8cee4ba6732c93d290372d366817c42153a90e9a8114ae42290311de7bc17932"
+    },
+    "utilities/prefill-prefix-sublayers/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "7ebff02d98c9dd6fbb5809fa9c1598b98c99deca4cd59ef31c22882c376caccf",
+      "local_sha256": "7ebff02d98c9dd6fbb5809fa9c1598b98c99deca4cd59ef31c22882c376caccf"
+    },
+    "utilities/prefill-prefix-sublayers/run.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "fad3c1bb4cf8066afd6e4b54d577aa369544ba16f4b1fa122a67ea824c3b2b23",
+      "local_sha256": "fad3c1bb4cf8066afd6e4b54d577aa369544ba16f4b1fa122a67ea824c3b2b23"
+    },
+    "utilities/prefill-projection-attribution/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "7c48e0b96b5a77710da26561122de163ca6c42c19a318763e616596b257f0474",
+      "local_sha256": "7c48e0b96b5a77710da26561122de163ca6c42c19a318763e616596b257f0474"
+    },
+    "utilities/prefill-projection-attribution/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "267f6ea62a0d50a0ca4a3763571438b7104e255c64909dc95859b9c28c3faa7a",
+      "local_sha256": "267f6ea62a0d50a0ca4a3763571438b7104e255c64909dc95859b9c28c3faa7a"
+    },
+    "utilities/prefill-projections/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "20e03c27737125455c256caed2a37247b1d4fdebb75402696435cf34005f499a",
+      "local_sha256": "20e03c27737125455c256caed2a37247b1d4fdebb75402696435cf34005f499a"
+    },
+    "utilities/prefill-projections/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "827a468b829879faf7a96a3fa8fd820728f2ec8959da7f18be828b3840d21b72",
+      "local_sha256": "827a468b829879faf7a96a3fa8fd820728f2ec8959da7f18be828b3840d21b72"
+    },
+    "utilities/prefill-residual-trace/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "80946f6e5f14100d62fa12c8d02b891bc25b57cec8f44b7b8f9dd9f29f55f7b2",
+      "local_sha256": "80946f6e5f14100d62fa12c8d02b891bc25b57cec8f44b7b8f9dd9f29f55f7b2"
+    },
+    "utilities/prefill-residual-trace/audit.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "f32bb59211c1a53c97e10d1495457f99ff85feffce0f65e30b6d2eed7ad955c9",
+      "local_sha256": "f32bb59211c1a53c97e10d1495457f99ff85feffce0f65e30b6d2eed7ad955c9"
+    },
+    "utilities/prefill-residual-trace/build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "a5a35ebec5887f2dfdc1d0e489fc050abf3c242d97772f147a5c9e61273e6d3e",
+      "local_sha256": "a5a35ebec5887f2dfdc1d0e489fc050abf3c242d97772f147a5c9e61273e6d3e"
+    },
+    "utilities/prefill-residual-trace/run.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "325f8af3918c9ba188e8baad680fe50a5513938b2af8e164b80420320ac02cad",
+      "local_sha256": "325f8af3918c9ba188e8baad680fe50a5513938b2af8e164b80420320ac02cad"
+    },
+    "utilities/prefill-residual-trace/trace.hpp": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "182d6cf1a52f84419aefadd25c97bf6f613ef3f4b8d3caec7f154089aaa51be5",
+      "local_sha256": "182d6cf1a52f84419aefadd25c97bf6f613ef3f4b8d3caec7f154089aaa51be5"
+    },
+    "utilities/prefill-slice/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "752c5a090452bf64576e3f04c4fff153be6a482002f960e7843ccce63e3a69f3",
+      "local_sha256": "752c5a090452bf64576e3f04c4fff153be6a482002f960e7843ccce63e3a69f3"
+    },
+    "utilities/prefill-slice/boundaries.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "2f7f6e2eea2666535bb6fc50bba0ef9ce16d624f25463d6ca4e84cd0b18a1c24",
+      "local_sha256": "2f7f6e2eea2666535bb6fc50bba0ef9ce16d624f25463d6ca4e84cd0b18a1c24"
+    },
+    "utilities/prefill-slice/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "589ec36f511cc91425709466a5dc4cc76a3d41f0f79c06e493310d0cac27f2fa",
+      "local_sha256": "589ec36f511cc91425709466a5dc4cc76a3d41f0f79c06e493310d0cac27f2fa"
+    },
+    "utilities/prefill-slice/depth.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "9a4dec3e3f1375d84e19b2fb83e4704e427f5ffcd61ba409fbd16617b4b19b54",
+      "local_sha256": "9a4dec3e3f1375d84e19b2fb83e4704e427f5ffcd61ba409fbd16617b4b19b54"
+    },
+    "utilities/prefill-sublayer-trace/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "4710ec22a6ef1acf552a2d9d98866a1a115d5e15f5b045a0b0a13d9036caf62d",
+      "local_sha256": "4710ec22a6ef1acf552a2d9d98866a1a115d5e15f5b045a0b0a13d9036caf62d"
+    },
+    "utilities/prefill-sublayer-trace/attribute.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "592cffc67860462e860ae9804d2eab0d0914f40d416318cf95f29e8903e6cb85",
+      "local_sha256": "592cffc67860462e860ae9804d2eab0d0914f40d416318cf95f29e8903e6cb85"
+    },
+    "utilities/prefill-sublayer-trace/build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "824528f93c025faf680c213cb9fd6f9f4765ece45bcf7de23abae83e5cd63f58",
+      "local_sha256": "824528f93c025faf680c213cb9fd6f9f4765ece45bcf7de23abae83e5cd63f58"
+    },
+    "utilities/prefill-sublayer-trace/capture.hpp": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "801480af027bc2c81c19cd16a82cec5ef36baa611503fc3ffaad96ef927e285c",
+      "local_sha256": "801480af027bc2c81c19cd16a82cec5ef36baa611503fc3ffaad96ef927e285c"
+    },
+    "utilities/prefill-sublayer-trace/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "1295a8051e563e2914a7ab02a224638e27ec0947e2b26dad505a52d6b844e407",
+      "local_sha256": "1295a8051e563e2914a7ab02a224638e27ec0947e2b26dad505a52d6b844e407"
+    },
+    "utilities/prefill-sublayer-trace/run.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "94d832382bc672b44cb4dad4b1336f323bfc24186dfed000945a9f1fc193b508",
+      "local_sha256": "94d832382bc672b44cb4dad4b1336f323bfc24186dfed000945a9f1fc193b508"
+    },
+    "utilities/prefill-upgate-replay/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "cd4d5d0ff7d0d92bbed4a7760208079ffb3fa056a8863d0169424b62d2946ec1",
+      "local_sha256": "cd4d5d0ff7d0d92bbed4a7760208079ffb3fa056a8863d0169424b62d2946ec1"
+    },
+    "utilities/prefill-upgate-replay/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "c1439dc4d9137f93b93f4842d46bee77ccf101e81230ecc70781a4201e904ca2",
+      "local_sha256": "c1439dc4d9137f93b93f4842d46bee77ccf101e81230ecc70781a4201e904ca2"
+    },
+    "utilities/prefill-weighted-cli/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "8c2132ec5b1b3ab6b600ae696e7d54e2997877903cb84e678a980ed4303d4626",
+      "local_sha256": "8c2132ec5b1b3ab6b600ae696e7d54e2997877903cb84e678a980ed4303d4626"
+    },
+    "utilities/prefill-weighted-cli/audit.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "8f81d28e176425152c0dcacb1e8f2e124039cce75db8c33d2ccd4a620db14968",
+      "local_sha256": "8f81d28e176425152c0dcacb1e8f2e124039cce75db8c33d2ccd4a620db14968"
+    },
+    "utilities/prefill-weighted-cli/build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "9911eeeead5b5ed4d7ff931d94d401c6eaa362492c49fed98b52c811bf1a4adc",
+      "local_sha256": "9911eeeead5b5ed4d7ff931d94d401c6eaa362492c49fed98b52c811bf1a4adc"
+    },
+    "utilities/prefill-weighted-cli/run.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "924d00398e8ceb3966c7d7ef43990a6ca6a11bf706608e7a24791f982833f29c",
+      "local_sha256": "924d00398e8ceb3966c7d7ef43990a6ca6a11bf706608e7a24791f982833f29c"
+    },
+    "utilities/prefill-weighted-cli/weighted_gemm.hpp": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "0415e1a55c15ad77e06cfd1fcdb5075f5ec96a487c6d05033e980974b94b8de1",
+      "local_sha256": "0415e1a55c15ad77e06cfd1fcdb5075f5ec96a487c6d05033e980974b94b8de1"
+    },
+    "utilities/prefill-weighted-sublayers/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "94c66400d7759dab47a98ca5001af054914e015171d9d9c0d61948f709bd2920",
+      "local_sha256": "94c66400d7759dab47a98ca5001af054914e015171d9d9c0d61948f709bd2920"
+    },
+    "utilities/prefill-weighted-sublayers/build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "5e1a99b83a00989e3cdb9043d1c378ebb85bd2e07341d2ff2ee393f83e76aaa7",
+      "local_sha256": "5e1a99b83a00989e3cdb9043d1c378ebb85bd2e07341d2ff2ee393f83e76aaa7"
+    },
+    "utilities/prefill-weighted-sublayers/capture.hpp": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "2b4235a8989bde92b185c7b5003bfe987854d768a219ad19a2b4f18df90c4282",
+      "local_sha256": "2b4235a8989bde92b185c7b5003bfe987854d768a219ad19a2b4f18df90c4282"
+    },
+    "utilities/prefill-weighted-sublayers/check.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "18a55674ee7cd6d33f523dd2f0c8b4c9834bf3ef418585671e93b89fc91a359c",
+      "local_sha256": "18a55674ee7cd6d33f523dd2f0c8b4c9834bf3ef418585671e93b89fc91a359c"
+    },
+    "utilities/prefill-weighted-sublayers/run.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "e16d6bf3c46b8e52a4cb1421b06de1c219876f7fe4eacd5246267b82bc4e05bf",
+      "local_sha256": "e16d6bf3c46b8e52a4cb1421b06de1c219876f7fe4eacd5246267b82bc4e05bf"
+    },
+    "utilities/q4nx-build/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "9f0b6a145a4b9934eb7abd120c7047be71aefbf675779eb072d2837ab0dd5036",
+      "local_sha256": "9f0b6a145a4b9934eb7abd120c7047be71aefbf675779eb072d2837ab0dd5036"
+    },
+    "utilities/q4nx-build/q4nx/cli.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "e80e6357491f85fefa2f6daa05403901bf84269dc67e987a0a21e4fccecb363d",
+      "local_sha256": "e80e6357491f85fefa2f6daa05403901bf84269dc67e987a0a21e4fccecb363d"
+    },
+    "utilities/q4nx-build/q4nx/config_normalize.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "15872a1d76a7864e703f1a9da71c499aca5bef9b6a4feaf882b6434ff8ebaae2",
+      "local_sha256": "15872a1d76a7864e703f1a9da71c499aca5bef9b6a4feaf882b6434ff8ebaae2"
+    },
+    "utilities/q4nx-build/tests/test_normalize_config.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "4f9196dcbbe1f1cf3c818de5e4ad11e881a2b92506f15dddb641df692890af3b",
+      "local_sha256": "4f9196dcbbe1f1cf3c818de5e4ad11e881a2b92506f15dddb641df692890af3b"
+    },
+    "utilities/qkv-full-layer/README.md": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "055ebe182bd5e3d3e6037af8b3eab57ede7b5a8e32e6793d34ce948b106f1a07",
+      "local_sha256": "055ebe182bd5e3d3e6037af8b3eab57ede7b5a8e32e6793d34ce948b106f1a07"
+    },
+    "utilities/qkv-full-layer/consistent_lx.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "9ed44de38f71ce586568a9040a55543bb429d85448637a8ed8abae1cee59f2bf",
+      "local_sha256": "2b7b440d9298b8778187ee705094ef719ed67e6bc462a4319835b8c96d2b39ac"
+    },
+    "utilities/qkv-full-layer/consistent_replay.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "43f36886ae24501876c19f23db63de59fee7acb74adb8bca0588969cc15d4e91",
+      "local_sha256": "43f36886ae24501876c19f23db63de59fee7acb74adb8bca0588969cc15d4e91"
+    },
+    "utilities/qkv-precision/design.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "5dbbd360151ed0046b9505f01e9364155ef55b482a2402205277c570cdaa5cb4",
+      "local_sha256": "5dbbd360151ed0046b9505f01e9364155ef55b482a2402205277c570cdaa5cb4"
+    },
+    "utilities/qkv-precision/diagnose.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "6cbe7b6170b877360ee51c40b851b22b0cc620722ab148db0a74e73ef584860c",
+      "local_sha256": "6cbe7b6170b877360ee51c40b851b22b0cc620722ab148db0a74e73ef584860c"
+    },
+    "utilities/qkv-precision/qkv_build.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "faf79e3a46aa82eca01ac3f6f6122746149d7b97c4987e6244c6eb3033825603",
+      "local_sha256": "faf79e3a46aa82eca01ac3f6f6122746149d7b97c4987e6244c6eb3033825603"
+    },
+    "utilities/qkv-precision/qkv_reference.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "a3b64d839d4b753f7268d6ff06298360887d33eed8380d23abb73213cf0fd140",
+      "local_sha256": "a3b64d839d4b753f7268d6ff06298360887d33eed8380d23abb73213cf0fd140"
+    },
+    "utilities/qkv-precision/qkv_replay.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "b8c053977b36770478b7926723ceba6c92b7c8fa8bddb70e30d122559fb2c50d",
+      "local_sha256": "b8c053977b36770478b7926723ceba6c92b7c8fa8bddb70e30d122559fb2c50d"
+    },
+    "utilities/qkv-precision/sweep.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "384a525b772c383b01fcea43f33b4467f0b149537d5a4e51939fd5a4208e79d8",
+      "local_sha256": "384a525b772c383b01fcea43f33b4467f0b149537d5a4e51939fd5a4208e79d8"
+    },
+    "utilities/qwen35_layer_replay.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "c19e74814d3ed5e4fc6f4c26ef2a61739326c1fcdc15645f317eb35449b424f4",
+      "local_sha256": "420f9c40b0d54467d3b19f9671882536cb19933e35a5d9e202b44fc7f64bff74"
+    },
+    "utilities/stream-decode-weights.py": {
+      "ref": "audit-pr213",
+      "commit": "5eda57ee98556df439c91e44c334325a82ab3362",
+      "upstream_sha256": "2dd247ae80e450f2fc346c7a9d53fccc7cd3a77bb65fb2e45f4221a3eac471ce",
+      "local_sha256": "2dd247ae80e450f2fc346c7a9d53fccc7cd3a77bb65fb2e45f4221a3eac471ce"
+    },
+    "npu_offload/gemm_rtp/README.md": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "b667d7b86cf0fa76311b3a9a9d7919785d5696f5ab47437e73f25dc5ae16bffe",
+      "local_sha256": "b667d7b86cf0fa76311b3a9a9d7919785d5696f5ab47437e73f25dc5ae16bffe"
+    },
+    "npu_offload/gemm_rtp/build.ps1": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "f53a267fa14e1afe3cd6da92f884a45bdb60d794c51b15994a6adc3597882da0",
+      "local_sha256": "f53a267fa14e1afe3cd6da92f884a45bdb60d794c51b15994a6adc3597882da0"
+    },
+    "npu_offload/gemm_rtp/check_design_sets.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "65311a1ec82cdef8618c04c02ba53c3c313ba7702c0cc1ebe9fc3c73ce5eef48",
+      "local_sha256": "65311a1ec82cdef8618c04c02ba53c3c313ba7702c0cc1ebe9fc3c73ce5eef48"
+    },
+    "npu_offload/gemm_rtp/export_gemm_rtp.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "dc95fc2ea97f777bb5e77b24978fc2cde6037510ac4e2c6d171840e4f29ce8b2",
+      "local_sha256": "dc95fc2ea97f777bb5e77b24978fc2cde6037510ac4e2c6d171840e4f29ce8b2"
+    },
+    "npu_offload/gemm_rtp/families.json": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "538e9afee260c5903f99e74c886b48301f77c54af2e4a50544983a738dc6e6ce",
+      "local_sha256": "538e9afee260c5903f99e74c886b48301f77c54af2e4a50544983a738dc6e6ce"
+    },
+    "npu_offload/gemm_rtp/gemm_pretiled.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "905ee5cfd4f0d3bd4d7c02be5bf12b533e96cb7e9c233167e3b096d61d164f21",
+      "local_sha256": "905ee5cfd4f0d3bd4d7c02be5bf12b533e96cb7e9c233167e3b096d61d164f21"
+    },
+    "npu_offload/gemm_rtp/npue.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "10b61d4d839bb2aec4bea64997ff915759319e3170f474be1c3ccfa38dc6305c",
+      "local_sha256": "10b61d4d839bb2aec4bea64997ff915759319e3170f474be1c3ccfa38dc6305c"
+    },
+    "npu_offload/gemm_rtp/toolchain_provenance.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "ab9c09572307d3ef3c471d2c7f4407bb44370662b4fe60223141b0131e0b9e98",
+      "local_sha256": "ab9c09572307d3ef3c471d2c7f4407bb44370662b4fe60223141b0131e0b9e98"
+    },
+    "npu_offload/m5-eltwise/kernels/gelu_poly.cc": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "62f40e41c923f601c5c7e0fc4b1a1a0237392b47e9142080e26f9c7a2d9f37d7",
+      "local_sha256": "62f40e41c923f601c5c7e0fc4b1a1a0237392b47e9142080e26f9c7a2d9f37d7"
+    },
+    "npu_offload/m5-eltwise/kernels/narrow_f32_bf16.cc": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "e70669eb7a91fc5a52e7e3082c82e51490947b5979f3cb8a94168b15147efb8d",
+      "local_sha256": "e70669eb7a91fc5a52e7e3082c82e51490947b5979f3cb8a94168b15147efb8d"
+    },
+    "npu_offload/m5-eltwise/kernels/narrow_i32_bf16.cc": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "843fd9964f007403fb4a59e11be6491f26661a419a4e89632bba06d2f96c8b07",
+      "local_sha256": "843fd9964f007403fb4a59e11be6491f26661a419a4e89632bba06d2f96c8b07"
+    },
+    "npu_offload/matmul/README.md": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "d96041131a9c5eaf63204252b64a11c149d2c5bb859a7c0d91a06eecf1251ca9",
+      "local_sha256": "d96041131a9c5eaf63204252b64a11c149d2c5bb859a7c0d91a06eecf1251ca9"
+    },
+    "npu_offload/matmul/build_host.sh": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "d038f87b47a5071f8ff1cc4f5b00088d664f3331d0f5191a146d9ef692098941",
+      "local_sha256": "d038f87b47a5071f8ff1cc4f5b00088d664f3331d0f5191a146d9ef692098941"
+    },
+    "npu_offload/matmul/compare.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "a4a306662b2db8f08082c44cc751c3e8f34d00103c7c9b2f7324f7b6bf7f25cf",
+      "local_sha256": "a4a306662b2db8f08082c44cc751c3e8f34d00103c7c9b2f7324f7b6bf7f25cf"
+    },
+    "npu_offload/matmul/host.cpp": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "18466dabfabc1ed0314aa32899886eec0ca2ae908879ecd9a6ce12fa60b55742",
+      "local_sha256": "18466dabfabc1ed0314aa32899886eec0ca2ae908879ecd9a6ce12fa60b55742"
+    },
+    "npu_offload/matmul/host_f32.cpp": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "d6a23490fe43063d2734e06bcb57ee39b93bf0ad9af23ee6cc7791bc7f9b72fd",
+      "local_sha256": "d6a23490fe43063d2734e06bcb57ee39b93bf0ad9af23ee6cc7791bc7f9b72fd"
+    },
+    "npu_offload/matmul/host_i16.cpp": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "2297cdeeb1e8c494d703eef1a5d2aee12969943d0d5b50089116ebce1ae2a463",
+      "local_sha256": "2297cdeeb1e8c494d703eef1a5d2aee12969943d0d5b50089116ebce1ae2a463"
+    },
+    "npu_offload/matmul/host_single_core.cpp": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "23ee52c707c5f437bad95d333123b58cbe0e4e429830e216771df11a9dfe4ab9",
+      "local_sha256": "23ee52c707c5f437bad95d333123b58cbe0e4e429830e216771df11a9dfe4ab9"
+    },
+    "npu_offload/matmul/host_var.cpp": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "d39be83836089798f4174b302d4ab594f059e914fb72f94086aac5a1eab60d42",
+      "local_sha256": "d39be83836089798f4174b302d4ab594f059e914fb72f94086aac5a1eab60d42"
+    },
+    "npu_offload/matmul/make_test.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "948e604ee7692ebb1378f329bd00e23b41332bc7c68d03791a632c9da0f5c435",
+      "local_sha256": "948e604ee7692ebb1378f329bd00e23b41332bc7c68d03791a632c9da0f5c435"
+    },
+    "npu_offload/matmul/matmul.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "0d7c003a690426798171a3824604442269e8e5c3aae937d2d8124a2285ad48dc",
+      "local_sha256": "0d7c003a690426798171a3824604442269e8e5c3aae937d2d8124a2285ad48dc"
+    },
+    "npu_offload/matmul/matmul_i16.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "01c21d88198c244caf56d63029205b85471e6cd5b8d6afa2e21b9470845d2ece",
+      "local_sha256": "01c21d88198c244caf56d63029205b85471e6cd5b8d6afa2e21b9470845d2ece"
+    },
+    "npu_offload/matmul/matmul_scalar.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "aa06b106ee463d28de0fbddc75e065715e07453783385eb7001898e9a6234880",
+      "local_sha256": "aa06b106ee463d28de0fbddc75e065715e07453783385eb7001898e9a6234880"
+    },
+    "npu_offload/matmul/matmul_single_core.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "090dd5abc0c557b0d5e0e6cd644448da737df637986b9e500c83f565d4906a90",
+      "local_sha256": "090dd5abc0c557b0d5e0e6cd644448da737df637986b9e500c83f565d4906a90"
+    },
+    "npu_offload/matmul/matmul_whole_array.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "7d463d92836eca3cbc14734ffea087ed25b60909dcea2350c76acd13f52e3028",
+      "local_sha256": "7d463d92836eca3cbc14734ffea087ed25b60909dcea2350c76acd13f52e3028"
+    },
+    "npu_offload/section3/build_host.sh": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "6d2487038df5ea42e461f62d493b30838f5373eb88a65860804b154f8520e44a",
+      "local_sha256": "6d2487038df5ea42e461f62d493b30838f5373eb88a65860804b154f8520e44a"
+    },
+    "npu_offload/section3/test.cpp": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "7c7b07eeccdd9fcc130b5e03fc89146ce1fba6b780b02af9114b0e1fe137617f",
+      "local_sha256": "7c7b07eeccdd9fcc130b5e03fc89146ce1fba6b780b02af9114b0e1fe137617f"
+    },
+    "npu_offload/section3/vector_scalar_mul.cc": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "a0afc696bf0ea8e8d786a7c11c52951b0323b2ac16373b7d02b868d6b393da3d",
+      "local_sha256": "a0afc696bf0ea8e8d786a7c11c52951b0323b2ac16373b7d02b868d6b393da3d"
+    },
+    "npu_offload/section3/vector_scalar_mul.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "780400bc352748b1d738af7c3e0bfa81da5917bad9c9761c54d3976ba4e65c38",
+      "local_sha256": "780400bc352748b1d738af7c3e0bfa81da5917bad9c9761c54d3976ba4e65c38"
+    },
+    "utilities/build-new-spec.py": {
+      "ref": "audit-pr223",
+      "commit": "0c22864a5258019b7a885fb4be962ec62e3cc276",
+      "upstream_sha256": "30d3916b37fc4c69941d63423936f2ee3c2ce88c036a53f7e0d434feafaa4c9d",
+      "local_sha256": "30d3916b37fc4c69941d63423936f2ee3c2ce88c036a53f7e0d434feafaa4c9d"
+    },
+    "utilities/catalogue-add-point.py": {
+      "ref": "audit-pr223",
+      "commit": "0c22864a5258019b7a885fb4be962ec62e3cc276",
+      "upstream_sha256": "1e96f8dd665ca8e6cc3d71b4d9af335d62c6517fea5c1b2ddaa09976d631e98a",
+      "local_sha256": "1e96f8dd665ca8e6cc3d71b4d9af335d62c6517fea5c1b2ddaa09976d631e98a"
+    },
+    "utilities/gen-kernel-spec.py": {
+      "ref": "audit-pr223",
+      "commit": "0c22864a5258019b7a885fb4be962ec62e3cc276",
+      "upstream_sha256": "fb6ec523d409d01cbc3fb4437122c85535ad38e8b06ac34761ef30749685368a",
+      "local_sha256": "fb6ec523d409d01cbc3fb4437122c85535ad38e8b06ac34761ef30749685368a"
+    },
+    "utilities/lx-probe.cpp": {
+      "ref": "audit-pr223",
+      "commit": "0c22864a5258019b7a885fb4be962ec62e3cc276",
+      "upstream_sha256": "1890e1dd0fab9bfe778342615777a6095c603404e10b19c24eecca675ea4a1d5",
+      "local_sha256": "1890e1dd0fab9bfe778342615777a6095c603404e10b19c24eecca675ea4a1d5"
+    },
+    "utilities/build-lx-probe.sh": {
+      "ref": "audit-pr223",
+      "commit": "0c22864a5258019b7a885fb4be962ec62e3cc276",
+      "upstream_sha256": "83d401fb5bc6c2d5733c8b57d4dc512fa6fcee094caa3a20f301c16d96214c4a",
+      "local_sha256": "83d401fb5bc6c2d5733c8b57d4dc512fa6fcee094caa3a20f301c16d96214c4a"
+    },
+    "utilities/act-region-report.py": {
+      "ref": "audit-pr223",
+      "commit": "0c22864a5258019b7a885fb4be962ec62e3cc276",
+      "upstream_sha256": "9f0bf2a70d32ce3c3780c7ffed79c3c909d50c9845940cb0e190afca39c27ad7",
+      "local_sha256": "9f0bf2a70d32ce3c3780c7ffed79c3c909d50c9845940cb0e190afca39c27ad7"
+    },
+    "utilities/core_sizes.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "c303ba946c3c189036fe942b0747306a15ee0f5698ccd7c2c6dc1aaae5ce05ec",
+      "local_sha256": "c303ba946c3c189036fe942b0747306a15ee0f5698ccd7c2c6dc1aaae5ce05ec"
+    },
+    "utilities/export-kernels.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "d069e28d7ba00922f31070e112f8e01a98737e03c749aed7a3544e72a632b513",
+      "local_sha256": "d069e28d7ba00922f31070e112f8e01a98737e03c749aed7a3544e72a632b513"
+    },
+    "utilities/wide_deltanet_reference.py": {
+      "ref": "origin/main",
+      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
+      "upstream_sha256": "978e7b97fdeaccdeb9b628a17ec451764848dc57716336c0e24fa3ac2b3a1916",
+      "local_sha256": "978e7b97fdeaccdeb9b628a17ec451764848dc57716336c0e24fa3ac2b3a1916"
+    }
+  },
+  "local_adjustments": {
+    "files": [
+      "utilities/audit-consistent-sum.py",
+      "utilities/deltanet-replay/build_full_layer.py",
+      "utilities/ffn-front-replay/front_build.py",
+      "utilities/linear-entry-replay/linear_common.py",
+      "utilities/qkv-full-layer/consistent_lx.py",
+      "utilities/qwen35_layer_replay.py"
+    ],
+    "reason": "Windows config paths, compiler dependency tokenization and generated-source newline handling; numerical gates retained"
+  }
+}

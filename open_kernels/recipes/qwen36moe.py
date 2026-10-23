@@ -24,6 +24,7 @@ import math
 import os
 from dataclasses import dataclass, field
 
+from . import gguf as GGUF
 from .catalogue import LIMITS, OpRangeError, check_buffer_args, require
 from .attnknobs import knobs as attn_knobs, probe_env as _attn_probe_env
 from .spec import FULL, LINEAR, QUANT_FORMATS, ModelSpec
@@ -106,6 +107,40 @@ def q8_chunk_bytes(quant: str) -> int:
     if quant == "q8_0_f32":
         return Q8_CHUNK_F32
     raise OpRangeError(f"quant={quant!r}: no open q8 pool chunk layout")
+
+
+# The MoE family's GGUF-direct twin: the expert weights are 3D tensors
+# ([experts, n, k]), and the pack ops that lay them out (expert_stripes,
+# expert_down) have no GGUF form yet -- a GGUF's expert tensors are
+# quantized, and the packer would have to requantize and re-stripe them.
+# Until those ops exist the family ships no twin: a manifest that advertises
+# the section would send the engine to kernels whose experts it cannot pack.
+GGUF_EXPERT_OPS_READY = False
+
+
+def pool_quant(spec: ModelSpec) -> str:
+    """The q4 pool's scale layout: the q4 roles' quant (q4nx bf16, or the
+    GGUF-direct f32). The pool is one pool, so one chunk size."""
+    for role in ("attn", "ffn", "linear", "linear_out", "experts", "shared"):
+        q = spec.quant_of(role)
+        if q != "q8":
+            # Ternary packing retains q4_1-sized logical pool slots; only the
+            # streamed tile is T2_CHUNK. GGUF twins instead change the pool law.
+            return "q4_1" if q == "t2" else q
+    return "q4_1"
+
+
+def pool_chunk(spec: ModelSpec) -> int:
+    """The q4 pool chunk bytes this spec's pool uses.
+
+    The pool's q4 roles carry the scale layout of their own format: the q4nx
+    container's bf16 scales (5120 B a chunk) or the GGUF-direct f32 scales
+    (6144 B). The manifest states it, and the engine lays the pool out by it --
+    so a GGUF-direct twin must state the f32 chunk, not the bf16 one. The
+    designs' own tile size (TILE) is the same number: a stream that reads a
+    chunk at the bf16 stride reads the wrong bytes out of an f32 pool.
+    """
+    return chunk_bytes(pool_quant(spec))
 
 
 def q4_bytes(rows: int, cols: int, quant: str = "q4_1") -> int:
@@ -383,6 +418,42 @@ class Linear:
     AB_LANES: int = 32
     AB_ROWS: int = 64
     GLUE_HALF_OUTER: bool = False
+    XN_F32: bool = False
+    CONV_F32: bool = False
+    FACTORED_READOUT: bool = False
+
+
+def paired_attention(spec: ModelSpec) -> bool:
+    """The validated wide dense Qwen attention geometry uses paired KV and FP32 OG."""
+    return (not spec.hadamard and not is_t2(spec) and
+            spec.family == "qwen35" and spec.hidden == 5120 and
+            (spec.num_heads, spec.num_kv_heads, spec.head_dim, spec.rotary_dim) == (24, 4, 256, 64))
+
+
+def linear_fp32(spec: ModelSpec) -> bool:
+    """Validated wide dense DeltaNet entry and conv-history storage."""
+    return (not spec.hadamard and not is_t2(spec) and
+            spec.family == "qwen35" and spec.hidden == 5120 and
+            (spec.lin_key_heads, spec.lin_value_heads, spec.lin_key_dim,
+             spec.lin_value_dim, spec.conv_kernel) == (16, 48, 128, 128, 4) and
+            norm_split(spec) and bool(down_split(spec)))
+
+
+def attention_entry_fp32(spec: ModelSpec) -> bool:
+    """Validated FP32 entry route on the paired, split dense attention geometry."""
+    return paired_attention(spec) and norm_split(spec) and bool(down_split(spec))
+
+
+def factored_recurrence(spec: ModelSpec) -> bool:
+    """Compensated readout with validated full-lx program/data memory budgets."""
+    return (spec.has_linear and spec.intermediate == 17408 and spec.num_experts == 0 and
+            linear_fp32(spec) and all(spec.quant_of(role) == "q4_1"
+                                     for role in ("linear", "linear_out", "attn", "ffn")))
+
+
+def consistent_q4_sum(spec: ModelSpec) -> bool:
+    """Validated full-lx Q4 affine terms use the same quantized FP32 activation."""
+    return factored_recurrence(spec) and attention_entry_fp32(spec)
 
 
 @dataclass(frozen=True)
@@ -403,6 +474,9 @@ class Attn:
     # the fast attention path (recipes/attnknobs.py); the defaults are the single-core
     # kernel every family compiled before it existed
     VEXP: int = 0; MLS: int = 0; ACORES: int = 1; NHL: int = 0; RB: int = 1
+    XN_F32: bool = False                 # full-attention entry norm and projection input
+    XN_ELEMS: int = 1                    # 4-KiB entry stream elements
+    KV_PAIR: bool = False                # [K hi, K lo, V hi, V lo], with FP32 gated output
     BLOCK: int = 0                       # 1: attn.h ATTN_BLOCK_ONLY -- no single-row kernel is built,
                                          # and the driver pads the streamed row count to a whole
                                          # number of blocks (stream_patch::attn_apply, manifest `rb`)
@@ -420,6 +494,8 @@ class Ffn:
     # (`down_split`): each piece is a whole number of h's f32 elements and runs as its own
     # GEMV into its own act region. Empty -- one GEMV over FF -- for every size that fits.
     DOWN_SPLIT: tuple = ()
+    XM_F32: bool = False  # split dense FFN preserves the post-attention norm input
+    CONSISTENT_SUM: bool = False  # direct FP32 table: sum reconstructed INT16 values
 
 
 @dataclass(frozen=True)
@@ -494,7 +570,7 @@ def xh_l1(spec: ModelSpec) -> int:
 
 
 def core_l1(tab: int, ms_floats: int, ds_floats: int, pc: int = PER_CALL, extra: int = 0,
-            chunk: int = CHUNK) -> int:
+            chunk: int = CHUNK, stack: int = STACK) -> int:
     """A main core's L1 bytes for a given scratch layout.
 
     Every main core carries the same six things and nothing else
@@ -503,9 +579,13 @@ def core_l1(tab: int, ms_floats: int, ds_floats: int, pc: int = PER_CALL, extra:
     weight elements, the x elements and the y elements, over a 0x1800 stack. Both tails
     compute it here rather than each restating the sum, for the reason the band law is
     shared -- two copies of a budget drift, and the one that drifts is the one no shipped
-    model exercises."""
+    model exercises.
+
+    `chunk` and `stack` are the two the dense recipe's f32-scale build changes (a 6 KB
+    chunk and a 5 KB stack); the MoE tail has one of each.
+    """
     return (tab + ms_floats * 4 + ds_floats * 4
-            + 2 * pc * chunk + 2 * ELEM + 2 * BAND_ROWS * 4 + STACK + extra)
+            + 2 * pc * chunk + 2 * ELEM + 2 * BAND_ROWS * 4 + stack + extra)
 
 
 def per_call(spec: ModelSpec, ffn: str = "moe") -> int:
@@ -541,7 +621,7 @@ def kwide(spec: ModelSpec, ffn: str = "moe") -> int:
     return max(wide, *(down_split(spec) or (spec.intermediate,)))
 
 
-def down_split(spec: ModelSpec) -> tuple[int, ...]:
+def down_split(spec: ModelSpec, chunk: int = CHUNK, stack: int = STACK) -> tuple[int, ...]:
     """The dense down GEMV's K pieces, or () when FF's table fits a main core whole.
 
     The down GEMV reduces over FF, and its activation table is 2.25 FF bytes. At the 27B's
@@ -552,21 +632,27 @@ def down_split(spec: ModelSpec) -> tuple[int, ...]:
     below FF / 2. Nothing is repacked: inside a band, pool chunk c covers k-tile c / 2
     (gemv_q4.h's band law), so the first 2 K0 / 256 chunks of every FF-wide band ARE a
     K0-wide band and the rest a (FF - K0)-wide one, and each piece is a strided DMA tap over
-    the pool the packer already writes."""
+    the pool the packer already writes.
+
+    Shared with the dense recipe (recipes/dense.py): both tails run the same split, so the
+    pieces and the budget they are measured against live in one place. `chunk` and `stack`
+    are the build's own (the dense f32-scale build's chunk is 6 KB), so the decision and
+    the budget agree.
+    """
     if not spec.intermediate:
         return ()
     base = max(spec.hidden, spec.lin_value_width if spec.has_linear else 0,
                spec.attn_q_width if spec.has_full else 0)
     ds = DN_SCRATCH_FLOATS if spec.has_linear else 0
     ff = spec.intermediate
-    if core_l1(tab_bytes(max(base, ff)), FFN_MS_FLOATS, ds, 1, xh_l1(spec)) <= L1_BUDGET:
+    if core_l1(tab_bytes(max(base, ff)), FFN_MS_FLOATS, ds, 1, xh_l1(spec), chunk, stack) <= L1_BUDGET:
         return ()
     e = ELEM // 4
     k0 = ff // 2 // e * e
     pieces = (k0, ff - k0)
-    if not k0 or ff % e or any(core_l1(tab_bytes(max(base, k)), FFN_MS_FLOATS, ds, 1, xh_l1(spec)) > L1_BUDGET
+    if not k0 or ff % e or any(core_l1(tab_bytes(max(base, k)), FFN_MS_FLOATS, ds, 1, xh_l1(spec), chunk, stack) > L1_BUDGET
                                for k in pieces):
-        raise OpRangeError(f"qwen35: an FF of {ff} does not fit a main core's L1 in two pieces of "
+        raise OpRangeError(f"dense: an FF of {ff} does not fit a main core's L1 in two pieces of "
                            f"whole f32 elements ({pieces}); a three-way split is not implemented")
     return pieces
 
@@ -589,10 +675,12 @@ def common(spec: ModelSpec, ffn: str = "moe") -> Common:
         return _common_dense(spec)
     n = LIMITS["n_cols"]
     hid, ff, ne = spec.hidden, spec.moe_intermediate, spec.experts_per_tok
-    stripe = q4_bytes(128, hid)                     # 128 rows x HID: one up (or gate) stripe, RS=4
-    half = q4_bytes(BAND_ROWS, hid)                 # 64 rows x HID
-    down_band = q4_bytes(128, ff)                   # 128 rows x FF, RS=4
-    up_bytes = q4_bytes(ff, hid)                    # one expert's up (= gate = down)
+    pq = pool_quant(spec)                           # the pool's scale layout (q4_1 or q4_1_f32)
+    chunk = chunk_bytes(pq)                         # ... and so its chunk size
+    stripe = q4_bytes(128, hid, pq)                 # 128 rows x HID: one up (or gate) stripe, RS=4
+    half = q4_bytes(BAND_ROWS, hid, pq)             # 64 rows x HID
+    down_band = q4_bytes(128, ff, pq)               # 128 rows x FF, RS=4
+    up_bytes = q4_bytes(ff, hid, pq)                # one expert's up (= gate = down)
     rows_pc, hid_pc = hid // n, ff // n
     # ms scratch (floats): rw[32] | xr[rows_pc] | acc[rows_pc] | u[hid_pc] | g[hid_pc] | yd[rows_pc]
     ms_rw, ms_xr = 0, 32
@@ -629,14 +717,14 @@ def common(spec: ModelSpec, ffn: str = "moe") -> Common:
             f"{DN_SCRATCH_FLOATS * 4} B of ds. Program memory only aiecc can measure, but "
             f"L1 is arithmetic, and until now nothing computed it for this tail.")
     dn_dim = spec.lin_value_dim if spec.has_linear else 0
-    dn_rows = CALL_BYTES // (dn_dim * 4) if dn_dim else 0      # S rows per streamed 10 KB element
+    dn_rows = (PER_CALL * chunk) // (dn_dim * 4) if dn_dim else 0   # S rows per streamed element
     dn_slices = roundup(dn_dim, dn_rows) // dn_rows if dn_dim else 0
     return Common(
         N_CORES=n, HID=hid, FF=ff, NE=ne, NX=ne + 1,
-        TILE=CHUNK, PER_CALL=PER_CALL, CALL_BYTES=CALL_BYTES,
-        STRIPE=stripe, HALF=half, PAIR=2 * CHUNK, DOWN_BAND=down_band, UP_BYTES=up_bytes,
+        TILE=chunk, PER_CALL=PER_CALL, CALL_BYTES=PER_CALL * chunk,
+        STRIPE=stripe, HALF=half, PAIR=2 * chunk, DOWN_BAND=down_band, UP_BYTES=up_bytes,
         DOWN_PER_CORE=rows_pc // 128,
-        BAND_ROWS=BAND_ROWS, BAND16=band_bytes(hid), BAND32=band_bytes(2 * hid), N_HDR=3,
+        BAND_ROWS=BAND_ROWS, BAND16=band_bytes(hid, pq), BAND32=band_bytes(2 * hid, pq), N_HDR=3,
         MS_FLOATS=ms_floats, DS_FLOATS=1280, TAB_BYTES=tab, H_TAB_OFF=h_tab, KWIDE=wide,
         MS_RW=ms_rw, MS_XR=ms_xr, MS_ACC=ms_acc, MS_U=ms_u, MS_G=ms_g, MS_YD=ms_yd,
         ROWS_PC=rows_pc, HID_PC=hid_pc,
@@ -681,8 +769,10 @@ def _common_dense(spec: ModelSpec) -> Common:
     DeltaNet field is `common()`'s law at this element size; the MoE-only fields are zero."""
     n = LIMITS["n_cols"]
     hid, ff = spec.hidden, spec.intermediate
+    pq = pool_quant(spec)                           # the pool's scale layout (q4_1 or q4_1_f32)
+    chunk = chunk_bytes(pq)                         # ... and so its chunk size
     pc = per_call(spec, "dense")
-    tile = T2_CHUNK if is_t2(spec) else CHUNK
+    tile = T2_CHUNK if is_t2(spec) else chunk
     call_bytes = pc * tile
     wide = kwide(spec, "dense")
     dn_rows, dn_slices, dn_pad, dn_heads_pc, dn_dim = _dn_geometry(spec, call_bytes, n)
@@ -690,7 +780,7 @@ def _common_dense(spec: ModelSpec) -> Common:
         N_CORES=n, HID=hid, FF=ff, NE=0, NX=0,
         TILE=tile, PER_CALL=pc, CALL_BYTES=call_bytes,
         STRIPE=0, HALF=0, PAIR=2 * tile, DOWN_BAND=0, UP_BYTES=0, DOWN_PER_CORE=0,
-        BAND_ROWS=BAND_ROWS, BAND16=band_bytes(hid), BAND32=band_bytes(2 * hid), N_HDR=0,
+        BAND_ROWS=BAND_ROWS, BAND16=band_bytes(hid, pq), BAND32=band_bytes(2 * hid, pq), N_HDR=0,
         MS_FLOATS=FFN_MS_FLOATS, DS_FLOATS=DN_SCRATCH_FLOATS if dn_dim else 0,
         TAB_BYTES=tab_bytes(wide), H_TAB_OFF=0, KWIDE=wide,
         MS_RW=0, MS_XR=0, MS_ACC=0, MS_U=0, MS_G=BAND_ROWS, MS_YD=0,
@@ -704,12 +794,13 @@ def _common_dense(spec: ModelSpec) -> Common:
 def ffn_geometry(spec: ModelSpec) -> Ffn:
     n = LIMITS["n_cols"]
     hid, ff = spec.hidden, spec.intermediate
+    fp32 = bool(down_split(spec)) and norm_split(spec)
     return Ffn(
         FF=ff, UP_PC=ff // BAND_ROWS // n, DOWN_PC=hid // BAND_ROWS // n,
         MS_U=0, MS_G=BAND_ROWS, MS_FLOATS=FFN_MS_FLOATS,
-        XN_ELEMS=roundup(hid * 2, ELEM) // ELEM, XM_ELEMS=roundup(hid * 2, ELEM) // ELEM,
+        XN_ELEMS=roundup(hid * 2, ELEM) // ELEM, XM_ELEMS=roundup(hid * (4 if fp32 else 2), ELEM) // ELEM,
         H_ELEMS=roundup(ff * 4, ELEM) // ELEM,
-        DOWN_SPLIT=down_split(spec),
+        DOWN_SPLIT=down_split(spec), XM_F32=fp32, CONSISTENT_SUM=consistent_q4_sum(spec),
     )
 
 
@@ -885,7 +976,7 @@ def _layout_dense(spec: ModelSpec, max_ctx: int = 4096) -> Layout:
                   GLUE_SIDE_BYTES=glue_side, SIDE_ALPHA=side.off["alpha"], SIDE_BETA=side.off["beta"],
                   SIDE_SMALL=side.off["small"], SIDE_CONV=side.off["conv"])
         a = _Alloc()
-        a.add("xn", F.XN_ELEMS * ELEM)
+        a.add("xn", roundup(hid * (4 if linear_fp32(spec) else 2), ELEM))
         a.add("qkv", nch * 4)
         a.add("z", vw * 4)
         a.add("vec", spec.lin_value_heads * DN_RECORD_FLOATS * 4)
@@ -903,7 +994,7 @@ def _layout_dense(spec: ModelSpec, max_ctx: int = 4096) -> Layout:
                   A_ROUT=0, A_HP=0, A_H=a.off["h"], A_OUT2=a.off["out2"], A_OUT2B=a.off.get("out2b", 0),
                   A_BYTES=roundup(a.n, ELEM))
         s_head = C.DN_PAD * C.DN_DIM * 4
-        s_off = (spec.conv_kernel - 1) * nch * 2
+        s_off = (spec.conv_kernel - 1) * nch * (4 if linear_fp32(spec) else 2)
         kv.update(S_ROWS=C.DN_PAD, S_HEAD_BYTES=s_head, STATE_S_OFF=s_off,
                   STATE_BYTES=s_off + spec.lin_value_heads * s_head + dn_state_tail(C))
     else:
@@ -916,8 +1007,9 @@ def _layout_dense(spec: ModelSpec, max_ctx: int = 4096) -> Layout:
     e_a, kv_row = 0, 0
     if spec.has_full:
         qw, kvw, hd = spec.attn_q_width, spec.attn_kv_width, spec.head_dim
-        e_a, kv_row = kvw * 2, 4 * kvw
-        og_att = roundup(qw * 2, ELEM) // ELEM * ELEM
+        paired = paired_attention(spec)
+        e_a, kv_row = kvw * 2, (8 if paired else 4) * kvw
+        og_att = roundup(qw * (4 if paired else 2), ELEM) // ELEM * ELEM
         c = _Alloc()
         c.add("lnw", eln)
         c.add("postln", eln)
@@ -928,7 +1020,7 @@ def _layout_dense(spec: ModelSpec, max_ctx: int = 4096) -> Layout:
         kv.update(CA_LNW=c.off["lnw"], CA_POSTLN=c.off["postln"], CA_META=c.off["meta"], CA_RW=0, CA_SGW=0,
                   CA_BYTES=c.n)
         a = _Alloc()
-        a.add("xn", F.XN_ELEMS * ELEM)
+        a.add("xn", roundup(hid * (4 if attention_entry_fp32(spec) else 2), ELEM))
         a.add("qg", 2 * qw * 4)                        # q | gate f32
         a.add("kvn", 2 * kvw * 4)                      # k | v f32
         a.add("og", og_att)
@@ -1005,9 +1097,11 @@ def linear(spec: ModelSpec) -> Linear | None:
     tile = 1024                                     # dn_glue's channel tile
     key_width = spec.lin_key_heads * spec.lin_key_dim
     lanes = ab_lanes(spec)
-    xn_elems = roundup(spec.hidden * 2, ELEM) // ELEM
+    fp32 = linear_fp32(spec)
+    xn_elems = roundup(spec.hidden * (4 if fp32 else 2), ELEM) // ELEM
     return Linear(
-        AB_LANES=lanes, AB_ROWS=ELEM // (2 * lanes),
+        AB_LANES=lanes, AB_ROWS=ELEM // (2 * lanes), XN_F32=fp32, CONV_F32=fp32,
+        FACTORED_READOUT=factored_recurrence(spec),
         GLUE_HALF_OUTER=glue_fills(xn_elems, False) > LIMITS["shim_fills"],
         QKV_PC=nch // BAND_ROWS // n, Z_PC=vw // BAND_ROWS // n, OUT_PC=spec.hidden // BAND_ROWS // n,
         QKV_DIM=nch, VW=vw,
@@ -1017,7 +1111,7 @@ def linear(spec: ModelSpec) -> Linear | None:
         RECORD_BYTES=DN_RECORD_FLOATS * 4, O_HEAD_BYTES=spec.lin_value_dim * 4,
         OUT_K=vw, QKV_K=spec.hidden,
         OG_ELEMS=roundup(vw * 2, ELEM) // ELEM,
-        XN_SIDE_ELEMS=roundup(spec.hidden * 2, ELEM) // ELEM,
+        XN_SIDE_ELEMS=xn_elems,
     )
 
 
@@ -1029,6 +1123,11 @@ def attn(spec: ModelSpec) -> Attn | None:
     e_a = kvw * 2                                 # one cache-row half, attn.h's fifo element
     hpe, hpo = e_a // (hd * 4), e_a // (hd * 2)   # f32 heads per q/k/v/gate element; bf16 heads per og element
     A = attn_knobs(spec, spec.num_heads, hpo)
+    paired = paired_attention(spec)
+    if paired:
+        if not A.VEXP or A.RB != 1 or A.BLOCK or A.NHL != 4:
+            raise OpRangeError("paired Qwen attention requires VEXP=1, RB=1, NHL=4")
+        hpo = hpe  # FP32 output heads per EA-byte FIFO element
     return Attn(
         NH=spec.num_heads, KVH=spec.num_kv_heads, HD=hd, ROT=spec.rotary_dim,
         Q_PC=qw // BAND_ROWS // n, KV_PC=kvw // BAND_ROWS // n, O_PC=spec.hidden // BAND_ROWS // n,
@@ -1037,7 +1136,9 @@ def attn(spec: ModelSpec) -> Attn | None:
         E_A=e_a, HPE=hpe, HPO=hpo,
         Q_AIN_ELEMS=spec.num_heads // hpe, K_AIN_ELEMS=spec.num_kv_heads // hpe,
         OG_AOUT_ELEMS=spec.num_heads // hpo,
-        OG_ELEMS=roundup(qw * 2, ELEM) // ELEM,
+        OG_ELEMS=roundup(qw * (4 if paired else 2), ELEM) // ELEM, KV_PAIR=paired,
+        XN_F32=attention_entry_fp32(spec),
+        XN_ELEMS=roundup(spec.hidden * (4 if attention_entry_fp32(spec) else 2), ELEM) // ELEM,
         VEXP=A.VEXP, MLS=A.MLS, ACORES=A.ACORES, NHL=A.NHL, RB=A.RB, BLOCK=A.BLOCK,
     )
 
@@ -1067,7 +1168,7 @@ def pack_plan(spec: ModelSpec) -> dict:
         {"op": "std_perm", "tensor": pre + "mlp.share_down_exps_proj.weight", "dst": L.POOL_SHARE_DOWN,
          "nch": q4_chunks(hid, ff), "in_dim": ff},
     ]
-    plan: dict = {"pool_bytes": L.POOL_BYTES, "chunk_bytes": CHUNK, "layer_types": {},
+    plan: dict = {"pool_bytes": L.POOL_BYTES, "chunk_bytes": pool_chunk(spec), "layer_types": {},
                   "lm_head": {"pool_bytes": L.LMHEAD_POOL_BYTES,
                               "ops": [{"op": "lmhead_q8", "tensor": "lm_head.weight", "chunk_bytes": Q8_CHUNK, "in_dim": hid, "dst": 0}]},
                   "embed": {"tensor": "model.embed_tokens.weight", "dim": hid},
@@ -1233,6 +1334,12 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
     `layer_types`, since the op indices the weight buffers name are its own. `q8_split` builds an
     all-q8 route as the exact q4_1 split, which the bf16 route carries as `variants.lean` (OPEN-PREFILL-MODE)."""
     dense = ffn == "dense"
+    if spec.quant == "q4_1_f32":
+        # The GGUF-direct twin's pool is the f32-scale one (6144 B a chunk); the
+        # block-prefill GEMM reads the bf16 chunk law by a hardcoded constant,
+        # so a f32-scale set must not advertise the route -- the engine then
+        # prefills through step() (decode-as-prefill), which is exact.
+        return None
     if not dense and spec.quant_of("shared") == "q8":
         return None
     L, T = layout(spec, ffn=ffn), GEMM_T
@@ -1360,6 +1467,7 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
             "head_dim": spec.lin_value_dim, "conv_kernel": spec.conv_kernel, "ff": ff, **m1,
             **({"out_split": True} if split else {}),
             "state_s_off": L.STATE_S_OFF, "s_head_bytes": L.S_HEAD_BYTES, "s_rows": L.S_ROWS,
+            **({"conv_dtype": "float32"} if linear_fp32(spec) else {}),
             **m2, **(ffn_of(LINEAR) if dense else {}),
         }
     if spec.has_full:
@@ -1539,6 +1647,13 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         for name, types in r.get("variants", {}).items():
             for lt, gb in types.items():
                 out["layer_types"][lt].setdefault("gemm_block_variants", {})[name] = gb
+    sec = GGUF.section(spec, max_ctx, programs, twins_built=GGUF_EXPERT_OPS_READY)
+    if sec:
+        # The GGUF-direct twin: the same layer designs against the f32-scale pool
+        # layout (the q4_1 codes with f32 block scales). The engine swaps this whole
+        # section in when the model ships a model.gguf, and the f32-scale kernel sets
+        # are the *_f32 builds the export makes.
+        out["gguf"] = sec
     return out
 
 
@@ -1556,7 +1671,7 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
     L, C = R.layout, R.common
     return {
         "hidden": spec.hidden, "vocab": spec.vocab, "real_vocab": spec.real_vocab,
-        "chunk_bytes": CHUNK, "pool_bytes": L.POOL_BYTES,
+        "chunk_bytes": pool_chunk(spec), "pool_bytes": L.POOL_BYTES,
         "lmhead_pool_bytes": L.LMHEAD_POOL_BYTES, "lmhead_chunk_bytes": Q8_CHUNK,
         "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim, "rope_theta": spec.rope_theta,
         "rope_inv_freq": spec.rope_inv_freq(),
@@ -1594,6 +1709,13 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
     b["lm_head_q8"] = {"design": "lm_head_q8/lm_head_q8.py", "build_dir": "lm_head_q8/build_full",
                        "env": {"LMHEAD_N": str(spec.vocab), "LMHEAD_K": str(spec.hidden),
                                "LMHEAD_CORES": str(LIMITS["n_cols"])}}
+    if spec.quant == "q4_1":
+        # The GGUF-direct twins: the same layer designs against the f32-scale pool
+        # layout (the q4_1 codes with f32 block scales). The env says which variant
+        # to build (designs/layer_x/layout.py reads it); the q4_1 builds above are
+        # untouched, so a shipped model keeps the kernels it has.
+        if GGUF_EXPERT_OPS_READY:
+            b.update(GGUF.twin_builds(b, skip=("ln", "lm_head_q8")))
     r = gemm_route(spec)
     if r:
         b.update(r["builds"])

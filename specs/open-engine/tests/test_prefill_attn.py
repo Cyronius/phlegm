@@ -57,9 +57,17 @@ def test_a_dense_family_says_which_attention_the_host_half_computes():
     for name in ("k2-horizon-7b.json", "k2-horizon-3.7b.json"):
         ab = manifest(load_spec(specs / name))["layer_types"]["dense"]["gemm_block"]["attn_block"]
         assert (ab["m"], ab["hd"], ab["prep"]) == (1024, 128, "rope"), name
-    # not yet measured (Llama, Phi-4-mini, Granite), the norm after the rotation (HunYuan); Granite's
-    # 1280 rows (5 blocks of 256) and Phi-4-mini's 768 (3) would not even tile in gemm_pretiled
-    for name in ("llama31-8b.json", "hy-mt2-7b.json", "phi4-mini-4b.json", "granite42-3b.json"):
+    # Llama's scaled inverse frequencies are already carried by the manifest; no q/k norm.
+    for name, rows, hd in (("llama31-8b.json", 1024, 128), ("llama32-1b.json", 1024, 64),
+                           ("llama32-3b.json", 768, 128)):
+        m = manifest(load_spec(specs / name))
+        ab = m["layer_types"]["dense"]["gemm_block"]["attn_block"]
+        assert (ab["m"], ab["hd"], ab["prep"]) == (rows, hd, "rope"), name
+        pv = m["builds"]["ag_pv256"]
+        assert int(pv["env"]["AG_COLS"]) * 32 == hd
+    # The other families keep their existing attention choices. Granite has its own flash
+    # attention route; HunYuan normalizes after rotation and Phi-4-mini has partial rotary.
+    for name in ("hy-mt2-7b.json", "phi4-mini-4b.json", "granite42-3b.json"):
         m = manifest(load_spec(specs / name))
         assert "attn_block" not in m["layer_types"]["dense"]["gemm_block"], name
         assert not [k for k in m["builds"] if k.startswith("ag_")], name
@@ -79,3 +87,36 @@ def test_a_dense_family_says_which_attention_the_host_half_computes():
 @pytest.mark.skip(reason="OPEN-PREFILL-ATTN hardware verification: see the procedure above")
 def test_the_route_on_hardware():
     pass
+
+
+def test_partial_rotary_llama_keeps_the_validated_sequential_attention():
+    from dataclasses import replace
+    from recipes.load import load_spec
+    from recipes.manifest import manifest
+    spec = load_spec(ROOT / "open_kernels/recipes/specs/llama32-3b.json")
+    m = manifest(replace(spec, rotary_dim=96))
+    assert "attn_block" not in m["layer_types"]["dense"]["gemm_block"]
+
+
+@pytest.mark.parametrize("ag16", ["0", "1"])
+def test_dense_attention_builds_do_not_alias_different_shapes(monkeypatch, ag16):
+    from recipes.load import load_spec
+    from recipes.manifest import manifest
+
+    monkeypatch.setenv("AG16", ag16)
+    seen = {}
+    for name in ("llama32-1b", "llama32-3b", "llama31-8b",
+                 "qwen3-0.6b", "qwen3-4b", "qwen3-8b",
+                 "k2-horizon-3.7b", "k2-horizon-7b"):
+        m = manifest(load_spec(ROOT / "open_kernels/recipes/specs" / (name + ".json")))
+        for build in m["builds"].values():
+            if build["design"] != "attn_block/attn_gemm.py":
+                continue
+            env = build["env"]
+            shape = tuple(sorted(env.items()))
+            directory = build["build_dir"]
+            assert seen.setdefault(directory, shape) == shape, (name, directory)
+            # The instruction stream must tile the actual attention design.
+            assert int(env["AG_M"]) % 256 == 0
+            assert int(env["AG_K"]) % 64 == 0
+            assert int(env["AG_N"]) % (int(env.get("AG_N_TILE", 32)) * int(env["AG_COLS"])) == 0

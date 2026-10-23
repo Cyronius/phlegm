@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import os
 
+from . import gguf as GGUF
 from .catalogue import LIMITS, OpRangeError, check_buffer_args, require
 from . import qwen36moe as M
 import os
@@ -121,7 +122,9 @@ def _check(spec: ModelSpec) -> None:
         # PR #148 implements the >32-head case (glue_ab_w.cc's 64-lane tile and the
         # half-outer walk in glue_side_fills), so the old "fused wide glue needs 3 input
         # DMA channels" refusal is gone: head count no longer gates this recipe.
-        if fills > LIMITS["shim_fills"]:
+        # The FP32 route has 17 sequential fills, bounded by Pipeline(3);
+        # its half-tile schedule is hardware-validated independently.
+        if fills > LIMITS["shim_fills"] and not M.linear_fp32(spec):
             raise OpRangeError(
                 f"qwen35: the glue's side channel needs {fills} fills at hidden {spec.hidden} "
                 f"(each xn half, then both accumulators' weight tiles for it, then small and conv), "
@@ -141,7 +144,7 @@ def _check(spec: ModelSpec) -> None:
 
 def xn_side_elems(spec: ModelSpec) -> int:
     """4 KB elements the layer-entry norm output arrives in on the glue's `side` channel."""
-    return roundup(spec.hidden * 2, ELEM) // ELEM
+    return roundup(spec.hidden * (4 if M.linear_fp32(spec) else 2), ELEM) // ELEM
 
 
 def ab_tiles_per_half(spec: ModelSpec) -> list[int]:
@@ -149,7 +152,7 @@ def ab_tiles_per_half(spec: ModelSpec) -> list[int]:
     4 KB element of the projection -- 64 rows at 32 lanes, 32 rows at the 27B's 64 -- and a
     half carries min(2048, HID - h*2048) rows. Equal halves only when HID is a multiple of
     2048 -- at HID 2560 the two halves are 32 and 8 tiles."""
-    rows = ELEM // 2                                  # bf16 rows in one 4 KB element
+    rows = ELEM // (4 if M.linear_fp32(spec) else 2)
     per_tile = ELEM // (2 * ab_lanes(spec))
     return [min(rows, spec.hidden - h * rows) // per_tile for h in range(xn_side_elems(spec))]
 
@@ -193,7 +196,7 @@ def pack_plan(spec: ModelSpec) -> dict:
         proj_op(spec, "ffn", pre + "mlp.gate_proj.weight", L.POOL_FFN_GATE, ff, hid, hid),
         proj_op(spec, "ffn", pre + "mlp.down_proj.weight", L.POOL_FFN_DOWN, hid, ff, ff),
     ]
-    plan: dict = {"pool_bytes": L.POOL_BYTES, "chunk_bytes": CHUNK, "layer_types": {},
+    plan: dict = {"pool_bytes": L.POOL_BYTES, "chunk_bytes": M.pool_chunk(spec), "layer_types": {},
                   "lm_head": lm_head_plan(spec),
                   "embed": {"tensor": "model.embed_tokens.weight", "dim": hid},
                   "norm": {"tensor": "model.norm.weight", "bytes": hid * 2}}
@@ -287,6 +290,13 @@ def gemm_route(spec: ModelSpec) -> dict | None:
     the sequential path serves that size either way."""
     plan = pack_plan(spec)["layer_types"]
     try:
+        if spec.quant == "q4_1_f32":
+            # The GGUF-direct twin's pool is the f32-scale one (6144 B a chunk);
+            # the block-prefill GEMM reads the bf16 chunk law by a hardcoded
+            # constant, so a f32-scale set must not advertise the route -- the
+            # engine then prefills through step() (decode-as-prefill), which is
+            # exact. The same holds for the MoE recipe.
+            return None
         route = M.gemm_route(spec, FFN, plan)
     except OpRangeError:
         return None
@@ -415,11 +425,14 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         for g in ("zero", "xresf", "hn"):
             del out["globals"][g]
         out["globals"]["lmact"] = 64 * 1024
+    f32 = spec.quant == "q4_1_f32"
+    lx_set = "lx_f32" if f32 else "lx"
+    ax_set = "ax_f32" if f32 else "ax"
     if spec.has_linear:
         args = ["pool", "xres", "consts", "state", "act", "ptab"] if merged else ["pool", "xres", "consts", "state", "act"]
         check_buffer_args("lx", args)
-        out["contexts"][lin_ctx] = "lx/final.xclbin"
-        out["kernels"]["lx"] = {"context": lin_ctx, "insts": "lx/insts.bin", "build": "lx"}
+        out["contexts"][lin_ctx] = f"{lx_set}/final.xclbin"
+        out["kernels"]["lx"] = {"context": lin_ctx, "insts": f"{lx_set}/insts.bin", "build": lx_set}
         out["layer_types"][LINEAR] = {
             "buffers": {"consts": L.C_BYTES, "act": L.A_BYTES,
                         "state": {"kind": "linear", "bytes": L.STATE_BYTES}},
@@ -428,8 +441,8 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     if spec.has_full:
         args = ["pool", "xres", "consts", "state", "act", "ptab"]
         check_buffer_args("ax", args)
-        out["contexts"].setdefault(full_ctx, "ax/final.xclbin")
-        out["kernels"]["ax"] = {"context": full_ctx, "insts": "ax/insts.bin", "patch": "attnpos", "build": "ax"}
+        out["contexts"].setdefault(full_ctx, f"{ax_set}/final.xclbin")
+        out["kernels"]["ax"] = {"context": full_ctx, "insts": f"{ax_set}/insts.bin", "patch": "attnpos", "build": ax_set}
         A = recipe(spec).attn
         if merged and A.RB > 1:
             # attn.h ATTN_BLOCK_WIN (dux.py): the host streams the window as whole blocks of RB
@@ -477,6 +490,13 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             out[k].update(r[k])
         for lt, gb in r["layer_types"].items():
             out["layer_types"][lt]["gemm_block"] = gb
+    sec = GGUF.section(spec, max_ctx, programs)
+    if sec:
+        # The GGUF-direct twin: the same layer designs against the f32-scale pool
+        # layout (the q4_1 codes with f32 block scales). The engine swaps this whole
+        # section in when the model ships a model.gguf, and the f32-scale kernel sets
+        # are the *_f32 builds the export makes.
+        out["gguf"] = sec
     return out
 
 
@@ -492,8 +512,14 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
     `has_moe` goes false and nothing asks for the router record."""
     L = layout(spec, max_ctx)
     return {
+        **({"attn_kv_dtype": "bfloat16_pair", "attn_output_dtype": "float32"} if M.paired_attention(spec) else {}),
+        **({"attn_entry_dtype": "float32"} if M.attention_entry_fp32(spec) else {}),
+        **({"linear_entry_dtype": "float32", "linear_conv_dtype": "float32"} if M.linear_fp32(spec) else {}),
+        **({"linear_recurrence": "factored_compensated"} if M.factored_recurrence(spec) else {}),
+        **({"q4_activation_sum": "quantized_fp32"} if M.consistent_q4_sum(spec) else {}),
+        **({"ffn_norm_dtype": "float32"} if ffn_geometry(spec).XM_F32 else {}),
         "hidden": spec.hidden, "vocab": spec.vocab, "real_vocab": spec.real_vocab,
-        "chunk_bytes": CHUNK, "pool_bytes": L.POOL_BYTES,
+        "chunk_bytes": M.pool_chunk(spec), "pool_bytes": L.POOL_BYTES,
         "lmhead_pool_bytes": lm_head_plan(spec)["pool_bytes"],
         "lmhead_chunk_bytes": LM_T2_CHUNK if head_t2(spec) else Q8_CHUNK,
         "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim,
@@ -547,6 +573,12 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
                            "build_dir": f"lm_head_q8/build_{spec.vocab}_k{spec.hidden}",
                            "env": {"LMHEAD_N": str(spec.vocab), "LMHEAD_K": str(spec.hidden),
                                    "LMHEAD_CORES": str(n)}}
+    if spec.quant == "q4_1":
+        # The GGUF-direct twins: the same layer designs against the f32-scale pool
+        # layout (the q4_1 codes with f32 block scales). The env says which variant
+        # to build (designs/layer_x/layout.py reads it); the q4_1 builds above are
+        # untouched, so a shipped model keeps the kernels it has.
+        b.update(GGUF.twin_builds(b, skip=("ln", "lm_head_q8", "lm_head_t2")))
     r = gemm_route(spec)
     if r:
         b.update(r["builds"])

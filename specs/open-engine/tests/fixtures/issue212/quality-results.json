@@ -1,0 +1,127 @@
+{
+  "llama1b-quality300": {
+    "baseline": {
+      "positions": 300,
+      "median_cosine": 0.999992,
+      "minimum_cosine": 0.999874,
+      "argmax_percent": 99.0,
+      "next_token_loss": 2.7606
+    },
+    "batched": {
+      "positions": 300,
+      "median_cosine": 0.999992,
+      "minimum_cosine": 0.999808,
+      "argmax_percent": 99.3,
+      "next_token_loss": 2.7599
+    },
+    "gate_passed": true
+  },
+  "llama3b-quality300": {
+    "baseline": {
+      "positions": 300,
+      "median_cosine": 0.999992,
+      "minimum_cosine": 0.999934,
+      "argmax_percent": 99.7,
+      "next_token_loss": 2.6768
+    },
+    "batched": {
+      "positions": 300,
+      "median_cosine": 0.999992,
+      "minimum_cosine": 0.999921,
+      "argmax_percent": 100.0,
+      "next_token_loss": 2.6777
+    },
+    "gate_passed": true
+  },
+  "llama1b-reasoning47": {
+    "baseline": {
+      "positions": 47,
+      "median_cosine": 0.999986,
+      "minimum_cosine": 0.999645,
+      "argmax_percent": 93.6,
+      "next_token_loss": 2.4308
+    },
+    "batched": {
+      "positions": 47,
+      "median_cosine": 0.999986,
+      "minimum_cosine": 0.999733,
+      "argmax_percent": 95.7,
+      "next_token_loss": 2.4336
+    },
+    "gate_passed": true
+  },
+  "llama1b-code37": {
+    "baseline": {
+      "positions": 37,
+      "median_cosine": 0.999993,
+      "minimum_cosine": 0.999973,
+      "argmax_percent": 97.3,
+      "next_token_loss": 2.1039
+    },
+    "batched": {
+      "positions": 37,
+      "median_cosine": 0.999993,
+      "minimum_cosine": 0.999968,
+      "argmax_percent": 94.6,
+      "next_token_loss": 2.1024
+    },
+    "gate_passed": false
+  },
+  "partial-257": {
+    "positions": 1,
+    "first": 256,
+    "last": 256,
+    "argmax_equal": 1,
+    "top5_equal": 1,
+    "identical_positions": 0,
+    "min_cosine": 0.9999931181782515,
+    "min_correlation": 0.9999908999877726,
+    "flips": [],
+    "passed": true,
+    "greedy_equal": true,
+    "history_note": "real 257-token prompt; partial block"
+  },
+  "window-merge": {
+    "positions": 1,
+    "first": 46,
+    "last": 46,
+    "argmax_equal": 1,
+    "top5_equal": 1,
+    "identical_positions": 0,
+    "min_cosine": 0.99999521728347,
+    "min_correlation": 0.9999805267003433,
+    "flips": [],
+    "passed": true,
+    "greedy_equal": true,
+    "history_note": "zero-filled prior cache; boundary/merge contract, not long-context recall"
+  },
+  "qwen06-sharing": {
+    "positions": 20,
+    "first": 0,
+    "last": 19,
+    "argmax_equal": 20,
+    "top5_equal": 20,
+    "identical_positions": 20,
+    "min_cosine": 0.9999999999999998,
+    "min_correlation": 0.9999999999999998,
+    "flips": [],
+    "passed": true
+  },
+  "weight-sharing": {
+    "positions": 6,
+    "first": 0,
+    "last": 5,
+    "argmax_equal": 6,
+    "top5_equal": 6,
+    "identical_positions": 6,
+    "min_cosine": 1.0,
+    "min_correlation": 0.9999999999999999,
+    "flips": [],
+    "passed": true
+  },
+  "sharing_byte_identity": {
+    "llama1b_prompt_and_decode_dumps": 22,
+    "qwen06_prompt_and_decode_dumps": 36,
+    "all_equal": true
+  }
+}

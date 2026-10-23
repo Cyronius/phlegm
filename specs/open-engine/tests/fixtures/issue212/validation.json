@@ -1,0 +1,39 @@
+{
+  "base_commit": "478dbea3",
+  "date": "2026-10-22",
+  "hardware": "AMD Ryzen AI 9 HX PRO 370 / Strix NPU",
+  "runtime": {
+    "xrt": "2.21.0",
+    "driver": "32.0.20102.3930",
+    "firmware": "1.1.2.64",
+    "compiler": "MSVC 19.44",
+    "mlir_aie": "1.4.2",
+    "peano": "21.0.0.2026080301+c9c5ecb7"
+  },
+  "models": {
+    "Llama-3.2-1B-NPU2": {
+      "spec_hash": "sha256:131a7093af07c5af73222e02979def3fcf66e28ef05a77ba7d35a61240fbf96b",
+      "build_key": "sha256:5580a4d9db663aa59bc6e5d88caf16b5f6a3fb1b3ad74451f5e0298747d6d716",
+      "sets": 42,
+      "all_recorded_artifacts_present": true
+    },
+    "Llama-3.2-3B-NPU2": {
+      "spec_hash": "sha256:557fcf71747d606e5bc23aaf26ea287f46d06fe58c70ace11d465ae7b9c5c427",
+      "build_key": "sha256:daf5ed2af5c585b0b6dd79cb0ea45cbeab389ed1bb96d56a10c0fb58bf996d75",
+      "sets": 42,
+      "all_recorded_artifacts_present": true
+    },
+    "Qwen3-0.6B-NPU2": {
+      "spec_hash": "sha256:940adeebeea9138ec2b179544c42db59c57f029440d7ffe5a863a4fac1d4615e",
+      "build_key": "sha256:c7cfa793789680d318e84509da9d7c9c8b575c2ed4425e3f8e5da596c29e05b8",
+      "sets": 42,
+      "all_recorded_artifacts_present": true
+    },
+    "Llama-3.1-8B-NPU2": {
+      "spec_hash": "sha256:e4baa37e429635bc133b50b9bdac750abb02e6ce58c0d10efcb06bc2bd29a4bb",
+      "build_key": "sha256:ddaaecfd3e835c90cfede93c1e064143e0735830696fce61675792c2ec92fbd0",
+      "sets": 42,
+      "all_recorded_artifacts_present": true
+    }
+  }
+}

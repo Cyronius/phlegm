@@ -1,0 +1,17 @@
+{
+  "texts": {
+    "france": "The capital of France is",
+    "reasoning": "Mira has twelve red marbles and seven blue marbles. She gives four red marbles to Sam, then buys three blue marbles. How many marbles does Mira have now? Explain the arithmetic in one sentence.",
+    "code": "Write a Python function that returns the sum of the even numbers in a list. Include a short example with the numbers 1, 2, 3, and 4."
+  },
+  "context_paragraph": "The river crossed the valley from north to south. A wooden bridge connected the two villages. Every morning the farmers carried apples and grain to the market. The librarian recorded the weather, the date, and the number of visitors. In the evening everyone returned home before the lamps went out. ",
+  "context_tokens": 8192,
+  "tokenizer": "Llama-3.2-1B-NPU2/tokenizer.json",
+  "files_sha256": {
+    "llama-context-8192.ids": "5e2c26b3f95173fae56eaeb0e8b205e073161de5d13ccbc4cfbfc46f9a03e777",
+    "llama-quality-300.ids": "24e47bd4afca62a5dd3fa0ca288e1cc7ce56b0e4d4bb6067854ae790cbc11e69",
+    "llama-quality-source.txt": "34f7aa82cd5122d91217e652af95d53853103b29491c47d90740f37eed3a763f"
+  },
+  "quality_prompt_tokens": 300,
+  "timing_note": "Engine microbenchmark on repeated self-authored prose. Separate quality passage. Not a needle-recall or HTTP TTFT result."
+}

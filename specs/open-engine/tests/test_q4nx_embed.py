@@ -153,3 +153,30 @@ def test_module_exposes_what_this_test_relies_on():
     assert hasattr(q4nx, "f32_to_bf16") and hasattr(q4nx, "bf16_to_f32")
     one = np.float32([1.0])
     np.testing.assert_array_equal(bf16_to_f32(f32_to_bf16(one)), one)
+
+
+@pytest.mark.parametrize("token", [0, 15, 16, 31, 32, 63])
+def test_q8_embedding_uses_native_scales_codes_and_tile_row_stride(tmp_path, token):
+    rows, width = 64, 512
+    chunks = np.zeros((rows // 32, width // 256, 8704), dtype=np.uint8)
+    expected = np.empty((rows, width), dtype=np.float32)
+    for row in range(rows):
+        for col in range(width):
+            scale = np.float32((1 + row % 5) / 8 + (col % 256 // 32) / 16 + (col // 256) / 32)
+            code = (row * 17 + col * 3) % 255 - 127
+            expected[row, col] = scale * code
+            chunk = chunks[row // 32, col // 256]
+            rr, b, i = row % 32, col % 256 // 32, col % 32
+            chunk[:512].view('<u2')[b * 32 + rr] = f32_to_bf16(np.array([scale]))[0]
+            chunk[512 + rr // 16 * 4096 + b * 512 + i * 16 + rr % 16] = code & 255
+    data = chunks.tobytes()
+    header = {"model.embed_tokens.weight": {"dtype": "I8", "shape": list(chunks.shape), "data_offsets": [0, len(data)]}}
+    blob = json.dumps(header).encode(); path = tmp_path / "q8.q4nx"
+    path.write_bytes(struct.pack('<Q', len(blob)) + blob + data)
+    q = Q4NX(path)
+    try:
+        np.testing.assert_array_equal(q.embed(token, width), expected[token])
+        with pytest.raises(IndexError): q.embed(rows, width)
+        with pytest.raises(ValueError): q.embed(token, width + 256)
+    finally:
+        q.mm.close(); q.f.close()

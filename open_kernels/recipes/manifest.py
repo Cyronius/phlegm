@@ -46,6 +46,10 @@ def has_glu_step(layer_types: dict) -> bool:
                for key in ("program", "shared_program", "ffn_program")
                for st in g.get(key, []))
 
+# 6 plus the bfp16_dit pack op (OPEN-PREFILL-GEMM8); 4 is already used by bfp16_gemm
+DIT_MANIFEST_VERSION = 7
+DIT_OPS = ("bfp16_dit",)
+
 
 def routes(layer_types: dict) -> list[dict]:
     """Every layer type's gemm_block and its variants (OPEN-PREFILL-MODE)."""
@@ -53,8 +57,8 @@ def routes(layer_types: dict) -> list[dict]:
             for g in [lt.get("gemm_block") or {}, *(lt.get("gemm_block_variants") or {}).values()]]
 
 
-def has_gemm_pool_op(layer_types: dict) -> bool:
-    return any(op.get("op") in GEMM_POOL_OPS
+def has_gemm_pool_op(layer_types: dict, ops: tuple = GEMM_POOL_OPS) -> bool:
+    return any(op.get("op") in ops
                for g in routes(layer_types)
                for key in ("weights", "shared_weights", "ffn_weights")
                for w in (g.get(key) or {}).values()
@@ -125,6 +129,9 @@ def manifest(spec: ModelSpec, max_ctx: int = 4096, key: str | None = None) -> di
         m["manifest_version"] = GLU_MANIFEST_VERSION
     if has_attn_fa_prep(m["layer_types"]):
         m["manifest_version"] = PREP_MANIFEST_VERSION
+
+    if has_gemm_pool_op(m["layer_types"], DIT_OPS):
+        m["manifest_version"] = DIT_MANIFEST_VERSION
     return m
 
 

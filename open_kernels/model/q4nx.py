@@ -116,8 +116,14 @@ def dq_chunks_q4_1(chunks):
     i = np.arange(32)[None, None, :]
     p = (r // 16) * 4096 + bc * 512 + i * 16 + (r % 16)
     j = bc * 32 + r + 0 * i
-    vals = n[:, p.reshape(-1)].reshape(nch, 32, 8, 32)
-    return vals * d[:, j.reshape(-1)].reshape(nch, 32, 8, 32) + mn[:, j.reshape(-1)].reshape(nch, 32, 8, 32)
+    # Advanced indexing puts the chunk axis at stride 4: a wide tensor's
+    # elementwise arithmetic then jumps between chunks instead of walking one.
+    # take keeps the same indices/FP32 operations in contiguous chunk order.
+    shape = (nch, 32, 8, 32)
+    vals = np.take(n, p.reshape(-1), axis=1).reshape(shape)
+    scales = np.take(d, j.reshape(-1), axis=1).reshape(shape)
+    mins = np.take(mn, j.reshape(-1), axis=1).reshape(shape)
+    return vals * scales + mins
 
 
 def dq_chunks_q8(chunks):
@@ -220,7 +226,17 @@ class Q4NX:
         # rather than an error. Raise rather than assert: an assert disappears
         # under `python -O` / PYTHONOPTIMIZE, which is exactly when a silent
         # out-of-bounds read is least welcome.
-        vocab_size, row = self.tensors["model.embed_tokens.weight"]["shape"]
+        tensor = self.tensors["model.embed_tokens.weight"]
+        shape = tensor["shape"]
+        quantized = tensor["dtype"] == "I8"
+        if quantized:
+            if len(shape) != 3 or shape[2] != CHUNK_Q8 or not shape[0] or not shape[1]:
+                raise ValueError("Q4NX.embed: expected Q8 [row_tiles, col_tiles, 8704]")
+            vocab_size, row = shape[0] * 32, shape[1] * 256
+        else:
+            if tensor["dtype"] != "BF16" or len(shape) != 2:
+                raise ValueError("Q4NX.embed: expected BF16 rows or Q8 tiled embedding")
+            vocab_size, row = shape
         if not 0 <= token < vocab_size:
             raise IndexError(
                 f"Q4NX.embed: token {token} is out of range for a {vocab_size}-row "
@@ -231,7 +247,18 @@ class Q4NX:
                 f"Q4NX.embed: hidden={hidden} does not match the embedding "
                 f"table's row width {row}; the row stride would be wrong and "
                 f"every token would read the wrong bytes")
-        o0 = self.tensors["model.embed_tokens.weight"]["data_offsets"][0]
+        o0, o1 = tensor["data_offsets"]
+        if o0 < 0 or o1 < o0 or self.data_base + o1 > len(self.mm):
+            raise ValueError("Q4NX.embed: embedding payload is outside the container")
+        if quantized:
+            if o1 - o0 != shape[0] * shape[1] * CHUNK_Q8:
+                raise ValueError("Q4NX.embed: Q8 shape and payload size disagree")
+            count = shape[1] * CHUNK_Q8
+            b = self.data_base + o0 + (token // 32) * count
+            chunks = np.frombuffer(self.mm[b:b + count], dtype=np.uint8).reshape(-1, CHUNK_Q8)
+            return dq_chunks_q8(chunks)[:, token % 32].reshape(-1).astype(np.float64)
+        if o1 - o0 != vocab_size * row * 2:
+            raise ValueError("Q4NX.embed: BF16 shape and payload size disagree")
         b = self.data_base + o0 + token * hidden * 2
         return bf16_to_f32(np.frombuffer(self.mm[b: b + hidden * 2], dtype=np.uint16)).astype(np.float64)
 

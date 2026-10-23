@@ -1,0 +1,99 @@
+diff --git a/src/open_qwen36/block_host.cpp b/src/open_qwen36/block_host.cpp
+index b900fc2..ba0ff5d 100644
+--- a/src/open_qwen36/block_host.cpp
++++ b/src/open_qwen36/block_host.cpp
+@@ -470,12 +470,14 @@ void attention_prep(const AttnGeom& g, const float* q, const float* k, const flo
+         const size_t t = static_cast<size_t>(tt), p = g.pos0 + t;
+         for (size_t h = 0; h < g.nh; ++h) {
+             float* dst = Q + t * qw + h * g.hd;
+-            rms_vec(q + t * qw + h * g.hd, g.hd, qn, g.eps, dst);
++            if (qn) rms_vec(q + t * qw + h * g.hd, g.hd, qn, g.eps, dst);
++            else std::copy(q + t * qw + h * g.hd, q + t * qw + h * g.hd + g.hd, dst);
+             rope(dst, half, inv_freq, static_cast<double>(p));
+             for (size_t j = 0; j < g.hd; ++j) dst[j] *= scale;
+         }
+         for (size_t h = 0; h < g.kvh; ++h) {
+-            rms_vec(k + t * kvw + h * g.hd, g.hd, kn, g.eps, kh.data() + h * g.hd);
++            if (kn) rms_vec(k + t * kvw + h * g.hd, g.hd, kn, g.eps, kh.data() + h * g.hd);
++            else std::copy(k + t * kvw + h * g.hd, k + t * kvw + h * g.hd + g.hd, kh.data() + h * g.hd);
+             rope(kh.data() + h * g.hd, half, inv_freq, static_cast<double>(p));
+         }
+         for (size_t j = 0; j < kvw; ++j) {
+diff --git a/src/open_qwen36/block_host.hpp b/src/open_qwen36/block_host.hpp
+index 3d4fc79..16a6838 100644
+--- a/src/open_qwen36/block_host.hpp
++++ b/src/open_qwen36/block_host.hpp
+@@ -101,7 +101,8 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
+ /// The host half of the block attention when its products run on the NPU (OPEN-PREFILL-ATTN):
+ /// what attention_block does before its products and nothing after. Q [T, nh*hd] fp32 out,
+ /// normed and roped with 1/sqrt(hd) folded in (a power of two at every head dim here, so the
+-/// bf16 the kernel sees rounds exactly as the unscaled value would); the block's k / v normed,
++/// bf16 the kernel sees rounds exactly as the unscaled value would; qn / kn null means no q/k norm,
++/// the rotation alone); the block's k / v normed,
+ /// roped and written to the cache rows [pos0, pos0 + t_real) in bf16. Rows of Q past t_real are zero.
+ void attention_prep(const AttnGeom& g, const float* q, const float* k, const float* v, const float* qn,
+                     const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems, float* Q);
+diff --git a/src/open_qwen36/core.cpp b/src/open_qwen36/core.cpp
+index 6284b74..b9627c0 100644
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -2452,8 +2452,9 @@ void Core::dense_attention_block(int l, const std::vector<float>& y_qkv3, size_t
+     const size_t qw = gb.qw, kvw = gb.kvw, hd = ab.hd;
+     // The geometry the products were built for, against what this layer's projection produces;
+     // attention_npu checks m against the group size times T.
+-    if (ab.prep != "qknorm_rope" || qw % hd || kvw % hd || (qw / hd) % (kvw / hd) || w_->rotary_dim > hd ||
+-        hc.qn.size() != hd || hc.kn.size() != hd)
++    const bool normed = ab.prep == "qknorm_rope";
++    if ((!normed && ab.prep != "rope") || qw % hd || kvw % hd || (qw / hd) % (kvw / hd) || w_->rotary_dim > hd ||
++        (normed && (hc.qn.size() != hd || hc.kn.size() != hd)))
+         throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": the dense attention products were built for "
+                                  "head dim " + std::to_string(hd) + ", which this layer's q / k / v widths do not divide into");
+     // y [n_qkv3, T] straight into the [T, width] parts attention_prep reads
+@@ -2476,7 +2477,8 @@ void Core::dense_attention_block(int l, const std::vector<float>& y_qkv3, size_t
+     g.pos0 = pos0; g.eps = gb.eps;
+     tt = std::chrono::steady_clock::now();
+     float* Q = BlockScratch::fit(bs_.qrope, T * qw);
+-    host::attention_prep(g, q, k, v, hc.qn.data(), hc.kn.data(), w_->rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, Q);
++    host::attention_prep(g, q, k, v, normed ? hc.qn.data() : nullptr, normed ? hc.kn.data() : nullptr,
++                         w_->rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, Q);
+     timing_.mid_ms += ms_since(tt);
+     og.assign(T * qw, 0.f);
+     // attention_npu books its dispatches as part0 and its host stages as part1, the full layers'
+diff --git a/src/open_qwen36/manifest.cpp b/src/open_qwen36/manifest.cpp
+index ae6f5e7..bab7b26 100644
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -280,7 +280,8 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+                 a.args = get<std::vector<std::string>>(aj, "args", aw);
+                 if (dense_ab) {
+                     a.prep = get<std::string>(aj, "prep", aw);
+-                    if (a.prep != "qknorm_rope") fail(aw, "prep " + a.prep + " is not one this engine computes (qknorm_rope)");
++                    if (a.prep != "qknorm_rope" && a.prep != "rope")
++                        fail(aw, "prep " + a.prep + " is not one this engine computes (qknorm_rope, rope)");
+                 }
+                 // the products tile K^T by (64, 32) and V by (64, 32): a dense head dim of 64 or
+                 // 128 is a narrower product, the full layers' 256 the widest
+diff --git a/src/open_qwen36/manifest_test.cpp b/src/open_qwen36/manifest_test.cpp
+index 40156e9..571f72e 100644
+--- a/src/open_qwen36/manifest_test.cpp
++++ b/src/open_qwen36/manifest_test.cpp
+@@ -460,7 +460,18 @@ int main(int argc, char** argv) {
+             refused(d, bad, "intermediate_size", "qwen3: an 8B config is refused by name");
+             // attnpos alone does not make a kernel the attention-only dispatch: the sequential
+             // dx is attnpos-patched too, and would run the whole layer per token of the block
+-            refused_manifest(argv[2], "not the attention-only", "qwen3: a route whose attn_kernel is the sequential dx is refused",
++            {
++        std::ifstream rf(argv[2]);
++        json rj = json::parse(rf);
++        rj["layer_types"]["dense"]["gemm_block"]["attn_block"]["prep"] = "rope";
++        try {
++            Manifest r = Manifest::parse(rj, "rope");
++            check(r.layer_types.at("dense").gemm_block.attn_block.prep == "rope", "a dense attn_block prep \"rope\" (the rotation alone) parses");
++        } catch (const std::exception& e) {
++            check(false, std::string("a dense attn_block prep \"rope\" parses: ") + e.what());
++        }
++    }
++    refused_manifest(argv[2], "not the attention-only", "qwen3: a route whose attn_kernel is the sequential dx is refused",
+                              [](json& j) { j["layer_types"]["dense"]["gemm_block"]["attn_kernel"] = "dx"; });
+             // the dense route runs its GEMMs through its own dispatch, which adds no split halves
+             refused_manifest(argv[2], "do not add split halves", "qwen3: a split step on the dense route is refused",
