@@ -90,6 +90,12 @@ class DenseGeometry:
     ACORES: int; NHL: int; RB: int                                  # attention cores; heads each owns; rows per call
     DOWN_SPLIT: tuple = ()                                          # the down GEMV's K pieces; () when the FF fits whole
     NORM_SPLIT: bool = False                                        # the norm helper streams instead of holding five elements
+    # Gemma 4 (OPEN-FAMILY-GEMMA4); the defaults are every other family, whose flags then
+    # stay off the build line (dx.py), so their kernels compile byte for byte as before
+    VNORM: int = 0                                                  # attn.h ATTN_VNORM: weightless RMSNorm on V
+    SCALE: float = 0.0                                              # attn.h ATTN_SCALE; 0 = 1/sqrt(HD)
+    ROPE_PAIR: int = 0                                              # attn.h ATTN_ROPE_PAIR; 0 = ROT/2
+    QLOCAL: int = 0                                                 # attn.h ATTN_QLOCAL: a core keeps only its q heads
 
 
 @dataclass(frozen=True)
@@ -128,7 +134,7 @@ DIT_T = 1024
 # that - attention_bias covers its o_proj, and all three expert projections carry one - so
 # adding it here is not enough on its own; it needs a fourth consts slot (gptoss-bringup.md).
 QKV_BIAS_FAMILIES = ("qwen2",)
-DENSE_FAMILIES = ("qwen3", "llama3", "gemma3", "hunyuan", "granite", "phi3", "qwen2", "k2")
+DENSE_FAMILIES = ("qwen3", "llama3", "gemma3", "hunyuan", "granite", "phi3", "qwen2", "k2", "gemma4")
 
 
 def qkv_bias(spec: ModelSpec) -> bool:
@@ -407,6 +413,14 @@ def attn_flags(G: DenseGeometry, probe_env=()) -> list[str]:
         flags.append(f"-DATTN_RB={G.RB}")                 # would change every other family's build line
     if G.QKVB:                                            # same: only a family that has a bias sees the flag
         flags.append("-DATTN_QKV_BIAS=1")
+    if G.VNORM:                                           # Gemma 4 (OPEN-FAMILY-GEMMA4); like the two above,
+        flags.append("-DATTN_VNORM=1")                    # only a family that has them sees these flags
+    if G.SCALE:
+        flags.append(f"-DATTN_SCALE={G.SCALE!r}f")
+    if G.ROPE_PAIR:
+        flags.append(f"-DATTN_ROPE_PAIR={G.ROPE_PAIR}")
+    if G.QLOCAL:
+        flags.append("-DATTN_QLOCAL=1")
     if G.PTAB_ELEMS > 1:                                 # the position record spans two elements
         flags.append("-DATTN_PTAB_SPLIT=1")
     for k, v in probe_env:
