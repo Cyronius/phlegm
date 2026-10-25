@@ -27,7 +27,7 @@ from .spec import ModelSpec
 # main cores: LX_NULL_DN compiles the DeltaNet arithmetic away, LX_NULL_GEMV the q4/q8 GEMV
 # tile body, both leaving every stream, fifo and DMA -- and so insts.bin -- byte-identical.
 PROBE_VARS = ("ATTN_T8_SPLIT", "ATTN_T8_SPLIT_U1", "ATTN_T8_SPLIT_U2", "ATTN_NULL", "ATTN_ABL", "ATTN_RB", "ATTN_FAST", "LX_NULL_DN", "LX_NULL_GEMV", "DXL_NULL_PREP", "DXL_NULL_LN", "ATTN_TREE8", "ATTN_REPEAT",
-              "DX_WRING", "DX_WORDER", "DX_ONECTX", "ATTN_KVSLICE", "ATTN_KVCORES", "ATTN_G5_PVROLL", "ATTN_DXL_KVSLICE", "DXL_WRING", "DXL_WDEPTH", "ATTN_EXPA", "DXL_T8_UNROLL", "DXL_NULL_OUT")
+              "DX_WRING", "DX_WORDER", "DX_ONECTX", "ATTN_KVSLICE", "ATTN_KVCORES", "ATTN_G4CORES", "ATTN_G5_PVROLL", "ATTN_DXL_KVSLICE", "DXL_WRING", "DXL_WDEPTH", "ATTN_EXPA", "DXL_T8_UNROLL", "DXL_NULL_OUT")
 
 RB_SUPPORTED = (1, 2, 4, 8)   # attn_stepb.cc has bodies for 2 and 4; 1 is the unblocked path; 8 only on the windowed kernels
 
@@ -122,6 +122,12 @@ KVCORES_MEASURED: dict[str, int] = {"granite": 2}
 def kv_cores(spec: ModelSpec, nh: int, kvh: int, hd: int, rb: int, kvsl: int) -> int:
     """Attention cores per kv head: 0 (the head split of attn_cores), 1 or 2 (attn.h ATTN_G5)."""
     forced = os.environ.get("ATTN_KVCORES")
+    # An explicit Llama experiment: the existing G5 implementation also handles
+    # four heads. Share each two-KV-head stream between two attention cores.
+    # Keep the measured family table and the old KVCORES probe unchanged.
+    if (os.environ.get("ATTN_G4CORES") == "1" and spec.family == "llama3"
+            and kvsl and nh == 32 and kvh == 8 and hd == 64 and rb == 4):
+        return 1
     n = int(forced) if forced is not None else KVCORES_MEASURED.get(spec.family, 0)
     return n if n in (1, 2) and kvsl and kvh == 8 and nh == 5 * kvh and hd == 64 and rb in (4, 8) else 0
 

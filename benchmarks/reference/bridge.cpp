@@ -37,12 +37,12 @@ static int greedy(const Core& core) {
 }
 static std::vector<int> prompt_ids(const json& request, const Core& core) {
     const auto ids = request.at("prompt").get<std::vector<int>>();
-    if (ids.empty() || ids.size() > 4096) throw std::runtime_error("prompt must contain 1..4096 IDs");
+    if (ids.empty() || ids.size() > core.max_ctx()) throw std::runtime_error("prompt must fit the context capacity");
     for (int id : ids) if (id < 0 || static_cast<size_t>(id) >= core.real_vocab())
         throw std::runtime_error("prompt token outside the model vocabulary");
     return ids;
 }
-static int prefill(Core& core, const std::vector<int>& ids, const std::string& route) {
+static void run_prefill(Core& core, const std::vector<int>& ids, const std::string& route) {
     if (static_cast<size_t>(core.position()) + ids.size() > core.max_ctx())
         throw std::runtime_error("prefill exceeds context capacity");
     if (route == "layer-major") {
@@ -60,7 +60,35 @@ static int prefill(Core& core, const std::vector<int>& ids, const std::string& r
     } else {
         for (size_t i = 0; i < ids.size(); ++i) core.step(ids[i], i + 1 == ids.size());
     }
+}
+static int prefill(Core& core, const std::vector<int>& ids, const std::string& route) {
+    run_prefill(core, ids, route);
     return greedy(core);
+}
+static std::string encode_base64(const unsigned char* data, size_t size) {
+    static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((size + 2) / 3) * 4);
+    for (size_t i = 0; i < size; i += 3) {
+        const unsigned a = data[i];
+        const unsigned b = i + 1 < size ? data[i + 1] : 0;
+        const unsigned c = i + 2 < size ? data[i + 2] : 0;
+        out.push_back(alphabet[a >> 2]);
+        out.push_back(alphabet[((a & 3) << 4) | (b >> 4)]);
+        out.push_back(i + 1 < size ? alphabet[((b & 15) << 2) | (c >> 6)] : '=');
+        out.push_back(i + 2 < size ? alphabet[c & 63] : '=');
+    }
+    return out;
+}
+static json logits_reply(const Core& core) {
+    const auto& logits = core.logits();
+    const size_t n = core.real_vocab();
+    if (!n || logits.size() < n) throw std::runtime_error("incomplete logits");
+    for (size_t i = 0; i < n; ++i)
+        if (!std::isfinite(logits[i])) throw std::runtime_error("nonfinite logits");
+    static_assert(sizeof(float) == 4, "logit transport requires binary32");
+    const auto* bytes = reinterpret_cast<const unsigned char*>(logits.data());
+    return {{"logits_f32_le_base64", encode_base64(bytes, n * sizeof(float))}};
 }
 
 int main() {
@@ -119,27 +147,50 @@ int main() {
                 if (token < 0 || static_cast<size_t>(token) >= core->real_vocab()) throw std::runtime_error("invalid decode token");
                 core->step(token, true);
                 reply({{"token", greedy(*core)}});
-            } else if (command == "trial") {
+            } else if (command == "prefill_logits") {
                 const auto ids = prompt_ids(request, *core);
-                const size_t outputs = request.at("output_tokens").get<size_t>();
+                run_prefill(*core, ids, route);
+                reply(logits_reply(*core));
+            } else if (command == "decode_logits") {
+                const int token = request.at("token").get<int>();
+                if (token < 0 || static_cast<size_t>(token) >= core->real_vocab()) throw std::runtime_error("invalid decode token");
+                core->step(token, true);
+                reply(logits_reply(*core));
+            } else if (command == "trial" || command == "survey_trial") {
+                const auto ids = prompt_ids(request, *core);
+                const bool survey = command == "survey_trial";
+                const auto forced = survey ? request.at("decode_tokens").get<std::vector<int>>() : std::vector<int>{};
+                for (int token : forced)
+                    if (token < 0 || static_cast<size_t>(token) >= core->real_vocab())
+                        throw std::runtime_error("survey decode token outside the model vocabulary");
+                const size_t outputs = survey ? forced.size() + 1 : request.at("output_tokens").get<size_t>();
                 if (outputs < 2 || outputs > 4096 || ids.size() + outputs - 1 > core->max_ctx())
                     throw std::runtime_error("invalid output length or insufficient context capacity");
                 std::vector<double> latencies;
                 latencies.reserve(outputs - 1);
+                std::vector<int> greedy_tokens;
+                if (survey) greedy_tokens.reserve(outputs);
                 core->reset();                 // excluded; no prefix caching in Core
                 const auto start = Clock::now();
                 int previous = prefill(*core, ids, route);
                 const double prefill_ms = elapsed(start);
+                if (survey) greedy_tokens.push_back(previous);
                 const auto decode_start = Clock::now();
                 for (size_t step = 1; step < outputs; ++step) {
                     const auto token_start = Clock::now();
-                    core->step(previous, true); // synchronous dispatch + logit readback
+                    core->step(survey ? forced[step - 1] : previous, true); // synchronous dispatch + logit readback
                     previous = greedy(*core);  // EOS never stops a benchmark
                     latencies.push_back(elapsed(token_start));
+                    if (survey) greedy_tokens.push_back(previous);
                 }
                 const double decode_ms = elapsed(decode_start);
-                reply({{"prompt_tokens", ids.size()}, {"output_tokens", outputs}, {"decode_steps", latencies.size()},
-                    {"sample", {{"prefill_ms", prefill_ms}, {"decode_ms", decode_ms}, {"decode_token_ms", latencies}}}});
+                json result = {{"prompt_tokens", ids.size()}, {"output_tokens", outputs}, {"decode_steps", latencies.size()},
+                    {"sample", {{"prefill_ms", prefill_ms}, {"decode_ms", decode_ms}, {"decode_token_ms", latencies}}}};
+                if (survey) {
+                    result["survey_protocol"] = "phlegm-engine-survey-v1";
+                    result["greedy_tokens"] = greedy_tokens;
+                }
+                reply(std::move(result));
             } else throw std::runtime_error("unknown command");
         }
         std::_Exit(0);

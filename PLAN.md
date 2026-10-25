@@ -1,6 +1,6 @@
 # Phlegm integration and kernel work plan
 
-Updated: 2026-10-23. Status: planned work, with existing results noted below.
+Updated: 2026-10-24. Status: planned work, with existing results noted below.
 
 This is the project handoff plan for continuing on another machine. Paths are
 relative to the repository root. Check the current checkout and later result
@@ -10,9 +10,10 @@ entries before resuming: several older plan headers predate completed work.
 
 Keep C++ as the inference engine while completing normal generation, model
 onboarding and the tray. The native Rust inference engine port comes last.
-The next product milestone is real `phlegm run` and `phlegm serve` through the
-existing C++ process adapter. The immediate kernel task is hardware validation
-of the combined kernel tree with a compatible C++ runtime.
+The CLI/server now use the resident C++ process adapter for NPU inference.
+The next milestone is a real hardware run with a compatible combined kernel set,
+followed by fixing the resulting integration or performance failures. Hardware
+validation of the combined kernel tree needs a compatible C++ runtime.
 
 The implementation order above follows the 2026-10-22 override in
 [the monorepo plan](.claude/plans/phlegm-monorepo.md). Its older P1/P2/P3 order
@@ -22,8 +23,10 @@ that they all block CLI/server integration.
 
 ## Starting point
 
-- The C++ reference benchmark adapter runs real models. Normal serving still
-  uses a mock backend; the tray currently provides its shell.
+- The C++ reference benchmark adapter runs real models. `phlegm run` and `serve`
+  now use it for NPU inference; `serve --mock` remains an explicit test path.
+  The tray currently provides its shell. Device inference with this Phlegm
+  revision has not yet been verified.
 - The 2026-10-23 kernel sync and worktree recovery are recorded in
   [UPSTREAM.md](open_kernels/UPSTREAM.md). The audited kernel imports are present.
 - That ledger records an offline suite result of 1793 passed, 58 skipped and
@@ -36,15 +39,13 @@ that they all block CLI/server integration.
 
 ## 1. Connect CLI and server generation to C++
 
-- [ ] Extend the existing process adapter from benchmark calls to normal model
-  loading, prefill and decode.
-- [ ] Connect `phlegm run` and `phlegm serve` to that adapter.
-- [ ] Support sampling, model-specific chat templates and EOS handling.
-- [ ] Support streaming and request isolation; validate context capacity and
-  request parameters before dispatch.
-- [ ] Return useful model/kernel loading errors and handle worker failures.
-- [ ] Verify OpenAI chat/model responses, finish reasons, streamed/non-streamed
-  behavior and NPU hold/release against the intended API contracts.
+- [x] Extend the resident process adapter with prefill/decode logits for normal generation.
+- [x] Connect `phlegm run` and `phlegm serve` to that adapter.
+- [x] Sample in Rust, load external/inline model chat templates, and derive EOS IDs.
+- [x] Stream server output, reset for each request, and bound generation by context capacity.
+- [x] Surface load/worker errors without silently using a placeholder tokenizer.
+- [ ] Verify actual OpenAI responses, finish reasons, streaming, and NPU
+  hold/release on a device with matching model and kernels.
 
 Completion: real prompts work through both CLI and server, including sampled,
 streamed and multi-turn requests; the mock backend is no longer the normal
@@ -55,6 +56,26 @@ Sources: [current direction](.claude/plans/phlegm-monorepo.md),
 [project status](README.md).
 
 ## 2. Validate the combined kernels and runtime
+
+2026-10-24 host inventory: see [baseline readiness](specs/open-engine/artlite-baseline-readiness.md).
+The current boot initializes the Strix Halo driver with IOMMU. Local Linux
+tools, XRT/plugin, the C++ bridge, an isolated ArtLite comparator and fresh Llama
+1B kernels are built, and Q4_1 weights are available. An ArtLite arithmetic NPU
+smoke passes. The authenticated memlock adjustment now permits Phlegm XRT
+enumeration, resident model inference and reset. Experimental GGUF block
+prefill and an explicit Q8 head pass a 300-token quality gate; the artificial
+4096-window gate still fails. See
+[Linux GGUF prefill](specs/open-engine/gguf-prefill-linux.md) for fixes and
+diagnostic survey progress. These routes remain opt-in.
+The measured development baseline supports versions 1–3 and local DIT7;
+a separate PR209 runtime candidate supports1–7 while preserving DIT7 and
+Llama hi/lo precision. Bonsai/Hadamard integration and broad family acceptance
+remain open. Real-prefix GGUF quality and active4k flash checks pass; diagnostic
+the corrected probability-hi/lo flash route reaches770/714/585 tokens/s at
+1k/4k/8k, still far behind ArtLite. All9 diagnostic pairs pass controls; the
+artificial zero-history failure remains, so the route stays opt-in. Decode
+compute/DMA and core-layout experiments are next. Every accepted parity cell remains
+open; these development measurements are not clean-release benchmark results.
 
 - [ ] Prepare an external C++ reference checkout at a recorded revision.
 - [ ] Reconcile the required companion changes against that checkout. Use
@@ -193,3 +214,16 @@ This work does not gate the C++-backed CLI, server, onboarding or tray milestone
    Record new evidence beside the relevant spec/report and update this checklist.
 5. Keep published benchmark reports restricted to matching clean, optimized
    release tags, as required by [Phlegm Bench](specs/bench/spec.md).
+
+
+2026-10-25 performance continuation: experimental compensated-BFP and rotated
+64x64 prefill pass full8192-position/model/bridge gates. Preliminary engine
+trials suggest1.42x at1K and1.31x at8K, but only2/3 and1/3 stable pairs; no
+accepted parity/default promotion. Dibs-isolated rerun waits for other sessions.
+See [.plans/artlite-performance.md](.plans/artlite-performance.md) for exact
+quality results, resource wait and next command.
+
+2026-10-25 clean Dibs continuation: five of five1K paired engine trials pass,
+prefill790 to1203 tokens/s (1.5204x); decode unchanged. Zero of five8K pairs
+pass controls, so no accepted8K figure. Full8192 model correctness remains
+validated; no ArtLite parity claim. Details in active performance plan.

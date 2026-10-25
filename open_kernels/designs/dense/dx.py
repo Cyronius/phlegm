@@ -177,6 +177,11 @@ if T8:
     ATTN_FLAGS.extend(tree8_flags(4))
 elif KVC:                                              # TREE8's companions, the G5 tree in its place
     ATTN_FLAGS.extend([f for f in tree8_flags(4) if not f.startswith("-DATTN_TREE8")] + ["-DATTN_G5=1"])
+    if GRP == 4 and "ATTN_EXPA" not in os.environ:
+        # The Llama placement probe keeps its original exponential. Granite's
+        # measured G5 default uses EXPA=2; that is a separate arithmetic change.
+        ATTN_FLAGS = [f for f in ATTN_FLAGS if not f.startswith("-DATTN_EXPA=")]
+        ATTN_FLAGS.append("-DATTN_EXPA=0")
 if KVSL:
     KVS, KVB = kv_slices(G.NH, G.KVH, ACORES, 2 if KVC else 1, CORE_H0)
     KW_GROUPS = sorted(set(KVB))                       # one window stream per distinct slice, read by its cores

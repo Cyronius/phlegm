@@ -7052,3 +7052,48 @@ them in the memtile) would make the kernel DMA-bound instead of compute-bound, b
 32-bit words), so it needs either a drafter-specific pack order or a K split across the column's cores with an
 on-chip sum.
 
+
+
+### Linux GGUF development evidence (2026-10-24)
+
+[GGUF prefill validation](gguf-prefill-linux.md) owns the local Strix Halo
+results for explicit f32-scale projection GEMMs, the Q8-repacked head, and
+KV-sliced decode. The experimental knobs are opt-in, with distinct build
+identities. Source CPU/model gates, retained failures, compiler budgets and raw
+paired-survey paths are recorded there. This evidence does not promote a route
+or establish ArtLite parity; published reports still require the benchmark
+spec's clean release and provenance gates.
+
+
+### OPEN-PREFILL-ATTN-FA-LLAMA: preserve paired probabilities
+
+An opt-in Llama GGUF flash route shall declare `attn_fa.psplit=true` and build
+every attention stream with AF_PSPLIT=1. Both the online denominator and PV
+shall consume the BF16 high and low probability parts. A supporting runtime
+shall refuse an enabled Llama flash route without that declaration; it shall
+also refuse an unavailable window rather than take an unsupported CPU path.
+This preserves the existing Llama probability contract while allowing the
+internal flash implementation to change. The low plane is core-local and does
+not add a hardware buffer argument. Other families retain their existing default.
+Full independent arithmetic, model, window and paired timing gates apply;
+[Linux GGUF development evidence](gguf-prefill-linux.md) retains the rejected
+single-probability experiments and current paired-probability validation.
+
+### OPEN-PREFILL-BFP-HILO-PROBE: explicit compensated input ABI
+
+Development-only Q4 Llama experiments may tag a block projection step
+`fmt: "bfp16_hilo"`. The input is T*K*9/4 bytes of high/residual BFP panels,
+with global order `[K64][T/8][K8][hi,lo]`; output is F32 `[N,T]`. This is
+not the old bfp16 weight/c-tiled-output route. Input twins need the larger
+allocation; staged, block-major and generic GEMM uploads all honor the tag.
+The current host packer accepts bounded finite activations |x|<=1e20, T%32=0
+and K%64=0. It raises exponents on positive mantissa rollover and is tested
+against an independent scalar encoder under three CPU rounding modes.
+
+Sequential/tail use, DIT reinterpretation and split/padded/GLU metadata are
+refused. Old runtimes reject the new format. Existing default manifests and
+local version7 DIT retain their previous contracts. Experimental image assembly
+checks every projection's CDO ELF/init/enable payloads before sharing a context.
+See [the source audit](artlite-prefill-code-audit.md) and
+[owning experimental report](gguf-prefill-linux.md) for numerical/model gates,
+failed variants and timing limitations. No default or parity promotion.

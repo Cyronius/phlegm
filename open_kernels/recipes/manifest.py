@@ -132,6 +132,9 @@ def manifest(spec: ModelSpec, max_ctx: int = 4096, key: str | None = None) -> di
 
     if has_gemm_pool_op(m["layer_types"], DIT_OPS):
         m["manifest_version"] = DIT_MANIFEST_VERSION
+    finalize = getattr(F, "finalize_gguf_manifest", None)
+    if finalize:
+        finalize(spec, m)
     return m
 
 

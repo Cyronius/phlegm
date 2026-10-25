@@ -51,6 +51,17 @@ sync is a plain diff of these two directories.
 | date | phlegm ref | upstream PR | state |
 |---|---|---|---|
 
+## Linux baseline build correction (2026-10-24)
+
+The first native harness build exposed duplicate `AttnRowPatch`,
+`attn_rows_table` and `attn_rows_apply` definitions in `harness/stream_patch.hpp`.
+Removed the older second block and retained the KV-slice-aware implementation.
+The canonical harness compiles against local XRT 2.27, and the compiler-backed
+row-offset/slice regression passes. Setup, source identities and untested
+hardware/model routes are in
+[baseline readiness](../specs/open-engine/artlite-baseline-readiness.md).
+No arithmetic optimization or ArtLite parity claim follows from this correction.
+
 ## Kernel sync integration (2026-10-23)
 
 The import was refreshed from the live upstream refs above. Original contributor
@@ -117,3 +128,29 @@ modified or deleted.
   include both M and head width. Llama 1B and Qwen3 4B share M=1024 but need
   different 64/128-wide heads. The AG16 experiment keeps 64-wide heads on the
   regular route because its 8 columns of 16 cannot tile N=64.
+
+
+## Linux development validation (2026-10-24)
+
+The Strix Halo Linux continuation is recorded in
+[GGUF prefill validation](../specs/open-engine/gguf-prefill-linux.md).
+Canonical changes add opt-in f32-scale GGUF GEMMs, an explicit Q8-repacked
+head, and a separate `DENSE_FLASH_PREFILL=1` experiment for eligible Llama GGUF
+sets. No measured default family table is promoted. Kernel images are rebuilt
+with all streams, with independent arithmetic and model gates. The artificial
+zero-history/window failure remains recorded; parity has not been reached.
+
+Two additional **alternative** companion patches are based directly at
+478dbea3: `linux-baseline-runtime.patch` preserves the measured 1–3/7 baseline;
+`linux-runtime-pr209.patch` additionally reconciles PR209's runtime routes,
+retaining local DIT7 and the Llama hi/lo sub-block merge. The latter's source
+integration head/base are in `upstream-patches/sources.json`; it is not a patch
+to apply after the baseline. It also refuses unsupported CPU fallback when an
+experimental flash window is unavailable. Bonsai/Hadamard is still not part of
+this combined runtime. DIT and additional family hardware acceptance stay open.
+
+Fresh KV-sliced Llama 1B decode matches all 300 and 4137 prefill logits, plus
+15 subsequent decode steps, byte for byte against the corresponding baseline.
+Real-prefix model gates pass at 4137 positions and independently on the 47-token
+4096 boundary slice. These development results do not establish recall quality,
+HTTP performance, or clean-release benchmark parity.

@@ -39,7 +39,7 @@ from __future__ import annotations
 import copy
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from . import gguf as GGUF
 from .catalogue import LIMITS, OpRangeError, check_buffer_args, require
@@ -197,6 +197,18 @@ def pool_quant(spec: ModelSpec) -> str:
     return "q4_1_f32" if spec.quant == "q4_1_f32" else "q4_1"
 
 
+def gguf_q8_head(spec: ModelSpec) -> bool:
+    """Opt-in Llama head avoiding the ordinary GGUF path's Q4 requantization."""
+    return (spec.family == "llama3" and spec.quant == "q4_1_f32"
+            and os.environ.get("DENSE_GGUF_HEAD_Q8") == "1")
+
+
+def head_pool_bytes(spec: ModelSpec, layout: DenseLayout) -> int:
+    if gguf_q8_head(spec):
+        return roundup(lm_rows(spec) * spec.hidden // 8192 * 8704, MB)
+    return layout.LMHEAD_POOL_BYTES
+
+
 def _check(spec: ModelSpec) -> None:
     n = cores_for(spec)
     if spec.family not in DENSE_FAMILIES:
@@ -323,7 +335,7 @@ from .attnknobs import probe_env as attn_knobs_probe_env
 #                    FF fits whole, so the split can be compared against the whole path
 #                    on a model that is already tested end to end.
 #   DENSE_NORM_SPLIT  "1" -- force the streaming norm helper (the same, for the norm).
-DENSE_PROBE_VARS = ("DENSE_DOWN_SPLIT", "DENSE_NORM_SPLIT")
+DENSE_PROBE_VARS = ("DENSE_DOWN_SPLIT", "DENSE_NORM_SPLIT", "DENSE_GGUF_GEMM", "DENSE_GGUF_HEAD_Q8", "DENSE_GGUF_COMPACT", "DENSE_FLASH_PREFILL", "AF_LMAX", "AF_LONG_STREAM")
 
 
 def probe_env() -> dict[str, str]:
@@ -499,10 +511,12 @@ def pack_plan(spec: ModelSpec) -> dict:
     return {
         "pool_bytes": L.POOL_BYTES, "chunk_bytes": chunk_bytes(pool_quant(spec)),
         "layer_types": {lt: one for lt in sorted(set(spec.layer_types))},
-        "lm_head": {"pool_bytes": L.LMHEAD_POOL_BYTES,
-                    "ops": [{"op": "std_perm_gguf" if spec.quant == "q4_1_f32" else "std_perm",
+        "lm_head": {"pool_bytes": head_pool_bytes(spec, L),
+                    "ops": ([{"op": "lmhead_q8", "tensor": "lm_head.weight", "dst": 0,
+                              "chunk_bytes": 8704, "in_dim": hid}] if gguf_q8_head(spec) else
+                            [{"op": "std_perm_gguf" if spec.quant == "q4_1_f32" else "std_perm",
                              "tensor": "lm_head.weight", "dst": 0,
-                              "nch": q4_chunks(lm_rows(spec), hid, pool_quant(spec)), "in_dim": hid}]},
+                              "nch": q4_chunks(lm_rows(spec), hid, pool_quant(spec)), "in_dim": hid}])},
         "embed": {"tensor": "model.embed_tokens.weight", "dim": hid,
                   **({"scale": hid ** 0.5} if spec.quant == "q4_1_f32" and spec.family == "gemma3" else {})},
         "norm": {"tensor": "model.norm.weight", "bytes": hid * 2},
@@ -524,6 +538,7 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
     The block size, the GEMM design and the one-context-per-route rule are the 35B route's
     (`qwen36moe.gemm_route`); what differs is the kind, and that the FFN here is dense rather
     than a set of experts, so the whole layer is five dispatches and a handful of host stages."""
+    f32_gemm = spec.quant == "q4_1_f32" and os.environ.get("DENSE_GGUF_GEMM") == "1"
     # A projection streamed at q8 has no route: the GEMM dequantises the q4_1 band law only
     # (OPEN-PREFILL-BATCH), so such a spec keeps exactly the sequential manifest it had.
     if any(spec.quant_of(r) == "q8" for r in Q8_ROLES):
@@ -573,16 +588,29 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
                       "kernels_s": {str(Lw): f"ag_s{Lw}" for Lw in ag_tiers},
                       "kernels_pv": {str(Lw): f"ag_pv{Lw}" for Lw in ag_tiers}, "prep": prep}
     attn_fa = None
-    # AF_LMAX narrows the windows for an experimental export; a longer window then takes the host attention
-    fa_tiers = list(range(256, min(ATTN_LMAX, max_ctx, int(os.environ.get("AF_LMAX", ATTN_LMAX))) + 1, 256))
-    if (spec.family in BLOCK_ATTN_FA and not attn_block and set(spec.layer_types) == {DENSE} and T == 256
+    # Explicit experiment for the GGUF Llama route. Keep the measured default
+    # score/PV route until independent model/window and paired timing gates pass.
+    flash_probe = f32_gemm and spec.family == "llama3" and os.environ.get("DENSE_FLASH_PREFILL") == "1"
+    # Build descriptions are also queried without the final context capacity.
+    # The explicit GGUF probe therefore fixes its cache shape from AF_LMAX;
+    # the runtime separately checks that each requested window fits its cache.
+    fa_cap = int(os.environ.get("AF_LMAX", ATTN_LMAX))
+    fa_long = flash_probe and os.environ.get("AF_LONG_STREAM") == "1"
+    if flash_probe and (fa_cap <= 0 or fa_cap % 256 or fa_cap > (8192 if fa_long else ATTN_LMAX)):
+        raise OpRangeError(f"DENSE_FLASH_PREFILL needs AF_LMAX divisible by 256, from 256 up to {8192 if fa_long else 4096}; >4096 requires AF_LONG_STREAM=1")
+    fa_rows = fa_cap if flash_probe else max_ctx
+    fa_limit = fa_cap if flash_probe else min(ATTN_LMAX, max_ctx, fa_cap)
+    fa_tiers = list(range(256, fa_limit + 1, 256))
+    if (((spec.family in BLOCK_ATTN_FA and not attn_block) or flash_probe) and set(spec.layer_types) == {DENSE} and T == 256
             and spec.head_dim == 64 and spec.rotary_dim == spec.head_dim and not spec.qk_norm and not spec.attn_gate
             and spec.num_heads % 4 == 0 and fa_tiers):
+        attn_block = None
         attn_fa = {"hd": 64, "l_max": fa_tiers[-1], "q_head": 4096 * (9 if AF_QSPLIT else 5), "qsplit": AF_QSPLIT,
+                   **({"psplit": True} if flash_probe else {}),
                    "kernels": {str(Lw): f"af{Lw}" for Lw in fa_tiers}}
         # OPEN-PREFILL-GLUE-PREP: the bfp16 route's rope, Q packing and cache write as one more stream of the same
         # context (Q hi / lo only); n_pad is the qkv GEMM's padded width, the c-tiled y it reads
-        if AF_QSPLIT:
+        if AF_QSPLIT and not f32_gemm:
             attn_fa["prep"] = {"kernel": "afp", "n_pad": -(-(qw + 2 * kvw) // BFP16_ROWS) * BFP16_ROWS}
     plans = pack_plan(spec)["layer_types"]
     shapes: set[tuple[int, int]] = set()
@@ -593,7 +621,7 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
         if N % 256 or K % 256:
             raise OpRangeError(f"gemm route: [{N}, {K}] is not a multiple of 256 in both dims")
         shapes.add((N, K))
-        return f"gemm_n{N}_k{K}"
+        return f"gemm_n{N}_k{K}" + ("_f32" if f32_gemm else "")
 
     def run(N: int, K: int, w: str) -> dict:
         return {"op": "run", "kernel": ctx(N, K), "args": [w, f"gemm_x_k{K}", f"gemm_y_n{N}"]}
@@ -656,10 +684,12 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
             name = f"af{Lw}"
             out["kernels"][name] = {"context": "af", "insts": f"{name}/insts.bin", "build": name}
             out["builds"][name] = {"design": "attn_fa/attn_fa.py",
-                                   "build_dir": f"attn_fa/build_l{Lw}_h{spec.num_heads}_kv{spec.num_kv_heads}{sfx}",
+                                   "build_dir": f"attn_fa/build_l{Lw}_h{spec.num_heads}_kv{spec.num_kv_heads}{sfx}" + (f"_r{fa_rows}" if flash_probe else ""),
                                    "env": {"AF_L": str(Lw), "AF_HEADS": str(spec.num_heads),
                                            "AF_KV_HEADS": str(spec.num_kv_heads), "AF_KV_LD": str(L.KV_ROW // 2),
-                                           "AF_MAX_ROWS": str(max_ctx), "AF_QSPLIT": str(int(AF_QSPLIT))}}
+                                           "AF_MAX_ROWS": str(fa_rows), "AF_QSPLIT": str(int(AF_QSPLIT)),
+                                           **({"AF_PSPLIT": "1"} if flash_probe else {}),
+                                           **({"AF_LONG_STREAM": "1"} if fa_long else {})}}
         if "prep" in attn_fa:
             out["kernels"]["afp"] = {"context": "af", "insts": "afp/insts.bin", "build": "afp"}
             out["builds"]["afp"] = {"design": "attn_fa/attn_fa.py",
@@ -734,15 +764,16 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
                                                 "AG_N": str(N), "AG_COLS": "8", "AG_N_TILE": "16"}}
 
     for N, K in sorted(shapes):
-        name = f"gemm_n{N}_k{K}"
+        name = ctx(N, K)
         out["contexts"].setdefault("gemm", f"{name}/final.xclbin")
         out["kernels"][name] = {"context": "gemm", "insts": f"{name}/insts.bin", "build": name}
         out["globals"][f"gemm_x_k{K}"] = K * T * 2      # bf16, pre-tiled [K, T]
         out["globals"][f"gemm_y_n{N}"] = N * T * 4      # f32 [N, T]
         out["builds"][name] = {"design": "gemm_q4_prefill/gemm_q4_prefill.py",
-                               "build_dir": f"gemm_q4_prefill/build_n{N}_k{K}_t{T}",
-                               "env": {"GQP_N": str(N), "GQP_K": str(K), "GQP_T": str(T)}}
-    dit = dit_route(spec, out, plans)
+                               "build_dir": f"gemm_q4_prefill/build_n{N}_k{K}_t{T}" + ("_f32" if f32_gemm else ""),
+                               "env": {"GQP_N": str(N), "GQP_K": str(K), "GQP_T": str(T),
+                                       **({"GQP_SCALES_F32": "1"} if f32_gemm else {})}}
+    dit = None if f32_gemm else dit_route(spec, out, plans)
     if dit:
         # the 8-bit route is the default (`fast`); this one stays as `lean`, without its weight copy
         out["variants"] = {"lean": out["layer_types"]}
@@ -903,7 +934,7 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     longrope = bool(sc) and sc.get("rope_type") == "longrope"
     f32 = spec.quant == "q4_1_f32"
     dx_set = "dx_f32" if f32 else "dx"
-    lm_set = "lm_head_q4_f32" if f32 else "lm_head_q4"
+    lm_set = "lm_head_q8_gguf" if gguf_q8_head(spec) else "lm_head_q4_f32" if f32 else "lm_head_q4"
     out = {
         "contexts": {"dx": f"{dx_set}/final.xclbin", "ln": "ln/final.xclbin", "lm": f"{lm_set}/final.xclbin"},
         "kernels": {"ln": {"context": "ln", "insts": "ln/insts.bin", "build": "ln"},
@@ -913,7 +944,7 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
                  {"op": "run", "kernel": "lm", "args": ["lmpool", "hn", "logits"]}],
         "globals": {"xres": spec.hidden * 4, "zero": spec.hidden * 4, "normw": spec.hidden * 2,
                     "xresf": spec.hidden * 4, "hn": spec.hidden * 2, "logits": lm_rows(spec) * 4,
-                    "lmpool": L.LMHEAD_POOL_BYTES},
+                    "lmpool": head_pool_bytes(spec, L)},
     }
     if one_context(spec):
         # the final norm and the head as a second stream over dx's image: no context change in a token
@@ -943,18 +974,16 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             "buffers": {"consts": L.CD_BYTES, "act": L.AD_BYTES, "state": {"kind": "kv", "row": L.KV_ROW}},
             "program": [{"op": "run", "kernel": kn, "args": args}],
         }
-    # The block-prefill GEMM route (gemm_q4_prefill / attn_block) reads the pool's 5120 B
-    # bf16-scale chunks by a hardcoded law; the GGUF-direct pool is 6144 B f32-scale, so a
-    # f32-scale kernel set must NOT advertise it -- the engine then prefills through step()
-    # (decode-as-prefill), which is exact. BUILDING THE f32 TWINS of those GEMMs is the way
-    # to bring the route back (its GQD_CHUNK_BYTES / scale loads need the SCALES_F32 variant).
-    r = None if f32 else gemm_route(spec, max_ctx)
+    # GGUF block prefill is an opt-in experiment until its independent numerical
+    # and model-quality gates pass. Its GEMMs read the 6144 B f32-scale chunks;
+    # the ordinary q4nx GEMMs cannot read that layout.
+    r = gemm_route(spec, max_ctx) if not f32 or os.environ.get("DENSE_GGUF_GEMM") == "1" else None
     if r:
         for k in ("contexts", "kernels", "globals"):
             out[k].update(r[k])
         for lt, gb in r["layer_types"].items():
             out["layer_types"][lt]["gemm_block"] = gb
-        bf = bfp16_route(spec, max_ctx)
+        bf = None if f32 else bfp16_route(spec, max_ctx)
         if bf:
             for k in ("contexts", "kernels", "globals"):
                 out[k].update(bf[k])
@@ -987,6 +1016,57 @@ def f32_twin_fits(spec: ModelSpec) -> bool:
     manifest must not advertise a "gguf" section that names one (the engine
     would look for a kernel that was never built)."""
     return not geometry(spec).DOWN_SPLIT
+
+
+def finalize_gguf_manifest(spec: ModelSpec, manifest: dict) -> None:
+    """Opt-in BF16 scale storage: the same rounding already done by the cores.
+
+    Keep the GGUF Q8 head and attention route while borrowing the ordinary
+    Q4 projection kernels and their pool geometry. No source codes are requantized.
+    """
+    if os.environ.get("DENSE_GGUF_COMPACT") != "1" or spec.quant == "q4_1_f32":
+        return
+    if (spec.family != "llama3" or spec.quant != "q4_1" or spec.q8_roles
+            or "gguf" not in manifest):
+        raise OpRangeError("DENSE_GGUF_COMPACT needs a pure-Q4 Llama GGUF twin")
+    if (os.environ.get("DENSE_GGUF_GEMM") != "1"
+            or os.environ.get("DENSE_GGUF_HEAD_Q8") != "1"):
+        raise OpRangeError("DENSE_GGUF_COMPACT requires DENSE_GGUF_GEMM=1 and DENSE_GGUF_HEAD_Q8=1")
+    g = manifest["gguf"]
+    g["spec"] = copy.deepcopy(manifest["spec"])
+    g["spec_hash"] = manifest["spec_hash"]
+    for key in ("chunk_bytes", "pool_bytes"):
+        g["layout"][key] = manifest["layout"][key]
+        g["pack"][key] = manifest["pack"][key]
+    for name, layer in g["layer_types"].items():
+        base = manifest["layer_types"][name]
+        old, new = layer["pack"], base["pack"]
+        if (old["consts"] != new["consts"] or len(old["pool"]) != len(new["pool"])
+                or any(a["tensor"] != b["tensor"] or b["op"] != "std_perm"
+                       for a, b in zip(old["pool"], new["pool"]))):
+            raise OpRangeError("DENSE_GGUF_COMPACT needs matching Q4 pool operations and unchanged constants")
+        layer["pack"] = copy.deepcopy(new)
+        for op in layer["pack"]["pool"]:
+            op["op"] = "std_perm_gguf"
+        layer["buffers"] = copy.deepcopy(base["buffers"])
+        layer["program"] = copy.deepcopy(base["program"])
+        for step in layer["gemm_block"]["program"]:
+            old_name = step["kernel"]
+            if not old_name.endswith("_f32") or old_name[:-4] not in manifest["kernels"]:
+                raise OpRangeError("DENSE_GGUF_COMPACT needs the ordinary Q4 projection GEMMs")
+            kernel = old_name[:-4]
+            step["kernel"] = kernel
+            g["kernels"][kernel] = copy.deepcopy(manifest["kernels"][kernel])
+            context = g["kernels"][kernel]["context"]
+            g["contexts"][context] = manifest["contexts"][context]
+            g["builds"][kernel] = copy.deepcopy(manifest["builds"][kernel])
+        for step in layer["program"]:
+            if step["op"] != "run":
+                continue
+            kernel = step["kernel"]
+            g["kernels"][kernel] = copy.deepcopy(manifest["kernels"][kernel])
+            context = g["kernels"][kernel]["context"]
+            g["contexts"][context] = manifest["contexts"][context]
 
 
 # Only families whose L-row pass (OPEN-DECODE-ROWS) has run on hardware get one.
@@ -1103,6 +1183,15 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
         bf = bfp16_route(spec)
         if bf:
             b.update(bf["builds"])
+    if os.environ.get("DENSE_GGUF_GEMM") == "1" and f32_twin_fits(spec):
+        gr = gemm_route(replace(spec, quant="q4_1_f32"))
+        if gr:
+            b.update(gr["builds"])
+    if gguf_q8_head(replace(spec, quant="q4_1_f32")) and f32_twin_fits(spec):
+        b["lm_head_q8_gguf"] = {"design": "lm_head_q8/lm_head_q8.py",
+            "build_dir": f"lm_head_q8/build_gguf_n{lm_rows(spec)}_k{spec.hidden}_c{n}",
+            "env": {"LMHEAD_N": str(lm_rows(spec)), "LMHEAD_K": str(spec.hidden),
+                    "LMHEAD_CORES": str(n), "LMHEAD_SCALES_F32": "0"}}
     rr = rows_route(spec)
     if rr:
         b.update(rr["builds"])
@@ -1113,7 +1202,7 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
     L = layout(spec, max_ctx)
     return {"hidden": spec.hidden, "vocab": lm_rows(spec), "real_vocab": spec.real_vocab,
             "chunk_bytes": chunk_bytes(pool_quant(spec)), "pool_bytes": L.POOL_BYTES,
-            "lmhead_pool_bytes": L.LMHEAD_POOL_BYTES,
+            "lmhead_pool_bytes": head_pool_bytes(spec, L),
             "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim, "rope_theta": spec.rope_theta,
             "rope_inv_freq": spec.rope_inv_freq()}     # the global table's short/base table; each ptab
             # global carries its own (both tables, for a longrope family -- see programs())
@@ -1207,6 +1296,7 @@ KERNEL_SOURCES = [
     "designs/attn/*.cc", "designs/attn/*.h",
     "designs/ln/ln.h", "designs/ln/*.cc", "designs/ln/ln.py", "designs/lin_layer/ln_nr.cc",
     "designs/lm_head_q4/*.py",
+    "designs/lm_head_q8/*.py", "designs/lm_head_q8/*.h", "designs/lm_head_q8/*.cc",
     # the block prefill route's GEMM (gemm_route); dx_attn.py is already in designs/dense/*.py
     "designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.cc", "designs/gemm_q4_prefill/*.h",
     "designs/gemm_bfp16/*.py", "designs/gemm_bfp16/*.cc",

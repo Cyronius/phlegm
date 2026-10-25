@@ -49,8 +49,10 @@ CORES = GROUP_COLS * N_ROWS            # per group: T // TQ
 Q_ELEMS = T // (2 * TQ)                # Q elements a pass (two cores' rows each)
 ELEM = LKP * HD                        # bf16 per fifo element
 MAX_INFLIGHT = int(os.environ.get("AF_INFLIGHT", 2))   # passes whose BDs are queued ahead
+LONG_STREAM = os.environ.get("AF_LONG_STREAM") == "1"
 STACK = 0x2000      # af_sm's four interleaved exponentials take a 5 KB frame; 4 KB hung the array
 QSPLIT = int(os.environ.get("AF_QSPLIT", 1))
+PSPLIT = os.environ.get("AF_PSPLIT") == "1"
 TAU = int(os.environ.get("AF_TAU", 16))
 KDEPTH = int(os.environ.get("AF_KDEPTH", 2))
 VDEPTH = int(os.environ.get("AF_VDEPTH", 1))
@@ -79,8 +81,9 @@ def q_head_elems(qsplit: int = QSPLIT) -> int:
 
 
 def check_shape(L: int, heads: int, kv_heads: int) -> str | None:
-    if L % 256 or L // LKP > 64 or heads % N_GROUPS or heads % kv_heads:
-        return (f"attn_fa needs L % 256 with at most 64 key chunks, heads % {N_GROUPS}, heads % kv_heads "
+    max_chunks = 128 if LONG_STREAM else 64
+    if L <= 0 or L % 256 or L // LKP > max_chunks or heads % N_GROUPS or heads % kv_heads:
+        return (f"attn_fa needs positive L % 256 with at most {max_chunks} key chunks, heads % {N_GROUPS}, heads % kv_heads "
                 f"(got L={L} heads={heads} kv_heads={kv_heads})")
     return None
 
@@ -100,19 +103,20 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
     q_ty = np.ndarray[(TQ * HD,), np.dtype[bfloat16]]
     s_ty = np.ndarray[(TQ * LKP,), np.dtype[np.float32]]
     st_ty = np.ndarray[(2 * TQ * 8 + 16,), np.dtype[np.float32]]
+    pl_ty = np.ndarray[(TQ * LKP,), np.dtype[bfloat16]]
     o_l1_ty = np.ndarray[(TQ * HD,), np.dtype[np.float32]]
     o_l2_ty = np.ndarray[(N_ROWS * TQ * HD,), np.dtype[np.float32]]
     rtp_ty = np.ndarray[(RTP_LEN,), np.dtype[np.int32]]
 
-    flags = [f"-DAF_QSPLIT={QSPLIT}", f"-DAF_TAU={TAU}", f"-DAF_ABL={ABL}", "-Wno-deprecated-declarations"]
+    flags = [f"-DAF_QSPLIT={QSPLIT}", f"-DAF_PSPLIT={int(PSPLIT)}", f"-DAF_TAU={TAU}", f"-DAF_ABL={ABL}", "-Wno-deprecated-declarations"]
     _ef = ExternalFunction("af_init", source_file=KERNEL_SRC, arg_types=[o_l1_ty, st_ty], compile_flags=flags)
     obj = _ef.object_file_name
     k_meta = Kernel("af_meta", obj, [elem_ty, st_ty])
     k_cap = Kernel("af_capture", obj, [elem_ty, q_ty, np.int32])
     k_init = Kernel("af_init", obj, [o_l1_ty, st_ty])
     k_qk = Kernel("af_qk", obj, [q_ty, q_ty, elem_ty, s_ty, st_ty, np.int32, np.int32])
-    k_sm = Kernel("af_sm", obj, [s_ty, st_ty, o_l1_ty, np.int32, np.int32])
-    k_pv = Kernel("af_pv", obj, [s_ty, elem_ty, o_l1_ty, st_ty])
+    k_sm = Kernel("af_sm", obj, [s_ty, st_ty, o_l1_ty] + ([pl_ty] if PSPLIT else []) + [np.int32, np.int32])
+    k_pv = Kernel("af_pv", obj, [s_ty, elem_ty, o_l1_ty, st_ty] + ([pl_ty] if PSPLIT else []))
     k_fin = Kernel("af_fin", obj, [o_l1_ty, st_ty])
     k_ptab = Kernel("af_ptab", obj, [elem_ty, s_ty])
     k_prep_q = Kernel("af_prep_q", obj, [elem_ty, s_ty, q_ty, q_ty, o_l1_ty])
@@ -149,7 +153,7 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
     def make_core_fn(i):
         tok0 = i * TQ
 
-        def core_fn(a_in, b_in, o_out, kern, q_hi, q_lo, s_buf, st, my_rtp, barrier):
+        def core_fn(a_in, b_in, o_out, kern, q_hi, q_lo, s_buf, st, my_rtp, barrier, p_lo):
             (meta, cap, init, qk, sm, pv, fin, ptab, prep_q, prep_kv) = kern
             barrier.wait_for_value(1)
             n_pass = my_rtp[RTP_PASSES]
@@ -175,9 +179,15 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
                     k = a_in.acquire(1)
                     qk(q_hi, q_lo, k, s_buf, st, tok0, c)
                     a_in.release(1)
-                    sm(s_buf, st, o, tok0, c)
+                    if PSPLIT:
+                        sm(s_buf, st, o, p_lo, tok0, c)
+                    else:
+                        sm(s_buf, st, o, tok0, c)
                     v = b_in.acquire(1)
-                    pv(s_buf, v, o, st)
+                    if PSPLIT:
+                        pv(s_buf, v, o, st, p_lo)
+                    else:
+                        pv(s_buf, v, o, st)
                     b_in.release(1)
                 fin(o, st)
                 o_out.release(1)
@@ -221,6 +231,9 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
                     Buffer(q_ty, name=f"qh_{g}_{i}"), Buffer(q_ty, name=f"ql_{g}_{i}"),
                     Buffer(s_ty, name=f"s_{g}_{i}"), Buffer(st_ty, name=f"st_{g}_{i}"),
                     rtp[(g, i)], barriers[(g, i)]]
+            # The low probabilities need one BF16 copy, not doubled broadcasts.
+            # The default path allocates nothing extra (the unused arg aliases st).
+            args.append(Buffer(pl_ty, name=f"pl_{g}_{i}") if PSPLIT else args[7])
             workers.append(Worker(make_core_fn(i), args, tile=t, stack_size=STACK))
 
     Q_ty = np.ndarray[(heads * qh_elems,), np.dtype[bfloat16]]
@@ -247,19 +260,27 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
                 kvh = h // gqa
                 base = h * qh_elems
                 a_prods[g].fill(q, offset=base, sizes=[qa_rows, HD], strides=[HD, 1], group=tg)
-                a_prods[g].fill(kv, offset=kvh * HD, sizes=[n_chunks, LKP, HD],
-                                strides=[LKP * kv_ld, kv_ld, 1], group=tg)
+                # A shim BD's repeat count is at most 64. Preserve stream order
+                # while splitting a longer window into consecutive transfers.
+                for chunk0 in range(0, n_chunks, 64):
+                    count = min(64, n_chunks - chunk0)
+                    a_prods[g].fill(kv, offset=chunk0 * LKP * kv_ld + kvh * HD,
+                                    sizes=[count, LKP, HD], strides=[LKP * kv_ld, kv_ld, 1], group=tg)
                 if QSPLIT:
                     b_prods[g].fill(q, offset=base + qa_rows * HD, sizes=[qb_rows, HD], strides=[HD, 1], group=tg)
-                b_prods[g].fill(kv, offset=(kv_heads + kvh) * HD, sizes=[n_chunks, LKP, HD],
-                                strides=[LKP * kv_ld, kv_ld, 1], group=tg)
+                for chunk0 in range(0, n_chunks, 64):
+                    count = min(64, n_chunks - chunk0)
+                    b_prods[g].fill(kv, offset=chunk0 * LKP * kv_ld + (kv_heads + kvh) * HD,
+                                    sizes=[count, LKP, HD], strides=[LKP * kv_ld, kv_ld, 1], group=tg)
                 for cc in range(GROUP_COLS):
                     col = g * GROUP_COLS + cc
                     row0 = cc * N_ROWS * TQ
                     o_conses[col].drain(o, offset=row0 * qw + h * HD, sizes=[N_ROWS * TQ, HD],
                                         strides=[qw, 1], wait=True, group=tg)
             inflight.append(tg)
-            if len(inflight) == MAX_INFLIGHT:
+            # At >4096 rows each input channel queues Q plus two KV BDs.
+            # One pass in flight keeps that below four BDs/channel.
+            if len(inflight) == (1 if n_chunks > 64 else MAX_INFLIGHT):
                 inflight.pop(0).finish()
         for tg in inflight:
             tg.finish()

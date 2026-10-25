@@ -31,6 +31,60 @@ this sidecar and the bridge source embedded in its own build before executing it
 Keep the binary and sidecar together. This is provenance, not a signature proving
 an untrusted executable safe: use your own reference build.
 
+## Build on Linux
+
+Requires Python 3.11+, a C++17 compiler with OpenMP/AVX2/FMA, matching XRT
+headers and `libxrt_coreutil.so.2`, and the XDNA userspace plugin for device
+access. The external reference checkout must implement the selected manifest
+features; the retained companion patches have different bases and need manual
+reconciliation. Building the bridge does not establish kernel compatibility.
+
+```bash
+python3 benchmarks/reference/build.py \
+  --reference-root /path/to/reconciled/openflowlm-next \
+  --xrt-include /path/to/xrt/include \
+  --xrt-lib /path/to/xrt/lib/libxrt_coreutil.so.2
+```
+
+The output is `target/reference-bench/phlegm-reference-bench` with a
+`.build.json` sidecar accepted by the same Rust provenance verifier as Windows.
+`--out-dir` and `--cxx` override the destination and compiler; `CXX` supplies the
+compiler default. Arguments are passed without a shell. The builder hashes the
+engine, adapter, helper, headers, selected link library, compiler executable and
+build script, and checks inputs and Git identity again after compilation. A
+failed build invalidates the previous sidecar. The runtime library directory is
+embedded as an rpath; keep the matching plugin and dependent libraries available.
+
+For Linux hardware runs, check `/dev/accel/accel0` access and both soft and hard
+memlock limits. The current local XRT stack needs a 64 MiB locked heap at device
+open; an 8 MiB limit prevents even enumeration. Local setup and remaining
+coverage are recorded in
+[baseline readiness](../../specs/open-engine/artlite-baseline-readiness.md).
+
+## Run and serve through the NPU bridge
+
+The same resident bridge now handles normal generation. `phlegm run` and
+`phlegm serve` reset the C++ Core for each request, prefill the prompt with the
+selected open-kernel route, and decode on the NPU. Rust samples the returned
+binary32 logits and applies the model's chat template and stop tokens.
+
+```powershell
+cargo run -p phlegm-cli -- run --model-dir C:/models/my-model `
+  --kernels C:/kernels/my-model `
+  --bridge target/reference-bench/phlegm-reference-bench.exe `
+  --prompt "Explain the NPU in one sentence"
+cargo run -p phlegm-cli -- serve --model-dir C:/models/my-model `
+  --kernels C:/kernels/my-model `
+  --bridge target/reference-bench/phlegm-reference-bench.exe
+```
+
+`--max-ctx`, `--threads`, `--prefill-route auto|block|sequential`,
+`--prefill-mode fast|lean`, `--timeout`, and `--dispatch-timeout-ms` select runtime
+settings. The bridge sends logits as base64 little-endian float32 bytes to
+avoid the overhead of a large JSON number array. `serve --mock` runs the
+explicit test backend. No release tag is needed for run/serve; the strict
+release and power-mode rules below still govern published benchmark reports.
+
 ## Run from a tagged Phlegm release
 
 The Phlegm source must be clean, its Cargo version must match an exact `v<version>`

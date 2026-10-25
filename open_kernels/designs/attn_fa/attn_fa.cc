@@ -19,6 +19,8 @@
 // Layouts (bf16 unless noted):
 //   Q^T  [64 dims][32 rows] (hi, lo)      K, V  [64 keys][64 dims], the cache's rows
 //   S^T  [64 keys][32 rows] fp32          P     [64 keys][2 x 32] bf16, each value doubled, in S^T's slot
+//   AF_PSPLIT adds P lo [64 keys][32 rows] bf16. Both PV and the denominator consume hi + lo;
+//   exp2v supplies the pre-rounding probability. Llama requires this variant.
 //   O    [32 rows][64 dims] fp32          st    m [32] | l [32] (fp32) | p0, status (int32)
 //
 //===----------------------------------------------------------------------===//
@@ -34,6 +36,9 @@
 #endif
 #ifndef AF_TAU
 #define AF_TAU 16
+#endif
+#ifndef AF_PSPLIT
+#define AF_PSPLIT 0
 #endif
 #ifndef AF_ABL
 #define AF_ABL 0   // ablation (timing only): 1 skips S = QK, 2 the softmax, 4 O += PV
@@ -237,7 +242,11 @@ static inline void qk_t(const bfloat16 *__restrict qh, const bfloat16 *__restric
 
 // O[r] += sum_j P[j][r] V[j], two rows a pass so each V load feeds two MACs. P is stored doubled
 // ([key][64]: rows 0..15 then 16..31, each value twice) so a row's value is one 32-bit broadcast.
-static inline void pv_t(const bfloat16 *__restrict p, const bfloat16 *__restrict v, float *__restrict o) {
+static inline void pv_t(const bfloat16 *__restrict p, const bfloat16 *__restrict v, float *__restrict o
+#if AF_PSPLIT
+                        , const bfloat16 *__restrict pl
+#endif
+                        ) {
   for (int r = 0; r < TQ; r += 2) {
     float *__restrict o0 = o + r * HD;
     float *__restrict o1 = o0 + HD;
@@ -257,6 +266,14 @@ static inline void pv_t(const bfloat16 *__restrict p, const bfloat16 *__restrict
       a01 = aie::mac(a01, b0, v1);
       a10 = aie::mac(a10, b1, v0);
       a11 = aie::mac(a11, b1, v1);
+#if AF_PSPLIT
+      const dup lp = dbl(aie::load_v<32>(pl + j * TQ));
+      const vb l0 = bc(lp, r), l1 = bc(lp, r + 1);
+      a00 = aie::mac(a00, l0, v0);
+      a01 = aie::mac(a01, l0, v1);
+      a10 = aie::mac(a10, l1, v0);
+      a11 = aie::mac(a11, l1, v1);
+#endif
     }
     aie::store_v(o0, a00.template to_vector<float>());
     aie::store_v(o0 + 32, a01.template to_vector<float>());
@@ -314,7 +331,11 @@ void af_qk(bfloat16 *__restrict qh, bfloat16 *__restrict ql, bfloat16 *__restric
 }
 
 // mask, lazy rescale, P^T = 2^(S^T - m) in place as bf16, l += rowsum(P)
-void af_sm(float *s, float *__restrict st, float *__restrict o, int32_t tok0, int32_t chunk) {
+void af_sm(float *s, float *__restrict st, float *__restrict o,
+#if AF_PSPLIT
+           bfloat16 *__restrict pl,
+#endif
+           int32_t tok0, int32_t chunk) {
   SET_ROUNDING();
   int32_t *si = reinterpret_cast<int32_t *>(st + ST_I);
   const int32_t status = si[1];
@@ -364,6 +385,21 @@ void af_sm(float *s, float *__restrict st, float *__restrict o, int32_t tok0, in
   // in place: P[j], doubled, is exactly the 128 bytes of S^T[j] this iteration has just read; four keys an
   // iteration so their exponential chains interleave
   bfloat16 *p = reinterpret_cast<bfloat16 *>(s);
+#if AF_PSPLIT
+  // Preserve Llama's probability hi/lo contract and sum exactly the two
+  // operands consumed by PV. One key at a time bounds the helper's stack.
+  for (int j = 0; j < LKP; ++j) {
+    const vf probability = exp2v(fsub(aie::load_v<32>(s + j * TQ), mm));
+    vb hi, lo;
+    split(probability, hi, lo);
+    const dup pd = dbl(hi);
+    aie::store_v(p + j * 2 * TQ, pd.lo);
+    aie::store_v(p + j * 2 * TQ + 32, pd.hi);
+    aie::store_v(pl + j * TQ, lo);
+    l = aie::mac(l, hi, one);
+    l = aie::mac(l, lo, one);
+  }
+#else
   for (int j = 0; j < LKP; j += 4) {
     vb pb[4];
 #pragma clang loop unroll(full)
@@ -380,15 +416,24 @@ void af_sm(float *s, float *__restrict st, float *__restrict o, int32_t tok0, in
         l = aie::mac(l, pb[u], one);
     }
   }
+#endif
   aie::store_v(st + ST_L, aie::add(l, l2).template to_vector<float>());
 }
 
-void af_pv(float *__restrict s, bfloat16 *__restrict v, float *__restrict o, float *__restrict st) {
+void af_pv(float *__restrict s, bfloat16 *__restrict v, float *__restrict o, float *__restrict st
+#if AF_PSPLIT
+           , bfloat16 *__restrict pl
+#endif
+           ) {
   SET_ROUNDING();
   const int32_t *si = reinterpret_cast<const int32_t *>(st + ST_I);
   if (si[1] == 0 || (AF_ABL & 4))
     return;
-  pv_t(reinterpret_cast<const bfloat16 *>(s), v, o);
+  pv_t(reinterpret_cast<const bfloat16 *>(s), v, o
+#if AF_PSPLIT
+       , pl
+#endif
+       );
 }
 
 // O /= l, row by row

@@ -56,6 +56,13 @@
 #include "aie_kernel_utils.h"
 #include <stdint.h>
 
+#ifndef GQD_SCALES_F32
+#define GQD_SCALES_F32 0
+#endif
+#if GQD_SCALES_F32 && defined(GQD_TWO_PASS)
+#error "the GGUF f32-scale format supports the fused dequant path only"
+#endif
+
 #if defined(GQD_TWO_PASS) && defined(GQD_R8)
 #error "GQD_TWO_PASS writes the (4 x 8) A-block layout only; the bfp16 mmul (GQD_R8) needs the fused pass"
 #endif
@@ -65,10 +72,18 @@ static constexpr unsigned GQD_K64 = 64;  // one matmul k-tile (= s * colA)
 static constexpr unsigned GQD_R = 4;     // mac_dims r (aie2p bf16, non-emulated: (4,8,8))
 static constexpr unsigned GQD_S = 8;     // mac_dims s
 static constexpr unsigned GQD_COLA = GQD_K64 / GQD_S;  // 8 col-blocks per k64-tile
+#if GQD_SCALES_F32
+static constexpr unsigned GQD_CHUNK_BYTES = 6144;
+static constexpr unsigned GQD_META_BYTES = 2048;
+static constexpr unsigned GQD_M_OFF = 1024;
+using gqd_scale_t = float;
+#else
 static constexpr unsigned GQD_CHUNK_BYTES = 5120;
 static constexpr unsigned GQD_META_BYTES = 1024;
-static constexpr unsigned GQD_D_OFF = 0;
 static constexpr unsigned GQD_M_OFF = 512;
+using gqd_scale_t = bfloat16;
+#endif
+static constexpr unsigned GQD_D_OFF = 0;
 static constexpr unsigned GQD_BAND_BYTES = 2 * GQD_CHUNK_BYTES;  // 10240
 
 // Pass 1: gather nibble VALUES for k-slice `ky` (0..3, each 64 of the band's
@@ -305,8 +320,15 @@ __attribute__((noinline)) inline void gqd_dequant_block(
 // unshifted -- into the scale. Verbatim from designs/moe_batch/moe_batch.h's
 // mb_scale; the two designs read the same pool bytes the same way.
 template <bool ODD, bool D16>
-static inline aie::vector<bfloat16, 64> gqd_scale(const bfloat16 *__restrict p, unsigned kb) {
+static inline aie::vector<bfloat16, 64> gqd_scale(const gqd_scale_t *__restrict p, unsigned kb) {
+#if GQD_SCALES_F32
+  // Match the GGUF decode path: narrow the losslessly widened scale with RNE.
+  aie::accum<accfloat, 16> sc;
+  sc.from_vector(aie::load_v<16>(p + kb * 32));
+  const aie::vector<bfloat16, 16> v16 = sc.to_vector<bfloat16>();
+#else
   const aie::vector<bfloat16, 16> v16 = aie::load_v<16>(p + kb * 32);
+#endif
   const aie::vector<bfloat16, 32> v32 = aie::concat(v16, v16);
   aie::vector<bfloat16, 16> h = ODD ? aie::filter_odd(v32, 1) : aie::filter_even(v32, 1);
   if constexpr (ODD && D16) h = aie::mul(h, (bfloat16)0.0625f).to_vector<bfloat16>();
@@ -324,8 +346,8 @@ __attribute__((noinline)) inline void gqd_fused_ky(const uint8_t *__restrict ban
     const uint8_t *__restrict chunk = band + part * GQD_CHUNK_BYTES;
     AIE_LOOP_RANGE(2, 2)
     for (unsigned half = 0; half < 2; ++half) {        // the chunk's two 16-row nibble halves
-      const bfloat16 *__restrict dp = reinterpret_cast<const bfloat16 *>(chunk + GQD_D_OFF) + half * 16;
-      const bfloat16 *__restrict mp = reinterpret_cast<const bfloat16 *>(chunk + GQD_M_OFF) + half * 16;
+      const gqd_scale_t *__restrict dp = reinterpret_cast<const gqd_scale_t *>(chunk + GQD_D_OFF) + half * 16;
+      const gqd_scale_t *__restrict mp = reinterpret_cast<const gqd_scale_t *>(chunk + GQD_M_OFF) + half * 16;
       const uint8_t *__restrict nibp = chunk + GQD_META_BYTES + half * 2048;
       const unsigned ib0 = part * 8 + half * 4;        // first 4-row block these 16 rows fill
       // The four scale vectors are built inside this loop although d and m only change

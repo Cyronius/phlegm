@@ -64,7 +64,7 @@ from recipes.load import default_spec, load_spec, spec_from_model_dir  # noqa: E
 from recipes.manifest import dumps, manifest  # noqa: E402
 
 # knobs that must NOT leak in from the caller's shell
-CLEAR = ("LX_PART", "LX_STOP", "AX_PART", "UX_PART", "DUX_PART", "LMHEAD_N", "LMHEAD_CORES", "OPEN_KERNELS_SPEC", "DX_HEAD")
+CLEAR = ("LX_PART", "LX_STOP", "AX_PART", "UX_PART", "DUX_PART", "LMHEAD_N", "LMHEAD_CORES", "OPEN_KERNELS_SPEC", "DX_HEAD", "GQP_SCALES_F32", "AF_LONG_STREAM", "AF_PSPLIT")
 FILES = ("final.xclbin", "insts.bin")
 
 

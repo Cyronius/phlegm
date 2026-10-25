@@ -78,9 +78,10 @@ BAND_BYTES = 10240 # 64 rows x 256 K x 5/8 B/elem
 # weight element per fifo slot: (bytes, K covered, matmul k-tiles, pool bytes per weight as num/den)
 FORMATS = {
     "q4_1": (BAND_BYTES, BAND_K, 4, 5, 8),
+    "q4_1_f32": (12288, BAND_K, 4, 3, 4),  # two GGUF-direct 6144 B chunks
     "bf16": (8192, 64, 1, 2, 1),          # recipes/pack.py pack_bf16_gemm, the A operand as stored
 }
-FMT = os.environ.get("GQP_FMT", "q4_1")
+FMT = "q4_1_f32" if os.environ.get("GQP_SCALES_F32") == "1" else os.environ.get("GQP_FMT", "q4_1")
 
 # ---- shape this build is specialised to (env-driven, like gemv_q4.py) ----
 N_WEIGHT = int(os.environ.get("GQP_N", 2560))
@@ -260,7 +261,9 @@ def gemm_q4_prefill(
     band_bytes = 2 * T2_BODY if wfmt_t2 else elem_bytes
     # the two-pass q4_1 dequant's row-major nibble scratch (GQD_TWO_PASS). The t2 path never
     # touches it and needs the L1, so it keeps a token 64 B; q4_1 builds keep theirs as they were.
-    nib_ty = np.ndarray[(64 if wfmt_t2 else m * k_tile,), np.dtype[np.uint8]]
+    # Fused GGUF dequant never touches the two-pass nibble scratch. Its larger
+    # weight FIFO needs that space; retain a 64 B placeholder for the entry ABI.
+    nib_ty = np.ndarray[(64 if wfmt_t2 or fmt == "q4_1_f32" else m * k_tile,), np.dtype[np.uint8]]
     # the A operand: bf16, or (GQP_XBFP) 9 B per 8 values of bfp16ebs8
     scratch_ty = (np.ndarray[(m * k_tile * 9 // 8,), np.dtype[np.uint8]] if xbfp
                   else np.ndarray[(m * k_tile,), np.dtype[dtype_in]])
@@ -288,7 +291,9 @@ def gemm_q4_prefill(
             _dequant_flags.append("-DGQD_IDQ")
     # GQP_NULL_MM=1: timing-only ablation, the matmul call skipped (B still acquired/released)
     null_mm = os.environ.get("GQP_NULL_MM") == "1"
-    if fmt == "q4_1":
+    if fmt in ("q4_1", "q4_1_f32"):
+        if fmt == "q4_1_f32":
+            _dequant_flags.append("-DGQD_SCALES_F32=1")
         dequant_srcs = ensure_dequant_entries(bfp=xbfp)
         dequant_kernels = [
             ExternalFunction(f"gqd_entry_k{ky}", source_file=str(dequant_srcs[ky]),
@@ -375,7 +380,7 @@ def gemm_q4_prefill(
         return [[Buffer(ty, name=f"{name}_{row}_{col}") for col in range(n_aie_cols)] for row in range(n_aie_rows)]
 
     # per-core L1 the format needs besides the fifos: q4_1 nibble + A scratch, bf16 none
-    local_grids = [grid(nib_ty, "nib"), grid(scratch_ty, "ascr")] if fmt == "q4_1" else []
+    local_grids = [grid(nib_ty, "nib"), grid(scratch_ty, "ascr")] if fmt != "bf16" else []
     acc_bufs = grid(C_acc_ty, "cacc") if yt else None
 
     # The band count K/256 was the only thing making each K its own image, and so its own
@@ -408,7 +413,7 @@ def gemm_q4_prefill(
 
             def one_band(band):
                 for ky in range(KPB):  # compile-time (Python) unroll: distinct entry symbols
-                    if fmt == "q4_1":
+                    if fmt in ("q4_1", "q4_1_f32"):
                         dequants[ky](band, local[0], local[1])
                     elem_in_b = in_b.acquire(1)
                     if not null_mm:
