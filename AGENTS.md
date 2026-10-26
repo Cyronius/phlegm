@@ -3,8 +3,8 @@
 ## Start and resume
 
 - Read `PLAN.md`, `.plans/README.md`, and the active plan before changing code.
-- Shared plans and handoffs live in tracked `.plans/`, independent of any agent
-  product. Do not rely on conversation history or ignored `.claude/` files.
+- Local plans and handoffs live in ignored `.plans/`, independent of any agent
+  product. Keep durable shared evidence in tracked specs; do not add plans to Git.
 - Current performance work: `.plans/artlite-performance.md`.
 - Preserve existing uncommitted work. Inspect `git status` and the relevant diff
   before editing; do not reset, overwrite, or commit unrelated changes.

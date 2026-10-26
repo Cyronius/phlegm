@@ -57,4 +57,4 @@ open_kernels/harness/out/
 lancedb/
 .codegraph/
 .DS_Store
-.plans/
+/.plans/
