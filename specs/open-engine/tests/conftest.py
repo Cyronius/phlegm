@@ -17,10 +17,13 @@ for path in (OPEN_KERNELS, OPEN_KERNELS / 'model', Path(__file__).resolve().pare
         sys.path.insert(0, str(path))
 
 RUNTIME_CHECKS = {
+    ('test_attention_pair_integration.py', 'test_hybrid_cache_preserves_low_planes_across_blocks'),
+    ('test_prefill_boundaries.py', 'test_native_boundary_and_continuation_against_independent_reference'),
     ('test_prefill_ffn_replay.py', 'test_bridge_uses_current_host_arithmetic_and_refuses_source_drift'),
     ('test_prefill_ffn_replay.py', 'test_native_bridge_norm_and_activation'),
     ('test_prefill_ffn_replay.py', 'test_bridge_rejects_invalid_norm'),
     ('test_prefill_paired_input.py', 'test_private_patch_preserves_single_dispatch_body_and_rejects_drift'),
+    ('test_prefill_paired_input.py', 'test_pair_reconstructs_input_and_preserves_reused_device_output'),
     ('test_prefill_prefix_sublayers.py', 'test_patch_keeps_weighted_arithmetic_and_rejects_repeat'),
     ('test_prefill_residual_trace.py', 'test_patch_rejects_source_drift_and_preserves_paired_body'),
     ('test_prefill_sublayer_trace.py', 'test_patch_is_private_and_refuses_drift'),
