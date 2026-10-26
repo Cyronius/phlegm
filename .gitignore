@@ -40,6 +40,8 @@ xdna-dump/tools/q4nx/reference/
 !xdna-dump/tools/kernel-interp/rust_ref/*.i64
 
 # open_kernels build output, run configs and logs
+/open_kernels/.staging*/
+/open_kernels/designs/.locks/
 open_kernels/designs/*/build*/
 open_kernels/designs/*/out*.bin
 open_kernels/designs/*/in.bin
@@ -55,3 +57,4 @@ open_kernels/harness/out/
 lancedb/
 .codegraph/
 .DS_Store
+.plans/
