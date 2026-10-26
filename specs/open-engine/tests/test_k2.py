@@ -105,6 +105,7 @@ def test_qwen3_spec_unaffected_by_the_field():
 @pytest.mark.parametrize("bad,why", [
     ({"query_key_norm": True}, "qk_norm is a qwen3 property"),
     ({"attention_gate_func": "sigmoid"}, "a gate is a MoE-family feature"),
+    ({"num_experts": 100, "mova_num_experts": 64}, "MoVA needs expert routing and projections"),
     ({"attention_bias": True}, "a qkv bias is a qwen2 property"),
     ({"use_sliding_window": True, "sliding_window": 4096}, "a window is gemma3's"),
     ({"hidden_act": "gelu_tanh"}, "K2's FFN is silu"),

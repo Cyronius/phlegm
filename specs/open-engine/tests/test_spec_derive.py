@@ -57,6 +57,25 @@ def test_the_text_only_moe_model_type_derives_the_same_spec():
     assert hf_model_types("qwen36moe") == ["qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next"]
 
 
+def test_published_qwen35_moe_vlm_decoder_reuses_the_35b_kernels():
+    # Ornith 1.5 publishes this nested decoder geometry. Nex N2.5 mini and
+    # KAT Coder V2.5 have the same decoder fields in their published configs.
+    text = {**HF_QWEN36, "model_type": "qwen3_5_moe_text"}
+    wrapper = {"model_type": "qwen3_5_moe", "text_config": text,
+               "vision_config": {"model_type": "qwen3_5_moe_vision"}}
+    spec = ModelSpec.from_hf_config(wrapper, real_vocab=248070)
+    assert spec.kernel_hash() == default_spec().kernel_hash()
+    assert strip(spec) == strip(default_spec())
+    from recipes.manifest import manifest
+    route = manifest(spec)
+    assert route["contexts"].get("gemm")
+    assert route["layer_types"][LINEAR]["gemm_block"]["t"] == 256
+    assert route["layer_types"][FULL]["gemm_block"]["t"] == 256
+
+    with pytest.raises(SpecError, match="qwen3_5_moe_text decoder"):
+        ModelSpec.from_hf_config({"model_type": "qwen3_5_moe", "text_config": {"model_type": "llama"}})
+
+
 def test_hf_layer_types_list_wins_over_the_interval():
     cfg = dict(HF_QWEN36, layer_types=[LINEAR] * 39 + [FULL])
     s = ModelSpec.from_hf_config(cfg)

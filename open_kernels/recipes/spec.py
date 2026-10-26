@@ -434,6 +434,14 @@ def _layer_types_hf(cfg: Mapping[str, Any], n: int) -> tuple[str, ...]:
 
 
 def _qwen36moe_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+    # Published Qwen3.5 MoE VLMs keep the decoder under text_config, while
+    # converted OFLM containers put the same fields at the top level.  The
+    # decoder geometry is shared by text-only fine-tunes of the 35B model.
+    if cfg.get("model_type") == "qwen3_5_moe" and "text_config" in cfg:
+        text = cfg["text_config"]
+        if not isinstance(text, Mapping) or text.get("model_type") != "qwen3_5_moe_text":
+            raise SpecError("qwen3_5_moe: text_config must be a qwen3_5_moe_text decoder")
+        cfg = {**text, "model_type": cfg["model_type"]}
     n = _need(cfg, "num_hidden_layers")
     rope = cfg.get("rope_parameters", {})
     theta = rope.get("rope_theta", cfg.get("rope_theta"))
@@ -1121,6 +1129,8 @@ def _k2_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
     contract is exactly this shape and a config that says otherwise is not a K2
     this kernel set serves.
     """
+    if cfg.get("num_experts", 0) or cfg.get("mova_num_experts", 0):
+        raise SpecError("k2: MoVA/MoE experts need a separate recipe; the dense K2 kernels cannot run them")
     n = _need(cfg, "num_hidden_layers")
     heads = _need(cfg, "num_attention_heads")
     hd = _need(cfg, "head_dim")
