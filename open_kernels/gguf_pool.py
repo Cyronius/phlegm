@@ -369,6 +369,39 @@ def pack_q4_pool(raw: np.ndarray, rs: int, gguf_type: str = "Q4_1") -> np.ndarra
     return out.reshape(-1)
 
 
+def pack_q4_expert_stripes(up: np.ndarray, gate: np.ndarray, gguf_type: str = "Q4_1") -> np.ndarray:
+    """Pack GGUF expert up/gate tensors as [expert][up stripe][gate stripe].
+
+    Inputs are raw GGUF blocks [experts, ff, hidden//32, block_bytes]. A stripe
+    covers 128 output rows; inside it the ordinary rs=4 chunk order is used.
+    The result is pool bytes, not a converted model file.
+    """
+    if up.shape != gate.shape or up.ndim != 4 or up.shape[1] % 128:
+        raise ValueError("expert up/gate need matching [E, FF, K//32, B] shapes and 128-row FF")
+    experts, ff, nb, _ = up.shape
+    if nb * BLK % 256:
+        raise ValueError("expert input width must be a multiple of 256")
+    stripes = ff // 128
+    stripe_bytes = 128 * nb * BLK // (32 * 256) * CH_Q4
+    out = np.empty((experts, stripes, 2, stripe_bytes), np.uint8)
+    for e in range(experts):
+        out[e, :, 0] = pack_q4_pool(up[e], 4, gguf_type).reshape(stripes, stripe_bytes)
+        out[e, :, 1] = pack_q4_pool(gate[e], 4, gguf_type).reshape(stripes, stripe_bytes)
+    return out.reshape(-1)
+
+
+def pack_q4_expert_down(raw: np.ndarray, gguf_type: str = "Q4_1") -> np.ndarray:
+    """Pack GGUF down experts in the rs=4 pool order, one expert at a time."""
+    if raw.ndim != 4 or raw.shape[1] % 128 or raw.shape[2] * BLK % 256:
+        raise ValueError("expert down needs [E, hidden, FF//32, B] with 128-row and 256-column tiles")
+    experts, rows, nb, _ = raw.shape
+    one_bytes = rows * nb * BLK // (32 * 256) * CH_Q4
+    out = np.empty((experts, one_bytes), np.uint8)
+    for e in range(experts):
+        out[e] = pack_q4_pool(raw[e], 4, gguf_type)
+    return out.reshape(-1)
+
+
 def pack_q8_pool(raw: np.ndarray, rs: int) -> np.ndarray:
     """GGUF Q8_0 raw blocks uint8[n, nb, 34] -> pool chunk bytes uint8[nch*9216]
     in the q4 band law (expert / dense-GEMV shapes use this when a q8 tensor

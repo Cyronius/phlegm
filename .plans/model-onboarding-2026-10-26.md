@@ -63,6 +63,10 @@ The model input requirement is GGUF only. The `model.gguf` bridge exists, but
 the Qwen3.5 MoE recipe deliberately omits its GGUF manifest section because
 `expert_stripes` and `expert_down` have no GGUF source form. The published
 Ornith/Nex/KAT text geometry therefore does not yet mean their GGUF weights run.
+The Python GGUF pool reference now packs Q4_0 and Q4_1 expert up/gate stripes
+and down slices without changing model-file format; its source-to-pool value
+test passes. The production C++ packer and manifest ops still need the same
+GGUF expert path before a full model can load.
 
 A synthetic GGUF-metadata Nanbeige spec reached the NPU2 compiler with
 `OPEN_KERNELS_UNVALIDATED=1`. The existing four-core split failed because
