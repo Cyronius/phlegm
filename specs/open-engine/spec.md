@@ -7097,3 +7097,23 @@ checks every projection's CDO ELF/init/enable payloads before sharing a context.
 See [the source audit](artlite-prefill-code-audit.md) and
 [owning experimental report](gguf-prefill-linux.md) for numerical/model gates,
 failed variants and timing limitations. No default or parity promotion.
+
+### OPEN-TURBO-PREFILL
+
+`run` and `serve` accept an explicit boolean `--turbo`. This opts into a
+complete lower-precision companion kernel bundle at `DIR/turbo/` where DIR is
+`--kernels`. Missing or unsupported bundles fail; there is no precision fallback.
+The selected bundle's `turbo.json` requires schema_version1, experimental:true,
+precision:bfp16-hh, arithmetic:"HH only; low limbs ignored", and SHA256 bindings
+for base_manifest_sha256 and turbo_manifest_sha256. Auto retains layer-major scheduling when supported; explicit block is retained.
+The bridge must confirm a batched route; sequential and mock are incompatible. The existing base selection
+remains the default. Server mode applies this choice to the resident engine.
+
+The initial HH-only Llama1B GEMM keeps the explicit bfp16_hilo host ABI and
+ordinary F32[N,T] output, but omits HL/LH terms. Source Q4 weights, attention
+probability precision and decode remain as in the selected image. Its resource
+and numerical/model gates are separate from compensated BFP. The turbo profile
+is declared before measurements: median cosine >=.9990, at most5pp argmax drop,
+NLL <=sequential*1.01; strict remains .9999/1pp/*1.005. Record CPU||route KL.
+See utilities/gguf-prefill/README.md and the active performance plan for commands
+and actual hardware evidence; the interface alone is not a speed or quality claim.

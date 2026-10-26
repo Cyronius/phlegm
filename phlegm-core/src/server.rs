@@ -7,7 +7,7 @@
 //!   POST /v1/chat/completions    -> chat completion; stream=true gives SSE deltas
 //!
 //! Backend-agnostic: `serve()` takes any `Box<dyn Backend + Send>` (a
-//! `MockBackend` today; a real NPU-backed one later, unmodified routing).
+//! `NpuBackend` for normal serving, `MockBackend` for explicit tests).
 //! Generation is serialized behind a `Mutex` around the backend, mirroring
 //! Python's per-backend lock ("the NPU is a single shared device").
 //!
@@ -22,10 +22,10 @@
 use crate::backend::{Backend, GenParams};
 use crate::placeholder_tokenizer::PlaceholderTokenizer;
 use crate::sampler::Sampler;
-use crate::tokenizer::{self, ChatMessage, Tokenizer};
+use crate::tokenizer::{ChatMessage, Tokenizer};
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,16 +44,10 @@ pub struct ServerConfig {
     pub default_max_tokens: usize,
     pub max_tokens_cap: usize,
     /// Directory containing `tokenizer.json` / `tokenizer_config.json` /
-    /// `chat_template.jinja`. `Some` and loadable -> real `Tokenizer` is
-    /// used; `None` (or load failure) -> falls back to
-    /// `PlaceholderTokenizer`. Not present in `config.py` (which has no
-    /// tokenizer concept yet); added here since the brief requires this
-    /// server to be able to use the real tokenizer when one is configured.
+    /// `chat_template.jinja` (or an inline template in tokenizer_config.json).
+    /// Required for an NPU backend; mock mode may use placeholder tokens.
     pub model_dir: Option<PathBuf>,
-    /// Reported verbatim in `GET /health`'s `"backend"` field. `config.py`
-    /// resolves `"auto"` -> `"npu"`/`"mock"` by checking for driver/pool
-    /// files on disk; that resolution is an integration concern outside this
-    /// module's scope, so this is just whatever the caller says it is.
+    /// Reported verbatim in `GET /health`; selected by the CLI after load.
     pub backend_name: String,
 }
 
@@ -68,7 +62,9 @@ impl ServerConfig {
             port: env_or("PHLEGM_PORT", "52625").parse().unwrap_or(52625),
             model_id: env_or("PHLEGM_MODEL_ID", "phlegm-mock"),
             default_max_tokens: env_or("PHLEGM_MAX_TOKENS", "64").parse().unwrap_or(64),
-            max_tokens_cap: env_or("PHLEGM_MAX_TOKENS_CAP", "512").parse().unwrap_or(512),
+            max_tokens_cap: env_or("PHLEGM_MAX_TOKENS_CAP", "512")
+                .parse()
+                .unwrap_or(512),
             model_dir: std::env::var("PHLEGM_MODEL_DIR").ok().map(PathBuf::from),
             backend_name: env_or("PHLEGM_BACKEND", "mock"),
         }
@@ -76,7 +72,7 @@ impl ServerConfig {
 }
 
 // --------------------------------------------------------------------------
-// Tokenizer swap point (real if configured + loadable, else placeholder)
+// Tokenizer selection (a real model must load; mock mode can use a placeholder)
 // --------------------------------------------------------------------------
 
 enum ServerTokenizer {
@@ -85,17 +81,47 @@ enum ServerTokenizer {
 }
 
 impl ServerTokenizer {
-    fn build(cfg: &ServerConfig) -> ServerTokenizer {
-        if let Some(dir) = &cfg.model_dir {
-            match Tokenizer::load(dir) {
-                Ok(t) => return ServerTokenizer::Real(t),
-                Err(e) => eprintln!(
-                    "server: failed to load real tokenizer from {:?} ({e}); falling back to placeholder",
-                    dir
-                ),
+    fn decode_stream(&self) -> Box<dyn FnMut(u32) -> Result<Option<String>, String> + '_> {
+        match self {
+            Self::Real(t) => Box::new(t.decode_stream()),
+            Self::Placeholder(t) => {
+                let mut ids = Vec::new();
+                let mut emitted = String::new();
+                Box::new(move |id| {
+                    ids.push(id);
+                    let full = t.decode(&ids);
+                    let piece = full
+                        .strip_prefix(&emitted)
+                        .ok_or("nonmonotonic placeholder decode")?
+                        .to_owned();
+                    emitted = full;
+                    Ok(Some(piece))
+                })
             }
         }
-        ServerTokenizer::Placeholder(PlaceholderTokenizer::new())
+    }
+
+    fn final_decode(&self, ids: &[u32]) -> Result<String, String> {
+        match self {
+            Self::Real(t) => t.decode(ids),
+            Self::Placeholder(t) => Ok(t.decode(ids)),
+        }
+    }
+
+    fn build(cfg: &ServerConfig) -> Result<ServerTokenizer, String> {
+        if let Some(dir) = &cfg.model_dir {
+            match Tokenizer::load(dir) {
+                Ok(t) => return Ok(ServerTokenizer::Real(t)),
+                Err(e) if cfg.backend_name != "mock" => return Err(e),
+                Err(e) => eprintln!("server: tokenizer unavailable ({e}); using mock tokenizer"),
+            }
+        }
+        if cfg.backend_name != "mock" {
+            return Err(
+                "NPU serving requires PHLEGM_MODEL_DIR with a tokenizer and chat template".into(),
+            );
+        }
+        Ok(ServerTokenizer::Placeholder(PlaceholderTokenizer::new()))
     }
 
     fn encode(&self, text: &str) -> Vec<u32> {
@@ -122,17 +148,20 @@ impl ServerTokenizer {
         match self {
             // add_generation_prompt=true (we always want a completion to
             // follow); enable_thinking=true (Qwen3.6's own default).
-            ServerTokenizer::Real(t) => t.apply_chat_template(messages, true, true).unwrap_or_else(|e| {
-                eprintln!("server: chat template render error: {e}");
-                String::new()
-            }),
+            ServerTokenizer::Real(t) => {
+                t.apply_chat_template(messages, true, true)
+                    .unwrap_or_else(|e| {
+                        eprintln!("server: chat template render error: {e}");
+                        String::new()
+                    })
+            }
             ServerTokenizer::Placeholder(t) => t.apply_chat_template(messages),
         }
     }
 
     fn stop_ids(&self) -> HashSet<u32> {
         match self {
-            ServerTokenizer::Real(_) => tokenizer::EOS_TOKEN_IDS.iter().copied().collect(),
+            ServerTokenizer::Real(t) => t.stop_ids(),
             ServerTokenizer::Placeholder(t) => t.eos_id().into_iter().collect(),
         }
     }
@@ -158,8 +187,12 @@ pub fn bind(cfg: &ServerConfig) -> Result<tiny_http::Server, String> {
 
 /// Run the accept loop against an already-bound server. Blocks forever (or
 /// until the socket errors out / is closed).
-pub fn run(server: tiny_http::Server, backend: Box<dyn Backend + Send>, cfg: ServerConfig) {
-    let tokenizer = ServerTokenizer::build(&cfg);
+pub fn run(
+    server: tiny_http::Server,
+    backend: Box<dyn Backend + Send>,
+    cfg: ServerConfig,
+) -> Result<(), String> {
+    let tokenizer = ServerTokenizer::build(&cfg)?;
     let backend_name = cfg.backend_name.clone();
     let model_id = cfg.model_id.clone();
     let state = Arc::new(ServerState {
@@ -184,13 +217,13 @@ pub fn run(server: tiny_http::Server, backend: Box<dyn Backend + Send>, cfg: Ser
             }
         }
     }
+    Ok(())
 }
 
 /// Bind + run in one call — the entry point `phlegm serve` calls.
 pub fn serve(backend: Box<dyn Backend + Send>, cfg: ServerConfig) -> Result<(), String> {
     let server = bind(&cfg)?;
-    run(server, backend, cfg);
-    Ok(())
+    run(server, backend, cfg)
 }
 
 // --------------------------------------------------------------------------
@@ -202,7 +235,11 @@ fn handle_request(request: Request, state: &Arc<ServerState>) {
     let url = request.url().to_string();
     match (method, url.as_str()) {
         (Method::Get, "/health") => {
-            respond_json(request, 200, &json!({"status": "ok", "backend": state.cfg.backend_name}));
+            respond_json(
+                request,
+                200,
+                &json!({"status": "ok", "backend": state.cfg.backend_name}),
+            );
         }
         (Method::Get, "/v1/models") => {
             respond_json(request, 200, &models_payload(&state.cfg));
@@ -212,7 +249,11 @@ fn handle_request(request: Request, state: &Arc<ServerState>) {
         }
         _ => {
             let msg = format!("unknown path {url}");
-            respond_json(request, 404, &json!({"error": {"message": msg, "type": "not_found"}}));
+            respond_json(
+                request,
+                404,
+                &json!({"error": {"message": msg, "type": "not_found"}}),
+            );
         }
     }
 }
@@ -237,7 +278,11 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
     let mut body = Vec::new();
     if let Err(e) = request.as_reader().read_to_end(&mut body) {
         let msg = format!("invalid JSON body: {e}");
-        respond_json(request, 400, &json!({"error": {"message": msg, "type": "invalid_request_error"}}));
+        respond_json(
+            request,
+            400,
+            &json!({"error": {"message": msg, "type": "invalid_request_error"}}),
+        );
         return;
     }
     let req_json: Value = if body.is_empty() {
@@ -247,7 +292,11 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
             Ok(v) => v,
             Err(e) => {
                 let msg = format!("invalid JSON body: {e}");
-                respond_json(request, 400, &json!({"error": {"message": msg, "type": "invalid_request_error"}}));
+                respond_json(
+                    request,
+                    400,
+                    &json!({"error": {"message": msg, "type": "invalid_request_error"}}),
+                );
                 return;
             }
         }
@@ -272,23 +321,53 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
         .and_then(Value::as_str)
         .unwrap_or(&state.cfg.model_id)
         .to_string();
-    let stream = req_json.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let stream = req_json
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let max_tokens = req_json
         .get("max_tokens")
         .and_then(Value::as_u64)
         .map(|v| v as usize)
         .unwrap_or(state.cfg.default_max_tokens);
     let max_tokens = max_tokens.max(1).min(state.cfg.max_tokens_cap);
-    let temperature = req_json.get("temperature").and_then(Value::as_f64).map(|v| v as f32);
-    let top_p = req_json.get("top_p").and_then(Value::as_f64).map(|v| v as f32);
+    let temperature = req_json
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .map(|v| v as f32);
+    let top_p = req_json
+        .get("top_p")
+        .and_then(Value::as_f64)
+        .map(|v| v as f32);
     let seed = req_json.get("seed").and_then(Value::as_u64);
+
+    if temperature.is_some_and(|v| !v.is_finite() || v < 0.0)
+        || top_p.is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 1.0)
+    {
+        respond_json(
+            request,
+            400,
+            &json!({"error": {"message": "temperature must be nonnegative and top_p must be in (0, 1]", "type": "invalid_request_error"}}),
+        );
+        return;
+    }
 
     let prompt = state.tokenizer.apply_chat_template(&messages);
     let prompt_ids = state.tokenizer.encode(&prompt);
     let stop_ids = state.tokenizer.stop_ids();
 
-    let sampler = Sampler::new(temperature.unwrap_or(0.0), 0, top_p.unwrap_or(1.0), 1.0, seed);
-    let params = GenParams { max_tokens, sampler, stop_ids };
+    let sampler = Sampler::new(
+        temperature.unwrap_or(0.0),
+        0,
+        top_p.unwrap_or(1.0),
+        1.0,
+        seed,
+    );
+    let params = GenParams {
+        max_tokens,
+        sampler,
+        stop_ids,
+    };
 
     if stream {
         stream_response(request, state, prompt_ids, params, model);
@@ -298,7 +377,11 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
 }
 
 fn parse_message(m: &Value) -> ChatMessage {
-    let role = m.get("role").and_then(Value::as_str).unwrap_or("user").to_string();
+    let role = m
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user")
+        .to_string();
     let content = match m.get("content") {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(parts)) => parts
@@ -327,12 +410,20 @@ fn full_response(
     };
     if let Err(e) = gen_result {
         let msg = format!("generation error: {e}");
-        respond_json(request, 500, &json!({"error": {"message": msg, "type": "internal_error"}}));
+        respond_json(
+            request,
+            500,
+            &json!({"error": {"message": msg, "type": "internal_error"}}),
+        );
         return;
     }
 
     let text = state.tokenizer.decode(&out_ids);
-    let finish = if out_ids.len() >= max_tokens { "length" } else { "stop" };
+    let finish = if out_ids.len() >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    };
     let resp = json!({
         "id": cmpl_id(),
         "object": "chat.completion",
@@ -369,46 +460,105 @@ fn stream_response(
     }
     let _ = sse_write(
         &mut *writer,
-        &sse_frame(&sse_chunk(&cid, created, &model, json!({"role": "assistant"}), None)),
+        &sse_frame(&sse_chunk(
+            &cid,
+            created,
+            &model,
+            json!({"role": "assistant"}),
+            None,
+        )),
     );
 
     let mut out_ids: Vec<u32> = Vec::new();
-    let mut prev_text = String::new();
+    let mut emitted = String::new();
+    let mut decode_error = None;
+    let mut decoder = state.tokenizer.decode_stream();
     let gen_result = {
         let mut backend = state.backend.lock().unwrap();
-        let tokenizer = &state.tokenizer;
         let mut on_token = |tid: u32| {
             out_ids.push(tid);
-            // incremental decode: emit only the newly-revealed suffix
-            let full = tokenizer.decode(&out_ids);
-            let piece = if let Some(p) = full.strip_prefix(prev_text.as_str()) {
-                p.to_string()
-            } else {
-                full.clone() // decode not monotonic (shouldn't happen with placeholder)
+            if decode_error.is_some() {
+                return;
+            }
+            let piece = match decoder(tid) {
+                Ok(Some(piece)) => piece,
+                Ok(None) => return,
+                Err(e) => {
+                    decode_error = Some(e);
+                    return;
+                }
             };
-            prev_text = full;
+            emitted.push_str(&piece);
             if !piece.is_empty() {
                 let _ = sse_write(
                     &mut *writer,
-                    &sse_frame(&sse_chunk(&cid, created, &model, json!({"content": piece}), None)),
+                    &sse_frame(&sse_chunk(
+                        &cid,
+                        created,
+                        &model,
+                        json!({"content": piece}),
+                        None,
+                    )),
                 );
             }
         };
         backend.generate(&prompt_ids, &mut params, &mut on_token)
     };
 
-    if let Err(e) = gen_result {
+    let result = gen_result.and_then(|_| {
+        if let Some(error) = decode_error {
+            return Err(error);
+        }
+        let full = state.tokenizer.final_decode(&out_ids)?;
+        let tail = final_stream_tail(&full, &emitted)?;
+        if !tail.is_empty() {
+            sse_write(
+                &mut *writer,
+                &sse_frame(&sse_chunk(
+                    &cid,
+                    created,
+                    &model,
+                    json!({"content": tail}),
+                    None,
+                )),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    });
+    if let Err(e) = result {
         let _ = sse_write(
             &mut *writer,
             &sse_frame(&json!({"error": {"message": e, "type": "internal_error"}})),
         );
+        let _ = sse_write(&mut *writer, "data: [DONE]\n\n");
+        let _ = sse_end(&mut *writer);
+        let _ = writer.flush();
+        return;
     }
 
-    let finish = if out_ids.len() >= max_tokens { "length" } else { "stop" };
-    let _ = sse_write(&mut *writer, &sse_frame(&sse_chunk(&cid, created, &model, json!({}), Some(finish))));
+    let finish = if out_ids.len() >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    };
+    let _ = sse_write(
+        &mut *writer,
+        &sse_frame(&sse_chunk(&cid, created, &model, json!({}), Some(finish))),
+    );
     let _ = sse_write(&mut *writer, "data: [DONE]\n\n");
     let _ = sse_end(&mut *writer);
     let _ = writer.flush();
+}
+
+fn final_stream_tail<'a>(full: &'a str, emitted: &str) -> Result<&'a str, String> {
+    let tail = full
+        .strip_prefix(emitted)
+        .ok_or("stream decoder changed already emitted text")?;
+    if tail.ends_with('\u{fffd}') {
+        return Err("stream ended with unresolved UTF-8/replacement text".into());
+    }
+    Ok(tail)
 }
 
 fn sse_chunk(cid: &str, created: u64, model: &str, delta: Value, finish: Option<&str>) -> Value {
@@ -497,12 +647,90 @@ fn cmpl_id() -> String {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let seq = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("chatcmpl-{:012x}{:012x}", nanos & 0xFFFF_FFFF_FFFF, seq & 0xFFFF_FFFF_FFFF)
+    format!(
+        "chatcmpl-{:012x}{:012x}",
+        nanos & 0xFFFF_FFFF_FFFF,
+        seq & 0xFFFF_FFFF_FFFF
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_finalization_flushes_only_unemitted_text_and_rejects_rewrites() {
+        assert_eq!(final_stream_tail("hello!", "hello").unwrap(), "!");
+        assert_eq!(final_stream_tail("🙂", "🙂").unwrap(), "");
+        assert!(final_stream_tail("🙂", "�").is_err());
+        assert!(final_stream_tail("hello�", "hello").is_err());
+    }
+
+    #[test]
+    fn real_tokenizer_sse_buffers_utf8_and_reports_truncated_terminal_bytes() {
+        struct Tokens(Vec<u32>);
+        impl Backend for Tokens {
+            fn generate(
+                &mut self,
+                _: &[u32],
+                _: &mut GenParams,
+                emit: &mut dyn FnMut(u32),
+            ) -> Result<(), String> {
+                for &id in &self.0 {
+                    emit(id);
+                }
+                Ok(())
+            }
+        }
+        for (ids, expected, error) in [(vec![3, 4, 5, 6, 2], "🙂A", false), (vec![2, 3], "A", true)]
+        {
+            let (dir, tokenizer) = crate::tokenizer::tests::fixture(false, false);
+            let cfg = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 0,
+                model_id: "fixture".into(),
+                default_max_tokens: 16,
+                max_tokens_cap: 16,
+                model_dir: None,
+                backend_name: "fixture".into(),
+            };
+            let server = bind(&cfg).unwrap();
+            let addr = server.server_addr().to_ip().unwrap().to_string();
+            let state = Arc::new(ServerState {
+                backend: Mutex::new(Box::new(Tokens(ids))),
+                tokenizer: ServerTokenizer::Real(tokenizer),
+                cfg,
+            });
+            let thread = std::thread::spawn(move || handle_request(server.recv().unwrap(), &state));
+            let (status, _, body) = http_request(
+                &addr,
+                "POST",
+                "/v1/chat/completions",
+                Some(r#"{"messages":[{"role":"user","content":"A"}],"stream":true}"#),
+            );
+            assert_eq!(status, 200);
+            let frames: Vec<Value> = body
+                .split("\n\n")
+                .filter_map(|frame| frame.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str(data).unwrap())
+                .collect();
+            let text: String = frames
+                .iter()
+                .filter_map(|v| v["choices"][0]["delta"]["content"].as_str())
+                .collect();
+            assert_eq!(text, expected);
+            assert_eq!(frames.iter().any(|v| v.get("error").is_some()), error);
+            if error {
+                assert!(!frames
+                    .iter()
+                    .any(|v| v["choices"][0]["finish_reason"].is_string()));
+            }
+            assert!(body.contains("data: [DONE]"));
+            thread.join().unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
     use crate::mock_backend::MockBackend;
     use std::io::{BufRead, BufReader};
     use std::net::TcpStream;
@@ -525,7 +753,7 @@ mod tests {
         let server = bind(&cfg).expect("bind");
         let addr = server.server_addr().to_ip().expect("ip addr");
         std::thread::spawn(move || {
-            run(server, Box::new(MockBackend::new()), cfg);
+            let _ = run(server, Box::new(MockBackend::new()), cfg);
         });
         format!("{}:{}", addr.ip(), addr.port())
     }
@@ -533,12 +761,15 @@ mod tests {
     /// Minimal blocking HTTP/1.1 client: send a raw request, return
     /// (status_code, headers, body_as_string). Reads the body either via
     /// Content-Length or by decoding a chunked transfer-encoding.
-    fn http_request(addr: &str, method: &str, path: &str, body: Option<&str>) -> (u16, Vec<String>, String) {
+    fn http_request(
+        addr: &str,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> (u16, Vec<String>, String) {
         let mut stream = TcpStream::connect(addr).expect("connect");
         let body_bytes = body.unwrap_or("").as_bytes();
-        let mut req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n"
-        );
+        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
         if body.is_some() {
             req.push_str("Content-Type: application/json\r\n");
             req.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
@@ -607,7 +838,11 @@ mod tests {
             out
         };
 
-        (status, headers, String::from_utf8_lossy(&body_out).to_string())
+        (
+            status,
+            headers,
+            String::from_utf8_lossy(&body_out).to_string(),
+        )
     }
 
     #[test]
@@ -642,10 +877,25 @@ mod tests {
     }
 
     #[test]
+    fn invalid_sampling_parameters_are_rejected_without_panicking() {
+        let addr = spawn_test_server(|_| {});
+        for extra in [r#""top_p":0"#, r#""temperature":-1"#] {
+            let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],{extra}}}"#);
+            let (status, _, response) =
+                http_request(&addr, "POST", "/v1/chat/completions", Some(&body));
+            assert_eq!(status, 400, "{response}");
+        }
+    }
+
+    #[test]
     fn empty_messages_is_400() {
         let addr = spawn_test_server(|_| {});
-        let (status, _headers, body) =
-            http_request(&addr, "POST", "/v1/chat/completions", Some("{\"messages\":[]}"));
+        let (status, _headers, body) = http_request(
+            &addr,
+            "POST",
+            "/v1/chat/completions",
+            Some("{\"messages\":[]}"),
+        );
         assert_eq!(status, 400);
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["error"]["type"], "invalid_request_error");
@@ -660,8 +910,12 @@ mod tests {
             "max_tokens": 200,
             "stream": false,
         });
-        let (status, _headers, body) =
-            http_request(&addr, "POST", "/v1/chat/completions", Some(&req.to_string()));
+        let (status, _headers, body) = http_request(
+            &addr,
+            "POST",
+            "/v1/chat/completions",
+            Some(&req.to_string()),
+        );
         assert_eq!(status, 200);
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["object"], "chat.completion");
@@ -680,8 +934,12 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 999,
         });
-        let (status, _headers, body) =
-            http_request(&addr, "POST", "/v1/chat/completions", Some(&req.to_string()));
+        let (status, _headers, body) = http_request(
+            &addr,
+            "POST",
+            "/v1/chat/completions",
+            Some(&req.to_string()),
+        );
         assert_eq!(status, 200);
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["usage"]["completion_tokens"], 3);
@@ -696,11 +954,20 @@ mod tests {
             "stream": true,
             "max_tokens": 200,
         });
-        let (status, headers, body) =
-            http_request(&addr, "POST", "/v1/chat/completions", Some(&req.to_string()));
+        let (status, headers, body) = http_request(
+            &addr,
+            "POST",
+            "/v1/chat/completions",
+            Some(&req.to_string()),
+        );
         assert_eq!(status, 200);
-        assert!(headers.iter().any(|h| h.to_lowercase() == "content-type: text/event-stream"));
-        assert!(headers.iter().any(|h| h.to_lowercase().contains("transfer-encoding") && h.to_lowercase().contains("chunked")));
+        assert!(headers
+            .iter()
+            .any(|h| h.to_lowercase() == "content-type: text/event-stream"));
+        assert!(headers
+            .iter()
+            .any(|h| h.to_lowercase().contains("transfer-encoding")
+                && h.to_lowercase().contains("chunked")));
 
         let frames: Vec<&str> = body
             .split("\n\n")

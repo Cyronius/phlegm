@@ -1,6 +1,9 @@
 //! Temporary, resident C++ reference-engine adapter. Timings originate in the
 //! child process, not in its JSON transport. The source checkout is never copied.
+mod turbo;
+
 use super::{is_hex, BenchBackend, ModelInfo, RuntimeInfo, Sample};
+use crate::backend::{Backend, GenParams};
 use crate::npu_lock::NpuLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -246,10 +249,10 @@ impl Process {
             let mut reader = BufReader::new(output);
             loop {
                 let mut line = Vec::new();
-                let result = (&mut reader).take(1_000_001).read_until(b'\n', &mut line);
+                let result = (&mut reader).take(8_000_001).read_until(b'\n', &mut line);
                 let value = match result {
                     Ok(0) => Err("reference bridge exited before replying".into()),
-                    Ok(_) if line.len() > 1_000_000 => Err("reference reply exceeds 1 MB".into()),
+                    Ok(_) if line.len() > 8_000_000 => Err("reference reply exceeds 8 MB".into()),
                     Ok(_) => serde_json::from_slice::<Value>(&line)
                         .map_err(|e| format!("invalid reference reply: {e}")),
                     Err(e) => Err(format!("reading reference reply: {e}")),
@@ -617,5 +620,220 @@ mod tests {
             manifest_hash(&a),
             format!("{:x}", Sha256::digest(b"a\x001\nb\x002\n"))
         );
+    }
+}
+
+/// Resident generation backend using the same verified C++ bridge as Phlegm Bench.
+/// Rust owns sampling and the device lock; the C++ child owns XRT resources.
+pub struct NpuBackend {
+    process: Process,
+    context_capacity: usize,
+    real_vocab: usize,
+    _lock: NpuLock,
+}
+
+pub struct NpuOptions {
+    pub bridge: PathBuf,
+    pub model_dir: PathBuf,
+    pub kernel_dir: PathBuf,
+    pub turbo: bool,
+    pub context_capacity: usize,
+    pub prefill_route: String,
+    pub prefill_mode: String,
+    pub threads: usize,
+    pub request_timeout: Duration,
+    pub dispatch_timeout_ms: u32,
+}
+
+impl NpuBackend {
+    pub fn load(mut options: NpuOptions) -> Result<Self, String> {
+        if options.threads == 0
+            || options.request_timeout.is_zero()
+            || options.dispatch_timeout_ms == 0
+            || options.context_capacity < 2
+            || !["auto", "sequential", "block"].contains(&options.prefill_route.as_str())
+            || !["fast", "lean"].contains(&options.prefill_mode.as_str())
+        {
+            return Err("invalid NPU engine settings".into());
+        }
+        if options.turbo {
+            options.kernel_dir = turbo::select(&options.kernel_dir, &options.prefill_route)?;
+            eprintln!("phlegm: turbo enabled: experimental bfp16-hh precision, batched prefill ({})",
+                      options.kernel_dir.display());
+        }
+        build_info(&options.bridge)?;
+        let lock = NpuLock::acquire("phlegm NPU")?;
+        let mut process =
+            Process::spawn(&options.bridge, options.threads, options.request_timeout)?;
+        let hello = process.request(json!({"command":"init", "model_dir":options.model_dir,
+            "kernel_dir":options.kernel_dir, "max_ctx":options.context_capacity,
+            "dispatch_timeout_ms":options.dispatch_timeout_ms, "prefill_route":options.prefill_route,
+            "prefill_mode":options.prefill_mode}))?;
+        if options.turbo {
+            turbo::validate_loaded_route(hello.get("prefill_route").and_then(Value::as_str))?;
+        }
+        let context_capacity = hello
+            .get("context_capacity")
+            .and_then(Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or("missing context capacity")?;
+        let real_vocab = hello
+            .get("real_vocab")
+            .and_then(Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or("missing real vocabulary")?;
+        if context_capacity != options.context_capacity || real_vocab == 0 {
+            return Err("NPU engine loaded unexpected capacity or vocabulary".into());
+        }
+        Ok(Self {
+            process,
+            context_capacity,
+            real_vocab,
+            _lock: lock,
+        })
+    }
+
+    fn logits(&mut self, command: Value) -> Result<Vec<f32>, String> {
+        let reply = self.process.request(command)?;
+        let encoded = reply
+            .get("logits_f32_le_base64")
+            .and_then(Value::as_str)
+            .ok_or("NPU engine returned no binary logits")?;
+        let bytes = base64::decode(encoded).map_err(|e| format!("invalid logit encoding: {e}"))?;
+        if bytes.len() != self.real_vocab * 4 {
+            return Err(format!(
+                "NPU engine returned {} logit bytes, expected {}",
+                bytes.len(),
+                self.real_vocab * 4
+            ));
+        }
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| {
+                let f = f32::from_le_bytes(chunk.try_into().unwrap());
+                if !f.is_finite() {
+                    return Err("nonfinite logit".into());
+                }
+                Ok(f)
+            })
+            .collect()
+    }
+}
+
+impl Backend for NpuBackend {
+    fn generate(
+        &mut self,
+        prompt_ids: &[u32],
+        params: &mut GenParams,
+        on_token: &mut dyn FnMut(u32),
+    ) -> Result<(), String> {
+        self._lock.ensure_held()?;
+        if prompt_ids.is_empty()
+            || params.max_tokens == 0
+            || prompt_ids
+                .len()
+                .checked_add(params.max_tokens - 1)
+                .is_none_or(|n| n > self.context_capacity)
+            || prompt_ids.iter().any(|&id| id as usize >= self.real_vocab)
+        {
+            return Err("prompt or output count exceeds the NPU model's context/vocabulary".into());
+        }
+        self.process.request(json!({"command":"reset"}))?;
+        let mut history: Vec<i64> = prompt_ids.iter().map(|&id| i64::from(id)).collect();
+        let mut logits = self.logits(json!({"command":"prefill_logits", "prompt":prompt_ids}))?;
+        for index in 0..params.max_tokens {
+            let next = params.sampler.sample(&logits, &history) as u32;
+            if params.stop_ids.contains(&next) {
+                break;
+            }
+            on_token(next);
+            history.push(i64::from(next));
+            if index + 1 < params.max_tokens {
+                logits = self.logits(json!({"command":"decode_logits", "token":next}))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod generation_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn resident_bridge_resets_and_stops_across_requests() {
+        let dir = std::env::temp_dir().join(format!("phlegm-bridge-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bridge = dir.join("fake-bridge");
+        fs::write(
+            &bridge,
+            r#"#!/usr/bin/env python3
+import base64, json, struct, sys
+print(json.dumps({'ok': True, 'protocol': 1, 'engine': 'openflowlm-cpp-reference'}), flush=True)
+phase = 0
+for line in sys.stdin:
+    r = json.loads(line)
+    cmd = r['command']
+    if cmd == 'init':
+        out = {'context_capacity': r['max_ctx'], 'real_vocab': 5}
+    elif cmd == 'reset':
+        phase = 0
+        out = {}
+    elif cmd == 'prefill_logits':
+        assert phase == 0 and r['prompt'] == [0, 1]
+        phase = 1
+        out = {'logits_f32_le_base64': base64.b64encode(struct.pack('<5f', 0, 0, 10, 0, 0)).decode()}
+    elif cmd == 'decode_logits':
+        assert phase == 1 and r['token'] == 2
+        phase = 2
+        out = {'logits_f32_le_base64': base64.b64encode(struct.pack('<5f', 0, 0, 0, 0, 10)).decode()}
+    elif cmd == 'quit':
+        print(json.dumps({'ok': True}), flush=True)
+        break
+    else:
+        raise RuntimeError(cmd)
+    out['ok'] = True
+    print(json.dumps(out), flush=True)
+"#,
+        )
+        .unwrap();
+        let mut mode = fs::metadata(&bridge).unwrap().permissions();
+        mode.set_mode(0o700);
+        fs::set_permissions(&bridge, mode).unwrap();
+        let adapter_sha = format!("{:x}", Sha256::digest(BRIDGE_SOURCE));
+        let files = BTreeMap::from([("bridge/bridge.cpp".into(), adapter_sha.clone())]);
+        let sidecar = json!({"protocol":1, "engine":BACKEND_NAME, "source_commit":"0".repeat(40),
+            "source_dirty":false, "source_tree_sha256":manifest_hash(&files),
+            "adapter_sha256":adapter_sha, "binary_sha256":hash_file(&bridge).unwrap(),
+            "compiler_flags":"fake test bridge", "source_files":files});
+        fs::write(bridge.with_extension("build.json"), sidecar.to_string()).unwrap();
+        let opts = NpuOptions {
+            bridge,
+            model_dir: dir.clone(),
+            kernel_dir: dir.clone(),
+            turbo: false,
+            context_capacity: 8,
+            prefill_route: "auto".into(),
+            prefill_mode: "fast".into(),
+            threads: 1,
+            request_timeout: Duration::from_secs(5),
+            dispatch_timeout_ms: 1000,
+        };
+        let mut backend = NpuBackend::load(opts).unwrap();
+        for _ in 0..2 {
+            let mut params = GenParams {
+                max_tokens: 4,
+                sampler: crate::sampler::Sampler::new(0.0, 0, 1.0, 1.0, None),
+                stop_ids: [4u32].into_iter().collect(),
+            };
+            let mut output = Vec::new();
+            backend
+                .generate(&[0, 1], &mut params, &mut |id| output.push(id))
+                .unwrap();
+            assert_eq!(output, vec![2]);
+        }
+        drop(backend);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

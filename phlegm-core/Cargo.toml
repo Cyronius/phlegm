@@ -9,6 +9,7 @@ license.workspace = true
 npu = []
 
 [dependencies]
+base64 = "0.13.1"
 minijinja = { version = "2.24.0", features = ["json"] }
 minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
 serde = { version = "1", features = ["derive"] }
