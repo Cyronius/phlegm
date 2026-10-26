@@ -1,6 +1,6 @@
 # Phlegm integration and kernel work plan
 
-Updated: 2026-10-24. Status: planned work, with existing results noted below.
+Updated: 2026-10-26. Status: Linux NPU development in progress; current evidence and remaining gates live in `.plans/`.
 
 This is the project handoff plan for continuing on another machine. Paths are
 relative to the repository root. Check the current checkout and later result
@@ -129,6 +129,17 @@ timing as separate follow-ups.
 Sources: [monorepo plan, P5](.claude/plans/phlegm-monorepo.md),
 [visualization plan](specs/viz/plans/flow-viz.md).
 
+## Native image model support
+
+Qwen Image 2.1 and FLUX 3 Image Klein are requested for text-to-image and
+editing through the CLI and image API, with native NPU inference. They are
+new model families: the existing FLUX.2 Klein NPU schedule and C++ image
+engine cannot load them by alias. The FLUX 3 port also needs its separate
+prompt upsampler and the published reference inference behavior. Acquisition,
+architecture differences, validation gates and current blockers are tracked
+in [the native image model plan](.plans/native-image-models.md). Do not register
+either model as supported until actual NPU generation and editing pass.
+
 ## 5. Kernel correctness and performance backlog
 
 ### Qwen3.8-27B prefill accuracy
@@ -227,3 +238,25 @@ quality results, resource wait and next command.
 prefill790 to1203 tokens/s (1.5204x); decode unchanged. Zero of five8K pairs
 pass controls, so no accepted8K figure. Full8192 model correctness remains
 validated; no ArtLite parity claim. Details in active performance plan.
+
+2026-10-25 turbo continuation: run/serve --turbo selects an explicit HH-only
+Llama1B companion image. Default arithmetic unchanged. Full300 and8192 turbo
+quality profiles pass;47-token4096 boundary fails relative NLL (+3.55%) and
+remains an experimental limitation. CLI generation and16-output bridge checks
+pass. Clean1K turbo timing queued through Dibs; see active plan for waiter.
+
+Turbo timing update: cancelled our pending measurement runner before launch to
+avoid holding the machine while waiting on other sessions. No turbo benchmark
+is queued/running. Exact retry command and known quality failure in active plan.
+
+2026-10-26 clean turbo result:5/5 valid1K pairs,Dibs CLEAN before/after.
+Compensated1136 versus turbo1111 prefill tokens/s (.97844x); no speedup.
+Continue dataflow/producer investigation; no default promotion. Active plan
+records exact evidence and retained boundary quality failure.
+
+2026-10-26 continuation: compact producer/activation gather/double-weight-buffer
+turbo variants built and match original turbo all8192 outputs plus16decode;
+selected W2 also matches300partial-block outputs. No new speed claim. Device
+SiLU/pack standalone diagnostic passes exactencoder plus separate arithmetic
+checks while original9byte CPUcandidate mismatch remains. C++integration not
+performed; shared CPUwork still prevents clean timing. Activeplan has evidence.

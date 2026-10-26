@@ -703,3 +703,79 @@ performance checkpoint. Preserve existing source and generated artifacts.
 
 summary.json SHA256 90ce76514f6e43f7e96bff0ddcbd1f33b3c9b4843e039208639e79f3ad692230
 raw.jsonl SHA256 ef97097894cb7aec5c3a3660222c8ae0539f302c6e3a070db32d55560d16ac28
+
+
+## 2026-10-26: clean turbo result — no engine speedup
+
+Queued session9838 completed normally. Dibs CLEAN before and CLEAN after;
+all5/5 retained1K pairs pass controls (discarded warmup pair failed and remains
+excluded). Same model/source weights/head/forced128-token trajectory,capacity
+16384,threads4,layer-major for both. Compensated64 prefill1135.766474 versus
+HH-only turbo1111.275604 tokens/s,median paired ratio .978436703. Decode
+39.714537 versus39.309394,ratio .989798614. This is a measured negative result:
+fewer matrix products did not improve this implementation's engine speed.
+Do not use cross-survey1203tps to compute its gain; the matched control is1136.
+Known turbo boundary NLL failure remains. No default or parity promotion.
+
+Evidence target/npu-dev/survey-hilo64-vs-turbo-dibs/ plus launcher.log.
+SHA256 summary d043655eb4c23de97195a6839e96375a55229be5e3bcdbf269fb9374919f383e;
+metadata846062ce9143f28e11b2138d6dd328f6df85bc07c8219efaaececbddca2f7b68;
+raw91f511e038a62881198e0167a73c72c48128be360e6a9b9e82246a7c4fe2436b.
+No pending benchmark. CPU shared activity currently busy; NPU free.
+
+Next hypotheses (not measured explanations): HH MAC still emits/reads residual
+panels, keeping conversion, buffer and transfer costs. Agent kernel_schedule
+owns a compact producer/MAC prototype with current global input ABI preserved;
+agent pipeline_audit audits raw matched routes; runtime_audit reviews exact
+ArtLite device-resident pipeline transfers. No agent NPU work. Heavy builds
+Dibs build; root numerical/model checks Dibs npu; new timing Dibs --measure.
+
+
+## 2026-10-26 compact turbo and standalone device packing checkpoint
+
+Three unpromoted whole-model variants preserve the original HH arithmetic and
+external high/low input ABI. Fresh four-stream images/CDOs verified pervariant:
+
+|Variant|Program/core|L1 incl4096B stack|Validated output|
+|---|---:|---:|---|
+|High-only weight producer|4640B|55880B|8192 positions+16decode exact|
+|Also gather high activation panels|4656B|46664B|8192 positions+16decode exact|
+|Also double weight buffering|4752B|58952B|8192 positions+16decode and300partial-block exact|
+
+All equality aggregates for8192+16 are SHA256
+89c0f4961c2114439981eaf91b43737028ef5000934fb208574f4843a2b48c20.
+These inherit the turbo real47 boundary NLL failure (+3.55% vs1%target), not a
+quality repair. IndependentQKV and longK arithmetic gates pass. No timing
+claim for these variants; original HH clean result remains .97844x compensated.
+Current installed turbo image is preserved, not silently replaced.
+
+Rebuild with compensated64/build_family.py --out <fresh-target> and respectively
+--turbo-high-only, --turbo-high-ab, --turbo-high-ab --weight-depth2 (space between
+option and2). Builds under Dibs build; actualmemory,BD,compiler checks retained
+in turbo64-high-{only,ab,ab-w2}-family/ under target/npu-dev. W2core5BD,
+memtilemax24BD with16/8 pooluse,6S2MM/3MM2S. LongK rank-split gather keeps
+outerrepeat<=64,wordstrides<2^20,positive strides,72B innerrows and large total
+transfers. No hostpacker/runtimeformat change. Prototypebundles under
+kernels/llama32-1b-gguf-hilo64-high-{only,ab,ab-w2}-probe/turbo.
+
+New standalone ffn_silu_pack/ prototype computes SiLU(gate)*up from native
+F32[F,T] then produces existing packeddowninput,4cores,F8192/T256. Original
+CPUcandidate strictbytegate FAILS9lowplanebytes. Diagnosticexposesactualdevice
+F32 and packedoutput from samekernel: independentCPUencoder(actualF32) matches
+ALLbytes; diagnosticpacked output equalsoriginaldeviceoutput. DeviceF32
+relativeerror1.214261629e-6 vsdouble and1.213874056e-6 vsindependentFP32,below
+predeclared .02; finalpackedoperatorerror .00166343. Thus tiny prepackarithmetic
+rounding changes BF16 decisions atmidpoints; encoder/layout matches for this
+fixture. Originalfailure retained, not retrospectively relabelled passed.
+No C++integration, fullmodelgate orspeedclaim forSiLUprototype. Extra context
+cost and scalarsoftfloat remain concerns; vectorization/chain timing required
+before integrating for performance. Diagnostic4cores:text9504B,frame896B
+plusmain128/helper64,stack4096B,L1end54272B,2fills/2drains percolumn.
+
+Evidence target/npu-dev/quality/turbo-high-{only,ab,ab-w2}-exact8192.json,
+turbo-high-ab-w2-exact300.json,parallel-pipeline/silu-pack-fixture-v{1,2}/,
+plus all build/source/resource metadata. Generated data ignored.36 focused
+Pythonregressions pass. --reverse-init added to paired_phlegm_routes.py,
+records actual creation/init order and preserves controls/defaults; fakeworker
+checks pass. Next clean comparison must exercise reverse init to probe worker
+placement; no relaxation ofpaired stabilityorquality thresholds.

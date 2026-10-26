@@ -1,13 +1,15 @@
 # Reach or exceed ArtLite performance
 
-Updated: 2026-10-25. Experimental compensated-BFP prefill now passes full
-300-token and 8192-token independent model gates, plus the real 4096-boundary
-slice. The rotated 64x64 kernel matches this route byte-for-byte at all 8192
-positions and 16 decode outputs; the resident bridge also passes all 16 outputs.
-Fused kernel measured 1.50965x over native under low load. Rotated geometry adds
-~1.26x in load-confounded kernel trials; no accepted engine speedup or parity
-claim yet. Idle paired engine trials are queued behind the unrelated training
-job. No default promotion. All work local; paid resources need fresh approval.
+Updated: 2026-10-26. Compensated-BFP development engine result at1K is1.5204x
+versus native (5/5 stable,Dibs CLEAN before/after); full300/8192 and real4096
+boundary gates pass. Initial HH-only turbo has NO speed benefit: matched clean
+1K1136 versus1111 tokens/s (.97844x,5/5 stable). Turbo aggregate quality passes,
+but real47 boundary NLL+3.55% fails its1% target; retained as experimental.
+Compact high-only producer and activation-gather variants match prior turbo
+all8192 logits +16decode exactly. Double-buffered weights fit and match8192/300 outputs exactly; bridge16passes.
+Standalone SiLU/pack original9byte golden mismatch is retained; separate device
+values prove exactencoding and bounded arithmetic. No runtime integration. No default/parity
+promotion. All work local; paid resources need fresh approval.
 
 ## Objective and evidence
 
@@ -700,3 +702,274 @@ performance checkpoint. Preserve existing source and generated artifacts.
 
 summary.json SHA256 90ce76514f6e43f7e96bff0ddcbd1f33b3c9b4843e039208639e79f3ad692230
 raw.jsonl SHA256 ef97097894cb7aec5c3a3660222c8ae0539f302c6e3a070db32d55560d16ac28
+
+## 2026-10-25: explicit turbo mode implementation in progress
+
+User requested opt-in higher loss for ArtLite-like reduced precision. Implementing
+HH-only compensated64 MAC (default remains HH+HL+LH), retaining input ABI to
+bound runtime changes. CLI run/serve --turbo selects fixed complete DIR/turbo
+bundle and forces block; missing/mismatched manifests reject, no fallback.
+Quality bounds preregistered before hardware measurements: cosine median .9990,
+argmax drop <=5pp, NLL <=sequential*1.01. Strict profile unchanged; both report
+CPU-reference forward KL. Agent builds all four fresh streams under Dibs build;
+root owns assembly/model checks; agents run no NPU jobs. Focused selector and
+publication tests pass. Full hardware/model/boundary and timing still pending.
+
+Turbo initial hardware check: Dibs npu+shared flock, check_gemm.py --profile
+turbo --activation-format bfp-hilo on fresh qkv3072x2048x256 stream passes
+relative source .00920426736 and BF16-operand .00883547471 (limits .02/.02).
+Artifact target/npu-dev/turbo64-check-qkv/result.json. No timing claim.
+Actual CLI dev binary built; embedded adapter matches existing snapshot bridge
+SHA256 ffb4dd5a39b5bc8d7ebdcd5ddb776ad309f25598b2b3980a988293ccded3f6a7.
+Pending full300/8192/boundary checks, then live --turbo generation and paired
+engine timing under Dibs --measure.
+
+Turbo four-stream family completed:32 cores per stream,text5120B,MAC frame64B,
+stack4096B,L1end60488B,identical CDO payloads; source/default and CPU layout
+gates saved under target/npu-dev/turbo64-family/*.json. Assembled companion
+under kernels/llama32-1b-gguf-hilo64-g4-flashpair8k/turbo; metadata binds both
+manifest hashes. Auto retains layer-major; explicit block retained; selected
+bridge must confirm batched route. This supersedes earlier 'force block' note.
+Turbo300 model gate PASSES:median cosine .9998059036302681,argmax297/300,
+NLL2.8056711277026714 vsseq2.803956639988847 (+.06115%),CPU forward KL
+mean .0013846764360789265. Strict300 comparison fails cosine, retained in
+quality/gate-turbo300-strict.json.35 focused Python tests pass (initial test
+command referenced a nonexistent filename and ran zero; corrected full command
+includes test_gguf_gemm_quality_gate.py and passes35). Rust turbo tests3 pass.
+Long model check currently active; no turbo performance claim yet.
+
+Turbo full8192 aggregate gate PASSES:cosine median .9998245962066122,
+argmax8190/8192 (sequential8190),NLL .03545125443710632 versus .03540104505674053
+(+.14183%),CPU forward KL mean .00005166273995015996. Real47-token boundary
+slice FAILS NLL target: .014680250247053704 versus .014176436293688022
+(+3.5539%,absolute+.0005038),47/47 argmax,cosine .9998176737960929. Retain this
+known failure without changing preregistered bounds; full-context aggregate
+pass is not an all-boundary quality acceptance. Long-K down independent check
+passes .00936125 source/.00898937 BF16 vs .02/.02. Artifacts quality/gate-turbo
+{300,8192,-tail47}.json and turbo64-check-down/result.json under target/npu-dev.
+Actual target/debug/phlegm run --turbo generated8 tokens successfully with
+matching bridge provenance (turbo-cli-smoke.log); auto retains batched layer-major.
+
+Turbo bridge check:16/16 outputs byte-exact to CLI after8192 prompt positions
+(quality/bridge-turbo8192.json). Paired1K standardcompensated64 vs turbo
+started through Dibs --measure npu, currently waiting for CPU holder
+codex-a53434a0b786/broad-more through~19:35. Exec session25407 will launch
+automatically after the reservation clears; out survey-hilo64-vs-turbo-dibs,
+sizes1024,rounds5,threads4,maxctx16384,maxhostload2.0,same saved inputs and
+snapshot bridge. Do not start duplicate or interfere with its future window.
+No turbo timing result yet. New xdna2-notes raw evidence saves aggregate versus
+boundary quality lesson and hashes, retaining the failed bound explicitly.
+- `target/npu-dev/quality/gate-turbo300.json`: `760f11e68d202130fafcf8da90e66f49105e728b81b0f3fc8d2110ed84d7baed`
+- `target/npu-dev/quality/gate-turbo8192.json`: `40456cccceace252efe1ffbf30f9e0d6f9437014d44b6598558cfb75fa862dc4`
+- `target/npu-dev/quality/gate-turbo-tail47.json`: `c838f1c64982ef3909032aff35b295a19a7b69d2532ec3da6f13699e66e5fe67`
+- `target/npu-dev/quality/bridge-turbo8192.json`: `64a1b66b96cc9bb141947343a3bee61787f840cc8b76c4016d9677fefbf017ed`
+- `target/npu-dev/turbo64-family/family.json`: `b7b308b56e752be2b41ae682ad8333c592c9043f2af3eda451045c8d5890c3fd`
+
+
+### Turbo timing waiter cancelled; current state
+
+The attempted --measure runner reserved machine/build while waiting for another
+CPU session until19:35. To avoid holding the machine while waiting, released
+ONLY our measurement reservation with dibs release --measure, then sent SIGINT
+to our verified waiting launcher PID2471000 (exec session25407 exit130).
+No benchmark child started and no other session's holds/jobs were changed.
+The separate wait --measure exited FREE. There is NO pending turbo benchmark.
+This supersedes the queued/automatic-launch notes immediately above.
+
+Next command once resources are available (fresh out path, development engine
+comparison; require CLEAN before/after and paired controls):
+
+```bash
+source target/npu-dev/env.sh
+dibs run --measure npu --label 'Turbo versus compensated1K engine comparison' --eta 10m -- \
+  flock target/npu-dev/.npu-work.lock python utilities/gguf-prefill/paired_phlegm_routes.py \
+  --bridge target/npu-dev/reference-hilo-snapshot-bridge/phlegm-reference-bench \
+  --model-dir target/npu-dev/models/llama32-1b \
+  --reference-kernels target/npu-dev/kernels/llama32-1b-gguf-hilo64-g4-flashpair8k \
+  --candidate-kernels target/npu-dev/kernels/llama32-1b-gguf-hilo64-g4-flashpair8k/turbo \
+  --inputs-jsonl target/npu-dev/survey-g4-flashpair-1k-8k/raw.jsonl \
+  --out target/npu-dev/survey-hilo64-vs-turbo-dibs \
+  --sizes 1024 --rounds 5 --threads 4 --max-ctx 16384 --max-host-load 2.0
+```
+
+Current tests:36 focused Python checks (35 earlier plus final shape-rejection
+case);3 Rust turbo tests; live CLI generation; bridge16 exact. Final git diff
+--check passes. Turbo remains experimental with the explicit boundary NLL
+failure; no speed/ArtLite parity claim. Lessons saved in xdna2-notes f288faf,
+with a separate follow-up noting cancellation of the initially queued timing.
+
+### 2026-10-25: clean turbo timing requeued at user's request
+
+Exec session9838 runs the exact retry command above after
+`dibs wait cpu gpu npu network runpod-ternary` returns FREE. Waiting does not
+hold a measurement reservation. No benchmark has started yet; current holder
+codex-671d23710056 is measuring stock Q4 versus ternary DFlash2 through~19:38;
+the broad_c remote-training session also declares network/runpod activity.
+The launcher will automatically request Dibs --measure and run five paired1K
+trials when clear. Output survey-hilo64-vs-turbo-dibs; benchmark-phase log
+target/npu-dev/survey-hilo64-vs-turbo-dibs-launcher.log (created after wait).
+Do not duplicate this waiter. Require initial/final CLEAN and paired controls;
+retain known boundary quality failure alongside any performance result.
+
+
+## 2026-10-26: clean turbo result — no engine speedup
+
+Queued session9838 completed normally. Dibs CLEAN before and CLEAN after;
+all5/5 retained1K pairs pass controls (discarded warmup pair failed and remains
+excluded). Same model/source weights/head/forced128-token trajectory,capacity
+16384,threads4,layer-major for both. Compensated64 prefill1135.766474 versus
+HH-only turbo1111.275604 tokens/s,median paired ratio .978436703. Decode
+39.714537 versus39.309394,ratio .989798614. This is a measured negative result:
+fewer matrix products did not improve this implementation's engine speed.
+Do not use cross-survey1203tps to compute its gain; the matched control is1136.
+Known turbo boundary NLL failure remains. No default or parity promotion.
+
+Evidence target/npu-dev/survey-hilo64-vs-turbo-dibs/ plus launcher.log.
+SHA256 summary d043655eb4c23de97195a6839e96375a55229be5e3bcdbf269fb9374919f383e;
+metadata846062ce9143f28e11b2138d6dd328f6df85bc07c8219efaaececbddca2f7b68;
+raw91f511e038a62881198e0167a73c72c48128be360e6a9b9e82246a7c4fe2436b.
+No pending benchmark. CPU shared activity currently busy; NPU free.
+
+Next hypotheses (not measured explanations): HH MAC still emits/reads residual
+panels, keeping conversion, buffer and transfer costs. Agent kernel_schedule
+owns a compact producer/MAC prototype with current global input ABI preserved;
+agent pipeline_audit audits raw matched routes; runtime_audit reviews exact
+ArtLite device-resident pipeline transfers. No agent NPU work. Heavy builds
+Dibs build; root numerical/model checks Dibs npu; new timing Dibs --measure.
+
+Compact-A turbo producer freshly rebuilt all4streams; shared CDO checks pass.
+Per-core text4640B,frame64B,stack4096B,L1end55880B (vs old60488B),
+external high/low input ABI unchanged. Independent3072x2048x256 check passes
+and output is BYTE-EXACT to original HH kernel (source .0092043,BF16 .0088355).
+Fresh unpromoted image at kernels/llama32-1b-gguf-hilo64-high-only-probe/turbo;
+full8192+16decode dump underway in exec session87191,Dibs npu,shared flock.
+No timing of compactproducer yet. Source pipeline audit saved in owning
+specs/open-engine/artlite-prefill-code-audit.md: actualT1024 still repeats
+dequant every256token sweep; paired dequant halves conversion duplication
+(2NKvs4NK),not externaltraffic. Device gate/up->SiLU/pack->down opportunity
+is derived20.5MiBhostsyncpayload/block/layer,not measuredlatency.
+
+
+Compact ABdepth1 fullmodel8192+16decode equality PASSES, aggregateSHA
+89c0f4961c2114439981eaf91b43737028ef5000934fb208574f4843a2b48c20.
+quality/turbo-high-ab-exact8192.json retains inherited boundary failure.
+ABW2 all4freshstreams fit actual58952B L1,4752Btext,64Bframe,4096Bstack;
+source hashes equalABdepth1,core5BD,membudgetmax24BD(16lowpool/8high),
+6S2MM/3MM2S. IndependentdownK8192 output byteexact to priorHH; full8192
+check active session72208. Claimed15GB quality-artifact disk growth viaDibs
+for repeatedfullcaptures; release outstandingclaim after all checks complete.
+
+Standalone ffn_silu_pack v1 ranNPU: relativeerror .00166343 againstdouble/FP32
+passes .02 operatorbound, butexactCPUcandidate bytes FAIL(9lowplanebytes).
+All mismatches occur within0–3FP32ULPs ofBF16 roundingmidpoints; nohighplane
+or exponent mismatch. This suggests prepack arithmetic drift, NOT yetproven.
+Originalfailedfixture retained. Newdiagnostic must expose actualdeviceF32
+andprove independenthostencoder(deviceF32)==devicepacked, with separate
+SiLUapproximationerror gates; no retroactive relaxation ofv1bytegate.
+No runtimeintegration orperformanceclaim. CurrentCPU studies prevent clean
+new timing; do not rununisolatedbenchmarks or replace existingturbo bundle.
+
+
+## 2026-10-26 compact turbo and standalone device packing checkpoint
+
+Three unpromoted whole-model variants preserve the original HH arithmetic and
+external high/low input ABI. Fresh four-stream images/CDOs verified pervariant:
+
+|Variant|Program/core|L1 incl4096B stack|Validated output|
+|---|---:|---:|---|
+|High-only weight producer|4640B|55880B|8192 positions+16decode exact|
+|Also gather high activation panels|4656B|46664B|8192 positions+16decode exact|
+|Also double weight buffering|4752B|58952B|8192 positions+16decode and300partial-block exact|
+
+All equality aggregates for8192+16 are SHA256
+89c0f4961c2114439981eaf91b43737028ef5000934fb208574f4843a2b48c20.
+These inherit the turbo real47 boundary NLL failure (+3.55% vs1%target), not a
+quality repair. IndependentQKV and longK arithmetic gates pass. No timing
+claim for these variants; original HH clean result remains .97844x compensated.
+Current installed turbo image is preserved, not silently replaced.
+
+Rebuild with compensated64/build_family.py --out <fresh-target> and respectively
+--turbo-high-only, --turbo-high-ab, --turbo-high-ab --weight-depth2 (space between
+option and2). Builds under Dibs build; actualmemory,BD,compiler checks retained
+in turbo64-high-{only,ab,ab-w2}-family/ under target/npu-dev. W2core5BD,
+memtilemax24BD with16/8 pooluse,6S2MM/3MM2S. LongK rank-split gather keeps
+outerrepeat<=64,wordstrides<2^20,positive strides,72B innerrows and large total
+transfers. No hostpacker/runtimeformat change. Prototypebundles under
+kernels/llama32-1b-gguf-hilo64-high-{only,ab,ab-w2}-probe/turbo.
+
+New standalone ffn_silu_pack/ prototype computes SiLU(gate)*up from native
+F32[F,T] then produces existing packeddowninput,4cores,F8192/T256. Original
+CPUcandidate strictbytegate FAILS9lowplanebytes. Diagnosticexposesactualdevice
+F32 and packedoutput from samekernel: independentCPUencoder(actualF32) matches
+ALLbytes; diagnosticpacked output equalsoriginaldeviceoutput. DeviceF32
+relativeerror1.214261629e-6 vsdouble and1.213874056e-6 vsindependentFP32,below
+predeclared .02; finalpackedoperatorerror .00166343. Thus tiny prepackarithmetic
+rounding changes BF16 decisions atmidpoints; encoder/layout matches for this
+fixture. Originalfailure retained, not retrospectively relabelled passed.
+No C++integration, fullmodelgate orspeedclaim forSiLUprototype. Extra context
+cost and scalarsoftfloat remain concerns; vectorization/chain timing required
+before integrating for performance. Diagnostic4cores:text9504B,frame896B
+plusmain128/helper64,stack4096B,L1end54272B,2fills/2drains percolumn.
+
+Evidence target/npu-dev/quality/turbo-high-{only,ab,ab-w2}-exact8192.json,
+turbo-high-ab-w2-exact300.json,parallel-pipeline/silu-pack-fixture-v{1,2}/,
+plus all build/source/resource metadata. Generated data ignored.36 focused
+Pythonregressions pass. --reverse-init added to paired_phlegm_routes.py,
+records actual creation/init order and preserves controls/defaults; fakeworker
+checks pass. Next clean comparison must exercise reverse init to probe worker
+placement; no relaxation ofpaired stabilityorquality thresholds.
+
+
+### Current handoff after correctness gates, 2026-10-26 03:19 local
+
+ABW2 partial300+16decode exact,full8192+16decode exact,andresidentbridge16/16
+exact all PASS. All three new variants inherit prior turbo quality failures.
+Standalone SiLU diagnostic actualdevicevalues packing has0byte mismatches;
+diagnosticpacked equalsoriginalpacked,actualF32relative errors1.214261629e-6
+(double) and1.213874056e-6(independentFP32). Originalstrict9bytefailure retained.
+Evidence parallel-pipeline/silu-pack-fixture-v2/diagnostic-check.json; no fullmodelintegration.
+36focused Pythonregressions anddiffcheckpass. Dibs diskclaim released; no
+own CPU/build/NPU/measurement holds or pendingbenchmarks. OtherCPUstudies
+consume~66% hostCPU; clean newtiming must wait. Notes committed xdna2-notes
+7bbf10a (negativecleanresult) andbebe33d (compact/encoderlessons). MainPhlegm
+newsource remains local/uncommitted alongside preserved unrelatedwork.
+
+Next clean timing: use paired_phlegm_routes.py command above, freshout
+survey-compensated-vs-turbo-high-ab-w2-dibs, --candidate-kernels
+ target/npu-dev/kernels/llama32-1b-gguf-hilo64-high-ab-w2-probe/turbo,
+--reference-kernels original llama32-1b-gguf-hilo64-g4-flashpair8k,
+--reverse-init, sizes1024,rounds5,threads4,maxctx16384,maxhostload2.
+Run under Dibs --measure npu +sharedflock only once other work clears; require
+CLEAN before/after andcontrols. Then compare A-only/AB/W2 stages and swapped
+initialization to attribute any gain. Do not replace installedturbo image or
+claim speed from smaller buffers. DeviceFFN runtimechain is later work; first
+vectorize/measure standalone pluscontextfloor, then addBOresidentinput/output
+with explicitformat/mode and rerun independentwholemodel/boundarygates.
+
+## 2026-10-26: separate native image model request
+
+The user requested Qwen Image 2.1 and FLUX 3 Image Klein for native NPU image
+inference via CLI and API. This is tracked in `.plans/native-image-models.md`
+and does not change the ArtLite performance route. The temporary Diffusers
+CLI wrapper was removed after the user specified NPU execution. Public Qwen
+and FLUX prompt-upsampler downloads are running under Dibs, with a 110 GB disk
+claim; gated FLUX model files await CLI authentication. No image-model NPU
+correctness or speed claim exists. Preserve the existing performance evidence
+and continue its next clean timing as above.
+
+
+### Ready-work commit checkpoint, 2026-10-26
+
+User requested committing ready changes. Reviewed and committed experimental
+turbo kernels/quality gates, standalone SiLU diagnostics, residentgeneration
+with explicit turbo selection, modelconfig guards, standaloneGPTOSS/Gemma
+components, and duplicateheader fix in separate units. During review fixed
+SSE splitUTF8 corruption with native stateful decoding and added BOS/EOS
+chattemplate context; fullRust packages44passed,2prerequisite checksignored.
+Also fixed gate/router checkers' fail-open NaN/count/probability validation;
+38focused tests pass. Final combined Python source regressions106passed,
+no skips. Coverage matrix reproduces byte-for-byte from pinned local registry.
+Diff whitespace checks pass. No newNPU orperformance trials in this commit
+pass; all existing acceptance limits and failures stay documented. Generated
+artifacts/locks/stagingcopies and an active native-image planning file are
+left outside the readywork commits. No reset, cleanup, push or paid action.

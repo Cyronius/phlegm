@@ -46,3 +46,11 @@ others instead of routing them to a superficially similar recipe.
 Next action: convert one Qwen3.5 MoE model into the existing supported container,
 run the full-model quality gate on the NPU, then evaluate block prefill and decode
 with Dibs reservations. Follow with Nanbeige's three-way down projection split.
+
+
+## Precommit validation, 2026-10-26
+
+The earlier missing-pytest gap is resolved using `source target/npu-dev/env.sh`
+and Dibs CPU. The focused parser/K2/header suite passed32 tests, and the final
+combined source regression suite passed106 tests with no skips. These are CPU
+source/config checks; the model-specific NPU acceptance gaps above remain.
