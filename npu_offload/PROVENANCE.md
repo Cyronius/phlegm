@@ -9,6 +9,11 @@ Imported on 2026-10-23 from Atomic-Germ/OpenFlowLM-Next `main` at
 - `matmul/` and `section3/`: source-only experiments and synthetic fixture
   generators retained from the upstream kernel tree.
 
+Phlegm's `matmul/export_gemma.py`, `gemma_shapes.py`, and `check_gemma.py` are
+local additions that build and verify the twelve Embedding-Gemma 300M matmul
+shapes from the imported whole-array design. Generated xclbins and fixtures
+stay under ignored `target/`; no upstream binary was imported.
+
 Compiled executables, binary fixtures and model weights were not imported.
 `utilities/kernel-sync-sources.json` lists every imported source file and hash.
 

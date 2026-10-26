@@ -76,3 +76,33 @@ The initial integration boundary is `open_embedding::Engine::matmul_t()`:
 
 The first artifact set covers transformer Q/output (`768x768`), MLP gate/up
 (`768x1152`), and MLP down (`1152x768`) projections at M=512.
+
+## Embedding-Gemma 300M kernel set
+
+`gemma_shapes.py` lists the twelve projection shapes packaged by the pinned
+FLM registry: six K/N pairs at M=512 and M=2048. `export_gemma.py` builds all
+twelve from this open design and writes a SHA256 manifest only after every
+image and instruction stream is present. The 1152-wide projection uses two
+AIE columns; the other shapes use four. The f32 core output FIFO uses one
+buffer so its tile fits NPU2 local memory.
+
+From the Phlegm root, with the NPU development environment configured:
+
+```bash
+source target/npu-dev/env.sh
+dibs run build --label 'Build Embedding-Gemma NPU set' --eta 20m -- \
+  python npu_offload/matmul/export_gemma.py \
+  --out target/npu-dev/embed-gemma-build
+dibs run npu --label 'Check Embedding-Gemma NPU set' --eta 12m -- \
+  python npu_offload/matmul/check_gemma.py \
+  --assets target/npu-dev/embed-gemma-build \
+  --driver target/npu-dev/harness-build/run_kernel \
+  --out target/npu-dev/embed-gemma-check --all
+```
+
+The 2026-10-26 NPU check passed all twelve random BF16 input shapes against
+FP64 products rounded to f32. Minimum cosine was 0.9999999999998282 and
+maximum relative error (normalized by maximum reference magnitude) was
+1.5062e-6. These are standalone matmul results. The embedding model still
+needs an NPU dispatch route, weight/activation conversion, and end-to-end
+validation.

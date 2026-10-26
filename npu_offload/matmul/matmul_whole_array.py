@@ -119,7 +119,11 @@ def whole_array_bf16(
             [m * n * row for row in range(n_aie_rows)],
             obj_types=[C_l1_ty] * n_aie_rows,
             names=[f"C_L1L2_{col}_{row}" for row in range(n_aie_rows)],
-            depths=[fifo_depth] * n_aie_rows,
+            # f32 output at tile_n=64 is 16 KiB per core. Two output buffers
+            # plus the two A and B input buffers exceed NPU2's 64 KiB L1.
+            # The memtile FIFO can still queue two joined outputs; each core
+            # produces its next tile after the previous output is consumed.
+            depths=[1] * n_aie_rows,
         )
         for row, fifo in enumerate(joined):
             C_l1l2[row][col] = fifo
