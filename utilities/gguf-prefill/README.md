@@ -56,3 +56,52 @@ native packing baseline. It accepts T, K, float32 input, native-output and
 packed-output paths. Its finite input range is intentionally bounded; it has no
 runtime hook. Byte checks against the host encoder and edge fixtures belong in
 the owning experiment report.
+
+## Explicit turbo prefill
+
+`phlegm run ... --turbo` and `phlegm serve ... --turbo` select a complete
+`--kernels DIR` companion bundle at `DIR/turbo/`. The first implementation
+uses only the HH BFP product for batched projections, instead of HH+HL+LH.
+It retains the same high/residual input packing and Q4 source weights; ignored
+low limbs are an intentional precision tradeoff. Decode and paired-probability
+attention retain their existing arithmetic. This is experimental Llama1B
+prefill support, not a clock/power mode or an ArtLite speed guarantee.
+
+Build **all four** streams with
+`open_kernels/designs/gemm_q4_prefill/compensated64/build.py --turbo-hh`.
+Then `prepare_bfp_hilo_image.py --turbo --base DIR --out DIR/turbo` with
+`--qkv`, `--o`, `--up`, `--down` pointing to their fresh `build/` directories.
+The assembler verifies HH-only metadata, binary hashes and identical shared
+CDO payloads. Base can use native BF16 or compensated packed-input projections;
+existing packed buffer sizes must not be enlarged twice. Generated bundles stay
+under ignored `target/`; they are not checked into git.
+
+Turbo requires a matching `turbo.json` bound to both manifest hashes. Missing,
+changed or unsupported bundles fail explicitly; `--mock` and sequential-only
+prefill cannot be combined with turbo. Without the flag, the supplied base
+bundle is selected as before. Turbo preserves auto scheduling (layer-major when available) or explicit block
+prefill; the bridge must confirm a batched route.
+
+Use `compare_model.py --profile turbo` for the separately declared quality
+bounds: median cosine >=.9990, argmax agreement no more than5 percentage points
+below the sequential control, next-token loss <=1.01 times control. `strict`
+remains the default (.9999,1pp,1.005). Both profiles record forward KL from CPU
+to route. Preserve strict failures and report model/context-specific quality
+and speed; accepting a wider bound does not establish correctness or general
+model quality. Require full long-prefix and real-boundary checks before timing. The independent
+kernel turbo profile allows relative Frobenius error <=.02 against each source
+and BF16-operand reference; strict .005/.0001 limits remain unchanged.
+
+Initial local Llama1B evidence: turbo300 and full8192 pass the declared turbo
+profile, but the real47-token4096 boundary slice fails the1% relative NLL bound
+(+3.55%, absolute+.000504 nats/token;47/47 argmax unchanged). This is a known
+experimental limitation, not an accepted all-context quality profile. Strict300
+cosine also fails as expected. Live CLI turbo generation succeeds. See the
+active plan for complete metrics and artifact hashes; no turbo engine speed
+is accepted until clean paired timing is available.
+
+2026-10-26 clean paired engine result: initial HH-only turbo is slower
+(1111 versus matched compensated1136 prefill tokens/s,5/5 valid1K pairs,Dibs
+CLEAN before/after). Lower precision is implemented but a speed benefit has
+not been demonstrated. Keep the explicit quality failures alongside this
+negative timing result; next investigation concerns producer/dataflow costs.

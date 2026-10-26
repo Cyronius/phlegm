@@ -102,3 +102,76 @@ was under unrelated training load and is not idle performance acceptance.
 
 Measured results and remaining gates belong in
 [`specs/open-engine/gguf-prefill-linux.md`](../../../../specs/open-engine/gguf-prefill-linux.md).
+
+## Experimental turbo HH only
+
+`--turbo-hh` explicitly selects one BFP product per accumulator, HH only. It
+ignores both low limbs and is **not compensated arithmetic**. The default
+remains HH + HL + LH. Both modes retain FP32 C and exactly the same weight,
+activation and output layouts. Turbo currently keeps the high/residual producer
+and host packing unchanged; this experiment saves MAC work only. Hardware
+compilation does not establish model quality or speed.
+
+Build a fresh complete family through Dibs; all three CDO payloads must agree:
+
+```bash
+source target/npu-dev/env.sh
+dibs run build --label "experimental HH-only T256 family" --eta 10m -- \
+  python open_kernels/designs/gemm_q4_prefill/compensated64/build_family.py \
+  --out target/npu-dev/turbo64-family --turbo-hh
+```
+
+The same family helper without `--turbo-hh` builds compensated streams. Each
+stream's `build.json` records `input=bfp16_hilo` and its separate arithmetic
+precision: `bfp16-hh` with `HH only; low limbs ignored` for turbo, or
+`bfp16-hilo` for the default. Never infer compensation from the host ABI name.
+Turbo needs independent numerical and model checks; preregistered experimental
+model bounds are cosine >=0.9990, at most five percentage points argmax loss,
+and at most 1% NLL increase. These are experiment acceptance bounds, not the
+production compensated route's gates or a claim that turbo passes.
+
+### Compact local high-only producer
+
+`--turbo-high-only` is a separate experiment from `--turbo-hh`. It converts each
+weight vector to its BFP high panel without computing a residual or writing a
+low panel. Local A becomes 4,608B in `[row-pair][K8][row][high]` order. Its MAC
+preserves the prior turbo HH accumulation order. Activation DMA and local B
+remain high/low, and the MAC advances over each unused B low panel. The
+external `bfp16_hilo` activation ABI, 6,144B weight chunks, FP32 output, and
+previous modes are unchanged. This isolates producer savings; it does not yet
+remove activation low-limb transfers or host packing work.
+
+Use `build_family.py --turbo-high-only --out target/npu-dev/turbo64-high-only-family`
+inside the same Dibs build command above, with a fresh output directory.
+`check_layout.py --turbo-high-only` adds an independent compact-A panel walk.
+Metadata identifies `producer=high-only` and `local_weight_panel_bytes=4608`.
+Expected L1 including stack and RTP is 55,880B; compiled resources must be
+checked. Compare output bytes to the prior HH-only variant before reusing its
+quality evidence. Its known boundary NLL failure remains a limitation if the
+outputs match; compact packing does not change the predeclared quality bounds.
+
+### High-only activation DMA gather
+
+`--turbo-high-ab` retains compact local A and gathers only B high panels from
+unchanged host `bfp16_hilo` storage. Local B and its depth-two FIFOs become
+4,608B per element. The MAC reads contiguous high panels and keeps the same
+HH operation order. The default and `--turbo-high-only` retain their previous
+DMA and local B layouts.
+
+For K2048, each activation fill uses byte sizes `[32,64,72]`, strides
+`[36864,144,1]`; K8192 uses `[2,64,64,72]`, strides
+`[2359296,36864,144,1]`. Factoring the long-K dimension avoids an iteration
+count of128 exceeding the six-bit limit. Maximum stride is589824 words,
+inner width18 words, and all panel bases are word-aligned with positive
+strides. A complete fill moves147456 or589824 bytes, not an individual72B
+shim transaction. The small whole-transfer failure in xdna2-notes F-0221
+therefore does not establish a blocker; hardware correctness remains required.
+
+Build with `build_family.py --turbo-high-ab --weight-depth 1` under Dibs, into
+fresh `target/npu-dev/turbo64-high-ab-family`. Run
+`check_layout.py --turbo-high-ab` for the full semantic panel/byte walk,
+including the long-K rank split. Expected L1 is46,664B including stack/RTP.
+`--weight-depth 2` is an optional separate experiment, requiring compact AB
+and an actual compiler placement check; its58,952B sum alone is not acceptance.
+The default weight FIFO depth remains1. ABI metadata separately records
+`activation_dma=gather-high-only`, both local panel sizes, and weight depth.

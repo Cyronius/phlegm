@@ -20,6 +20,9 @@ T, M, KT, TN = 256, 64, 64, 64
 FEATURE_COLS, TOKEN_ROWS = 8, 4
 BAND_K, BAND_BYTES = 256, 12288
 SOURCE = Path(os.environ['COMPENSATED64_SOURCE_DIR'])
+WEIGHT_DEPTH = int(os.environ.get('COMPENSATED64_WEIGHT_DEPTH', '1'))
+HIGH_B = os.environ.get('COMPENSATED64_HIGH_B') == '1'
+HIGH_ONLY = os.environ.get('COMPENSATED64_HIGH_ONLY') == '1'
 
 
 def include_dirs():
@@ -48,8 +51,8 @@ def gemm_q4_prefill(W: In, X: In, Y: Out, *, n_weight: CompileTime[int], k: Comp
 
     band_ty = np.ndarray[(BAND_BYTES,), np.dtype[np.uint8]]
     nib_ty = np.ndarray[(64,), np.dtype[np.uint8]]
-    a_ty = np.ndarray[(M * KT * 9 // 4,), np.dtype[np.uint8]]
-    b_ty = np.ndarray[(KT * TN * 9 // 4,), np.dtype[np.uint8]]
+    a_ty = np.ndarray[(M * KT * 9 // (8 if HIGH_ONLY else 4),), np.dtype[np.uint8]]
+    b_ty = np.ndarray[(KT * TN * 9 // (8 if HIGH_B else 4),), np.dtype[np.uint8]]
     c_ty = np.ndarray[(M, TN), np.dtype[dtype_out]]
     c_flat_ty = np.ndarray[(M * TN,), np.dtype[dtype_out]]
     c_join_ty = np.ndarray[(M * TN * TOKEN_ROWS,), np.dtype[dtype_out]]
@@ -60,13 +63,15 @@ def gemm_q4_prefill(W: In, X: In, Y: Out, *, n_weight: CompileTime[int], k: Comp
     dequants = [ExternalFunction(f'gqd_entry_k{ky}', source_file=str(SOURCE / f'entry{ky}.cc'),
                                 arg_types=[band_ty, nib_ty, a_ty], include_dirs=include_dirs(),
                                 compile_flags=['-DGQD_R8', '-DGQD_SCALES_F32=1']) for ky in range(4)]
-    mm = ExternalFunction('gqp_comp', source_file=str(HERE / 'mm.cc'),
-                          arg_types=[a_ty, b_ty, c_flat_ty], include_dirs=include_dirs())
+    mm = ExternalFunction('gqp_comp', source_file=str(HERE / ('mm_high_only.cc' if HIGH_ONLY else 'mm.cc')),
+                          arg_types=[a_ty, b_ty, c_flat_ty], include_dirs=include_dirs(),
+                          compile_flags=['-DCOMPENSATED64_HIGH_B=1'] if HIGH_B else
+                          ['-DCOMPENSATED64_TURBO_HH=1'] if os.environ.get('COMPENSATED64_TURBO_HH') == '1' else [])
 
     # One weight stream per feature column, broadcast to its four token rows.
     a_l3 = [ObjectFifo(band_ty, name=f'A_L3L2_{f}', depth=2) for f in range(FEATURE_COLS)]
     a_l1 = [a_l3[f].cons().forward(obj_type=band_ty, name=f'A_L2L1_{f}',
-                                  depth=1, tile=Tile(f, 1)) for f in range(FEATURE_COLS)]
+                                  depth=WEIGHT_DEPTH, tile=Tile(f, 1)) for f in range(FEATURE_COLS)]
     # One activation stream per token row, broadcast across eight feature columns.
     b_l3, b_l1 = [], []
     for row in range(TOKEN_ROWS):
@@ -137,6 +142,15 @@ def gemm_q4_prefill(W: In, X: In, Y: Out, *, n_weight: CompileTime[int], k: Comp
 
     def b_tap(row, ntile):
         offset = (row + ntile * TOKEN_ROWS) * block_bytes
+        if HIGH_B:
+            # Gather only high72B panels from unchanged hi/lo DDR storage.
+            if nkt <= 64:
+                sizes, strides = [nkt, 64, 72], [nb * block_bytes, 144, 1]
+            else:
+                assert nkt % 64 == 0 and nkt // 64 <= 64
+                sizes = [nkt // 64, 64, 64, 72]
+                strides = [64 * nb * block_bytes, nb * block_bytes, 144, 1]
+            return TensorAccessPattern((k * T * 9 // 4,), offset, sizes, strides)
         return TensorAccessPattern((k * T * 9 // 4,), offset, [nkt, 8, block_bytes // 8],
                                    [nb * block_bytes, block_bytes // 8, 1])
 

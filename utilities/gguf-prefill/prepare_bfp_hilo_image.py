@@ -21,7 +21,12 @@ def main():
     ap.add_argument('--out', required=True, type=Path)
     for tag in ['qkv', 'o', 'up', 'down']:
         ap.add_argument(f'--{tag}', required=True, type=Path)
+    ap.add_argument('--turbo', action='store_true', help='publish an explicitly lower-precision HH-only companion bundle')
     args = ap.parse_args()
+    if args.out.exists():
+        ap.error('output directory already exists; use a fresh destination')
+    if args.turbo and args.out.resolve() != (args.base / 'turbo').resolve():
+        ap.error('--turbo must publish to BASE/turbo for explicit CLI selection')
     m = json.loads((args.base / 'manifest.json').read_text())
     gg = m['gguf']
     if gg['layout']['chunk_bytes'] != 6144 or set(gg['layer_types']) != {'dense'}:
@@ -37,14 +42,31 @@ def main():
                       full_model_quality='pending', artifacts={})
     for tag, name in mapping.items():
         build = getattr(args, tag)
+        if args.turbo:
+            metadata = json.loads((build.parent / 'build.json').read_text())
+            expected = dict(qkv=(3072, 2048), o=(2048, 2048), up=(8192, 2048), down=(2048, 8192))[tag]
+            if (metadata.get('n'), metadata.get('k'), metadata.get('tokens')) != (*expected, 256):
+                raise RuntimeError(f'{tag}: turbo stream shape does not match its projection')
+            if (metadata.get('precision') != 'bfp16-hh'
+                    or metadata.get('arithmetic') != 'HH only; low limbs ignored'
+                    or metadata.get('weight_chunk_bytes') != 6144
+                    or metadata.get('input') != 'bfp16_hilo'
+                    or metadata.get('output') != 'float32[N,T]'):
+                raise RuntimeError(f'{tag}: not a declared HH-only turbo stream')
+            for artifact in ['final.xclbin', 'insts.bin', 'insts.elf']:
+                if metadata.get('artifacts', {}).get(artifact) != digest(build / artifact):
+                    raise RuntimeError(f'{tag}: artifact differs from turbo build metadata')
         here = {f: digest(build / 'final.prj/cdo_main' / f)
                 for f in ['main_aie_cdo_elfs.bin', 'main_aie_cdo_init.bin', 'main_aie_cdo_enable.bin']}
         if cdo is not None and here != cdo:
             raise RuntimeError(f'{tag}: image differs; cannot share the hardware context')
         cdo = here
         provenance['artifacts'][name] = {f: digest(build / f) for f in ['final.xclbin', 'insts.bin', 'insts.elf']}
+    formats = {step.get('fmt', 'bf16') for step in g['program']}
+    if formats not in ({'bf16'}, {'bfp16_hilo'}):
+        raise RuntimeError('unexpected or mixed input formats')
     for step in g['program']:
-        if step['kernel'] not in mapping.values() or step.get('fmt') or step.get('split') or step.get('n_pad'):
+        if step['kernel'] not in mapping.values() or step.get('fmt') not in (None, 'bf16', 'bfp16_hilo') or step.get('split') or step.get('n_pad'):
             raise RuntimeError('unexpected projection step; refusing to reinterpret its input')
         step['fmt'] = 'bfp16_hilo'
     names = {step['args'][1] for step in g['program']}
@@ -52,9 +74,10 @@ def main():
         old = gg['globals'][name]
         if not isinstance(old, int) or old % 8:
             raise RuntimeError('unexpected input buffer representation')
-        gg['globals'][name] = old * 9 // 8
+        if formats == {'bf16'}:
+            gg['globals'][name] = old * 9 // 8
     # A separate directory preserves the baseline and all unchanged images.
-    shutil.copytree(args.base, args.out)
+    shutil.copytree(args.base, args.out, ignore=shutil.ignore_patterns('turbo'))
     for tag, name in mapping.items():
         dest = args.out / name
         dest.mkdir(exist_ok=True)
@@ -62,6 +85,13 @@ def main():
             shutil.copy2(getattr(args, tag) / f, dest / f)
     provenance['shared_cdo_sha256'] = cdo
     (args.out / 'manifest.json').write_text(json.dumps(m, indent=2) + '\n')
+    if args.turbo:
+        provenance['kind'] = 'experimental-bfp16-hh-turbo'
+        (args.out / 'turbo.json').write_text(json.dumps(dict(
+            schema_version=1, precision='bfp16-hh', experimental=True,
+            base_manifest_sha256=provenance['base_manifest_sha256'],
+            turbo_manifest_sha256=digest(args.out / 'manifest.json'),
+            arithmetic='HH only; low limbs ignored'), indent=2) + '\n')
     (args.out / 'bfp-hilo-probe.json').write_text(json.dumps(provenance, indent=2) + '\n')
     print(json.dumps(dict(out=str(args.out), globals={n: gg['globals'][n] for n in names}), indent=2))
 

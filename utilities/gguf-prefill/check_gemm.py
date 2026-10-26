@@ -12,10 +12,33 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / 'open_kernels'))
-sys.path.insert(0, str(ROOT / 'npu_offload/gemm_rtp'))
-from gguf_pool import pack_q4_pool
-from npue import tile_b
+PROFILES = {
+    'strict': dict(source_rel_fro_max=.005, bf16_operand_rel_fro_max=.0001),
+    'turbo': dict(source_rel_fro_max=.02, bf16_operand_rel_fro_max=.02),
+}
+
+
+def evaluate_outputs(got, reference, operand_reference, profile='strict'):
+    """Require both independent products; timing-only ablations cannot pass."""
+    if profile not in PROFILES:
+        raise ValueError(f'unknown quality profile: {profile}')
+    arrays = [np.asarray(a, dtype=np.float64) for a in (got, reference, operand_reference)]
+    if not arrays[0].size or any(a.shape != arrays[0].shape or not np.isfinite(a).all() for a in arrays):
+        raise ValueError('incomplete or nonfinite GEMM output/reference')
+    got, reference, operand_reference = arrays
+    norms = [float(np.linalg.norm(a)) for a in (reference, operand_reference)]
+    if any(not np.isfinite(norm) or norm <= 0 for norm in norms):
+        raise ValueError('undefined GEMM reference norm')
+    rel = float(np.linalg.norm(got - reference) / norms[0])
+    operand_rel = float(np.linalg.norm(got - operand_reference) / norms[1])
+    if not np.isfinite([rel, operand_rel]).all():
+        raise ValueError('nonfinite GEMM error metrics')
+    thresholds = PROFILES[profile].copy()
+    return dict(profile=profile, thresholds=thresholds, rel_fro=rel,
+                operand_rel_fro=operand_rel,
+                scope='independent operator numerical gate; not full-model quality or timing',
+                passed=(rel <= thresholds['source_rel_fro_max']
+                        and operand_rel <= thresholds['bf16_operand_rel_fro_max']))
 
 
 def main():
@@ -28,10 +51,15 @@ def main():
     ap.add_argument('--tokens', type=int, default=256)
     ap.add_argument('--seed', type=int, default=212)
     ap.add_argument('--activation-format', choices=('bf16', 'bfp-hilo', 'bfp-hilo-pairs'), default='bf16')
+    ap.add_argument('--profile', choices=PROFILES, default='strict')
     args = ap.parse_args()
     n, k, t = args.n, args.k, args.tokens
     if min(n, k, t) <= 0 or any(v % 256 for v in (n, k, t)):
         ap.error('N, K and tokens must be positive multiples of 256')
+    sys.path.insert(0, str(ROOT / 'open_kernels'))
+    sys.path.insert(0, str(ROOT / 'npu_offload/gemm_rtp'))
+    from gguf_pool import pack_q4_pool
+    from npue import tile_b
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
@@ -86,12 +114,10 @@ def main():
     if got.size != n * t or not np.isfinite(got).all():
         raise RuntimeError('incomplete or nonfinite GEMM output')
     got = got.reshape(n, t).astype(np.float64)
-    rel = float(np.linalg.norm(got - reference) / np.linalg.norm(reference))
-    operand_rel = float(np.linalg.norm(got - operand_reference) / np.linalg.norm(operand_reference))
-    result = dict(n=n, k=k, tokens=t, seed=args.seed, activation_format=args.activation_format, rel_fro=rel,
-                  operand_rel_fro=operand_rel, passed=rel <= .005 and operand_rel <= .0001)
-    (out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
-    print(json.dumps(result))
+    result = evaluate_outputs(got, reference, operand_reference, profile=args.profile)
+    result.update(n=n, k=k, tokens=t, seed=args.seed, activation_format=args.activation_format)
+    (out / 'result.json').write_text(json.dumps(result, indent=2, allow_nan=False) + '\n')
+    print(json.dumps(result, allow_nan=False))
     return 0 if result['passed'] else 1
 
 

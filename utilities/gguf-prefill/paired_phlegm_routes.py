@@ -160,7 +160,10 @@ def main():
     ap.add_argument('--threads', type=int, default=4)
     ap.add_argument('--max-ctx', type=int, default=16384)
     ap.add_argument('--max-host-load', type=float, help='reject pairs when any before/after load1 exceeds this positive finite bound')
+    ap.add_argument('--reverse-init', action='store_true',
+                    help='initialize candidate before reference; keep trial order and route labels unchanged')
     args = ap.parse_args()
+    initialization_order = tuple(reversed(ROUTES)) if args.reverse_init else ROUTES
     try:
         sizes = [int(x) for x in args.sizes.split(',')]
         if args.rounds < 1 or args.threads < 1 or args.max_ctx < 1:
@@ -204,6 +207,7 @@ def main():
     env.update(OMP_WAIT_POLICY='PASSIVE', OMP_NUM_THREADS=str(args.threads))
     meta = dict(protocol=PROTOCOL, development=True, engine_only=True,
                 comparison='same-engine reference versus candidate route',
+                worker_initialization_order=list(initialization_order),
                 matched_weight_and_tail_contract=contracts['reference'],
                 created_unix=time.time(), context_capacity=args.max_ctx, output_tokens=128,
                 control_prompt_tokens=256, control_output_tokens=16,
@@ -262,7 +266,7 @@ def main():
     record(dict(kind='control_inputs', prompt=control_prompt, decode_tokens=control_forced, output_tokens=16))
     failure = None
     try:
-        for name in ROUTES:
+        for name in initialization_order:
             workers[name] = Worker([str(args.bridge.resolve())], env, args.out / f'{name}.stderr')
             init = workers[name].request(command='init', model_dir=str(args.model_dir.resolve()),
                 kernel_dir=str(kernel_dirs[name].resolve()), max_ctx=args.max_ctx,
