@@ -38,6 +38,52 @@ CONSTANTS = {
 }
 
 
+def required_header() -> dict[str, tuple[str, tuple[int, ...]]]:
+    """Expected public GPT-OSS-20B q4nx tensors, including both router layouts."""
+    tensors = {
+        "model.embed_tokens.weight": ("BF16", (201088, 2880)),
+        "model.norm.weight": ("BF16", (2880,)),
+        "lm_head.weight": ("I8", HEAD_SHAPE),
+    }
+    for layer in range(24):
+        prefix = f"model.layers.{layer}."
+        for suffix, shape in CONSTANTS.values():
+            tensors[prefix + suffix] = ("BF16", shape)
+        tensors[prefix + "mlp.router.weight"] = ("BF16", (45, 128, 16))
+        tensors[prefix + "mlp.router.weight_prefill"] = ("BF16", (32, 2944))
+        for role, shape in ATTN_SHAPES.items():
+            tensors[prefix + f"self_attn.{role}_proj.weight"] = ("I8", shape)
+        tensors[prefix + "ffn_gate_up_down_exps.weight"] = ("U8", EXPERT_SHAPE)
+        for role in ("gate", "up", "down"):
+            tensors[prefix + f"mlp.experts.{role}_proj_bias"] = ("BF16", (32, 2880))
+    return tensors
+
+
+def validate_header(tensors: dict) -> dict:
+    """Validate all required tensor geometries and disjoint byte extents."""
+    expected = required_header()
+    missing = expected.keys() - tensors.keys()
+    if missing:
+        raise ValueError(f"missing GPT-OSS tensors: {sorted(missing)[:5]}")
+    extents = []
+    for name, (dtype, shape) in expected.items():
+        item = tensors[name]
+        if item.get("dtype") != dtype or tuple(item.get("shape", ())) != shape:
+            raise ValueError(f"unexpected GPT-OSS tensor layout: {name}")
+        offsets = item.get("data_offsets")
+        size = prod(shape) * (2 if dtype == "BF16" else 1)
+        if (not isinstance(offsets, (list, tuple)) or len(offsets) != 2 or
+                offsets[0] < 0 or offsets[1] - offsets[0] != size):
+            raise ValueError(f"invalid GPT-OSS tensor byte extent: {name}")
+        extents.append((offsets[0], offsets[1], name))
+    extents.sort()
+    for previous, current in zip(extents, extents[1:]):
+        if previous[1] > current[0]:
+            raise ValueError(f"overlapping GPT-OSS tensor extents: {previous[2]}, {current[2]}")
+    return {"required": len(expected), "validated": len(extents),
+            "extra": sorted(tensors.keys() - expected.keys())}
+
+
 class GptOssSource:
     """Use an open ``model.q4nx`` reader without copying a full expert tensor."""
 
@@ -81,6 +127,18 @@ class GptOssSource:
         suffix, shape = CONSTANTS[role]
         name = self._prefix(layer) + suffix
         return np.frombuffer(self._bytes(name, "BF16", shape), bfloat16).copy()
+
+    def embedding(self, token: int) -> np.ndarray:
+        if not isinstance(token, int) or token < 0 or token >= 201088:
+            raise ValueError("GPT-OSS token id must be in [0,201088)")
+        row_bytes = 2880 * 2
+        raw = self._bytes("model.embed_tokens.weight", "BF16", (201088, 2880),
+                          token * row_bytes, row_bytes)
+        return np.frombuffer(raw, bfloat16).copy()
+
+    def final_norm(self) -> np.ndarray:
+        raw = self._bytes("model.norm.weight", "BF16", (2880,))
+        return np.frombuffer(raw, bfloat16).copy()
 
     def router_weight(self, layer: int) -> np.ndarray:
         """Return BF16 [2880,32], the orientation expected by gptoss_router."""

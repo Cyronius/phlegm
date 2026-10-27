@@ -12,7 +12,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "open_kernels"))
-from recipes.gptoss_source import GptOssSource, ONE_EXPERT_CHUNKS, CHUNK, HEAD_BANDS  # noqa: E402
+from recipes.gptoss_source import (GptOssSource, ONE_EXPERT_CHUNKS, CHUNK,
+                                   HEAD_BANDS, required_header, validate_header)  # noqa: E402
 from recipes.pack import expert_chunks, fuse_chunks, supertile_perm  # noqa: E402
 from export_gptoss_source import export  # noqa: E402
 from export_gptoss_head import export as export_head  # noqa: E402
@@ -70,6 +71,39 @@ def test_source_exposes_kernel_oriented_constants(source):
     name = "model.layers.0.mlp.experts.gate_proj_bias"
     start = source.reader.tensors[name]["data_offsets"][0] + 7 * 5760
     assert source.reader.mm.reads[-1] == (start, start + 5760)
+
+
+def test_embedding_and_final_norm_use_bounded_source_reads(source):
+    token = 197624
+    embedding = source.embedding(token)
+    assert embedding.shape == (2880,)
+    offset = source.reader.tensors["model.embed_tokens.weight"]["data_offsets"][0]
+    assert source.reader.mm.reads[-1] == (offset + token * 5760, offset + (token + 1) * 5760)
+    assert source.final_norm().shape == (2880,)
+    with pytest.raises(ValueError, match="token id"):
+        source.embedding(201088)
+
+
+def test_complete_gptoss_header_layout_and_disjoint_extents():
+    expected = required_header()
+    assert len(expected) == 435
+    tensors = {}
+    offset = 0
+    for name, (dtype, shape) in expected.items():
+        size = int(np.prod(shape)) * (2 if dtype == "BF16" else 1)
+        tensors[name] = {"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + size]}
+        offset += size
+    assert validate_header(tensors) == {"required": 435, "validated": 435, "extra": []}
+    broken = {name: dict(value) for name, value in tensors.items()}
+    broken["model.layers.23.mlp.router.weight"]["shape"] = [45, 128, 15]
+    with pytest.raises(ValueError, match="layout"):
+        validate_header(broken)
+    overlap = {name: dict(value) for name, value in tensors.items()}
+    target = "model.layers.0.input_layernorm.weight"
+    size = overlap[target]["data_offsets"][1] - overlap[target]["data_offsets"][0]
+    overlap[target]["data_offsets"] = [0, size]
+    with pytest.raises(ValueError, match="overlapping"):
+        validate_header(overlap)
 
 
 def test_router_prefill_padding_is_removed_and_rows_are_transposed(source, monkeypatch):
