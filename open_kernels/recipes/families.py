@@ -43,8 +43,9 @@ FAMILIES = ("qwen36moe", "qwen35", "qwen3", "llama3", "gemma3", "hunyuan", "gran
 # stage of the layer and then report parity against a replica making the same mistake.
 NOT_IMPLEMENTED = {
     "gptoss": "the arithmetic is settled and tested (model/replica_gptoss.py); standalone "
-              "gptoss_gate, gptoss_mxfp4, gptoss_router and gptoss_expert_gemv kernels cover "
-              "clamped activation, MXFP4 expert projection with bias, and biased top-four routing, "
+              "gptoss_gate, gptoss_mxfp4, gptoss_router, gptoss_expert_gemv and gptoss_mix "
+              "kernels cover clamped activation, MXFP4 expert projection with bias, biased "
+              "top-four routing and mixing; the one-token MoE arithmetic is NPU-checked, "
               "but no layer recipe composes them. o_proj carries a bias the existing layer "
               "design has no room for; the MoE FFN has to compose with sliding-window layers, "
               "which no recipe does today; and the expert intermediate equals hidden, which "
