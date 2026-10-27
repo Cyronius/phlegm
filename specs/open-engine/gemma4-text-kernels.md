@@ -21,6 +21,7 @@ compositions, not an exported model or native generation path.
 | q4 text Q/K/V/O and MLP projections | `open_kernels/build_gemma4_text_projections.py` | Published geometries compiled; E2B Q and split down, plus 12B split down, passed representative NPU arithmetic checks |
 | E2B/E4B BF16 per-layer projections | `open_kernels/designs/gemma4_bf16_gemv/` | All four source-layout geometries compiled and passed representative NPU arithmetic checks (maximum relative error `7.27e-7`) |
 | FLM text weight mapping | `open_kernels/gemma4_source.py` | Public E2B, E4B, and 12B q4nx headers passed 597, 727, and 668 required tensor shape/byte checks; 12B's signed q4 and q8 16-row tile repackers passed exact synthetic value checks |
+| Bounded source reads | `open_kernels/gemma4_text_source.py` | E2B/E4B/12B public headers passed complete required-tensor and nonoverlapping byte-extent checks; synthetic reads cover striped q4 projection bands, 12B signed q4 and q8 head bands, BF16 per-layer matrices, and scaled embedding rows |
 | Per-layer context norm and token mix | `open_kernels/designs/gemma4_ple_input/` | E2B/E4B with-token and context-only variants compiled and passed NPU checks |
 | Full-width MLP GELU-tanh and up product | `open_kernels/designs/gemma4_gelu_mul/` | All four 6144/10240/12288/15360-wide images compiled and passed NPU checks (maximum absolute error `3.05e-5`) |
 
@@ -39,8 +40,10 @@ vocabulary row. Maximum relative errors were `6.64e-6` (E2B), `6.27e-6`
 third check does not validate its source format. After the NPU softcap, maximum absolute errors
 were `4.01e-5`, `4.05e-5`, and `7.06e-5` respectively. These checks use the
 generic 5120-byte q4_1 pool format; the actual Gemma 4 package's source
-layout was checked against the public q4nx headers. Numerical checks using
-actual source weight bytes remain pending.
+layout was checked against the public q4nx headers. The source adapter reads
+one projection or vocabulary band at a time, so it does not need to map a full
+matrix into a separate array. Numerical checks using actual source weight
+bytes remain pending.
 
 The text projection inventory has 310 E2B, 384 E4B, and 328 12B logical
 matrices. E2B and E4B include three BF16 per-layer matrices per layer in
