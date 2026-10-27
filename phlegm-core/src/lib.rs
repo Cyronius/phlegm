@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod bench;
+pub mod gguf;
 pub mod mock_backend;
 pub mod placeholder_tokenizer;
 pub mod sampler;

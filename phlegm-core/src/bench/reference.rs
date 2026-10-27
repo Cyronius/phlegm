@@ -332,6 +332,7 @@ impl ReferenceBackend {
             return Err("invalid reference-engine settings".into());
         }
         let build = build_info(&options.bridge)?;
+        crate::gguf::preflight_direct_route(&options.model_dir, &options.kernel_dir)?;
         let tokenizer_path = options.model_dir.join("tokenizer.json");
         let tokenizer =
             tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| e.to_string())?;
@@ -661,6 +662,7 @@ impl NpuBackend {
             eprintln!("phlegm: turbo enabled: experimental bfp16-hh precision, batched prefill ({})",
                       options.kernel_dir.display());
         }
+        crate::gguf::preflight_direct_route(&options.model_dir, &options.kernel_dir)?;
         build_info(&options.bridge)?;
         let lock = NpuLock::acquire("phlegm NPU")?;
         let mut process =
