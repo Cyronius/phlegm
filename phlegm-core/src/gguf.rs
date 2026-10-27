@@ -11,6 +11,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const POOL_CHUNK: usize = 6144;
+const Q8_POOL_CHUNK: usize = 9216;
 const VALUES_PER_BLOCK: u64 = 32;
 const MAX_STRING: u64 = 16 * 1024 * 1024;
 
@@ -275,6 +276,45 @@ impl<R: Read + Seek> Gguf<R> {
         Ok(SharedRegions { up_bytes, gate_bytes, down_bytes })
     }
 
+    /// Stream a GGUF Q8_0 matrix into the f32-scale NPU Q8 pool.
+    /// A four-row group is the 128-row lm_head supertile order.
+    pub fn pack_q8_matrix<W: Write>(&mut self, name: &str, row_group: u64, out: &mut W)
+        -> Result<u64, String> {
+        if row_group != 2 && row_group != 4 {
+            return Err("GGUF Q8 matrix row_group must be 2 or 4".into());
+        }
+        let info = self.tensor(name).ok_or_else(|| format!("missing GGUF tensor {name}"))?;
+        if info.gguf_type != 8 {
+            return Err(format!("GGUF tensor {name} is type {}, need Q8_0", info.gguf_type));
+        }
+        if info.dims.len() != 2 || info.dims[0] % 256 != 0
+            || info.dims[1] % (32 * row_group) != 0 {
+            return Err(format!("GGUF tensor {name} needs [K, rows] with 256-column and {}-row bands", 32 * row_group));
+        }
+        let (cols, rows) = (info.dims[0], info.dims[1]);
+        let mut written = 0u64;
+        for band in 0..rows / (32 * row_group) {
+            for k in 0..cols / 256 {
+                for rb in 0..row_group {
+                    let chunk = self.pack_q8_chunk(name, cols,
+                                                   band * 32 * row_group + rb * 32, k * 256)?;
+                    out.write_all(&chunk).map_err(|e| e.to_string())?;
+                    written += Q8_POOL_CHUNK as u64;
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    pub fn pack_q8_lm_head<W: Write>(&mut self, out: &mut W) -> Result<u64, String> {
+        let name = if self.tensor("output.weight").is_some() {
+            "output.weight"
+        } else {
+            "token_embd.weight"
+        };
+        self.pack_q8_matrix(name, 4, out)
+    }
+
     fn read_blocks(&mut self, name: &str, block: u64, block_bytes: usize, dst: &mut [u8]) -> Result<(), String> {
         let info = self.tensors.get(name).ok_or_else(|| format!("missing GGUF tensor {name}"))?;
         let n = info.byte_len.ok_or_else(|| format!("GGUF tensor {name} has unsupported type {}", info.gguf_type))?;
@@ -402,6 +442,28 @@ impl<R: Read + Seek> Gguf<R> {
                     let q1 = if kb & 1 == 0 { c1 & 15 } else { c1 >> 4 };
                     set_nibble(&mut out[2048..], p, q0);
                     set_nibble(&mut out[2048..], p + 256, q1);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn pack_q8_chunk(&mut self, name: &str, cols: u64,
+                     row0: u64, col0: u64) -> Result<[u8; Q8_POOL_CHUNK], String> {
+        let mut out = [0u8; Q8_POOL_CHUNK];
+        let mut row_blocks = [0u8; 8 * 34];
+        let blocks_per_row = cols / 32;
+        for r in 0..32u64 {
+            let source_block = (row0 + r) * blocks_per_row + col0 / 32;
+            self.read_blocks(name, source_block, 34, &mut row_blocks)?;
+            for kb in 0..8usize {
+                let block = &row_blocks[kb * 34..(kb + 1) * 34];
+                let d = f32_from_f16(u16::from_le_bytes([block[0], block[1]]));
+                let plane = 4 * (kb * 32 + r as usize);
+                out[plane..plane + 4].copy_from_slice(&d.to_le_bytes());
+                for i in 0..32usize {
+                    let p = (r as usize / 16) * 4096 + (kb * 32 + i) * 16 + r as usize % 16;
+                    out[1024 + p] = block[2 + i];
                 }
             }
         }
@@ -670,6 +732,32 @@ mod tests {
         file
     }
 
+    fn q8_matrix_fixture(name: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        for row in 0..128u16 {
+            for kb in 0..16u8 {
+                data.extend_from_slice(&0x3c00u16.to_le_bytes());
+                for i in 0..32u8 {
+                    data.push((row as u8).wrapping_add(kb).wrapping_add(i));
+                }
+            }
+        }
+        let mut file = Vec::new();
+        file.extend_from_slice(b"GGUF");
+        u32le(&mut file, 3);
+        u64le(&mut file, 1);
+        u64le(&mut file, 0);
+        string(&mut file, name);
+        u32le(&mut file, 2);
+        u64le(&mut file, 512);
+        u64le(&mut file, 128);
+        u32le(&mut file, 8);
+        u64le(&mut file, 0);
+        align(&mut file);
+        file.extend(data);
+        file
+    }
+
     fn pool_code(chunk: &[u8], row: usize, col: usize) -> u8 {
         let p = (row / 16) * 4096 + col * 16 + row % 16;
         let b = chunk[2048 + p / 2];
@@ -837,6 +925,29 @@ mod tests {
         let mut untouched = Vec::new();
         assert!(missing.pack_qwen35_shared_experts(0, &mut untouched).unwrap_err().contains("missing"));
         assert!(untouched.is_empty());
+    }
+
+    #[test]
+    fn q8_lm_head_keeps_codes_and_supertile_order() {
+        for name in ["output.weight", "token_embd.weight"] {
+            let mut file = Gguf::new(Cursor::new(q8_matrix_fixture(name))).unwrap();
+            let mut pool = Vec::new();
+            assert_eq!(file.pack_q8_lm_head(&mut pool).unwrap(), (8 * Q8_POOL_CHUNK) as u64);
+            for chunk_idx in 0..8usize {
+                let chunk = &pool[chunk_idx * Q8_POOL_CHUNK..(chunk_idx + 1) * Q8_POOL_CHUNK];
+                let row0 = (chunk_idx % 4) * 32;
+                let kb0 = (chunk_idx / 4) * 8;
+                for (row, col) in [(0, 0), (15, 17), (16, 32), (31, 255)] {
+                    let kb = kb0 + col / 32;
+                    let expected = (row0 + row + kb + col % 32) as u8;
+                    let p = (row / 16) * 4096 + col * 16 + row % 16;
+                    assert_eq!(chunk[1024 + p], expected);
+                    let plane = 4 * ((col / 32) * 32 + row);
+                    assert_eq!(f32::from_le_bytes(chunk[plane..plane + 4].try_into().unwrap()), 1.0);
+                }
+            }
+            assert!(file.pack_q8_matrix(name, 3, &mut Vec::new()).unwrap_err().contains("row_group"));
+        }
     }
 
     #[test]
