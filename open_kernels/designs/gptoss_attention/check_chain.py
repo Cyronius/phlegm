@@ -1,4 +1,4 @@
-"""Check GPT-OSS QKV projection -> YaRN RoPE -> sliding sink attention on NPU."""
+"""Check GPT-OSS QKV, YaRN and sliding or full sink attention on NPU."""
 from __future__ import annotations
 
 import argparse
@@ -45,12 +45,16 @@ def invoke(driver: Path, build: Path, out: Path,
 
 def run(driver: Path, qkv_build: Path, rope_build: Path, attn_build: Path,
         out: Path, pos: int, activation: np.ndarray | None = None,
-        oracle_activation: np.ndarray | None = None) -> dict:
-    if pos < 127 or pos >= CONFIG["max_position_embeddings"]:
-        raise ValueError("position must be from 127 to 131071 for the 128-row window")
+        oracle_activation: np.ndarray | None = None,
+        full_state_build: Path | None = None) -> dict:
+    if full_state_build is None and (pos < 127 or pos >= CONFIG["max_position_embeddings"]):
+        raise ValueError("sliding position must be from 127 to 131071")
+    if full_state_build is not None and (pos < 0 or pos > 4096):
+        raise ValueError("full-layer fixture supports positions 0 through 4096")
     if not driver.is_file():
         raise FileNotFoundError(driver)
-    for build in (qkv_build, rope_build, attn_build):
+    builds = (qkv_build, rope_build, attn_build)
+    for build in builds + ((full_state_build,) if full_state_build is not None else ()):
         for name in ("final.xclbin", "insts.bin"):
             if not (build / name).is_file():
                 raise FileNotFoundError(build / name)
@@ -91,8 +95,9 @@ def run(driver: Path, qkv_build: Path, rope_build: Path, attn_build: Path,
     q_gold = rope(q_gold, pos, 64, spec.rope_theta, inv, scale).astype(bfloat16)
     k_gold = rope(k_gold, pos, 64, spec.rope_theta, inv, scale).astype(bfloat16)
 
-    previous_k = rng.normal(0, 0.4, (127, 8, 64)).astype(np.float32).astype(bfloat16)
-    previous_v = rng.normal(0, 0.5, (127, 8, 64)).astype(np.float32).astype(bfloat16)
+    previous_rows = pos if full_state_build is not None else 127
+    previous_k = rng.normal(0, 0.4, (previous_rows, 8, 64)).astype(np.float32).astype(bfloat16)
+    previous_v = rng.normal(0, 0.5, (previous_rows, 8, 64)).astype(np.float32).astype(bfloat16)
     v = outputs["v"].astype(bfloat16).reshape(8, 64)
     v_gold = references["v"].astype(bfloat16).reshape(8, 64)
     K = np.concatenate((previous_k, rotated[64:][None]), axis=0)
@@ -102,19 +107,43 @@ def run(driver: Path, qkv_build: Path, rope_build: Path, attn_build: Path,
     sinks = rng.normal(0, 1.5, 64).astype(np.float32)
     q_sink = np.frombuffer(rotated[:64].tobytes() + sinks.tobytes(), np.uint8).copy()
     kv = np.ascontiguousarray(np.concatenate((K, V), axis=1))
-    actual = invoke(driver, attn_build, out / "attention",
-                    [("q_sink", q_sink), ("kv", kv)], np.dtype(np.float32), 64 * 64)
-    # The fixture holds only the last 128 rows. Its local position is 127;
-    # absolute pos is used solely to form the YaRN table for the new token.
-    expected = sink_attention(q_gold, K_gold, V_gold, sinks,
-                              sliding_window=128, pos=127).ravel().astype(np.float32)
+    if full_state_build is None:
+        actual = invoke(driver, attn_build, out / "attention",
+                        [("q_sink", q_sink), ("kv", kv)], np.dtype(np.float32), 64 * 64)
+        # The fixture holds only the last 128 rows. Its local position is 127;
+        # absolute pos is used solely to form the YaRN table for the new token.
+        expected = sink_attention(q_gold, K_gold, V_gold, sinks,
+                                  sliding_window=128, pos=127).ravel().astype(np.float32)
+    else:
+        state = np.zeros((64, 68), np.float32)
+        state[:, 64] = sinks
+        state[:, 65] = 1
+        for start in range(0, len(kv), 512):
+            valid = min(512, len(kv) - start)
+            meta = np.array([valid, 0, 0, 0], np.int32)
+            q_state = np.frombuffer(rotated[:64].tobytes() + state.tobytes() +
+                                    meta.tobytes(), np.uint8).copy()
+            rows = np.zeros((512, 16, 64), bfloat16)
+            rows[:valid] = kv[start:start + valid]
+            state = invoke(driver, full_state_build,
+                           out / "attention" / f"chunk-{start // 512:02d}",
+                           [("q_state", q_state), ("kv_rows", rows)],
+                           np.dtype(np.float32), 64 * 68).reshape(64, 68)
+            if np.any(state[:, 65] <= 0) or not np.isfinite(state).all():
+                raise AssertionError("invalid carried full-attention state")
+        actual = (state[:, :64] / state[:, 65, None]).ravel().astype(np.float32)
+        (out / "attention").mkdir(parents=True, exist_ok=True)
+        (out / "attention" / "result.bin").write_bytes(actual.tobytes())
+        expected = sink_attention(q_gold, K_gold, V_gold, sinks,
+                                  pos=pos).ravel().astype(np.float32)
     (out / "attention" / "expected.bin").write_bytes(expected.tobytes())
     a, e = actual.astype(np.float64), expected.astype(np.float64)
     max_abs = float(np.max(np.abs(a - e)))
     max_rel = float(max_abs / max(np.max(np.abs(e)), 1e-30))
     cosine = float(a @ e / (np.linalg.norm(a) * np.linalg.norm(e)))
     report = {"passed": bool(max_rel < 0.005 and cosine > 0.9999),
-              "position": pos, "projection_calls": len(projection_reports),
+              "position": pos, "mode": "full-state" if full_state_build else "sliding-128",
+              "attention_rows": len(kv), "projection_calls": len(projection_reports),
               "projection_max_relative_error": max(r["max_relative_error"] for r in projection_reports),
               "attention_max_absolute_error": max_abs,
               "attention_max_relative_error": max_rel,
@@ -133,11 +162,14 @@ def main() -> None:
     p.add_argument("--qkv-build", required=True, type=Path)
     p.add_argument("--rope-build", required=True, type=Path)
     p.add_argument("--attn-build", required=True, type=Path)
+    p.add_argument("--full-state-build", type=Path)
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--pos", type=int, default=127)
     a = p.parse_args()
     print(json.dumps(run(a.driver.resolve(), a.qkv_build.resolve(), a.rope_build.resolve(),
-                         a.attn_build.resolve(), a.out.resolve(), a.pos), indent=2))
+                         a.attn_build.resolve(), a.out.resolve(), a.pos,
+                         full_state_build=a.full_state_build.resolve()
+                         if a.full_state_build else None), indent=2))
 
 
 if __name__ == "__main__":

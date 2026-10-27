@@ -19,7 +19,7 @@ from replica_dense import rms  # noqa: E402
 
 def run(driver: Path, norm_build: Path, qkv_build: Path, rope_build: Path,
         attn_build: Path, o_build: Path, residual_build: Path,
-        out: Path, pos: int) -> dict:
+        out: Path, pos: int, full_state_build: Path | None = None) -> dict:
     rng = np.random.default_rng(20261030 + pos)
     xres = rng.normal(0, 0.7, 2880).astype(np.float32)
     weight = rng.normal(1, 0.2, 2880).astype(np.float32).astype(bfloat16)
@@ -33,7 +33,8 @@ def run(driver: Path, norm_build: Path, qkv_build: Path, rope_build: Path,
                                    o_build, residual_build, out / "sublayer", pos,
                                    activation=actual_norm,
                                    oracle_activation=golden_norm,
-                                   residual_input=xres)
+                                   residual_input=xres,
+                                   full_state_build=full_state_build)
     report = {"passed": bool(sublayer["passed"] and norm_err < 0.02),
               "position": pos, "input_norm_max_absolute_error": norm_err,
               "input_norm_exact_bf16_fraction": float(np.mean(actual_norm == golden_norm)),

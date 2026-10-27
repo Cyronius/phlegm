@@ -19,10 +19,12 @@ def run(driver: Path, qkv_build: Path, rope_build: Path, attn_build: Path,
         o_build: Path, residual_build: Path, out: Path, pos: int,
         activation: np.ndarray | None = None,
         oracle_activation: np.ndarray | None = None,
-        residual_input: np.ndarray | None = None) -> dict:
+        residual_input: np.ndarray | None = None,
+        full_state_build: Path | None = None) -> dict:
     chain = out / "chain"
     chain_report = attention_chain(driver, qkv_build, rope_build, attn_build, chain,
-                                   pos, activation, oracle_activation)
+                                   pos, activation, oracle_activation,
+                                   full_state_build)
     actual_attn = np.fromfile(chain / "attention" / "result.bin", np.float32).astype(bfloat16)
     golden_attn = np.fromfile(chain / "attention" / "expected.bin", np.float32).astype(bfloat16)
     if actual_attn.shape != (4096,) or golden_attn.shape != (4096,):

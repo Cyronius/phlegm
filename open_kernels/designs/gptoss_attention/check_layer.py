@@ -21,9 +21,11 @@ from replica_dense import rms  # noqa: E402
 def run(driver: Path, norm_build: Path, qkv_build: Path, rope_build: Path,
         attn_build: Path, o_build: Path, residual_build: Path,
         router_build: Path, expert_build: Path, gate_build: Path,
-        mixer_build: Path, out: Path, pos: int) -> dict:
+        mixer_build: Path, out: Path, pos: int,
+        full_state_build: Path | None = None) -> dict:
     attn = pre_attn(driver, norm_build, qkv_build, rope_build, attn_build,
-                    o_build, residual_build, out / "attention", pos)
+                    o_build, residual_build, out / "attention", pos,
+                    full_state_build)
     sub = out / "attention" / "sublayer" / "residual"
     actual_res = np.fromfile(sub / "result.bin", np.float32)
     golden_res = np.fromfile(sub / "expected.bin", np.float32)
@@ -43,7 +45,8 @@ def run(driver: Path, norm_build: Path, qkv_build: Path, rope_build: Path,
                   residual_input=actual_res, oracle_residual_input=golden_res)
     final = moe["ffn_residual"]
     report = {"passed": bool(attn["passed"] and moe["passed"] and norm_err < 0.02),
-              "position": pos, "attention_relative_error": attn["sublayer_max_relative_error"],
+              "position": pos, "mode": "full-state" if full_state_build else "sliding-128",
+              "attention_relative_error": attn["sublayer_max_relative_error"],
               "post_attention_norm_max_absolute_error": norm_err,
               "post_attention_norm_exact_bf16_fraction": float(np.mean(actual_norm == golden_norm)),
               "expert_ids": moe["expert_ids"],
@@ -65,13 +68,15 @@ def main() -> None:
                  "gate-build", "mixer-build", "out"):
         p.add_argument("--" + name, required=True, type=Path)
     p.add_argument("--pos", type=int, default=127)
+    p.add_argument("--full-state-build", type=Path)
     a = p.parse_args()
     print(json.dumps(run(a.driver.resolve(), a.norm_build.resolve(),
                          a.qkv_build.resolve(), a.rope_build.resolve(),
                          a.attn_build.resolve(), a.o_build.resolve(),
                          a.residual_build.resolve(), a.router_build.resolve(),
                          a.expert_build.resolve(), a.gate_build.resolve(),
-                         a.mixer_build.resolve(), a.out.resolve(), a.pos), indent=2))
+                         a.mixer_build.resolve(), a.out.resolve(), a.pos,
+                         a.full_state_build.resolve() if a.full_state_build else None), indent=2))
 
 
 if __name__ == "__main__":

@@ -62,6 +62,30 @@ MoE composition, cache and runtime wiring.
 attention residual into the existing top-four MXFP4 expert chain. The full
 synthetic one-token layer passed on NPU at positions 127 and 65535. Maximum
 relative errors were 2.783e-3 and 2.658e-7, with cosines 0.99999748 and
-0.99999999999998. It checks arithmetic across separate compiled images;
-packing a real layer, managing persistent KV state and dispatching a model
-remain open.
+0.99999999999998. The same checker can use the bounded full-attention state
+image instead of the 128-row sliding image:
+
+```bash
+dibs run npu --label 'Check GPT-OSS full-attention layer' --eta 25m -- \
+  python open_kernels/designs/gptoss_attention/check_layer.py \
+  --driver target/npu-dev/harness-build/run_kernel \
+  --norm-build target/npu-dev/gptoss-norm \
+  --qkv-build target/npu-dev/gptoss-qkv-b16 \
+  --rope-build target/npu-dev/gptoss-rope-v3 \
+  --attn-build target/npu-dev/gptoss-attn-r128-v2 \
+  --full-state-build target/npu-dev/gptoss-attn-state-r512-tail \
+  --o-build target/npu-dev/gptoss-o-b16 \
+  --residual-build target/npu-dev/gptoss-residual-v2 \
+  --router-build target/npu-dev/gptoss-router-build \
+  --expert-build target/npu-dev/gptoss-expert-gemv-b90 \
+  --gate-build target/npu-dev/gptoss-gate-b45-v2 \
+  --mixer-build target/npu-dev/gptoss-mix-build \
+  --out target/npu-dev/gptoss-layer-full-p4096 --pos 4096
+```
+
+On 2026-10-27, position 4096 passed with 4097 K/V rows carried through nine
+512-row NPU calls, including a one-row final chunk. The attention maximum
+relative error was 1.921e-7; the final layer error was 3.069e-7 with cosine
+0.9999999999999905. The checker uses synthetic quantized weights and an
+artificial cache. Packing a real layer, managing persistent KV state and
+dispatching a model remain open.

@@ -101,7 +101,7 @@ def test_raw_output_requires_exact_byte_count_without_device(monkeypatch, tmp_pa
     else:
         cases = [('invalid', np.zeros(2880, np.float32), np.zeros((2880, 32), np.float32), np.zeros(32, np.float32))]
         output = 'result.bin'
-    monkeypatch.setattr(checker, 'cases', lambda: cases)
+    monkeypatch.setattr(checker, 'cases', lambda *args: cases)
 
     def fake_process(*args, **kwargs):
         (tmp_path / 'invalid' / output).write_bytes(bytes(size))
