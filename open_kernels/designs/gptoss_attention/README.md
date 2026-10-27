@@ -50,3 +50,10 @@ maximum relative errors were 8.396e-4 and 2.011e-7 respectively, with
 cosines above 0.99999998. The fixture uses synthetic quantized weights in
 the real container layout and an artificial 128-row cache; it is a composed
 arithmetic check, not model acceptance.
+
+`check_sublayer.py` extends the chain through six output projection calls,
+BF16 o_proj bias and FP32 residual addition. The composed NPU check passed
+at positions 127 and 65535 with sublayer maximum relative errors 3.331e-4
+and 2.265e-6, and cosines above 0.99999997. It still uses synthetic weights
+and a pre-normalized activation; a packaged GPT-OSS layer needs its norms,
+MoE composition, cache and runtime wiring.

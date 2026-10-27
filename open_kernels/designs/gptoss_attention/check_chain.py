@@ -102,6 +102,7 @@ def run(driver: Path, qkv_build: Path, rope_build: Path, attn_build: Path,
     # absolute pos is used solely to form the YaRN table for the new token.
     expected = sink_attention(q_gold, K_gold, V_gold, sinks,
                               sliding_window=128, pos=127).ravel().astype(np.float32)
+    (out / "attention" / "expected.bin").write_bytes(expected.tobytes())
     a, e = actual.astype(np.float64), expected.astype(np.float64)
     max_abs = float(np.max(np.abs(a - e)))
     max_rel = float(max_abs / max(np.max(np.abs(e)), 1e-30))
