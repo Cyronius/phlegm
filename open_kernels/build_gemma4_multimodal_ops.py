@@ -34,10 +34,16 @@ OPERATIONS = {
     "audio_silu_1024": ("gemma4_audio_act/gemma4_audio_act.py", {"PHLEGM_WIDTH": "1024", "PHLEGM_GLU": "0"}),
     "audio_silu_4096": ("gemma4_audio_act/gemma4_audio_act.py", {"PHLEGM_WIDTH": "4096", "PHLEGM_GLU": "0"}),
 }
+for _width in (768, 1024, 2048, 3072, 4096):
+    for _mode, _post in (("pre", "0"), ("post", "1")):
+        OPERATIONS[f"linear_clip_{_mode}_{_width}"] = (
+            "gemma4_clip/gemma4_clip.py",
+            {"PHLEGM_WIDTH": str(_width), "PHLEGM_POST_LINEAR": _post},
+        )
 
 
 def plan() -> dict:
-    return {"format": "phlegm-gemma4-multimodal-ops-v3", "images": {
+    return {"format": "phlegm-gemma4-multimodal-ops-v4", "images": {
         name: {"design": design, "environment": env}
         for name, (design, env) in sorted(OPERATIONS.items())}}
 
