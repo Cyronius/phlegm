@@ -208,16 +208,16 @@ impl<R: Read + Seek> Gguf<R> {
     pub fn pack_expert_stripes<W: Write>(&mut self, up: &str, gate: &str, out: &mut W) -> Result<u64, String> {
         let (ue, rows, cols, uq) = self.expert_shape(up)?;
         let (ge, gr, gc, gq) = self.expert_shape(gate)?;
-        if (ue, rows, cols, uq) != (ge, gr, gc, gq) {
-            return Err("GGUF up/gate expert tensor shapes or types differ".into());
+        if (ue, rows, cols) != (ge, gr, gc) {
+            return Err("GGUF up/gate expert tensor shapes differ".into());
         }
         let mut written = 0u64;
         for e in 0..ue {
             for stripe in 0..rows / 128 {
-                for name in [up, gate] {
+                for (name, quant) in [(up, uq), (gate, gq)] {
                     for k in 0..cols / 256 {
                         for rb in 0..4 {
-                            let chunk = self.pack_chunk(name, e, rows, cols, stripe * 128 + rb * 32, k * 256, uq)?;
+                            let chunk = self.pack_chunk(name, e, rows, cols, stripe * 128 + rb * 32, k * 256, quant)?;
                             out.write_all(&chunk).map_err(|e| e.to_string())?;
                             written += POOL_CHUNK as u64;
                         }
@@ -448,8 +448,11 @@ mod tests {
     }
 
     fn fixture() -> Vec<u8> {
+        fixture_with_quants([Quant::Q4_1, Quant::Q4_1, Quant::Q4_0])
+    }
+
+    fn fixture_with_quants(quants: [Quant; 3]) -> Vec<u8> {
         let names = ["blk.0.ffn_up_exps.weight", "blk.0.ffn_gate_exps.weight", "blk.0.ffn_down_exps.weight"];
-        let quants = [Quant::Q4_1, Quant::Q4_1, Quant::Q4_0];
         let mut data = Vec::new();
         let mut offsets = Vec::new();
         for (role, quant) in quants.iter().enumerate() {
@@ -604,6 +607,21 @@ mod tests {
         let mut stripes = Vec::new();
         file.pack_expert_stripes(name, name, &mut stripes).unwrap();
         assert_eq!(&stripes[..4 * POOL_CHUNK], &stripes[4 * POOL_CHUNK..8 * POOL_CHUNK]);
+    }
+
+    #[test]
+    fn up_and_gate_can_have_different_gguf_quant_types() {
+        let mut file = Gguf::new(Cursor::new(fixture_with_quants([
+            Quant::Q4_1, Quant::Q4_0, Quant::Q4_0,
+        ]))).unwrap();
+        let mut stripes = Vec::new();
+        file.pack_expert_stripes("blk.0.ffn_up_exps.weight", "blk.0.ffn_gate_exps.weight", &mut stripes).unwrap();
+        let up = &stripes[..POOL_CHUNK];
+        let gate = &stripes[4 * POOL_CHUNK..5 * POOL_CHUNK];
+        assert_eq!(f32::from_le_bytes(up[1024..1028].try_into().unwrap()), 0.5);
+        assert_eq!(f32::from_le_bytes(gate[1024..1028].try_into().unwrap()), -8.0);
+        assert_eq!(pool_code(up, 0, 0), 0);
+        assert_eq!(pool_code(gate, 0, 0), 1);
     }
 
     #[test]
