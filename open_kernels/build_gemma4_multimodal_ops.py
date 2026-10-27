@@ -23,6 +23,7 @@ OPERATIONS = {
     "vision_online_attn_472x64": ("gemma4_attention/gemma4_attention.py", {"PHLEGM_HEAD_DIM": "64", "PHLEGM_ATTN_ROWS": "472"}),
     "vision_hidden_norm_768": ("gemma4_hidden_norm/gemma4_hidden_norm.py", {"PHLEGM_HIDDEN": "768"}),
     "vision_gelu_mul_3072": ("gemma4_gelu_mul/gemma4_gelu_mul.py", {"PHLEGM_WIDTH": "3072"}),
+    "vision_pos_add_256x768": ("gemma4_vision_pos_add/gemma4_vision_pos_add.py", {}),
     "vision_pool_280x9x768": ("gemma4_vision_pool/gemma4_vision_pool.py", {}),
     "audio_depthwise_256x1024": ("gemma4_audio_dw/gemma4_audio_dw.py", {}),
     "audio_relative_attn_8x12x24": ("gemma4_audio_attn/gemma4_audio_attn.py", {}),
@@ -36,7 +37,7 @@ OPERATIONS = {
 
 
 def plan() -> dict:
-    return {"format": "phlegm-gemma4-multimodal-ops-v2", "images": {
+    return {"format": "phlegm-gemma4-multimodal-ops-v3", "images": {
         name: {"design": design, "environment": env}
         for name, (design, env) in sorted(OPERATIONS.items())}}
 
