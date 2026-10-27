@@ -89,3 +89,21 @@ relative error was 1.921e-7; the final layer error was 3.069e-7 with cosine
 0.9999999999999905. The checker uses synthetic quantized weights and an
 artificial cache. Packing a real layer, managing persistent KV state and
 dispatching a model remain open.
+
+`recipes/gptoss_source.py` reads the shipped GPT-OSS-20B q4nx shapes and
+selects source chunks for the checked Q/K/V/O and expert images. It bounds
+each expert read to one expert's fused MXFP4 payload, extracts the separate
+BF16 biases and norms, and transposes the flat router weight into the NPU
+router's input layout. To save one layer's source inputs with byte hashes:
+
+```bash
+python open_kernels/export_gptoss_source.py \
+  --model /path/to/model.q4nx --layer 0 --experts 3 17 26 9 \
+  --out target/gptoss-layer-0-source
+```
+
+The exporter requires the actual model container, which was not available
+for this check. Its source reads and output inventory are tested against the
+pinned container header using virtual payloads. The resulting bundle is a
+kernel input artifact; a runtime pack plan, token embedding, LM head, cache
+manager and model dispatch still need implementation and model validation.
