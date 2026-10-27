@@ -16,9 +16,11 @@ compositions, not an exported model or native generation path.
 | Composed head and softcap | `open_kernels/gemma4_logits_check.py` | All three text widths passed across the full vocabulary |
 | E2B/E4B per-layer input GELU gate | `open_kernels/designs/gemma4_ple_gate/` | BF16-rounded 256-value NPU check matched exactly |
 | Hidden RMSNorm and residual | `open_kernels/designs/gemma4_hidden_norm/` | E2B/E4B/12B widths passed with residual and plain norm modes |
-| Text layer scheduler plan | `open_kernels/gemma4_text_plan.py` | Published E2B/E4B/12B geometry, shared-K/V providers, K=V routing, MLP widths, and local/full sequence checked by four CPU tests |
-| q4 text Q/K/V/O, MLP and PLE projections | `open_kernels/build_gemma4_text_projections.py` | All distinct published geometries compiled: 11 E2B, 11 E4B, 8 12B images; NPU arithmetic checks pending |
+| Text layer scheduler plan | `open_kernels/gemma4_text_plan.py` | Published E2B/E4B/12B geometry, shared-K/V providers, K=V routing, MLP widths, and local/full sequence checked by eight CPU tests |
+| q4 text Q/K/V/O and MLP projections | `open_kernels/build_gemma4_text_projections.py` | Published geometries compiled; NPU arithmetic checks pending |
+| E2B/E4B BF16 per-layer projections | `open_kernels/designs/gemma4_bf16_gemv/` | All four source-layout geometries compiled; NPU arithmetic checks pending |
 | Per-layer context norm and token mix | `open_kernels/designs/gemma4_ple_input/` | E2B/E4B with-token and context-only variants compiled; NPU arithmetic checks pending |
+| Full-width MLP GELU-tanh and up product | `open_kernels/designs/gemma4_gelu_mul/` | All four 6144/10240/12288/15360-wide images compiled from the checked 256-value gate arithmetic; NPU checks pending |
 
 The attention state image processes 1, 128, 512, or 1024 rows per call. Its
 FP32 carry output supports consecutive full-attention chunks. The caller
@@ -36,13 +38,18 @@ were `4.01e-5`, `4.05e-5`, and `7.06e-5` respectively. These checks use the
 generic 5120-byte q4_1 pool format; the actual Gemma 4 package's source
 layout and any required transcode remain unverified.
 
-The text projection inventory has 276 E2B, 343 E4B, and 328 12B logical
-matrices. It omits K/V projections in shared layers and the full-attention V
+The text projection inventory has 310 E2B, 384 E4B, and 328 12B logical
+matrices. E2B and E4B include three BF16 per-layer matrices per layer in
+FLM's `[N/32,K,32]` layout: model projection, input gate, and projection
+back to hidden width. This mapping follows the FLM q4nx converter and the
+actual E2B q4nx package header; numeric source bytes remain unchecked.
+The inventory omits K/V projections in shared layers and the full-attention V
 projection in 12B. A 12288-wide E2B down projection exceeded AIE tile memory
 as one call; the plan splits it into two 6144-wide calls. E4B's 10240-wide
 and 12B's 15360-wide down projections similarly use two calls. The complete
-12B, E2B, and E4B projection image sets compiled from pinned configuration
-fixtures on 2026-10-27. Compiling establishes image feasibility, not matrix
+12B, E2B, and E4B all-q4 projection image sets compiled from pinned configuration
+fixtures on 2026-10-27. The E2B/E4B PLE images in those earlier bundles used
+the wrong weight format; corrected bundles are pending. Compiling establishes image feasibility, not matrix
 arithmetic correctness; the corresponding NPU checks are still pending.
 
 ## Remaining work for a model recipe

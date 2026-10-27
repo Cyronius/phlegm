@@ -63,6 +63,7 @@ class Projection:
     name: str
     rows: int
     cols: int
+    format: str = "q4"
 
 
 def projections(plan: TextPlan) -> tuple[Projection, ...]:
@@ -72,9 +73,6 @@ def projections(plan: TextPlan) -> tuple[Projection, ...]:
     Matrix naming here is a logical role; source-container names are separate.
     """
     out = []
-    if plan.layers[0].per_layer_input_width:
-        out.append(Projection(None, "per_layer_model_projection",
-                              len(plan.layers) * plan.layers[0].per_layer_input_width, plan.hidden))
     for layer in plan.layers:
         i, hidden, ff = layer.index, plan.hidden, layer.mlp_width
         out.append(Projection(i, "q", layer.query_width, hidden))
@@ -87,14 +85,18 @@ def projections(plan: TextPlan) -> tuple[Projection, ...]:
                     Projection(i, "up", ff, hidden),
                     Projection(i, "down", hidden, ff)))
         if layer.per_layer_input_width:
-            out.extend((Projection(i, "per_layer_input_gate", layer.per_layer_input_width, hidden),
-                        Projection(i, "per_layer_projection", hidden, layer.per_layer_input_width)))
+            out.extend((Projection(i, "per_layer_model_projection", layer.per_layer_input_width,
+                                   hidden, "bf16"),
+                        Projection(i, "per_layer_input_gate", layer.per_layer_input_width,
+                                   hidden, "bf16"),
+                        Projection(i, "per_layer_projection", hidden,
+                                   layer.per_layer_input_width, "bf16")))
     return tuple(out)
 
 
 def projection_geometries(plan: TextPlan) -> tuple[tuple[int, int], ...]:
     """Distinct (rows, cols) image geometries, sorted for deterministic builds."""
-    shapes = {(p.rows, p.cols) for p in projections(plan)}
+    shapes = {(p.rows, p.cols) for p in projections(plan) if p.format == "q4"}
     if any(n % 64 or k % 256 for n, k in shapes):
         raise Gemma4PlanError("a projection is outside the q4 GEMV tile geometry")
     return tuple(sorted(shapes))
@@ -108,6 +110,12 @@ def projection_image_geometry(projection: Projection) -> tuple[int, int, int]:
     verified safe input width is 8192; wider reductions run equal K stripes.
     """
     n, k = projection.rows, projection.cols
+    if projection.format == "bf16":
+        if n % 32 or k % 256:
+            raise Gemma4PlanError("a projection is outside the BF16 GEMV tile geometry")
+        return n, k, 1
+    if projection.format != "q4":
+        raise Gemma4PlanError(f"unknown projection format: {projection.format}")
     if n % 64 or k % 256:
         raise Gemma4PlanError("a projection is outside the q4 GEMV tile geometry")
     calls = (k + 8191) // 8192

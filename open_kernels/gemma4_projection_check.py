@@ -8,11 +8,25 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
 
-from gemma4_lm_head_check import fixture
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+from open_kernels.gemma4_lm_head_check import fixture  # noqa: E402
+
+
+def band_stripe(raw: np.ndarray, full_cols: int, image_cols: int,
+                stripe: int) -> np.ndarray:
+    """One 64-row q4_1 band, selected by consecutive 256-column tiles."""
+    chunks = image_cols // 256
+    if (full_cols % image_cols or raw.size != full_cols // 256 * 2 * 5120
+            or stripe < 0 or stripe >= full_cols // image_cols):
+        raise ValueError("invalid q4 band stripe")
+    full = raw.reshape(full_cols // 256, 2, 5120)
+    return np.ascontiguousarray(full[stripe * chunks:(stripe + 1) * chunks]).reshape(-1)
 
 
 def run(driver: Path, build: Path, out: Path, rows: int, cols: int,
@@ -31,16 +45,13 @@ def run(driver: Path, build: Path, out: Path, rows: int, cols: int,
     expected = np.tile(np.concatenate((first_expected, second_expected)),
                        (bands + 1) // 2)[:rows]
     out.mkdir(parents=True, exist_ok=True)
-    stripe_chunks = image_cols // 256
-    fixture_chunks = (first.reshape(cols // 256, 2, 5120),
-                      second.reshape(cols // 256, 2, 5120))
     partials = []
     for stripe in range(cols // image_cols):
         wd = out / f"weights_{stripe}.bin"
         with wd.open("wb") as stream:
             for band in range(bands):
-                stream.write(fixture_chunks[band % 2][stripe * stripe_chunks:
-                                                       (stripe + 1) * stripe_chunks].tobytes())
+                stream.write(band_stripe((first, second)[band % 2], cols,
+                                         image_cols, stripe).tobytes())
         xd = out / f"activation_{stripe}.bin"
         xs = np.ascontiguousarray(x[stripe * image_cols:(stripe + 1) * image_cols])
         xd.write_bytes(xs.tobytes())

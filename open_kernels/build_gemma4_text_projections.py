@@ -1,4 +1,4 @@
-"""Compile every distinct Gemma 4 text q4 projection image from a config.json.
+"""Compile every distinct Gemma 4 text projection image from a config.json.
 
 Run the build command inside `dibs run build`. This produces NPU images and a
 geometry manifest; packing source model weights and scheduling layers remain
@@ -19,6 +19,7 @@ sys.path.insert(0, str(HERE.parent))
 from open_kernels.gemma4_text_plan import from_hf_config, projection_image_geometry, projections  # noqa: E402
 
 DESIGN = HERE / "designs" / "lm_head_q4" / "lm_head_q4.py"
+BF16_DESIGN = HERE / "designs" / "gemma4_bf16_gemv" / "gemma4_bf16_gemv.py"
 BUILD = HERE / "build_design.py"
 
 
@@ -28,16 +29,19 @@ def image_plan(config: dict) -> dict:
     images = {}
     for projection in slots:
         rows, cols, calls = projection_image_geometry(projection)
-        tag = f"n{rows}_k{cols}"
-        images[tag] = {"rows": rows, "image_cols": cols,
-                       "cores": min(8, rows // 64)}
-    return {"variant": plan.variant, "hidden": plan.hidden,
+        tag = f"{projection.format}_n{rows}_k{cols}" if projection.format == "bf16" else f"n{rows}_k{cols}"
+        images[tag] = {"rows": rows, "image_cols": cols, "format": projection.format,
+                       "cores": min(8, rows // 64) if projection.format == "q4" else 1}
+    config_hash = hashlib.sha256(json.dumps(config, sort_keys=True,
+                                            separators=(",", ":")).encode()).hexdigest()
+    return {"variant": plan.variant, "config_sha256": config_hash, "hidden": plan.hidden,
             "layers": len(plan.layers), "vocab": plan.vocab,
             "projection_count": len(slots),
             "images": {tag: images[tag] for tag in sorted(images)},
             "projections": [{"layer": p.layer, "name": p.name,
-                             "rows": p.rows, "cols": p.cols,
-                             "image": f"n{projection_image_geometry(p)[0]}_k{projection_image_geometry(p)[1]}",
+                             "rows": p.rows, "cols": p.cols, "format": p.format,
+                             "image": (("bf16_" if p.format == "bf16" else "") +
+                                       f"n{projection_image_geometry(p)[0]}_k{projection_image_geometry(p)[1]}"),
                              "calls": projection_image_geometry(p)[2]}
                             for p in slots]}
 
@@ -48,15 +52,20 @@ def build_all(config: dict, output: Path) -> dict:
     for tag, image in manifest["images"].items():
         destination = output / tag
         env = os.environ.copy()
-        env.update(LMHEAD_N=str(image["rows"]), LMHEAD_K=str(image["image_cols"]),
-                   LMHEAD_CORES=str(image["cores"]))
-        subprocess.run((sys.executable, str(BUILD), str(DESIGN), str(destination)),
+        if image["format"] == "q4":
+            env.update(LMHEAD_N=str(image["rows"]), LMHEAD_K=str(image["image_cols"]),
+                       LMHEAD_CORES=str(image["cores"]))
+            design = DESIGN
+        else:
+            env.update(PHLEGM_N=str(image["rows"]), PHLEGM_K=str(image["image_cols"]))
+            design = BF16_DESIGN
+        subprocess.run((sys.executable, str(BUILD), str(design), str(destination)),
                        env=env, check=True)
         image["xclbin"] = f"{tag}/final.xclbin"
         image["insts"] = f"{tag}/insts.bin"
         image["xclbin_sha256"] = hashlib.sha256((destination / "final.xclbin").read_bytes()).hexdigest()
         image["insts_sha256"] = hashlib.sha256((destination / "insts.bin").read_bytes()).hexdigest()
-    manifest["format"] = "phlegm-gemma4-text-projections-v1"
+    manifest["format"] = "phlegm-gemma4-text-projections-v2"
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 
