@@ -49,8 +49,12 @@ def image_plan(config: dict) -> dict:
         for token in (0, 1):
             add(f"ple_input_token{token}", "gemma4_ple_input/gemma4_ple_input.py",
                 PHLEGM_HIDDEN=text.hidden, PHLEGM_HAS_TOKEN=token)
-    add("lm_head", "lm_head_q4/lm_head_q4.py",
-        LMHEAD_N=text.vocab, LMHEAD_K=text.hidden)
+    if text.variant == "12B":
+        add("lm_head", "lm_head_q8/lm_head_q8.py",
+            LMHEAD_N=text.vocab, LMHEAD_K=text.hidden, LMHEAD_CORES=8)
+    else:
+        add("lm_head", "lm_head_q4/lm_head_q4.py",
+            LMHEAD_N=text.vocab, LMHEAD_K=text.hidden)
     add("logit_cap", "gemma4_logit_cap/gemma4_logit_cap.py")
     return {"variant": text.variant, "text_images": {tag: images[tag] for tag in sorted(images)},
             "projections": projection_plan(config)}

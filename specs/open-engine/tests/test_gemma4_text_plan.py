@@ -120,6 +120,7 @@ class Gemma4TextPlanTest(unittest.TestCase):
         self.assertIn("ple_input_token1", e4b)
         self.assertIn("head_norm_h1_d512", b12)
         self.assertIn("rope_h17_d512", b12)
+        self.assertEqual(b12["lm_head"]["design"], "lm_head_q8/lm_head_q8.py")
         self.assertNotIn("ple_gate", b12)
 
     def test_split_q4_down_band_preserves_the_full_matvec(self):
