@@ -44,10 +44,11 @@ FAMILIES = ("qwen36moe", "qwen35", "qwen3", "llama3", "gemma3", "hunyuan", "gran
 NOT_IMPLEMENTED = {
     "gptoss": "the arithmetic is settled and tested (model/replica_gptoss.py); standalone "
               "gptoss_gate, gptoss_mxfp4, gptoss_router, gptoss_expert_gemv, gptoss_mix and "
-              "gptoss_residual, gptoss_attention and gptoss_attention_state "
+              "gptoss_residual, gptoss_attention, gptoss_attention_state and gptoss_rope "
               "kernels cover clamped activation, MXFP4 expert projection with bias, biased "
               "top-four routing, mixing, output bias/residual and sink attention arithmetic; "
-              "the one-token MoE FFN and full/sliding sink attention are NPU-checked, "
+              "the one-token MoE FFN, full/sliding sink attention and YaRN rotation "
+              "are NPU-checked, "
               "but no layer recipe composes them. "
               "o_proj bias still has no slot in the existing layer design; the MoE FFN has to "
               "compose with sliding-window layers, which no recipe does today; QKV projection "
