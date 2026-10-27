@@ -19,7 +19,8 @@ from replica_dense import rms  # noqa: E402
 
 def run(driver: Path, norm_build: Path, qkv_build: Path, rope_build: Path,
         attn_build: Path, o_build: Path, residual_build: Path,
-        out: Path, pos: int, full_state_build: Path | None = None) -> dict:
+        out: Path, pos: int, full_state_build: Path | None = None,
+        finalize_build: Path | None = None) -> dict:
     rng = np.random.default_rng(20261030 + pos)
     xres = rng.normal(0, 0.7, 2880).astype(np.float32)
     weight = rng.normal(1, 0.2, 2880).astype(np.float32).astype(bfloat16)
@@ -34,7 +35,8 @@ def run(driver: Path, norm_build: Path, qkv_build: Path, rope_build: Path,
                                    activation=actual_norm,
                                    oracle_activation=golden_norm,
                                    residual_input=xres,
-                                   full_state_build=full_state_build)
+                                   full_state_build=full_state_build,
+                                   finalize_build=finalize_build)
     report = {"passed": bool(sublayer["passed"] and norm_err < 0.02),
               "position": pos, "input_norm_max_absolute_error": norm_err,
               "input_norm_exact_bf16_fraction": float(np.mean(actual_norm == golden_norm)),
@@ -54,11 +56,15 @@ def main() -> None:
                  "o-build", "residual-build", "out"):
         p.add_argument("--" + name, required=True, type=Path)
     p.add_argument("--pos", type=int, default=127)
+    p.add_argument("--full-state-build", type=Path)
+    p.add_argument("--finalize-build", type=Path)
     a = p.parse_args()
     print(json.dumps(run(a.driver.resolve(), a.norm_build.resolve(),
                          a.qkv_build.resolve(), a.rope_build.resolve(),
                          a.attn_build.resolve(), a.o_build.resolve(),
-                         a.residual_build.resolve(), a.out.resolve(), a.pos), indent=2))
+                         a.residual_build.resolve(), a.out.resolve(), a.pos,
+                         a.full_state_build.resolve() if a.full_state_build else None,
+                         a.finalize_build.resolve() if a.finalize_build else None), indent=2))
 
 
 if __name__ == "__main__":

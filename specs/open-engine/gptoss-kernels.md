@@ -19,6 +19,10 @@ MXFP4 expert projection, expert gate and mix, and the full 201,088-logit q4
 LM head. The bundle's 4097-row full-attention-to-residual composition passed
 on NPU, and its full LM head passed against an FP64 decoded-weight reference
 with maximum relative error `5.69e-6`.
+The complete synthetic one-token layer, using the bundle's full-attention,
+finalizer, norm, router, four experts, mixer and residual images at position
+4096, also passed against the FP64 layer reference with maximum relative error
+`3.07e-7`. This checks image composition; it does not use public model weights.
 
 `recipes/gptoss_source.py` validates the complete 435-tensor public GPT-OSS
 20B q4nx header: all 24 layers, both router layouts, the expert payloads,
