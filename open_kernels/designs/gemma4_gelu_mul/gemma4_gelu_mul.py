@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE.parent.parent))
 from ironutil import Pipeline, include_dirs  # noqa: E402
 
 CHUNK = 256
-WIDTHS = (6144, 10240, 12288, 15360)
+WIDTHS = (3072, 6144, 10240, 12288, 15360)
 
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])

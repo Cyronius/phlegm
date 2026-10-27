@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from ml_dtypes import bfloat16
 
-WIDTHS = (6144, 10240, 12288, 15360)
+WIDTHS = (3072, 6144, 10240, 12288, 15360)
 
 
 def run(driver: Path, build: Path, out: Path, width: int) -> dict:

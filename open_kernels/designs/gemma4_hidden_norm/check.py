@@ -60,7 +60,7 @@ def main() -> None:
     p.add_argument("--driver", required=True, type=Path)
     p.add_argument("--build", required=True, type=Path)
     p.add_argument("--out", required=True, type=Path)
-    p.add_argument("--hidden", required=True, type=int, choices=(1536, 2560, 3840))
+    p.add_argument("--hidden", required=True, type=int, choices=(768, 1024, 1536, 2560, 3840))
     p.add_argument("--zero-residual", action="store_true")
     a = p.parse_args()
     print(json.dumps(run(a.driver.resolve(), a.build.resolve(), a.out.resolve(),

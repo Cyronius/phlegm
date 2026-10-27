@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from open_kernels.gemma4_mm_source import npu_weight, npu_weight_row_major, source_matrix
+from open_kernels.build_gemma4_multimodal_mm import image_plan
 from npue import untile_b
 
 
@@ -25,6 +26,11 @@ class Gemma4MultimodalWeightTest(unittest.TestCase):
         matrix = (np.arange(rows * cols, dtype=np.uint32) % 65521).astype(np.uint16).reshape(rows, cols)
         packed = npu_weight_row_major(matrix, rows, cols)
         np.testing.assert_array_equal(untile_b(packed, cols, rows, 64, 32, 8, 8), matrix.T)
+
+    def test_matrix_plan_includes_both_audio_subsamplers(self):
+        plan = image_plan([{}], ["fixture"])
+        self.assertEqual(plan["format"], "phlegm-gemma4-multimodal-mm-v2")
+        self.assertEqual(set(plan["images"]), {"m256_n256_k64", "m256_n256_k1152"})
 
 
 if __name__ == "__main__":

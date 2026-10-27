@@ -22,7 +22,7 @@ from ironutil import Pipeline, include_dirs  # noqa: E402
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
 def gemma4_hidden_norm(value_residual: In, scale: In, output: Out,
                        *, hidden: CompileTime[int], srchash: CompileTime[int] = 0):
-    assert hidden in (1536, 2560, 3840)
+    assert hidden in (768, 1024, 1536, 2560, 3840)
     pair_ty = np.ndarray[(2 * hidden,), np.dtype[bfloat16]]
     row_ty = np.ndarray[(hidden,), np.dtype[bfloat16]]
     fn = ExternalFunction("gemma4_hidden_norm", source_file=str(HERE / "norm.cc"),

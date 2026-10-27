@@ -39,7 +39,12 @@ def image_plan(headers: list[dict], names: list[str]) -> dict:
             image = images.setdefault(tag, {"m": 256, "n": rows, "k": cols, "sources": []})
             image["sources"].append({"header": source_name, "tensor": tensor,
                                      "layout": layout, "shape": shape})
-    return {"format": "phlegm-gemma4-multimodal-mm-v1",
+    for rows, cols, operation in ((256, 64, "audio_subsample_conv0"),
+                                  (256, 1152, "audio_subsample_conv1")):
+        tag = f"m256_n{rows}_k{cols}"
+        image = images.setdefault(tag, {"m": 256, "n": rows, "k": cols, "sources": []})
+        image["sources"].append({"operation": operation, "layout": "im2col_bf16"})
+    return {"format": "phlegm-gemma4-multimodal-mm-v2",
             "images": {tag: images[tag] for tag in sorted(images)}}
 
 
