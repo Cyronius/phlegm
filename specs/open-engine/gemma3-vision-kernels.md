@@ -58,8 +58,17 @@ rows and first/last columns; their maximum sampled relative errors were
 `4.72e-7`, `5.65e-7`, `6.04e-7`, and `9.91e-7` respectively. Padded output
 columns were zero. The matrix source remains synthetic.
 
-Remaining work includes full SigLIP attention, matrix bias/activation and
-residual boundaries, real FLM tensor-layout conversion for all vision
+`build_gemma3_vision_post_mm.py` builds four BF16 bias boundary images. QKV
+uses 3456 logical channels; attention output and FC2 use 1152; FC1 uses
+4304 and applies SigLIP's tanh GELU after the BF16 bias round. Their NPU
+checks passed with maximum relative errors `2.05e-5`, `0`, `5.09e-6`, and
+`0` respectively against BF16 references, with zeroed padded channels.
+The earlier 1152-channel two-addend image also serves attention and MLP
+residual boundaries when packed with bias and residual instead of bias and
+position; this NPU check matched all BF16 outputs exactly.
+
+Remaining work includes full SigLIP attention and a 27-layer schedule,
+real FLM tensor-layout conversion for all vision
 weights, variant-specific geometry checks, and image-to-text output
 acceptance. These 4B entries remain
 text-only recipe routes in the coverage matrix until the full vision path is
