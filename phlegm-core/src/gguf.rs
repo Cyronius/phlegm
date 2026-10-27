@@ -1,4 +1,4 @@
-//! Bounded GGUF tensor reader and lossless Q4 expert pool packing.
+//! Bounded GGUF tensor reader and direct Q4 expert pool packing.
 //!
 //! GGUF stays the model file. These routines stream its blocks into the
 //! f32-scale chunk layout consumed by the NPU kernels; they create no Q4NX
@@ -18,6 +18,7 @@ const MAX_STRING: u64 = 16 * 1024 * 1024;
 pub enum Quant {
     Q4_0,
     Q4_1,
+    Q4K,
 }
 
 impl Quant {
@@ -25,7 +26,8 @@ impl Quant {
         match ty {
             2 => Ok(Self::Q4_0),
             3 => Ok(Self::Q4_1),
-            _ => Err(format!("GGUF tensor type {ty} cannot use the exact Q4 expert packer")),
+            12 => Ok(Self::Q4K),
+            _ => Err(format!("GGUF tensor type {ty} cannot use the Q4 expert packer")),
         }
     }
 
@@ -33,6 +35,7 @@ impl Quant {
         match self {
             Self::Q4_0 => 18,
             Self::Q4_1 => 20,
+            Self::Q4K => 144,
         }
     }
 }
@@ -187,10 +190,10 @@ impl<R: Read + Seek> Gguf<R> {
         &self.tensors
     }
 
-    fn read_block(&mut self, name: &str, block: u64, dst: &mut [u8]) -> Result<(), String> {
+    fn read_blocks(&mut self, name: &str, block: u64, block_bytes: usize, dst: &mut [u8]) -> Result<(), String> {
         let info = self.tensors.get(name).ok_or_else(|| format!("missing GGUF tensor {name}"))?;
         let n = info.byte_len.ok_or_else(|| format!("GGUF tensor {name} has unsupported type {}", info.gguf_type))?;
-        let relative = block.checked_mul(dst.len() as u64).ok_or("GGUF block offset overflow")?;
+        let relative = block.checked_mul(block_bytes as u64).ok_or("GGUF block offset overflow")?;
         if relative.checked_add(dst.len() as u64).is_none_or(|end| end > n) {
             return Err(format!("GGUF tensor {name} block {block} runs past tensor"));
         }
@@ -200,7 +203,7 @@ impl<R: Read + Seek> Gguf<R> {
         read_exact(&mut self.reader, dst)
     }
 
-    /// Pack a Q4_0/Q4_1 [K, FF, E] pair in expert/stripe/up-then-gate order.
+    /// Pack a Q4_0/Q4_1/Q4_K [K, FF, E] pair in expert/stripe/up-then-gate order.
     /// Each stripe holds 128 output rows; one chunk covers 32 rows x 256 K.
     pub fn pack_expert_stripes<W: Write>(&mut self, up: &str, gate: &str, out: &mut W) -> Result<u64, String> {
         let (ue, rows, cols, uq) = self.expert_shape(up)?;
@@ -225,7 +228,7 @@ impl<R: Read + Seek> Gguf<R> {
         Ok(written)
     }
 
-    /// Pack a Q4_0/Q4_1 [FF, hidden, E] down tensor, one expert at a time.
+    /// Pack a Q4_0/Q4_1/Q4_K [FF, hidden, E] down tensor, one expert at a time.
     pub fn pack_expert_down<W: Write>(&mut self, name: &str, out: &mut W) -> Result<u64, String> {
         let (experts, rows, cols, quant) = self.expert_shape(name)?;
         let mut written = 0u64;
@@ -254,14 +257,18 @@ impl<R: Read + Seek> Gguf<R> {
 
     fn pack_chunk(&mut self, name: &str, expert: u64, rows: u64, cols: u64,
                   row0: u64, col0: u64, quant: Quant) -> Result<[u8; POOL_CHUNK], String> {
+        if quant == Quant::Q4K {
+            return self.pack_q4k_chunk(name, expert, rows, cols, row0, col0);
+        }
         let mut out = [0u8; POOL_CHUNK];
         let block_bytes = quant.block_bytes();
         let blocks_per_row = cols / VALUES_PER_BLOCK;
-        let mut block = [0u8; 20];
-        for kb in 0..8u64 {
-            for r in 0..32u64 {
-                let source_block = (expert * rows + row0 + r) * blocks_per_row + (col0 / 32 + kb);
-                self.read_block(name, source_block, &mut block[..block_bytes])?;
+        let mut row_blocks = [0u8; 160];
+        for r in 0..32u64 {
+            let source_block = (expert * rows + row0 + r) * blocks_per_row + col0 / 32;
+            self.read_blocks(name, source_block, block_bytes, &mut row_blocks[..8 * block_bytes])?;
+            for kb in 0..8u64 {
+                let block = &row_blocks[kb as usize * block_bytes..(kb as usize + 1) * block_bytes];
                 let d = f32_from_f16(u16::from_le_bytes([block[0], block[1]]));
                 let m = if quant == Quant::Q4_1 {
                     f32_from_f16(u16::from_le_bytes([block[2], block[3]]))
@@ -281,6 +288,48 @@ impl<R: Read + Seek> Gguf<R> {
             }
         }
         Ok(out)
+    }
+
+    fn pack_q4k_chunk(&mut self, name: &str, expert: u64, rows: u64, cols: u64,
+                      row0: u64, col0: u64) -> Result<[u8; POOL_CHUNK], String> {
+        let mut out = [0u8; POOL_CHUNK];
+        let mut block = [0u8; 144];
+        let blocks_per_row = cols / 256;
+        for r in 0..32u64 {
+            let source_block = (expert * rows + row0 + r) * blocks_per_row + col0 / 256;
+            self.read_blocks(name, source_block, 144, &mut block)?;
+            let d = f32_from_f16(u16::from_le_bytes([block[0], block[1]]));
+            let dmin = f32_from_f16(u16::from_le_bytes([block[2], block[3]]));
+            let scales = &block[4..16];
+            let codes = &block[16..144];
+            for kb in 0..8usize {
+                let (scale, min) = q4k_scale_min(scales, kb);
+                let plane = 4 * (kb * 32 + r as usize);
+                out[plane..plane + 4].copy_from_slice(&(d * scale as f32).to_le_bytes());
+                out[1024 + plane..1024 + plane + 4]
+                    .copy_from_slice(&(-dmin * min as f32).to_le_bytes());
+                let half = kb / 2;
+                for i in 0..16usize {
+                    let c0 = codes[half * 32 + i];
+                    let c1 = codes[half * 32 + i + 16];
+                    let p = (r as usize / 16) * 4096 + (kb * 32 + i) * 16 + r as usize % 16;
+                    let q0 = if kb & 1 == 0 { c0 & 15 } else { c0 >> 4 };
+                    let q1 = if kb & 1 == 0 { c1 & 15 } else { c1 >> 4 };
+                    set_nibble(&mut out[2048..], p, q0);
+                    set_nibble(&mut out[2048..], p + 256, q1);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn q4k_scale_min(q: &[u8], j: usize) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        ((q[j + 4] & 15) | ((q[j - 4] >> 6) << 4),
+         (q[j + 4] >> 4) | ((q[j] >> 6) << 4))
     }
 }
 
@@ -433,6 +482,46 @@ mod tests {
         file
     }
 
+    fn q4k_fixture() -> Vec<u8> {
+        const SCALES: [u8; 8] = [3, 5, 7, 9, 47, 53, 59, 61];
+        const MINS: [u8; 8] = [2, 4, 6, 8, 17, 23, 29, 31];
+        let mut packed = [0u8; 12];
+        for j in 0..4 {
+            packed[j] = SCALES[j] | ((SCALES[j + 4] >> 4) << 6);
+            packed[j + 4] = MINS[j] | ((MINS[j + 4] >> 4) << 6);
+        }
+        for j in 4..8 {
+            packed[j + 4] = (SCALES[j] & 15) | ((MINS[j] & 15) << 4);
+        }
+        let mut data = Vec::new();
+        for expert in 0..2u8 {
+            for row in 0..128u8 {
+                data.extend_from_slice(&0x3c00u16.to_le_bytes()); // d = 1
+                data.extend_from_slice(&0x3800u16.to_le_bytes()); // dmin = 0.5
+                data.extend_from_slice(&packed);
+                for i in 0..128u8 {
+                    let lo = i.wrapping_add(row).wrapping_add(expert) & 15;
+                    let hi = i.wrapping_add(row).wrapping_add(expert).wrapping_add(3) & 15;
+                    data.push(lo | hi << 4);
+                }
+            }
+        }
+        let mut file = Vec::new();
+        file.extend_from_slice(b"GGUF");
+        u32le(&mut file, 3);
+        u64le(&mut file, 1);
+        u64le(&mut file, 1);
+        string(&mut file, "general.architecture"); u32le(&mut file, 8); string(&mut file, "qwen35moe");
+        string(&mut file, "blk.0.ffn_down_exps.weight");
+        u32le(&mut file, 3);
+        for d in [256, 128, 2] { u64le(&mut file, d); }
+        u32le(&mut file, 12);
+        u64le(&mut file, 0);
+        align(&mut file);
+        file.extend(data);
+        file
+    }
+
     fn pool_code(chunk: &[u8], row: usize, col: usize) -> u8 {
         let p = (row / 16) * 4096 + col * 16 + row % 16;
         let b = chunk[2048 + p / 2];
@@ -483,8 +572,38 @@ mod tests {
         let mut truncated = fixture();
         truncated.truncate(truncated.len() - 1);
         assert!(Gguf::new(Cursor::new(truncated)).err().unwrap().contains("past EOF"));
-        assert!(Quant::from_type(12).unwrap_err().contains("exact Q4"));
+        assert!(Quant::from_type(13).unwrap_err().contains("Q4 expert"));
         assert_eq!(f32_from_f16(1), 2f32.powi(-24));
+    }
+
+    #[test]
+    fn q4k_expert_pool_keeps_scales_mins_codes_and_order() {
+        const SCALES: [u8; 8] = [3, 5, 7, 9, 47, 53, 59, 61];
+        const MINS: [u8; 8] = [2, 4, 6, 8, 17, 23, 29, 31];
+        let name = "blk.0.ffn_down_exps.weight";
+        let mut file = Gguf::new(Cursor::new(q4k_fixture())).unwrap();
+        let mut down = Vec::new();
+        assert_eq!(file.pack_expert_down(name, &mut down).unwrap(), (2 * 4 * POOL_CHUNK) as u64);
+        for expert in 0..2usize {
+            for rb in 0..4usize {
+                let chunk = &down[(expert * 4 + rb) * POOL_CHUNK..(expert * 4 + rb + 1) * POOL_CHUNK];
+                for row in [0, 15, 16, 31] {
+                    for kb in [0, 1, 4, 7] {
+                        let plane = 4 * (kb * 32 + row);
+                        assert_eq!(f32::from_le_bytes(chunk[plane..plane + 4].try_into().unwrap()), SCALES[kb] as f32);
+                        assert_eq!(f32::from_le_bytes(chunk[1024 + plane..1028 + plane].try_into().unwrap()), -(MINS[kb] as f32) * 0.5);
+                        for i in [0, 15, 16, 31] {
+                            let source_byte = (kb / 2) * 32 + i;
+                            let q = (source_byte + rb * 32 + row + expert + if kb & 1 == 0 { 0 } else { 3 }) & 15;
+                            assert_eq!(pool_code(chunk, row, kb * 32 + i), q as u8);
+                        }
+                    }
+                }
+            }
+        }
+        let mut stripes = Vec::new();
+        file.pack_expert_stripes(name, name, &mut stripes).unwrap();
+        assert_eq!(&stripes[..4 * POOL_CHUNK], &stripes[4 * POOL_CHUNK..8 * POOL_CHUNK]);
     }
 
     #[test]
