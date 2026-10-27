@@ -67,7 +67,20 @@ The earlier 1152-channel two-addend image also serves attention and MLP
 residual boundaries when packed with bias and residual instead of bias and
 position; this NPU check matched all BF16 outputs exactly.
 
-Remaining work includes full SigLIP attention and a 27-layer schedule,
+`build_gemma3_vision_attention.py` adds three images for SigLIP's global,
+bidirectional attention: Q×Kᵀ at M256×K128×N4096, 4096-key scaled BF16
+softmax, and P×V at M256×K4096×N256. `gemma3_vision_attention_pack.py`
+extracts the 72 channels of a selected Q/K/V head and pads its matrix
+dimensions. The scale is `1/sqrt(72)`; attention is over every one of the
+4096 patches. A whole image requires 16 heads and 16 query panels per head.
+On NPU, head 5 and query rows 256–511 passed against a full FP64/BF16 CPU
+reference: QK maximum relative error `1.27e-7`, 99.9888% softmax BF16
+matches with maximum absolute error `3.81e-6`, PV maximum relative error
+`1.47e-6`, and composed output maximum relative error `0.000182`.
+The 184 padded output channels were zero.
+
+Remaining work includes a full 16-head, 4096-query SigLIP attention schedule
+and a 27-layer tower schedule,
 real FLM tensor-layout conversion for all vision
 weights, variant-specific geometry checks, and image-to-text output
 acceptance. These 4B entries remain
