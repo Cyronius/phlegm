@@ -59,8 +59,17 @@ output projection bands, discards the final 192 padded channels, and passes
 the 2880 projected values, source bias, and residual through the NPU residual
 image. Its seven-call fixture check matched an independent decoded q4
 projection and FP32 residual reference at maximum relative error `1.68e-6`.
+`gptoss_attention_run.py` now composes the source QKV runner with YaRN RoPE,
+carried sink attention, and NPU BF16 finalization for one token. It validates
+the supplied GPT-OSS config against the fixed image geometry and derives full
+versus sliding mode from the layer schedule. Fixture checks passed all 13 NPU
+calls for layer 1 at position 0 (full, exact BF16 attention) and layer 0 at
+position 128 (sliding, maximum relative error `1.09e-6`). The new key and
+value matched the independent BF16 reference exactly in both cases. The
+published FLM GPT-OSS 20B config uses this alternating schedule and geometry:
+<https://huggingface.co/FastFlowLM/GPT-OSS-20B-NPU2/blob/main/config.json>.
 These checks use fixture activations and weights to verify the source/kernel
-ABI. The attention cache and 24-layer token schedule still need to consume
+ABI. The per-layer cache and 24-layer token schedule still need to consume
 these inputs with actual model weights.
 
 Remaining model work includes a complete layer and token scheduler, real

@@ -88,7 +88,7 @@ def inventory(registry: Path, xclbins_root: Path | None = None) -> dict:
                 state = "missing_recipe"
                 gaps = ["no complete NPU recipe"]
                 if family == "gpt-oss":
-                    gaps.append("13-image NPU bundle, source QKV and output/residual runners, router/expert input ABIs checked; scheduler and real-weight output checks remain")
+                    gaps.append("13-image NPU bundle, source attention and output/residual runners, router/expert input ABIs checked; 24-layer scheduler and real-weight output checks remain")
                 elif family == "gemma4e":
                     gaps.append("text and multimodal NPU primitives built; scheduler and real-weight output checks remain")
                 elif family == "gemma4-12b":
