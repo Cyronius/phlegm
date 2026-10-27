@@ -42,3 +42,12 @@ On 2026-10-27, all eight images passed synthetic FP64 checks. The 512-wide
 image carried NPU state through four 1024-row chunks; its final output had
 maximum absolute error `3.54e-7` at 4096 rows. A Gemma 4 model recipe and
 real source-weight validation remain to be implemented.
+
+`check_chain.py` checks all six E2B, E4B and 12B local/full text head layouts
+through the separate NPU head-norm, RoPE and attention images. It verifies
+Q/K/V norms, rotation, grouped K/V selection and 128-row attention. All six
+passed on 2026-10-27. Conditioned on the actual NPU norm and RoPE outputs,
+the worst attention error was `5.67e-6`. The worst end-to-end difference from
+the BF16-rounded FP64 oracle was `0.00505`: one E4B local query norm value
+rounded to an adjacent BF16 value and changed the scale-1 attention scores.
+The chain records both diagnostics in each `report.json`.
