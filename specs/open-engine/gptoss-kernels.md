@@ -12,6 +12,14 @@ output-projection and residual composition using this NPU handoff passed with
 maximum relative residual error `4.71e-4` on 2026-10-27. This is kernel
 coverage, not a deployable package or model-output acceptance.
 
+`build_gptoss_kernels.py` compiled 13 GPT-OSS images into a hashed manifest:
+input norm, q4 Q/K/V and output projections, YaRN RoPE, sliding and carried
+full attention, BF16 state finalization, residual addition, top-4 routing,
+MXFP4 expert projection, expert gate and mix, and the full 201,088-logit q4
+LM head. The bundle's 4097-row full-attention-to-residual composition passed
+on NPU, and its full LM head passed against an FP64 decoded-weight reference
+with maximum relative error `5.69e-6`.
+
 `recipes/gptoss_source.py` validates the complete 435-tensor public GPT-OSS
 20B q4nx header: all 24 layers, both router layouts, the expert payloads,
 attention projections, embedding, final norm, and LM head. The validator
