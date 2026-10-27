@@ -10,9 +10,9 @@ audio matrices use the same layout. The 12B multimodal matrices use row-major
 BF16. `gemma4_mm_source.py` converts either representation to the Phlegm
 pre-tiled B layout while preserving BF16 bits. The bundle builder found and
 compiled all 15 unique matrix shapes across the E2B vision/audio, E4B
-vision/audio, and unified 12B image/audio headers. The updated matrix plan
-also includes two im2col shapes for the audio subsampling convolutions.
-`build_gemma4_multimodal_ops.py` builds 26 additional operation images into a
+vision/audio, and unified 12B image/audio headers. The v2 matrix bundle also
+builds two im2col shapes for the audio subsampling convolutions, 17 images total.
+`build_gemma4_multimodal_ops.py` builds 27 additional operation images into a
 manifest with image hashes.
 
 | Primitive | Source | NPU check on 2026-10-27 |
@@ -30,6 +30,7 @@ manifest with image hashes.
 | Audio stride-2, pad-1 3×3 subsampling convolutions | `open_kernels/gemma4_audio_subsample.py`, `gemma4_audio_subsample_check.py` | Both 1→128 and 128→32 channel stages passed 256-pixel NPU checks; maximum relative errors `3.11e-8` and `5.40e-7` |
 | Audio subsampler LayerNorm/ReLU, 128 and 32 channels | `open_kernels/designs/gemma4_audio_subnorm/` | Both passed with exact BF16 output |
 | Audio relative local attention, 8 heads×12 queries×24 context rows | `open_kernels/designs/gemma4_audio_attn/`, `gemma4_audio_attention_pack.py` | NPU computes projected-relative-key scores and shift, softcap 50, masks, softmax and value reduction; maximum relative error `1.21e-6` |
+| Audio learned Q and fixed K scaling, 8 heads×12/24 rows×128 lanes | `open_kernels/designs/gemma4_audio_qk_scale/`, `gemma4_audio_qk_scale_pack.py` | BF16 learned per-dimension softplus, model Q/K factors and FP32 output passed full 8-head NPU check exactly |
 | Audio hidden RMSNorm/residual, width 1024; GLU/SiLU activations | `open_kernels/designs/gemma4_hidden_norm/`, `gemma4_audio_act/` | 1024-wide norm passed; 1024-wide GLU, 1024/4096-wide SiLU passed exactly at BF16 output precision |
 
 The single-query vision online path is numerically accurate, while the

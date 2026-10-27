@@ -27,6 +27,7 @@ OPERATIONS = {
     "vision_pool_280x9x768": ("gemma4_vision_pool/gemma4_vision_pool.py", {}),
     "audio_depthwise_256x1024": ("gemma4_audio_dw/gemma4_audio_dw.py", {}),
     "audio_relative_attn_8x12x24": ("gemma4_audio_attn/gemma4_audio_attn.py", {}),
+    "audio_qk_scale_8x12x24": ("gemma4_audio_qk_scale/gemma4_audio_qk_scale.py", {}),
     "audio_hidden_norm_1024": ("gemma4_hidden_norm/gemma4_hidden_norm.py", {"PHLEGM_HIDDEN": "1024"}),
     "audio_subnorm_128": ("gemma4_audio_subnorm/gemma4_audio_subnorm.py", {"PHLEGM_CHANNELS": "128"}),
     "audio_subnorm_32": ("gemma4_audio_subnorm/gemma4_audio_subnorm.py", {"PHLEGM_CHANNELS": "32"}),
@@ -43,7 +44,7 @@ for _width in (768, 1024, 2048, 3072, 4096):
 
 
 def plan() -> dict:
-    return {"format": "phlegm-gemma4-multimodal-ops-v4", "images": {
+    return {"format": "phlegm-gemma4-multimodal-ops-v5", "images": {
         name: {"design": design, "environment": env}
         for name, (design, env) in sorted(OPERATIONS.items())}}
 

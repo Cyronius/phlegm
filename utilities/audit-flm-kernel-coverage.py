@@ -83,6 +83,10 @@ def inventory(registry: Path, xclbins_root: Path | None = None) -> dict:
                 gaps = ["no complete NPU recipe"]
                 if family == "gpt-oss":
                     gaps.append("NPU-checked synthetic one-token layer lacks a deployable recipe")
+                elif family == "gemma4e":
+                    gaps.append("text and multimodal NPU primitives built; scheduler and real-weight output checks remain")
+                elif family == "gemma4-12b":
+                    gaps.append("text and multimodal matrix images built; scheduler and real-weight output checks remain")
             else:
                 raise ValueError(f"{name}: unreviewed FLM family {family!r}")
             images = None

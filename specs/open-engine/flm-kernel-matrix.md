@@ -15,9 +15,9 @@ Phlegm kernel implementation or a compatible ABI.
 | --- | --- | --- | --- | --- |
 | `nanbeige4.1:3b` | `nanbeige` | `llama3` | `recipe_source` | verify model config and packed geometry |
 | `qwen3vl-it:4b` | `qwen3vl` | `qwen3` | `recipe_source` | vision tower kernel route not established |
-| `gemma4-it:e2b` | `gemma4e` | `—` | `missing_recipe` | no complete NPU recipe |
-| `gemma4-it:e4b` | `gemma4e` | `—` | `missing_recipe` | no complete NPU recipe |
-| `gemma4-it:12b` | `gemma4-12b` | `—` | `missing_recipe` | no complete NPU recipe |
+| `gemma4-it:e2b` | `gemma4e` | `—` | `missing_recipe` | no complete NPU recipe; text and multimodal NPU primitives built; scheduler and real-weight output checks remain |
+| `gemma4-it:e4b` | `gemma4e` | `—` | `missing_recipe` | no complete NPU recipe; text and multimodal NPU primitives built; scheduler and real-weight output checks remain |
+| `gemma4-it:12b` | `gemma4-12b` | `—` | `missing_recipe` | no complete NPU recipe; text and multimodal matrix images built; scheduler and real-weight output checks remain |
 | `qwen3.5:0.8b` | `qwen3.5` | `qwen35` | `recipe_source` | vision tower kernel route not established |
 | `qwen3.5:2b` | `qwen3.5` | `qwen35` | `recipe_source` | vision tower kernel route not established |
 | `qwen3.5:4b` | `qwen3.5` | `qwen35` | `recipe_source` | vision tower kernel route not established |
