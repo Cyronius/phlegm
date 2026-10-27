@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,9 +12,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "open_kernels"))
-from recipes.gptoss_source import GptOssSource, ONE_EXPERT_CHUNKS, CHUNK  # noqa: E402
-from recipes.pack import expert_chunks, supertile_perm  # noqa: E402
+from recipes.gptoss_source import GptOssSource, ONE_EXPERT_CHUNKS, CHUNK, HEAD_BANDS  # noqa: E402
+from recipes.pack import expert_chunks, fuse_chunks, supertile_perm  # noqa: E402
 from export_gptoss_source import export  # noqa: E402
+from export_gptoss_head import export as export_head  # noqa: E402
 
 
 class SparseBytes:
@@ -118,6 +120,29 @@ def test_source_rejects_unsupported_call_indices(source):
         source.expert(0, 32, "gate")
     with pytest.raises(ValueError, match="layer"):
         source.constant(24, "sinks")
+    with pytest.raises(ValueError, match="head band"):
+        source.head_band(HEAD_BANDS)
+
+
+def test_head_band_fuses_half_chunks_in_q4_kernel_order(source, monkeypatch):
+    half = np.zeros((23, 2, CHUNK), np.uint8)
+    half[:, :, 0] = np.arange(46, dtype=np.uint8).reshape(23, 2)
+    monkeypatch.setattr(source, "_bytes", lambda *args, **kwargs: half.tobytes())
+    full = source.head_band(31)
+    assert full.shape == (24, 5120)
+    for kt in range(11):
+        for rb in range(2):
+            expected = fuse_chunks(half[2 * kt, rb], half[2 * kt + 1, rb])[0]
+            assert np.array_equal(full[2 * kt + rb], expected)
+    assert np.array_equal(full[22], fuse_chunks(half[22, 0], np.zeros(CHUNK, np.uint8))[0])
+    assert np.array_equal(full[23], fuse_chunks(half[22, 1], np.zeros(CHUNK, np.uint8))[0])
+
+
+def test_head_band_reads_only_its_own_container_slice(source):
+    band = 17
+    source.head_band(band)
+    start = source.reader.tensors["lm_head.weight"]["data_offsets"][0] + band * 23 * 2 * CHUNK
+    assert source.reader.mm.reads[-1] == (start, start + 23 * 2 * CHUNK)
 
 
 def test_exported_layer_has_all_attention_calls_and_recorded_bytes(source, tmp_path):
@@ -132,3 +157,19 @@ def test_exported_layer_has_all_attention_calls_and_recorded_bytes(source, tmp_p
     with pytest.raises(ValueError, match="distinct"):
         export(source, 0, tmp_path / "bad", (3, 3))
     assert not (tmp_path / "bad").exists()
+
+
+def test_head_export_streams_bands_and_records_digest(tmp_path):
+    class Source:
+        def head_band(self, band):
+            result = np.zeros((24, 5120), np.uint8)
+            result[0, 0] = band + 1
+            return result
+
+    out = tmp_path / "head"
+    report = export_head(Source(), out, bands=2)
+    data = (out / "head.bin").read_bytes()
+    assert len(data) == 2 * 24 * 5120
+    assert data[0] == 1 and data[24 * 5120] == 2
+    assert report["head"]["sha256"] == hashlib.sha256(data).hexdigest()
+    assert not report["complete"]

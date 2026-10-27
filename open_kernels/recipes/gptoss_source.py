@@ -14,6 +14,7 @@ from ml_dtypes import bfloat16
 from designs.gptoss_expert_gemv.pack import ONE_EXPERT_CHUNKS, projection as expert_projection
 from designs.gptoss_o_gemv.pack import projection as o_projection
 from designs.gptoss_qkv_gemv.pack import ROLE_ROWS, projection as qkv_projection
+from recipes.pack import fuse_chunks
 
 CHUNK = 2560
 EXPERT_SHAPE = (32, 69, 23, 4, CHUNK)
@@ -23,6 +24,8 @@ ATTN_SHAPES = {
     "v": (4, 23, 4, CHUNK),
     "o": (24, 32, 4, CHUNK),
 }
+HEAD_BANDS = 201088 // 64
+HEAD_SHAPE = (HEAD_BANDS, 23, 2, CHUNK)
 CONSTANTS = {
     "input_norm": ("input_layernorm.weight", (2880,)),
     "post_attention_norm": ("post_attention_layernorm.weight", (2880,)),
@@ -115,3 +118,20 @@ class GptOssSource:
         name = self._prefix(layer) + f"mlp.experts.{role}_proj_bias"
         return np.frombuffer(self._bytes(name, "BF16", (32, 2880),
                                          expert_id * 2880 * 2, 2880 * 2), bfloat16).copy()
+
+    def head_band(self, band: int) -> np.ndarray:
+        """Return q4_1 uint8[24,5120] for one 64-logit, 3072-wide head band.
+
+        The container has 23 128-column tiles and two 32-row halves. Pair
+        adjacent tiles for the ordinary 256-column q4 kernel, then append a
+        zero tile. The activation's final 192 channels are zero at runtime.
+        """
+        if not isinstance(band, int) or band < 0 or band >= HEAD_BANDS:
+            raise ValueError(f"GPT-OSS head band must be in [0,{HEAD_BANDS})")
+        one = 23 * 2 * CHUNK
+        raw = self._bytes("lm_head.weight", "I8", HEAD_SHAPE, band * one, one)
+        half = np.zeros((24, 2, CHUNK), np.uint8)
+        half[:23] = np.frombuffer(raw, np.uint8).reshape(23, 2, CHUNK)
+        full = fuse_chunks(half[0::2].reshape(-1, CHUNK),
+                           half[1::2].reshape(-1, CHUNK))
+        return full.reshape(24, 5120)

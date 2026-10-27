@@ -107,3 +107,25 @@ for this check. Its source reads and output inventory are tested against the
 pinned container header using virtual payloads. The resulting bundle is a
 kernel input artifact; a runtime pack plan, token embedding, LM head, cache
 manager and model dispatch still need implementation and model validation.
+
+The same adapter packs `lm_head.weight` one 64-logit band at a time. It fuses
+the container's 128-column q4_1 halves into the existing q4 LM-head kernel's
+256-column chunks, pads the input from 2880 to 3072 with zeros and writes
+the 201088-logit pool without holding it all in memory:
+
+```bash
+python open_kernels/export_gptoss_head.py \
+  --model /path/to/model.q4nx --out target/gptoss-head-source
+LMHEAD_N=201088 LMHEAD_K=3072 LMHEAD_CORES=8 \
+  dibs run build --label 'Build GPT-OSS LM head' --eta 25m -- \
+  python open_kernels/build_design.py \
+  open_kernels/designs/lm_head_q4/lm_head_q4.py target/gptoss-lmhead-build
+```
+
+The full-size image built and passed a synthetic 201088-logit NPU check on
+2026-10-27, with two distinct quantized bands alternating across the whole
+weight stream. Its maximum relative error was 5.689e-6 and cosine
+0.999999999988 against decoded-weight FP64 products. Reproduce with
+`open_kernels/gptoss_lm_head_check.py --bands 3142` and a full-size build.
+The test checks the complete image geometry and stream traversal; it does
+not use the absent model container or establish output-token quality.
