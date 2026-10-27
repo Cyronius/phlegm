@@ -65,6 +65,13 @@ pub struct Gguf<R: Read + Seek> {
     tensors: HashMap<String, TensorInfo>,
 }
 
+/// Byte ranges at the start of a Qwen3.5 MoE layer's NPU weight pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertRegions {
+    pub up_gate_bytes: u64,
+    pub down_bytes: u64,
+}
+
 /// Check a direct-GGUF bundle before taking the NPU lock or hashing large weights.
 /// Legacy model directories without model.gguf continue through the reference
 /// bridge until the Rust inference path replaces them.
@@ -188,6 +195,26 @@ impl<R: Read + Seek> Gguf<R> {
 
     pub fn tensors(&self) -> &HashMap<String, TensorInfo> {
         &self.tensors
+    }
+
+    /// Stream the routed experts of one Qwen3.5 MoE layer in NPU pool order.
+    /// The caller can write this directly into a resident layer buffer;
+    /// shared experts and attention weights follow in later pool regions.
+    pub fn pack_qwen35_moe_experts<W: Write>(&mut self, layer: usize, out: &mut W)
+        -> Result<ExpertRegions, String> {
+        let up = format!("blk.{layer}.ffn_up_exps.weight");
+        let gate = format!("blk.{layer}.ffn_gate_exps.weight");
+        let down = format!("blk.{layer}.ffn_down_exps.weight");
+        let (experts, ff, hidden, _) = self.expert_shape(&up)?;
+        let (gate_experts, gate_ff, gate_hidden, _) = self.expert_shape(&gate)?;
+        let (down_experts, down_hidden, down_ff, _) = self.expert_shape(&down)?;
+        if (gate_experts, gate_ff, gate_hidden) != (experts, ff, hidden)
+            || (down_experts, down_hidden, down_ff) != (experts, hidden, ff) {
+            return Err(format!("GGUF layer {layer} expert up/gate/down shapes are inconsistent"));
+        }
+        let up_gate_bytes = self.pack_expert_stripes(&up, &gate, out)?;
+        let down_bytes = self.pack_expert_down(&down, out)?;
+        Ok(ExpertRegions { up_gate_bytes, down_bytes })
     }
 
     fn read_blocks(&mut self, name: &str, block: u64, block_bytes: usize, dst: &mut [u8]) -> Result<(), String> {
@@ -452,6 +479,10 @@ mod tests {
     }
 
     fn fixture_with_quants(quants: [Quant; 3]) -> Vec<u8> {
+        fixture_with_rows(quants, 128)
+    }
+
+    fn fixture_with_rows(quants: [Quant; 3], rows: u16) -> Vec<u8> {
         let names = ["blk.0.ffn_up_exps.weight", "blk.0.ffn_gate_exps.weight", "blk.0.ffn_down_exps.weight"];
         let mut data = Vec::new();
         let mut offsets = Vec::new();
@@ -459,7 +490,7 @@ mod tests {
             align(&mut data);
             offsets.push(data.len() as u64);
             for expert in 0..2u8 {
-                for row in 0..128u16 {
+                for row in 0..rows {
                     for kb in 0..8u8 { data.extend(source_block(*quant, role as u8, expert, row, kb)); }
                 }
             }
@@ -476,7 +507,7 @@ mod tests {
         for ((name, quant), offset) in names.iter().zip(quants).zip(offsets) {
             string(&mut file, name);
             u32le(&mut file, 3);
-            for d in [256, 128, 2] { u64le(&mut file, d); }
+            for d in [256, rows as u64, 2] { u64le(&mut file, d); }
             u32le(&mut file, if quant == Quant::Q4_0 { 2 } else { 3 });
             u64le(&mut file, offset);
         }
@@ -622,6 +653,27 @@ mod tests {
         assert_eq!(f32::from_le_bytes(gate[1024..1028].try_into().unwrap()), -8.0);
         assert_eq!(pool_code(up, 0, 0), 0);
         assert_eq!(pool_code(gate, 0, 0), 1);
+    }
+
+    #[test]
+    fn qwen35_layer_packs_expert_regions_after_validating_geometry() {
+        let mut valid = Gguf::new(Cursor::new(fixture_with_rows([
+            Quant::Q4_1, Quant::Q4_0, Quant::Q4_0,
+        ], 256))).unwrap();
+        let mut pool = Vec::new();
+        let regions = valid.pack_qwen35_moe_experts(0, &mut pool).unwrap();
+        assert_eq!(regions, ExpertRegions {
+            up_gate_bytes: (2 * 2 * 2 * 4 * POOL_CHUNK) as u64,
+            down_bytes: (2 * 2 * 4 * POOL_CHUNK) as u64,
+        });
+        assert_eq!(pool.len() as u64, regions.up_gate_bytes + regions.down_bytes);
+        let down = &pool[regions.up_gate_bytes as usize..];
+        assert_eq!(f32::from_le_bytes(down[1024..1028].try_into().unwrap()), -8.0);
+
+        let mut invalid = Gguf::new(Cursor::new(fixture())).unwrap();
+        let mut out = Vec::new();
+        assert!(invalid.pack_qwen35_moe_experts(0, &mut out).unwrap_err().contains("inconsistent"));
+        assert!(out.is_empty());
     }
 
     #[test]
