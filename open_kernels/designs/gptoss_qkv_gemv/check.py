@@ -11,9 +11,10 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "model"))
 from q4nx import dq_chunks_q4_1  # noqa: E402
-from pack import CHUNK, K_BLOCKS, ROLE_ROWS, projection  # noqa: E402
+from designs.gptoss_qkv_gemv.pack import CHUNK, K_BLOCKS, ROLE_ROWS, projection  # noqa: E402
 
 
 def fixture(role: str, start_band: int, bands: int,

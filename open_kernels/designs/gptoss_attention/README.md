@@ -57,3 +57,11 @@ at positions 127 and 65535 with sublayer maximum relative errors 3.331e-4
 and 2.265e-6, and cosines above 0.99999997. It still uses synthetic weights
 and a pre-normalized activation; a packaged GPT-OSS layer needs its norms,
 MoE composition, cache and runtime wiring.
+
+`check_layer.py` adds the input and post-attention RMSNorm and feeds the
+attention residual into the existing top-four MXFP4 expert chain. The full
+synthetic one-token layer passed on NPU at positions 127 and 65535. Maximum
+relative errors were 2.783e-3 and 2.658e-7, with cosines 0.99999748 and
+0.99999999999998. It checks arithmetic across separate compiled images;
+packing a real layer, managing persistent KV state and dispatching a model
+remain open.

@@ -11,10 +11,9 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "designs" / "gptoss_qkv_gemv"))
 sys.path.insert(0, str(ROOT / "model"))
 sys.path.insert(0, str(ROOT))
-from check import fixture as qkv_fixture, run as qkv_run  # noqa: E402
+from designs.gptoss_qkv_gemv.check import fixture as qkv_fixture, run as qkv_run  # noqa: E402
 from recipes.spec import ModelSpec  # noqa: E402
 from replica_dense import rope  # noqa: E402
 from replica_gptoss import sink_attention  # noqa: E402
@@ -45,7 +44,8 @@ def invoke(driver: Path, build: Path, out: Path,
 
 
 def run(driver: Path, qkv_build: Path, rope_build: Path, attn_build: Path,
-        out: Path, pos: int) -> dict:
+        out: Path, pos: int, activation: np.ndarray | None = None,
+        oracle_activation: np.ndarray | None = None) -> dict:
     if pos < 127 or pos >= CONFIG["max_position_embeddings"]:
         raise ValueError("position must be from 127 to 131071 for the 128-row window")
     if not driver.is_file():
@@ -55,7 +55,13 @@ def run(driver: Path, qkv_build: Path, rope_build: Path, attn_build: Path,
             if not (build / name).is_file():
                 raise FileNotFoundError(build / name)
     rng = np.random.default_rng(20261028 + pos)
-    x = rng.normal(0, 0.5, 2880).astype(np.float32).astype(bfloat16)
+    x = (rng.normal(0, 0.5, 2880).astype(np.float32).astype(bfloat16)
+         if activation is None else np.asarray(activation))
+    if x.shape != (2880,) or x.dtype != bfloat16:
+        raise ValueError("QKV input must be BF16[2880]")
+    golden_x = x if oracle_activation is None else np.asarray(oracle_activation)
+    if golden_x.shape != (2880,) or golden_x.dtype != bfloat16:
+        raise ValueError("oracle QKV input must be BF16[2880]")
     outputs = {}
     references = {}
     projection_reports = []
@@ -68,7 +74,7 @@ def run(driver: Path, qkv_build: Path, rope_build: Path, attn_build: Path,
             projection_reports.append(qkv_run(driver, qkv_build, directory,
                                               role, start, 16, x))
             chunks.append(np.fromfile(directory / "result.bin", np.float32))
-            gold.append(qkv_fixture(role, start, 16, x)[2])
+            gold.append(qkv_fixture(role, start, 16, golden_x)[2])
         outputs[role] = np.concatenate(chunks)
         references[role] = np.concatenate(gold)
 

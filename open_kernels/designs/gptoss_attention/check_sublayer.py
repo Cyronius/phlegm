@@ -16,9 +16,13 @@ from designs.gptoss_o_gemv.check import fixture as o_fixture, run as o_run  # no
 
 
 def run(driver: Path, qkv_build: Path, rope_build: Path, attn_build: Path,
-        o_build: Path, residual_build: Path, out: Path, pos: int) -> dict:
+        o_build: Path, residual_build: Path, out: Path, pos: int,
+        activation: np.ndarray | None = None,
+        oracle_activation: np.ndarray | None = None,
+        residual_input: np.ndarray | None = None) -> dict:
     chain = out / "chain"
-    chain_report = attention_chain(driver, qkv_build, rope_build, attn_build, chain, pos)
+    chain_report = attention_chain(driver, qkv_build, rope_build, attn_build, chain,
+                                   pos, activation, oracle_activation)
     actual_attn = np.fromfile(chain / "attention" / "result.bin", np.float32).astype(bfloat16)
     golden_attn = np.fromfile(chain / "attention" / "expected.bin", np.float32).astype(bfloat16)
     if actual_attn.shape != (4096,) or golden_attn.shape != (4096,):
@@ -36,13 +40,17 @@ def run(driver: Path, qkv_build: Path, rope_build: Path, attn_build: Path,
     golden_projected = np.concatenate(golden_projected)[:2880]
 
     rng = np.random.default_rng(20261029 + pos)
-    residual = rng.normal(0, 0.7, 2880).astype(np.float32)
+    residual = (rng.normal(0, 0.7, 2880).astype(np.float32)
+                if residual_input is None else np.asarray(residual_input, np.float32))
+    if residual.shape != (2880,):
+        raise ValueError("attention residual must be FP32[2880]")
     bias = rng.normal(0, 0.1, 2880).astype(np.float32).astype(bfloat16)
     pair = np.stack((residual.reshape(45, 64), projected.reshape(45, 64)), axis=1)
     actual = invoke(driver, residual_build, out / "residual",
                     [("pair", pair), ("bias", bias)], np.dtype(np.float32), 2880)
     expected = residual.astype(np.float64) + golden_projected.astype(np.float64) + \
                bias.astype(np.float64)
+    (out / "residual" / "expected.bin").write_bytes(expected.astype(np.float32).tobytes())
     a = actual.astype(np.float64)
     max_abs = float(np.max(np.abs(a - expected)))
     max_rel = float(max_abs / max(np.max(np.abs(expected)), 1e-30))

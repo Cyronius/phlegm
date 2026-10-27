@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT / "model"))
 from gptoss_router.check import cases, validate  # noqa: E402
 from gptoss_expert_gemv.check import fixture, reference  # noqa: E402
 from replica_gptoss import clamped_swiglu  # noqa: E402
-from check import invoke  # noqa: E402
+from gptoss_mix.check import invoke  # noqa: E402
 
 HIDDEN = 2880
 PADDED = 23 * 128
@@ -44,7 +44,11 @@ def score(actual: np.ndarray, expected: np.ndarray) -> dict:
 
 def run(driver: Path, router_build: Path, projection_build: Path,
         gate_build: Path, mixer_build: Path, out: Path,
-        residual_build: Path | None = None) -> dict:
+        residual_build: Path | None = None,
+        activation: np.ndarray | None = None,
+        oracle_activation: np.ndarray | None = None,
+        residual_input: np.ndarray | None = None,
+        oracle_residual_input: np.ndarray | None = None) -> dict:
     if not driver.is_file():
         raise FileNotFoundError(driver)
     builds = (router_build, projection_build, gate_build, mixer_build)
@@ -53,14 +57,19 @@ def run(driver: Path, router_build: Path, projection_build: Path,
             if not (build / name).is_file():
                 raise FileNotFoundError(build / name)
     out.mkdir(parents=True, exist_ok=True)
-    _, x, router_matrix, bias = cases()[0]
+    _, fixture_x, router_matrix, bias = cases()[1 if activation is not None else 0]
+    x = fixture_x if activation is None else np.asarray(activation)
+    ref_x = x if oracle_activation is None else np.asarray(oracle_activation)
+    if x.shape != (HIDDEN,) or ref_x.shape != (HIDDEN,) or \
+            x.dtype != bfloat16 or ref_x.dtype != bfloat16:
+        raise ValueError("MoE and oracle activations must be BF16[2880]")
     x_bias = np.concatenate([x, bias])
     route_bytes = invoke(driver, router_build, out / "router",
                          [x_bias, router_matrix], 256)
     ids = np.frombuffer(route_bytes, dtype=np.int32, count=4).copy()
     weights = np.frombuffer(route_bytes, dtype=np.float32, count=4, offset=16).copy()
     logits = np.frombuffer(route_bytes, dtype=np.float32, count=32, offset=32).copy()
-    logits_ref = x.astype(np.float64) @ router_matrix.astype(np.float64)
+    logits_ref = ref_x.astype(np.float64) @ router_matrix.astype(np.float64)
     logits_ref += bias.astype(np.float64)
     validate(ids, weights, logits, logits_ref)
     ref_top = np.argsort(-logits_ref, kind="stable")[:4]
@@ -68,6 +77,8 @@ def run(driver: Path, router_build: Path, projection_build: Path,
     ref_weights = e / e.sum()
     x_pad = np.zeros(PADDED, dtype=bfloat16)
     x_pad[:HIDDEN] = x
+    ref_x_pad = np.zeros(PADDED, dtype=bfloat16)
+    ref_x_pad[:HIDDEN] = ref_x
     down_outputs = []
     down_refs = []
     stage_errors = []
@@ -85,8 +96,8 @@ def run(driver: Path, router_build: Path, projection_build: Path,
         down_x[:HIDDEN] = hidden
         down = f32(invoke(driver, projection_build, d / "down_projection",
                           [down_x, role_chunks[2]], HIDDEN * 4))
-        gate_ref = reference(x_pad, role_chunks[0]).ravel()
-        up_ref = reference(x_pad, role_chunks[1]).ravel()
+        gate_ref = reference(ref_x_pad, role_chunks[0]).ravel()
+        up_ref = reference(ref_x_pad, role_chunks[1]).ravel()
         # Large random MXFP4 products legitimately saturate the sigmoid.
         with np.errstate(over="ignore"):
             hidden_ref = clamped_swiglu(gate_ref, up_ref).astype(bfloat16)
@@ -106,13 +117,18 @@ def run(driver: Path, router_build: Path, projection_build: Path,
     residual_score = None
     if residual_build is not None:
         rng = np.random.default_rng(20261028)
-        residual = rng.normal(0, 2, HIDDEN).astype(np.float32)
+        residual = (rng.normal(0, 2, HIDDEN).astype(np.float32)
+                    if residual_input is None else np.asarray(residual_input, np.float32))
+        ref_residual = (residual if oracle_residual_input is None else
+                        np.asarray(oracle_residual_input, np.float32))
+        if residual.shape != (HIDDEN,) or ref_residual.shape != (HIDDEN,):
+            raise ValueError("MoE residual and oracle residual must be FP32[2880]")
         pair = np.ascontiguousarray(np.stack([residual.reshape(45, 64),
                                               actual.reshape(45, 64)], axis=1))
         zero_bias = np.zeros(HIDDEN, dtype=bfloat16)
         got = f32(invoke(driver, residual_build, out / "ffn_residual",
                          [pair, zero_bias], HIDDEN * 4))
-        residual_score = score(got, residual.astype(np.float64) + expected)
+        residual_score = score(got, ref_residual.astype(np.float64) + expected)
     passed = (np.array_equal(ids, ref_top) and
               all(s["max_relative_error"] < 0.01 for s in stage_errors) and
               result_score["max_relative_error"] < 0.01 and
