@@ -23,6 +23,7 @@ compositions, not an exported model or native generation path.
 | FLM text weight mapping | `open_kernels/gemma4_source.py` | Public E2B, E4B, and 12B q4nx headers passed 597, 727, and 668 required tensor shape/byte checks; 12B's signed q4 and q8 16-row tile repackers passed exact synthetic value checks |
 | Bounded source reads | `open_kernels/gemma4_text_source.py` | E2B/E4B/12B public headers passed complete required-tensor and nonoverlapping byte-extent checks; synthetic reads cover striped q4 projection bands, 12B signed q4 and q8 head bands, BF16 per-layer matrices, and scaled embedding rows |
 | Source-format Q projection on NPU | `open_kernels/gemma4_source_projection_check.py` | Complete layer-zero Q projection passed from E2B, E4B, and 12B source-format fixtures; maximum relative errors `5.27e-6`, `6.76e-6`, and `9.34e-6` against independent FP64 source decoders |
+| 12B source-format q8 head on NPU | `open_kernels/gemma4_source_head_check.py` | One 128-logit band passed at maximum relative error `5.14e-6` against an independent decoder of FLM's 16-row q8 source tiles |
 | Per-layer context norm and token mix | `open_kernels/designs/gemma4_ple_input/` | E2B/E4B with-token and context-only variants compiled and passed NPU checks |
 | Full-width MLP GELU-tanh and up product | `open_kernels/designs/gemma4_gelu_mul/` | All four 6144/10240/12288/15360-wide images compiled and passed NPU checks (maximum absolute error `3.05e-5`) |
 
