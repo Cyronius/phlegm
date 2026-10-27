@@ -60,7 +60,10 @@ def inventory(registry: Path, xclbins_root: Path | None = None) -> dict:
                 if family in ALIAS_NEEDS_CONFIG:
                     gaps.append("verify model config and packed geometry")
                 if model.get("vlm") and family in VISION_TEXT_ONLY:
-                    gaps.append("vision tower kernel route not established")
+                    if family == "gemma3":
+                        gaps.append("4B vision projector images built; tower and variant geometry checks remain")
+                    else:
+                        gaps.append("vision tower kernel route not established")
                 if name == "qwen3.8:27b":
                     gaps.append("text recipe composes; vision tower route and model validation remain open")
             elif family in SPECIAL_ROUTE:
