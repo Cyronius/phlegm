@@ -2,9 +2,14 @@
 
 Both `gpt-oss:20b` and `gpt-oss-sg:20b` remain `missing_recipe` in the pinned
 46-entry FLM matrix. Phlegm has open NPU primitives for Q/K/V and output
-projection, RoPE, attention state, router, expert MXFP4 decoding and GEMV,
-gating, normalization, residual, and q4 LM head. These primitives include
-synthetic NPU checks, including a one-token layer composition. This is kernel
+projection, RoPE, attention state and BF16 finalization, router, expert MXFP4
+decoding and GEMV, gating, normalization, residual, and q4 LM head. These include
+synthetic NPU checks, including a one-token layer composition. The long-context
+finalizer takes the 64×68 FP32 online-softmax state and produces the 4096 BF16
+values consumed by the output GEMV. It passed exact BF16 checks against both
+synthetic state and a saved 4097-row attention result. A 4097-row attention to
+output-projection and residual composition using this NPU handoff passed with
+maximum relative residual error `4.71e-4` on 2026-10-27. This is kernel
 coverage, not a deployable package or model-output acceptance.
 
 `recipes/gptoss_source.py` validates the complete 435-tensor public GPT-OSS

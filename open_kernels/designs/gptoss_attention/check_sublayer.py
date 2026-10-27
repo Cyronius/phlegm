@@ -20,12 +20,15 @@ def run(driver: Path, qkv_build: Path, rope_build: Path, attn_build: Path,
         activation: np.ndarray | None = None,
         oracle_activation: np.ndarray | None = None,
         residual_input: np.ndarray | None = None,
-        full_state_build: Path | None = None) -> dict:
+        full_state_build: Path | None = None,
+        finalize_build: Path | None = None) -> dict:
     chain = out / "chain"
     chain_report = attention_chain(driver, qkv_build, rope_build, attn_build, chain,
                                    pos, activation, oracle_activation,
-                                   full_state_build)
-    actual_attn = np.fromfile(chain / "attention" / "result.bin", np.float32).astype(bfloat16)
+                                   full_state_build, finalize_build)
+    actual_attn = (np.fromfile(chain / "attention" / "projection_input.bin", bfloat16)
+                   if finalize_build is not None else
+                   np.fromfile(chain / "attention" / "result.bin", np.float32).astype(bfloat16))
     golden_attn = np.fromfile(chain / "attention" / "expected.bin", np.float32).astype(bfloat16)
     if actual_attn.shape != (4096,) or golden_attn.shape != (4096,):
         raise AssertionError("attention projection input must have 4096 values")
@@ -61,6 +64,7 @@ def run(driver: Path, qkv_build: Path, rope_build: Path, attn_build: Path,
               "position": pos, "attention": chain_report,
               "o_projection_calls": len(projection_reports),
               "o_projection_max_relative_error": max(r["max_relative_error"] for r in projection_reports),
+              "npu_attention_finalizer": finalize_build is not None,
               "sublayer_max_absolute_error": max_abs,
               "sublayer_max_relative_error": max_rel,
               "sublayer_cosine": cosine,
@@ -82,10 +86,16 @@ def main() -> None:
     p.add_argument("--residual-build", required=True, type=Path)
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--pos", type=int, default=127)
+    p.add_argument("--full-state-build", type=Path)
+    p.add_argument("--finalize-build", type=Path)
     a = p.parse_args()
     print(json.dumps(run(a.driver.resolve(), a.qkv_build.resolve(), a.rope_build.resolve(),
                          a.attn_build.resolve(), a.o_build.resolve(),
-                         a.residual_build.resolve(), a.out.resolve(), a.pos), indent=2))
+                         a.residual_build.resolve(), a.out.resolve(), a.pos,
+                         full_state_build=a.full_state_build.resolve()
+                         if a.full_state_build else None,
+                         finalize_build=a.finalize_build.resolve()
+                         if a.finalize_build else None), indent=2))
 
 
 if __name__ == "__main__":
