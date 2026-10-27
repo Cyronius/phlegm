@@ -72,6 +72,13 @@ pub struct ExpertRegions {
     pub down_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedRegions {
+    pub up_bytes: u64,
+    pub gate_bytes: u64,
+    pub down_bytes: u64,
+}
+
 /// Check a direct-GGUF bundle before taking the NPU lock or hashing large weights.
 /// Legacy model directories without model.gguf continue through the reference
 /// bridge until the Rust inference path replaces them.
@@ -242,6 +249,30 @@ impl<R: Read + Seek> Gguf<R> {
             }
         }
         Ok(written)
+    }
+
+    /// Append Qwen3.5 MoE shared up, gate, and down matrices to the layer pool.
+    /// They follow the routed expert regions in the kernel recipe's pool layout.
+    pub fn pack_qwen35_shared_experts<W: Write>(&mut self, layer: usize, out: &mut W)
+        -> Result<SharedRegions, String> {
+        let up = format!("blk.{layer}.ffn_up_shexp.weight");
+        let gate = format!("blk.{layer}.ffn_gate_shexp.weight");
+        let down = format!("blk.{layer}.ffn_down_shexp.weight");
+        let shape = |name: &str| -> Result<(u64, u64), String> {
+            let info = self.tensor(name).ok_or_else(|| format!("missing GGUF tensor {name}"))?;
+            if info.dims.len() != 2 {
+                return Err(format!("GGUF tensor {name} is not a matrix"));
+            }
+            Ok((info.dims[0], info.dims[1]))
+        };
+        let (hidden, ff) = shape(&up)?;
+        if shape(&gate)? != (hidden, ff) || shape(&down)? != (ff, hidden) {
+            return Err(format!("GGUF layer {layer} shared expert shapes are inconsistent"));
+        }
+        let up_bytes = self.pack_q4_matrix(&up, 2, out)?;
+        let gate_bytes = self.pack_q4_matrix(&gate, 2, out)?;
+        let down_bytes = self.pack_q4_matrix(&down, 2, out)?;
+        Ok(SharedRegions { up_bytes, gate_bytes, down_bytes })
     }
 
     fn read_blocks(&mut self, name: &str, block: u64, block_bytes: usize, dst: &mut [u8]) -> Result<(), String> {
@@ -606,6 +637,39 @@ mod tests {
         file
     }
 
+    fn shared_fixture() -> Vec<u8> {
+        let names = ["blk.0.ffn_up_shexp.weight", "blk.0.ffn_gate_shexp.weight",
+                     "blk.0.ffn_down_shexp.weight"];
+        let quants = [Quant::Q4_1, Quant::Q4_0, Quant::Q4_1];
+        let mut data = Vec::new();
+        let mut offsets = Vec::new();
+        for (role, quant) in quants.iter().enumerate() {
+            align(&mut data);
+            offsets.push(data.len() as u64);
+            for row in 0..256u16 {
+                for kb in 0..8u8 {
+                    data.extend(source_block(*quant, role as u8, 0, row, kb));
+                }
+            }
+        }
+        let mut file = Vec::new();
+        file.extend_from_slice(b"GGUF");
+        u32le(&mut file, 3);
+        u64le(&mut file, 3);
+        u64le(&mut file, 0);
+        for ((name, quant), offset) in names.iter().zip(quants).zip(offsets) {
+            string(&mut file, name);
+            u32le(&mut file, 2);
+            u64le(&mut file, 256);
+            u64le(&mut file, 256);
+            u32le(&mut file, if quant == Quant::Q4_0 { 2 } else { 3 });
+            u64le(&mut file, offset);
+        }
+        align(&mut file);
+        file.extend(data);
+        file
+    }
+
     fn pool_code(chunk: &[u8], row: usize, col: usize) -> u8 {
         let p = (row / 16) * 4096 + col * 16 + row % 16;
         let b = chunk[2048 + p / 2];
@@ -751,6 +815,28 @@ mod tests {
             }
         }
         assert!(file.pack_q4_matrix(name, 3, &mut Vec::new()).unwrap_err().contains("row_group"));
+    }
+
+    #[test]
+    fn qwen35_shared_experts_follow_pool_order() {
+        let mut file = Gguf::new(Cursor::new(shared_fixture())).unwrap();
+        let mut pool = Vec::new();
+        let regions = file.pack_qwen35_shared_experts(0, &mut pool).unwrap();
+        assert_eq!(regions, SharedRegions {
+            up_bytes: (8 * POOL_CHUNK) as u64,
+            gate_bytes: (8 * POOL_CHUNK) as u64,
+            down_bytes: (8 * POOL_CHUNK) as u64,
+        });
+        assert_eq!(pool.len(), 24 * POOL_CHUNK);
+        for (i, min) in [(0, 0.5), (1, -8.0), (2, 0.5)] {
+            let chunk = &pool[i * 8 * POOL_CHUNK..(i * 8 + 1) * POOL_CHUNK];
+            assert_eq!(f32::from_le_bytes(chunk[1024..1028].try_into().unwrap()), min);
+            assert_eq!(pool_code(chunk, 0, 0), i as u8);
+        }
+        let mut missing = Gguf::new(Cursor::new(matrix_fixture())).unwrap();
+        let mut untouched = Vec::new();
+        assert!(missing.pack_qwen35_shared_experts(0, &mut untouched).unwrap_err().contains("missing"));
+        assert!(untouched.is_empty());
     }
 
     #[test]
