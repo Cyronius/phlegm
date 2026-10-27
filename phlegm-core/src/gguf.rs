@@ -217,6 +217,33 @@ impl<R: Read + Seek> Gguf<R> {
         Ok(ExpertRegions { up_gate_bytes, down_bytes })
     }
 
+    /// Stream a two-dimensional GGUF Q4 matrix into the f32-scale NPU pool.
+    /// `row_group` is 2 for ordinary projection bands and 4 for MoE bands.
+    pub fn pack_q4_matrix<W: Write>(&mut self, name: &str, row_group: u64, out: &mut W)
+        -> Result<u64, String> {
+        if row_group != 2 && row_group != 4 {
+            return Err("GGUF Q4 matrix row_group must be 2 or 4".into());
+        }
+        let info = self.tensor(name).ok_or_else(|| format!("missing GGUF tensor {name}"))?;
+        if info.dims.len() != 2 || info.dims[0] % 256 != 0
+            || info.dims[1] % (32 * row_group) != 0 {
+            return Err(format!("GGUF tensor {name} needs [K, rows] with 256-column and {}-row bands", 32 * row_group));
+        }
+        let (cols, rows, quant) = (info.dims[0], info.dims[1], Quant::from_type(info.gguf_type)?);
+        let mut written = 0u64;
+        for band in 0..rows / (32 * row_group) {
+            for k in 0..cols / 256 {
+                for rb in 0..row_group {
+                    let chunk = self.pack_chunk(name, 0, rows, cols,
+                                                band * 32 * row_group + rb * 32, k * 256, quant)?;
+                    out.write_all(&chunk).map_err(|e| e.to_string())?;
+                    written += POOL_CHUNK as u64;
+                }
+            }
+        }
+        Ok(written)
+    }
+
     fn read_blocks(&mut self, name: &str, block: u64, block_bytes: usize, dst: &mut [u8]) -> Result<(), String> {
         let info = self.tensors.get(name).ok_or_else(|| format!("missing GGUF tensor {name}"))?;
         let n = info.byte_len.ok_or_else(|| format!("GGUF tensor {name} has unsupported type {}", info.gguf_type))?;
@@ -556,6 +583,29 @@ mod tests {
         file
     }
 
+    fn matrix_fixture() -> Vec<u8> {
+        let mut data = Vec::new();
+        for row in 0..128u16 {
+            for kb in 0..16u8 {
+                data.extend(source_block(Quant::Q4_1, 0, 0, row, kb));
+            }
+        }
+        let mut file = Vec::new();
+        file.extend_from_slice(b"GGUF");
+        u32le(&mut file, 3);
+        u64le(&mut file, 1);
+        u64le(&mut file, 0);
+        string(&mut file, "blk.0.ffn_gate_shexp.weight");
+        u32le(&mut file, 2);
+        u64le(&mut file, 512);
+        u64le(&mut file, 128);
+        u32le(&mut file, 3);
+        u64le(&mut file, 0);
+        align(&mut file);
+        file.extend(data);
+        file
+    }
+
     fn pool_code(chunk: &[u8], row: usize, col: usize) -> u8 {
         let p = (row / 16) * 4096 + col * 16 + row % 16;
         let b = chunk[2048 + p / 2];
@@ -674,6 +724,33 @@ mod tests {
         let mut out = Vec::new();
         assert!(invalid.pack_qwen35_moe_experts(0, &mut out).unwrap_err().contains("inconsistent"));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn q4_matrix_packs_standard_and_moe_band_order() {
+        let name = "blk.0.ffn_gate_shexp.weight";
+        let mut file = Gguf::new(Cursor::new(matrix_fixture())).unwrap();
+        for row_group in [2, 4] {
+            let mut pool = Vec::new();
+            assert_eq!(file.pack_q4_matrix(name, row_group, &mut pool).unwrap(), (8 * POOL_CHUNK) as u64);
+            for chunk_idx in 0..8usize {
+                let chunk = &pool[chunk_idx * POOL_CHUNK..(chunk_idx + 1) * POOL_CHUNK];
+                let per_band = row_group as usize * 2;
+                let band = chunk_idx / per_band;
+                let inside = chunk_idx % per_band;
+                let row0 = band * row_group as usize * 32 + (inside % row_group as usize) * 32;
+                let kb0 = (inside / row_group as usize) * 8;
+                assert_eq!(f32::from_le_bytes(chunk[1024..1028].try_into().unwrap()), 0.5);
+                for (row, col) in [(0, 0), (15, 17), (31, 255)] {
+                    let kb = kb0 + col / 32;
+                    let i = col % 32;
+                    let lo = (row0 + row + kb + i % 16) & 15;
+                    let expected = if i < 16 { lo } else { (lo + 7) & 15 };
+                    assert_eq!(pool_code(chunk, row, col), expected as u8);
+                }
+            }
+        }
+        assert!(file.pack_q4_matrix(name, 3, &mut Vec::new()).unwrap_err().contains("row_group"));
     }
 
     #[test]
