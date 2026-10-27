@@ -43,10 +43,12 @@ def score(actual: np.ndarray, expected: np.ndarray) -> dict:
 
 
 def run(driver: Path, router_build: Path, projection_build: Path,
-        gate_build: Path, mixer_build: Path, out: Path) -> dict:
+        gate_build: Path, mixer_build: Path, out: Path,
+        residual_build: Path | None = None) -> dict:
     if not driver.is_file():
         raise FileNotFoundError(driver)
-    for build in (router_build, projection_build, gate_build, mixer_build):
+    builds = (router_build, projection_build, gate_build, mixer_build)
+    for build in builds + ((residual_build,) if residual_build is not None else ()):
         for name in ("final.xclbin", "insts.bin"):
             if not (build / name).is_file():
                 raise FileNotFoundError(build / name)
@@ -101,13 +103,27 @@ def run(driver: Path, router_build: Path, projection_build: Path,
     actual = f32(invoke(driver, mixer_build, out / "mix", [packed, route], HIDDEN * 4))
     expected = ref_weights @ np.stack(down_refs).astype(np.float64)
     result_score = score(actual, expected)
+    residual_score = None
+    if residual_build is not None:
+        rng = np.random.default_rng(20261028)
+        residual = rng.normal(0, 2, HIDDEN).astype(np.float32)
+        pair = np.ascontiguousarray(np.stack([residual.reshape(45, 64),
+                                              actual.reshape(45, 64)], axis=1))
+        zero_bias = np.zeros(HIDDEN, dtype=bfloat16)
+        got = f32(invoke(driver, residual_build, out / "ffn_residual",
+                         [pair, zero_bias], HIDDEN * 4))
+        residual_score = score(got, residual.astype(np.float64) + expected)
     passed = (np.array_equal(ids, ref_top) and
               all(s["max_relative_error"] < 0.01 for s in stage_errors) and
               result_score["max_relative_error"] < 0.01 and
-              result_score["cosine"] > 0.9999)
+              result_score["cosine"] > 0.9999 and
+              (residual_score is None or
+               (residual_score["max_relative_error"] < 0.01 and
+                residual_score["cosine"] > 0.9999)))
     report = {"passed": bool(passed), "expert_ids": ids.tolist(),
               "router_max_weight_error": float(np.max(np.abs(weights - ref_weights))),
               "expert_down_stages": stage_errors, "moe_output": result_score,
+              "ffn_residual": residual_score,
               "reference": "FP64 router, decoded MXFP4 and clamped gate with BF16 activation boundary",
               "scope": "one token FFN arithmetic through separate images; no layer/runtime/model acceptance"}
     (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -123,11 +139,13 @@ def main() -> None:
     p.add_argument("--projection-build", required=True, type=Path)
     p.add_argument("--gate-build", required=True, type=Path)
     p.add_argument("--mixer-build", required=True, type=Path)
+    p.add_argument("--residual-build", type=Path)
     p.add_argument("--out", required=True, type=Path)
     a = p.parse_args()
     print(json.dumps(run(a.driver.resolve(), a.router_build.resolve(),
                          a.projection_build.resolve(), a.gate_build.resolve(),
-                         a.mixer_build.resolve(), a.out.resolve()), indent=2))
+                         a.mixer_build.resolve(), a.out.resolve(),
+                         a.residual_build.resolve() if a.residual_build else None), indent=2))
 
 
 if __name__ == "__main__":

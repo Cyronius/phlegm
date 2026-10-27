@@ -37,7 +37,12 @@ dibs run npu --label 'Check GPT-OSS MoE arithmetic' --eta 20m -- \
   --out target/npu-dev/gptoss-moe-check
 ```
 
+Pass `--residual-build target/npu-dev/gptoss-residual-build` to also run the
+FFN residual addition with zero bias after the mixer.
+
 The 2026-10-27 NPU run selected experts 27, 23, 29 and 17. The final output's
 maximum relative error was 1.9471e-6 and cosine was 0.999999999998659. This
 checks one-token MoE arithmetic across separate images. Packing a model,
 constructing a layer recipe, attention integration and runtime dispatch remain.
+With the residual image included, the final residual output passed with
+maximum relative error 1.9414e-6.
