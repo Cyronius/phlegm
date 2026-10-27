@@ -1,8 +1,9 @@
 # Gemma 4 Q/K RoPE
 
 This NPU2 design rotates one decode token's BF16 query and key heads. It
-accepts an FP32 table containing cosine values followed by sine values for
-half-split head pairs. The 512-wide full-attention table implements
+accepts an FP32 table containing BF16-rounded cosine values followed by
+BF16-rounded sine values for half-split head pairs. The 512-wide
+full-attention table implements
 proportional RoPE: 64 frequency pairs are active and 192 have cosine 1 and
 sine 0. Local attention uses all 128 pairs of a 256-wide head.
 

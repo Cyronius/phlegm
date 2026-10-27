@@ -29,8 +29,11 @@ def table_for(position: int, head_dim: int) -> np.ndarray:
         inv[:count] = 1000000.0 ** (-2 * np.arange(count, dtype=np.float64) / head_dim)
     else:
         raise ValueError(head_dim)
-    angle = position * inv
-    return np.concatenate((np.cos(angle), np.sin(angle))).astype(np.float32)
+    # Gemma4TextRotaryEmbedding forms angles in FP32 and casts cos/sin to
+    # the BF16 query dtype before apply_rotary_pos_emb. The NPU table remains
+    # FP32 for arithmetic, carrying those already-rounded BF16 values.
+    angle = np.float32(position) * inv.astype(np.float32)
+    return np.concatenate((np.cos(angle), np.sin(angle))).astype(bfloat16).astype(np.float32)
 
 
 def fixture(geometry: str, position: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
