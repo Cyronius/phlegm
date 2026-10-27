@@ -68,6 +68,13 @@ position 128 (sliding, maximum relative error `1.09e-6`). The new key and
 value matched the independent BF16 reference exactly in both cases. The
 published FLM GPT-OSS 20B config uses this alternating schedule and geometry:
 <https://huggingface.co/FastFlowLM/GPT-OSS-20B-NPU2/blob/main/config.json>.
+`gptoss_attention_block_run.py` composes the input RMSNorm, source attention
+runner, six-band output projection, bias and residual for one token. The
+layer-0 sliding check at position 128 passed all 21 NPU calls against
+independently decoded q4 and FP64 references. Maximum relative errors were
+`1.13e-4` at input norm, `4.37e-3` at attention finalization, and `4.65e-4`
+at the final residual. This fixture establishes a complete attention half of
+one layer; the expert MoE half and actual model weights remain open.
 These checks use fixture activations and weights to verify the source/kernel
 ABI. The per-layer cache and 24-layer token schedule still need to consume
 these inputs with actual model weights.
