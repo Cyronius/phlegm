@@ -1,4 +1,4 @@
-"""Check the 12B q8 LM head arithmetic on one 128-logit band."""
+"""Check the 12B q8 LM head on one band or the full vocabulary."""
 from __future__ import annotations
 
 import argparse
@@ -31,19 +31,25 @@ def fixture():
     return chunks.reshape(-1), x, expected
 
 
-def run(driver: Path, build: Path, out: Path) -> dict:
-    weight, activation, expected = fixture()
+def run(driver: Path, build: Path, out: Path, bands: int = 1) -> dict:
+    if bands not in (1, 262144 // 128):
+        raise ValueError("bands must be one or the full 12B vocabulary")
+    weight, activation, one_expected = fixture()
+    expected = np.tile(one_expected, bands)
     for name in ("final.xclbin", "insts.bin"):
         if not (build / name).is_file():
             raise FileNotFoundError(build / name)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "weights.bin").write_bytes(weight.tobytes())
+    with (out / "weights.bin").open("wb") as stream:
+        one = weight.tobytes()
+        for _ in range(bands):
+            stream.write(one)
     (out / "activation.bin").write_bytes(activation.tobytes())
     config = out / "run.cfg"
     config.write_text("\n".join([
         "device", f"xclbin G {build / 'final.xclbin'}",
         f"kernelx k G {build / 'insts.bin'}",
-        f"buf weights {weight.nbytes} {out / 'weights.bin'}",
+        f"buf weights {weight.nbytes * bands} {out / 'weights.bin'}",
         f"buf activation {activation.nbytes} {out / 'activation.bin'}",
         f"buf result {expected.nbytes}", "run k weights activation result",
         f"dump result {out / 'result.bin'} {expected.nbytes}", "",
@@ -58,7 +64,7 @@ def run(driver: Path, build: Path, out: Path) -> dict:
     maximum = float(np.max(np.abs(a - e)))
     relative = maximum / max(float(np.max(np.abs(e))), 1e-20)
     cosine = float(a @ e / (np.linalg.norm(a) * np.linalg.norm(e)))
-    report = {"rows": 128, "cols": 3840, "max_absolute_error": maximum,
+    report = {"rows": bands * 128, "cols": 3840, "max_absolute_error": maximum,
               "max_relative_error": relative, "cosine": cosine,
               "passed": bool(relative < 0.001 and cosine > 0.999999),
               "reference": "FP64 matvec of independently decoded synthetic q8 chunks"}
@@ -73,5 +79,6 @@ if __name__ == "__main__":
     p.add_argument("--driver", required=True, type=Path)
     p.add_argument("--build", required=True, type=Path)
     p.add_argument("--out", required=True, type=Path)
+    p.add_argument("--bands", type=int, choices=(1, 262144 // 128), default=1)
     a = p.parse_args()
-    print(json.dumps(run(a.driver.resolve(), a.build.resolve(), a.out.resolve()), indent=2))
+    print(json.dumps(run(a.driver.resolve(), a.build.resolve(), a.out.resolve(), a.bands), indent=2))

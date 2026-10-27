@@ -12,7 +12,7 @@ compositions, not an exported model or native generation path.
 | Decode attention with online softmax state | `open_kernels/designs/gemma4_attention/` | Eight width/chunk images passed; 512-wide state carried through 4096 rows |
 | Composed norm, RoPE, GQA attention | `open_kernels/designs/gemma4_attention/check_chain.py` | All six E2B/E4B/12B local/full head layouts passed at position 127 |
 | q4 full-vocabulary LM head | `open_kernels/designs/lm_head_q4/` and `open_kernels/gemma4_lm_head_check.py` | Full 262144-logit images passed at K=1536, 2560, 3840; 12B's FLM source uses q8 instead |
-| 12B q8 full-vocabulary LM head | `open_kernels/designs/lm_head_q8/` | K=3840, N=262144 image compiled; representative 128-logit band passed at maximum relative error `4.43e-6` |
+| 12B q8 full-vocabulary LM head | `open_kernels/designs/lm_head_q8/`, `gemma4_q8_head_check.py` | Complete 262144-logit image passed at maximum relative error `4.43e-6` against independently decoded synthetic q8 chunks |
 | Final logit softcap | `open_kernels/designs/gemma4_logit_cap/` | Full 262144 logits passed against `30*tanh(logit/30)` |
 | Composed head and softcap | `open_kernels/gemma4_logits_check.py` | All three text widths passed across the full vocabulary |
 | E2B/E4B per-layer input GELU gate | `open_kernels/designs/gemma4_ple_gate/` | BF16-rounded 256-value NPU check matched exactly |
