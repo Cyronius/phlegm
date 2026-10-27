@@ -24,6 +24,7 @@ compositions, not an exported model or native generation path.
 | Bounded source reads | `open_kernels/gemma4_text_source.py` | E2B/E4B/12B public headers passed complete required-tensor and nonoverlapping byte-extent checks; synthetic reads cover striped q4 projection bands, 12B signed q4 and q8 head bands, BF16 per-layer matrices, and scaled embedding rows |
 | Source-format Q projection on NPU | `open_kernels/gemma4_source_projection_check.py` | Complete layer-zero Q projection passed from E2B, E4B, and 12B source-format fixtures; maximum relative errors `5.27e-6`, `6.76e-6`, and `9.34e-6` against independent FP64 source decoders |
 | 12B source-format q8 head on NPU | `open_kernels/gemma4_source_head_check.py` | One 128-logit band passed at maximum relative error `5.14e-6` against an independent decoder of FLM's 16-row q8 source tiles |
+| 12B local/full decoder layer | `open_kernels/gemma4_12b_layer_run.py` | Layer 0 local and layer 5 full K=V paths passed zero-weight NPU wiring at positions 0 and 1, 162 calls total; residual and cache rows matched exactly |
 | Per-layer context norm and token mix | `open_kernels/designs/gemma4_ple_input/` | E2B/E4B with-token and context-only variants compiled and passed NPU checks |
 | Full-width MLP GELU-tanh and up product | `open_kernels/designs/gemma4_gelu_mul/` | All four 6144/10240/12288/15360-wide images compiled and passed NPU checks (maximum absolute error `3.05e-5`) |
 
@@ -64,10 +65,12 @@ families and selected shapes, not every layer or real weight payload.
 
 ## Remaining work for a model recipe
 
-The three model entries need real source-weight payload checks, residual and sandwich-norm wiring, and a
-scheduler that executes the validated layer plan. E2B and E4B also need the
+The three model entries need real source-weight payload checks and a scheduler
+that executes the validated layer plan. The 12B local/full decoder layer now
+composes the sandwich norms, projections, attention, MLP and output scale; its
+zero-weight two-position check covers wiring only. E2B and E4B also need the
 per-layer input and shared-K/V state routing in that scheduler. The 12B full
-attention path needs its K=V alternative in the exporter and scheduler.
+attention path routes K=V in the layer runner, but still needs real-weight acceptance.
 All three require real-container arithmetic checks, complete
 generation, and model-output acceptance. Vision and audio progress is recorded
 in `gemma4-multimodal-kernels.md`. Do not change their

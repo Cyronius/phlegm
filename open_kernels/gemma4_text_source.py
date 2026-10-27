@@ -105,7 +105,12 @@ class Gemma4TextSource:
         return np.frombuffer(self._bytes(name, "BF16", (width,)), bfloat16).copy()
 
     def embedding(self, token: int) -> np.ndarray:
-        """Decode one already-scaled token embedding row to FP32."""
+        """Decode one source token row to FP32.
+
+        E2B/E4B q4nx conversion stores the sqrt(hidden) scaling in its
+        quantized row. The 12B BF16 source row is returned as stored; its
+        model recipe must apply the checkpoint's embedding scale.
+        """
         if not isinstance(token, int) or token < 0 or token >= self.plan.vocab:
             raise ValueError("Gemma 4 token id out of range")
         width = self.plan.hidden
