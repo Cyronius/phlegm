@@ -58,10 +58,23 @@ report validation work now (`phlegm bench --help`). A [temporary C++ reference
 adapter](benchmarks/reference/README.md) runs the suite against an external
 OpenFlowLM checkout, explicitly labeling its results as reference-engine runs.
 
-NPU support needs the XRT import lib once, then the `npu` feature:
+The native Rust XRT bindings build with the `npu` feature. On Windows, first
+create the XRT import library:
 
 ```sh
 phlegm-core/xrt-shim/build_import_lib.cmd
+cargo build --features phlegm-cli/npu
+```
+
+On Linux, set `XILINX_XRT` to an XRT install containing `include/xrt` and
+`lib/libxrt_coreutil.so`, then build with a C++17 compiler. Set `XRT_INCLUDE_DIR`
+or `XRT_LIB_DIR` if those directories are elsewhere. The XRT library directory
+must also be on the runtime loader path. This compiles the Rust device bindings;
+the model inference path currently still uses the reference bridge.
+
+```sh
+export XILINX_XRT=/path/to/xrt
+export LD_LIBRARY_PATH="$XILINX_XRT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 cargo build --features phlegm-cli/npu
 ```
 

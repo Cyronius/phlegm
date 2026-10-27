@@ -1,5 +1,5 @@
-// Builds xrt-shim into a static lib and links it with XRT's import lib, only under the `npu` feature.
-// Override the vcvars path with VCVARS64.
+// Build the XRT C++ shim only under the `npu` feature. Windows uses MSVC;
+// Linux uses a local XRT install and the configured C++ toolchain.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,6 +18,48 @@ fn main() {
 
     let shim_src = manifest.join("xrt-shim").join("xrt_shim.cpp");
     let shim_hdr = manifest.join("xrt-shim").join("xrt_shim.h");
+    println!("cargo:rerun-if-changed={}", shim_src.display());
+    println!("cargo:rerun-if-changed={}", shim_hdr.display());
+    match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("windows") => build_windows(&manifest, &out_dir, &shim_src),
+        Ok("linux") => build_linux(&out_dir, &shim_src),
+        _ => panic!("the npu feature supports Windows and Linux only"),
+    }
+}
+
+fn build_linux(out_dir: &std::path::Path, shim_src: &std::path::Path) {
+    for name in ["CXX", "AR", "XILINX_XRT", "XRT_INCLUDE_DIR", "XRT_LIB_DIR"] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    let xrt_root = PathBuf::from(std::env::var("XILINX_XRT").unwrap_or_else(|_| "/opt/xilinx/xrt".into()));
+    let include = std::env::var_os("XRT_INCLUDE_DIR").map(PathBuf::from)
+        .unwrap_or_else(|| xrt_root.join("include"));
+    let lib_dir = std::env::var_os("XRT_LIB_DIR").map(PathBuf::from)
+        .unwrap_or_else(|| xrt_root.join("lib"));
+    if !include.join("xrt/xrt_device.h").is_file() || !lib_dir.join("libxrt_coreutil.so").is_file() {
+        panic!("Linux XRT headers or libxrt_coreutil.so are missing under {} and {}",
+               include.display(), lib_dir.display());
+    }
+    let cxx = std::env::var("CXX").unwrap_or_else(|_| "g++".into());
+    let ar = std::env::var("AR").unwrap_or_else(|_| "ar".into());
+    let obj = out_dir.join("xrt_shim.o");
+    let lib = out_dir.join("libxrt_shim.a");
+    let status = Command::new(&cxx)
+        .args(["-std=c++17", "-O2", "-fPIC", "-c", "-I"])
+        .arg(&include).arg(shim_src).arg("-o").arg(&obj)
+        .status().expect("failed to launch Linux C++ compiler for XRT shim");
+    if !status.success() { panic!("Linux XRT shim compilation failed"); }
+    let status = Command::new(&ar).arg("crs").arg(&lib).arg(&obj)
+        .status().expect("failed to launch ar for XRT shim");
+    if !status.success() { panic!("Linux XRT shim archive failed"); }
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-lib=static=xrt_shim");
+    println!("cargo:rustc-link-lib=dylib=xrt_coreutil");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+}
+
+fn build_windows(manifest: &std::path::Path, out_dir: &std::path::Path, shim_src: &std::path::Path) {
     let xrt_inc = manifest
         .join("deps")
         .join("XRT")
@@ -28,8 +70,6 @@ fn main() {
     // build_import_lib.cmd makes it from the system xrt_coreutil.dll; XRT ships no import lib.
     let xrt_lib_dir = manifest.join("xrt-shim").join("out");
 
-    println!("cargo:rerun-if-changed={}", shim_src.display());
-    println!("cargo:rerun-if-changed={}", shim_hdr.display());
     println!("cargo:rerun-if-env-changed=VCVARS64");
 
     if !xrt_lib_dir.join("xrt_coreutil.lib").exists() {

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Compiles the C-ABI xrt-shim and links XRT; needs MSVC (vcvars64) and xrt-shim/out/xrt_coreutil.lib.
+# Compiles the C-ABI xrt-shim and links XRT (MSVC/import lib on Windows, C++17/XRT .so on Linux).
 npu = []
 
 [dependencies]
