@@ -43,6 +43,16 @@ passed an independent FP64 decoded-MXFP4 reference with maximum relative
 error `6.45e-7`. The check used fixture weights and nonzero fixture bias;
 real model payload arithmetic is still pending.
 
+The source adapter also packs each 16-band Q/K/V call as BF16[2880]
+activation, 64 zero padding values, and the selected 512 BF16 bias values.
+This stream passed the 16-band Q NPU image at maximum relative error
+`9.86e-7` against the decoded q4 reference. It packs the router activation
+with the layer's 32 BF16 router biases; the NPU top-four check selected
+experts `[17, 9, 3, 26]` and reached maximum logit error `5.33e-6`.
+These checks use fixture activations and weights to verify the source/kernel
+ABI. The attention cache and 24-layer token schedule still need to consume
+these inputs with actual model weights.
+
 Remaining model work includes a complete layer and token scheduler, real
 container weight export and NPU arithmetic checks, and model-output
 acceptance. Keep both registry entries at `missing_recipe` until those checks

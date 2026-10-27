@@ -73,6 +73,31 @@ def test_source_exposes_kernel_oriented_constants(source):
     assert source.reader.mm.reads[-1] == (start, start + 5760)
 
 
+def test_qkv_input_selects_only_the_requested_bias_bands(source, monkeypatch):
+    from ml_dtypes import bfloat16
+    activation = np.full(2880, 2, bfloat16)
+    bias = np.arange(4096, dtype=np.float32).astype(bfloat16)
+    monkeypatch.setattr(source, "constant", lambda *args: bias.copy())
+    packed = source.qkv_input(0, "q", 32, activation)
+    assert packed.shape == (3456,)
+    assert np.array_equal(packed[:2880], activation)
+    assert np.count_nonzero(packed[2880:2944]) == 0
+    assert np.array_equal(packed[2944:], bias[1024:1536])
+    with pytest.raises(ValueError, match="aligned"):
+        source.qkv_input(0, "k", 16, activation)
+
+
+def test_router_input_appends_the_source_bias(source, monkeypatch):
+    from ml_dtypes import bfloat16
+    x = np.full(2880, 2, bfloat16)
+    bias = np.arange(32, dtype=np.float32).astype(bfloat16)
+    monkeypatch.setattr(source, "constant", lambda *args: bias.copy())
+    packed = source.router_input(0, x)
+    assert packed.shape == (2912,)
+    assert np.array_equal(packed[:2880], x)
+    assert np.array_equal(packed[2880:], bias)
+
+
 def test_expert_input_embeds_each_bias_in_the_kernel_chunk(source, monkeypatch):
     from ml_dtypes import bfloat16
     chunks = np.full((90, 23, CHUNK), 9, np.uint8)

@@ -146,6 +146,13 @@ class GptOssSource:
         raw = self._bytes(name, "BF16", (32, 2944))
         return np.ascontiguousarray(np.frombuffer(raw, bfloat16).reshape(32, 2944)[:, :2880].T)
 
+    def router_input(self, layer: int, activation: np.ndarray) -> np.ndarray:
+        """BF16[2912] activation and layer router bias for top-four NPU routing."""
+        x = np.asarray(activation)
+        if x.shape != (2880,) or x.dtype != bfloat16:
+            raise ValueError("GPT-OSS router activation must be BF16[2880]")
+        return np.concatenate((x, self.constant(layer, "router_bias")))
+
     def attention(self, layer: int, role: str, start_band: int) -> np.ndarray:
         """Return one aligned 16-band q4_1 projection call in kernel order."""
         if role not in ATTN_SHAPES:
@@ -157,6 +164,18 @@ class GptOssSource:
         if start_band not in range(0, ROLE_ROWS[role] // 32, 16):
             raise ValueError(f"{role}: expected an aligned 16-band call")
         return qkv_projection(raw, role, start_band, 16)
+
+    def qkv_input(self, layer: int, role: str, start_band: int,
+                  activation: np.ndarray) -> np.ndarray:
+        """BF16[3456] activation and selected bias for a 16-band Q/K/V GEMV."""
+        if role not in ROLE_ROWS or start_band not in range(0, ROLE_ROWS[role] // 32, 16):
+            raise ValueError(f"{role}: expected an aligned 16-band Q/K/V call")
+        x = np.asarray(activation)
+        if x.shape != (2880,) or x.dtype != bfloat16:
+            raise ValueError("GPT-OSS Q/K/V activation must be BF16[2880]")
+        bias = self.constant(layer, role + "_bias")
+        selected = bias[start_band * 32:(start_band + 16) * 32]
+        return np.concatenate((x, np.zeros(64, bfloat16), selected))
 
     def expert(self, layer: int, expert_id: int, role: str) -> np.ndarray:
         """Return one expert's gate/up/down 90-band MXFP4 source stream."""
