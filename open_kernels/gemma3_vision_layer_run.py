@@ -10,8 +10,10 @@ from ml_dtypes import bfloat16
 
 from open_kernels.gemma3_vision_attention_check import maxrel, run_image
 from open_kernels.gemma3_vision_attention_run import run as run_attention, selected_reference
+from open_kernels.gemma3_vision_source import layer as load_vision_layer
 from open_kernels.gemma3_vision_tower_weights import pad_matrix
 from open_kernels.gemma4_mm_source import npu_weight_row_major
+from open_kernels.model.q4nx import Q4NX
 
 
 def bf(value: np.ndarray) -> np.ndarray:
@@ -30,6 +32,15 @@ def fixture() -> tuple[np.ndarray, dict[str, np.ndarray]]:
         weights[name + "_weight"] = bf(rng.normal(0, 0.025, shape))
         weights[name + "_bias"] = bf(rng.normal(0, 0.025, shape[0]))
     return hidden, weights
+
+
+def flm_fixture(vision_weights: Path, input_path: Path,
+                layer_index: int) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    x = np.fromfile(input_path, bfloat16)
+    if x.size != 4096 * 1152:
+        raise ValueError("input must be BF16[4096,1152] after SigLIP patch embedding")
+    weights = load_vision_layer(Q4NX(vision_weights), layer_index)
+    return np.ascontiguousarray(x.reshape(4096, 1152)), weights
 
 
 def layernorm_ref(x: np.ndarray, gamma: np.ndarray, beta: np.ndarray) -> np.ndarray:
@@ -61,9 +72,13 @@ def read(path: Path, dtype, shape: tuple[int, ...]) -> np.ndarray:
 
 
 def run(driver: Path, tower: Path, post: Path, attention_bundle: Path,
-        residual_build: Path, out: Path) -> dict:
+        residual_build: Path, out: Path, vision_weights: Path | None = None,
+        input_path: Path | None = None, layer_index: int = 0) -> dict:
     out.mkdir(parents=True, exist_ok=True)
-    x, weights = fixture()
+    if (vision_weights is None) != (input_path is None):
+        raise ValueError("--vision-weights and --input must be supplied together")
+    synthetic = vision_weights is None
+    x, weights = fixture() if synthetic else flm_fixture(vision_weights, input_path, layer_index)
     params = {name: np.stack((weights[name + "_gamma"], weights[name + "_beta"]))
               for name in ("ln1", "ln2")}
     packed_weights = {}
@@ -136,7 +151,8 @@ def run(driver: Path, tower: Path, post: Path, attention_bundle: Path,
     checks = [{"row": row, "max_relative_error": maxrel(
         final[row], downstream_reference(row, x, attended, weights))}
         for row in (0, 257, 4095)]
-    report = {"model": "synthetic Gemma 3 4B SigLIP encoder layer",
+    report = {"model": "Gemma 3 4B SigLIP encoder layer",
+              "synthetic": synthetic, "layer_index": layer_index,
               "tokens": 4096, "hidden": 1152, "heads": 16,
               "attention": attention_reference,
               "downstream_checks": checks,
@@ -153,6 +169,13 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     for key in ("driver", "tower", "post", "attention", "residual", "out"):
         p.add_argument(f"--{key}", required=True, type=Path)
+    p.add_argument("--vision-weights", type=Path,
+                   help="FLM vision_weights.q4nx; synthetic weights if absent")
+    p.add_argument("--input", type=Path,
+                   help="BF16[4096,1152] patch embeddings for a real-weight layer")
+    p.add_argument("--layer-index", type=int, default=0)
     a = p.parse_args()
     print(json.dumps(run(a.driver.resolve(), a.tower.resolve(), a.post.resolve(),
-                         a.attention.resolve(), a.residual.resolve(), a.out.resolve()), indent=2))
+                         a.attention.resolve(), a.residual.resolve(), a.out.resolve(),
+                         a.vision_weights.resolve() if a.vision_weights else None,
+                         a.input.resolve() if a.input else None, a.layer_index), indent=2))

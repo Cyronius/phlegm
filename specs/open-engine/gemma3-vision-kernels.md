@@ -1,8 +1,8 @@
 # Gemma 3 4B vision NPU kernels
 
 The four Gemma 3-family 4B entries in the pinned FLM registry still need a
-vision-tower route. This work covers patch embedding and the projector around
-the SigLIP transformer; the transformer itself remains open. The Google/Hugging
+validated vision-tower route. The NPU images now cover patch embedding, a
+complete SigLIP encoder layer, and the projector. The Google/Hugging
 Face Gemma 3 projector performs 4×4 average pooling from a 64×64 patch grid
 to 256 tokens, applies RMSNorm with
 `1 + weight`, then projects from 1152 vision channels into the 2560-channel
@@ -93,9 +93,17 @@ row checks using captured attention matched the BF16 CPU reconstruction
 exactly. This establishes the kernel schedule for one layer, not a real
 checkpoint result.
 
+`gemma3_vision_source.py` reads the BF16 tensors from FLM's
+`vision_weights.q4nx`, validates the 4B shapes, and undoes FLM's 64×256
+matrix tiling. It exposes patch embedding, all 27 encoder layers, final
+post-LayerNorm, and projector weights. The layer runner accepts
+`--vision-weights`, `--input` (BF16[4096,1152] patch embeddings), and
+`--layer-index` for a real-weight layer check. The tile inverse and padding
+rejection have CPU tests. No local FLM vision-weight payload was available
+for an end-to-end real-weight run.
+
 Remaining work includes a 27-layer tower schedule and final post-LayerNorm,
-real FLM tensor-layout conversion for all vision
-weights, variant-specific geometry checks, and image-to-text output
-acceptance. These 4B entries remain
+variant-specific geometry checks, and image-to-text output acceptance. These
+4B entries remain
 text-only recipe routes in the coverage matrix until the full vision path is
 validated.
