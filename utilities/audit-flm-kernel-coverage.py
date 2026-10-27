@@ -62,7 +62,7 @@ def inventory(registry: Path, xclbins_root: Path | None = None) -> dict:
                 if model.get("vlm") and family in VISION_TEXT_ONLY:
                     gaps.append("vision tower kernel route not established")
                 if name == "qwen3.8:27b":
-                    gaps.append("wide DeltaNet and FFN recipe is not buildable")
+                    gaps.append("text recipe composes; vision tower route and model validation remain open")
             elif family in SPECIAL_ROUTE:
                 route = SPECIAL_ROUTE[family]
                 state = "special_source"

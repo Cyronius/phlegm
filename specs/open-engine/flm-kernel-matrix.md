@@ -23,7 +23,7 @@ Phlegm kernel implementation or a compatible ABI.
 | `qwen3.5:4b` | `qwen3.5` | `qwen35` | `recipe_source` | vision tower kernel route not established |
 | `qwen3.5:9b` | `qwen3.5` | `qwen35` | `recipe_source` | vision tower kernel route not established |
 | `qwen3.6-moe:35b-a3b` | `qwen3.6-moe` | `qwen36moe` | `recipe_source` | vision tower kernel route not established |
-| `qwen3.8:27b` | `qwen3.5` | `qwen35` | `recipe_source` | wide DeltaNet and FFN recipe is not buildable |
+| `qwen3.8:27b` | `qwen3.5` | `qwen35` | `recipe_source` | text recipe composes; vision tower route and model validation remain open |
 | `lfm2:1.2b` | `lfm2` | `lfm2` | `recipe_source` | model-specific build and validation |
 | `lfm2:2.6b` | `lfm2` | `lfm2` | `recipe_source` | model-specific build and validation |
 | `lfm2-trans:2.6b` | `lfm2` | `lfm2` | `recipe_source` | model-specific build and validation |
