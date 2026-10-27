@@ -61,7 +61,7 @@ def inventory(registry: Path, xclbins_root: Path | None = None) -> dict:
                     gaps.append("verify model config and packed geometry")
                 if model.get("vlm") and family in VISION_TEXT_ONLY:
                     if family == "gemma3":
-                        gaps.append("4B vision synthetic full layer checked and FLM weight adapter added; 27-layer tower, real-weight validation and variants remain")
+                        gaps.append("4B vision NPU kernels and 27-layer schedule built; real-weight tower, output acceptance and variants remain")
                     else:
                         gaps.append("vision tower kernel route not established")
                 if name == "qwen3.8:27b":

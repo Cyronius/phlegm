@@ -102,8 +102,23 @@ post-LayerNorm, and projector weights. The layer runner accepts
 rejection have CPU tests. No local FLM vision-weight payload was available
 for an end-to-end real-weight run.
 
-Remaining work includes a 27-layer tower schedule and final post-LayerNorm,
-variant-specific geometry checks, and image-to-text output acceptance. These
-4B entries remain
+`gemma3_vision_tower_run.py` now schedules the 16 patch panels, 27 encoder
+layers, 16 post-LayerNorm panels, one 4×4 spatial pool/norm image, and one
+projector matrix image. It alternates two hidden-state files and reuses one
+layer scratch directory. Input is FLM's preprocessed BF16 CHW[3,896,896]
+image. Output is a BF16[256,2560] projected image-token file alongside the
+FP32 projector output. The 27-layer chaining test checks every layer index
+and the final input to the projector.
+
+For the new full-image path, a synthetic 4096-patch NPU run passed FP64/BF16
+checks at patches 0, 257, 2047, and 4095 with exact BF16 results. The
+synthetic final post-LayerNorm, pool/norm and projector path also passed NPU
+checks: sampled post-LayerNorm rows were exact BF16, pool/norm maximum
+relative error was `0.003125`, and sampled projector matrix maximum relative
+error was `6.62e-7`. These checks establish the endpoints of the scheduled
+tower; they do not validate propagation through a real 27-layer checkpoint.
+
+Remaining work includes real-weight 27-layer execution, variant-specific
+geometry checks, and image-to-text output acceptance. These 4B entries remain
 text-only recipe routes in the coverage matrix until the full vision path is
 validated.
