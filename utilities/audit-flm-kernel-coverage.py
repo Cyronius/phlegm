@@ -82,7 +82,7 @@ def inventory(registry: Path, xclbins_root: Path | None = None) -> dict:
                 state = "missing_recipe"
                 gaps = ["no complete NPU recipe"]
                 if family == "gpt-oss":
-                    gaps.append("standalone gate, MXFP4 decode and biased router are not integrated")
+                    gaps.append("expert projection, gate and router kernels lack a composed layer recipe")
             else:
                 raise ValueError(f"{name}: unreviewed FLM family {family!r}")
             images = None
