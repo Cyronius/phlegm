@@ -15,6 +15,7 @@ compositions, not an exported model or native generation path.
 | Final logit softcap | `open_kernels/designs/gemma4_logit_cap/` | Full 262144 logits passed against `30*tanh(logit/30)` |
 | Composed head and softcap | `open_kernels/gemma4_logits_check.py` | All three text widths passed across the full vocabulary |
 | E2B/E4B per-layer input GELU gate | `open_kernels/designs/gemma4_ple_gate/` | BF16-rounded 256-value NPU check matched exactly |
+| Hidden RMSNorm and residual | `open_kernels/designs/gemma4_hidden_norm/` | E2B/E4B/12B widths passed with residual and plain norm modes |
 
 The attention state image processes 1, 128, 512, or 1024 rows per call. Its
 FP32 carry output supports consecutive full-attention chunks. The caller
