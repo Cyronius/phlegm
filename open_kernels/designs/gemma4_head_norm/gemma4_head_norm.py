@@ -24,7 +24,7 @@ from ironutil import Pipeline, include_dirs  # noqa: E402
 def gemma4_head_norm(input: In, scale: In, output: Out,
                      *, heads: CompileTime[int], head_dim: CompileTime[int],
                      srchash: CompileTime[int] = 0):
-    assert heads in (1, 2, 8, 16) and head_dim in (256, 512)
+    assert (heads == 12 and head_dim == 64) or (heads in (1, 2, 8, 16) and head_dim in (256, 512))
     full_ty = np.ndarray[(heads * head_dim,), np.dtype[bfloat16]]
     row_ty = np.ndarray[(head_dim,), np.dtype[bfloat16]]
     fn = ExternalFunction("gemma4_head_norm_row", source_file=str(HERE / "norm.cc"),

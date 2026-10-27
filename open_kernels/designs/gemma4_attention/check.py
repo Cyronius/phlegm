@@ -81,8 +81,8 @@ def main() -> None:
     p.add_argument("--driver", required=True, type=Path)
     p.add_argument("--build", required=True, type=Path)
     p.add_argument("--out", required=True, type=Path)
-    p.add_argument("--head-dim", required=True, type=int, choices=(256, 512))
-    p.add_argument("--rows", required=True, type=int, choices=(1, 128, 512, 1024))
+    p.add_argument("--head-dim", required=True, type=int, choices=(64, 256, 512))
+    p.add_argument("--rows", required=True, type=int, choices=(1, 128, 472, 512, 1024))
     p.add_argument("--chunks", type=int, default=1)
     a = p.parse_args()
     if a.chunks < 1:

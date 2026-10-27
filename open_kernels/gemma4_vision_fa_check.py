@@ -11,7 +11,7 @@ from ml_dtypes import bfloat16
 
 
 def run(driver: Path, build: Path, out: Path, tokens: int = 256,
-        valid_len: int | None = None) -> dict:
+        valid_len: int | None = None, qk_scale: float = 1.0) -> dict:
     heads, width = 12, 64
     valid_len = tokens if valid_len is None else valid_len
     if not 0 < valid_len <= tokens:
@@ -19,7 +19,7 @@ def run(driver: Path, build: Path, out: Path, tokens: int = 256,
     rng = np.random.default_rng(20261027)
     q, k, v = (rng.normal(0, scale, (heads, tokens, width))
                .astype(np.float32).astype(bfloat16)
-               for scale in (0.25, 0.25, 0.5))
+               for scale in (qk_scale, qk_scale, 0.5))
     out.mkdir(parents=True, exist_ok=True)
     paths = {}
     for name, array in (("q", q), ("k", k), ("v", v)):
@@ -53,6 +53,7 @@ def run(driver: Path, build: Path, out: Path, tokens: int = 256,
     flat_a, flat_e = actual.astype(np.float64).ravel(), expected.astype(np.float64).ravel()
     cosine = float(flat_a @ flat_e / (np.linalg.norm(flat_a) * np.linalg.norm(flat_e)))
     report = dict(tokens=tokens, valid_len=valid_len, heads=heads, head_dim=width,
+                  qk_scale=qk_scale,
                   max_absolute_error=abs_error, max_relative_error=relative,
                   cosine=cosine,
                   passed=bool(np.isfinite(actual).all() and relative < 0.04 and cosine > 0.999))
@@ -69,6 +70,7 @@ if __name__ == "__main__":
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--tokens", type=int, default=256)
     parser.add_argument("--valid-len", type=int)
+    parser.add_argument("--qk-scale", type=float, default=1.0)
     args = parser.parse_args()
     print(json.dumps(run(args.driver.resolve(), args.build.resolve(), args.out.resolve(),
-                         args.tokens, args.valid_len), indent=2))
+                         args.tokens, args.valid_len, args.qk_scale), indent=2))

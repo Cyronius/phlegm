@@ -62,8 +62,8 @@ def main() -> None:
     p.add_argument("--driver", required=True, type=Path)
     p.add_argument("--build", required=True, type=Path)
     p.add_argument("--out", required=True, type=Path)
-    p.add_argument("--heads", required=True, type=int, choices=(1, 2, 8, 16))
-    p.add_argument("--head-dim", required=True, type=int, choices=(256, 512))
+    p.add_argument("--heads", required=True, type=int, choices=(1, 2, 8, 12, 16))
+    p.add_argument("--head-dim", required=True, type=int, choices=(64, 256, 512))
     p.add_argument("--unit-scale", action="store_true")
     a = p.parse_args()
     print(json.dumps(run(a.driver.resolve(), a.build.resolve(), a.out.resolve(),

@@ -24,7 +24,7 @@ from ironutil import Pipeline, include_dirs  # noqa: E402
 def gemma4_attention(query_state: In, kv_rows: In, state_out: Out,
                      *, head_dim: CompileTime[int], rows: CompileTime[int],
                      srchash: CompileTime[int] = 0):
-    assert head_dim in (256, 512) and rows in (1, 128, 512, 1024)
+    assert (head_dim in (256, 512) and rows in (1, 128, 512, 1024)) or (head_dim == 64 and rows in (472, 1024))
     meta_bytes = head_dim * 2 + (2 * head_dim + 16) * 4
     meta_ty = np.ndarray[(meta_bytes,), np.dtype[np.uint8]]
     row_ty = np.ndarray[(2 * head_dim,), np.dtype[bfloat16]]

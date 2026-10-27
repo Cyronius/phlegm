@@ -15,13 +15,19 @@ vision/audio, and unified 12B image/audio headers.
 | Primitive | Source | NPU check on 2026-10-27 |
 | --- | --- | --- |
 | Vision and audio BF16 matrix multiplication, M=256 | `open_kernels/designs/gemma4_mm/`, `build_gemma4_multimodal_mm.py` | Five representative matrices passed: K768×N768, K1024×N2048, K768×N2560, K640×N3840, K6912×N3840; maximum relative error `2.51e-6` |
-| Bidirectional vision attention, 12 heads×64 lanes | `open_kernels/designs/whisper_fa/`, `gemma4_vision_fa_check.py` | Unit-scale image compiled for 2520 valid patches padded to 2560; NPU check passed at maximum relative error `0.0227` and cosine `0.999747` |
+| Bidirectional vision attention, 12 heads×64 lanes | `open_kernels/designs/whisper_fa/`, `gemma4_vision_fa_check.py` | Unit-scale image compiled for 2520 valid patches padded to 2560; low-magnitude Q/K passed (`0.0227` maximum relative error), but normalized-magnitude Q/K failed (`0.0961` maximum relative error against `0.04` limit); native BF16 matmul variant produced nonfinite output |
+| Vision per-head Q/K/V RMSNorm, width 64 | `open_kernels/designs/gemma4_head_norm/` | 12 learned-scale and 12 unit-scale heads passed with exact BF16 output |
+| Vision axial 2D RoPE, 24 Q/K heads×64 lanes | `open_kernels/designs/gemma4_vision_rope/` | Position pairs (23,47) and (1023,2047) passed with exact BF16 output |
+| Vision FP32 online attention, 64-lane query with 2520 keys | `open_kernels/designs/gemma4_attention/`, `gemma4_vision_online_check.py` | 1024+1024+472 rows carried across NPU images; normalized-magnitude Q/K passed with maximum absolute error `3.37e-7` |
 | Audio 5-tap depthwise convolution, 256 frames×1024 channels | `open_kernels/designs/gemma4_audio_dw/`, `gemma4_audio_dw_pack.py` | BF16 inputs and weights, FP32 output passed with maximum relative error `4.05e-8` |
 | Audio stride-2, pad-1 3×3 subsampling convolutions | `open_kernels/gemma4_audio_subsample.py`, `gemma4_audio_subsample_check.py` | Both 1→128 and 128→32 channel stages passed 256-pixel NPU checks; maximum relative errors `3.11e-8` and `5.40e-7` |
+| Audio relative local attention, 8 heads×12 queries×24 context rows | `open_kernels/designs/gemma4_audio_attn/`, `gemma4_audio_attention_pack.py` | NPU computes projected-relative-key scores and shift, softcap 50, masks, softmax and value reduction; maximum relative error `1.21e-6` |
 
-The vision attention check covers SDPA after Q/K/V normalization and vision
-RoPE. The remaining multimodal kernel gaps include those normalization and
-2D RoPE operations, audio attention with relative position terms, image
-patch processing, and tower normalization and activation. Model-level work
+The single-query vision online path is numerically accurate, while the
+bidirectional image has a precision gap at realistic normalized inputs. The
+remaining multimodal kernel gaps include image patch processing, the audio
+subsampler's LayerNorm/ReLU, and tower normalization and activation. The audio
+relative-key projection uses the compiled 1024×1024 matrix shape; its output
+still needs model-level packing and clipped-linear handling. Model-level work
 also needs tensor-by-tensor weight export, a scheduler connecting these
 operations, real-package numerical checks, and image/audio output acceptance.
