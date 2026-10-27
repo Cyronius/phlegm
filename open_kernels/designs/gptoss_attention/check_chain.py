@@ -5,6 +5,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -34,13 +35,25 @@ def invoke(driver: Path, build: Path, out: Path,
               f"dump result {out / 'result.bin'} {count * np.dtype(dtype).itemsize}", ""]
     config = out / "run.cfg"
     config.write_text("\n".join(lines))
-    completed = subprocess.run([str(driver), str(config)], capture_output=True, text=True)
-    if completed.returncode:
-        raise RuntimeError(f"{out.name}: {completed.stdout}\n{completed.stderr}")
-    result = np.fromfile(out / "result.bin", dtype=dtype)
-    if result.size != count or not np.isfinite(result.astype(np.float32)).all():
-        raise AssertionError(f"{out.name}: invalid NPU output")
-    return result
+    result_path = out / "result.bin"
+    # An occasional long sequence of XRT launches has returned a short or
+    # nonfinite dump for a pure GEMV. Bound the recovery and record any replay.
+    for launch in range(3):
+        completed = subprocess.run([str(driver), str(config)], capture_output=True, text=True)
+        if completed.returncode:
+            raise RuntimeError(f"{out.name}: {completed.stdout}\n{completed.stderr}")
+        for attempt in range(20):
+            result = np.fromfile(result_path, dtype=dtype)
+            if result.size == count and np.isfinite(result.astype(np.float32)).all():
+                if launch:
+                    (out / "retries.json").write_text(json.dumps({"replays": launch}) + "\n")
+                return result
+            if result.size == count:
+                break
+            if attempt < 19:
+                time.sleep(0.1)
+    raise AssertionError(f"{out.name}: invalid NPU output after 3 launches "
+                         f"({result.size} of {count})")
 
 
 def run(driver: Path, qkv_build: Path, rope_build: Path, attn_build: Path,

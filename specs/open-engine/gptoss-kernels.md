@@ -88,12 +88,23 @@ Relative error against the independently decoded end-to-end oracle was
 rounding. Against a decoded MoE reference conditioned on the actual NPU
 inputs, the final error was `3.10e-7`. The checker records both boundaries
 and keeps the strict conditioned kernel bound separate from propagated drift.
+`gptoss_token_run.py` now carries separate key/value caches for all 24 layers,
+trims the sliding layers to 127 previous rows, runs final RMSNorm, and feeds
+all 201,088 logits through the NPU LM head. A position-zero zero-weight smoke
+check passed all 986 NPU calls, kept the residual unchanged through every
+layer, verified all 24 cache files, and returned zero logits. This check
+establishes scheduling and buffer handoffs, while the nonzero one-layer checks
+above establish arithmetic. It does not establish actual model output quality.
+Two earlier long smoke attempts encountered intermittent nonfinite output in
+an all-zero output-projection call; replaying the identical kernel input
+returned finite zeros. The shared GPT-OSS harness wrapper now retries an
+invalid pure kernel call at most twice and writes `retries.json` when it does.
+The successful 986-call run needed no replays.
 These checks use fixture activations and weights to verify the source/kernel
-ABI. The per-layer cache and 24-layer token schedule still need to consume
-these inputs with actual model weights.
+ABI. The token schedule still needs actual model weights and output checks.
 
-Remaining model work includes a 24-layer and token scheduler, real
-container weight export and NPU arithmetic checks, and model-output
+Remaining model work includes real container weight NPU arithmetic checks,
+multi-token cache reuse, prompt prefill, and model-output
 acceptance. Keep both registry entries at `missing_recipe` until those checks
 pass. Matching header geometry does not imply the variants share weight
 contents or output behavior.

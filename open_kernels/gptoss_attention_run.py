@@ -25,7 +25,8 @@ def validate_config(config: dict) -> ModelSpec:
     baseline = ModelSpec.from_hf_config(CONFIG)
     fields = ("hidden", "num_layers", "num_heads", "num_kv_heads", "head_dim",
               "rotary_dim", "sliding_window", "rope_theta", "rope_scaling",
-              "layer_types")
+              "layer_types", "vocab", "num_experts", "experts_per_tok",
+              "moe_intermediate", "norm_eps", "activation")
     if any(getattr(spec, key) != getattr(baseline, key) for key in fields):
         raise ValueError("GPT-OSS config differs from the checked NPU image geometry")
     if config.get("max_position_embeddings") != CONFIG["max_position_embeddings"]:
