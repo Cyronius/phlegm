@@ -74,7 +74,13 @@ layer-0 sliding check at position 128 passed all 21 NPU calls against
 independently decoded q4 and FP64 references. Maximum relative errors were
 `1.13e-4` at input norm, `4.37e-3` at attention finalization, and `4.65e-4`
 at the final residual. This fixture establishes a complete attention half of
-one layer; the expert MoE half and actual model weights remain open.
+one layer. Actual model weight checks remain open.
+`gptoss_moe_run.py` now takes the post-attention BF16 activation and FP32
+residual through the source router, four selected experts, clamped gate,
+weighted mix, and residual. The 19-call NPU fixture selected experts
+`[17, 9, 3, 26]`; the final residual matched the independently decoded
+MXFP4 and FP64 router reference at maximum relative error `1.28e-6`.
+The fixture verifies source bias insertion for gate, up, and down streams.
 These checks use fixture activations and weights to verify the source/kernel
 ABI. The per-layer cache and 24-layer token schedule still need to consume
 these inputs with actual model weights.
