@@ -16,6 +16,7 @@ compositions, not an exported model or native generation path.
 | Composed head and softcap | `open_kernels/gemma4_logits_check.py` | All three text widths passed across the full vocabulary |
 | E2B/E4B per-layer input GELU gate | `open_kernels/designs/gemma4_ple_gate/` | BF16-rounded 256-value NPU check matched exactly |
 | Hidden RMSNorm and residual | `open_kernels/designs/gemma4_hidden_norm/` | E2B/E4B/12B widths passed with residual and plain norm modes |
+| Text layer scheduler plan | `open_kernels/gemma4_text_plan.py` | Published E2B/E4B/12B geometry, shared-K/V providers, K=V routing, MLP widths, and local/full sequence checked by four CPU tests |
 
 The attention state image processes 1, 128, 512, or 1024 rows per call. Its
 FP32 carry output supports consecutive full-attention chunks. The caller
@@ -36,10 +37,11 @@ layout and any required transcode remain unverified.
 ## Remaining work for a model recipe
 
 The three model entries need source-weight mapping and packing, text Q/K/V/O
-and MLP projections, residual and sandwich-norm wiring, and a layer scheduler.
-E2B and E4B also need per-layer input projection and shared-K/V routing. The 12B full
-attention path needs its K=V alternative represented in the exporter and
-scheduler. All three require real-container arithmetic checks, complete
+and MLP projections, residual and sandwich-norm wiring, and a scheduler that
+executes the validated layer plan. E2B and E4B also need the per-layer input
+projection and shared-K/V state routing in that scheduler. The 12B full
+attention path needs its K=V alternative in the exporter and scheduler.
+All three require real-container arithmetic checks, complete
 generation, and model-output acceptance. Vision and audio routes for the
 multimodal entries are still separate coverage gaps. Do not change their
 `missing_recipe` matrix state until those pieces form a deployable recipe.
