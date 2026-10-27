@@ -73,6 +73,19 @@ def test_source_exposes_kernel_oriented_constants(source):
     assert source.reader.mm.reads[-1] == (start, start + 5760)
 
 
+def test_expert_input_embeds_each_bias_in_the_kernel_chunk(source, monkeypatch):
+    from ml_dtypes import bfloat16
+    chunks = np.full((90, 23, CHUNK), 9, np.uint8)
+    bias = np.arange(2880, dtype=np.float32).astype(bfloat16)
+    monkeypatch.setattr(source, "expert", lambda *args: chunks.copy())
+    monkeypatch.setattr(source, "expert_bias", lambda *args: bias.copy())
+    packed = source.expert_input(0, 7, "gate")
+    assert np.array_equal(packed[:, 0, 128:192], bias.view(np.uint8).reshape(90, 64))
+    assert np.all(packed[:, 0, 127] == 9)
+    assert np.all(packed[:, 0, 192] == 9)
+    assert np.all(packed[:, 1, :] == 9)
+
+
 def test_embedding_and_final_norm_use_bounded_source_reads(source):
     token = 197624
     embedding = source.embedding(token)

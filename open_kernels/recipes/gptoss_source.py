@@ -177,6 +177,17 @@ class GptOssSource:
         return np.frombuffer(self._bytes(name, "BF16", (32, 2880),
                                          expert_id * 2880 * 2, 2880 * 2), bfloat16).copy()
 
+    def expert_input(self, layer: int, expert_id: int, role: str) -> np.ndarray:
+        """One NPU expert GEMV stream with its BF16 bias in the first K chunk.
+
+        The 90×32 bias values occupy bytes 128:192 of each band's first
+        2560-byte chunk, matching the checked expert kernel ABI.
+        """
+        chunks = self.expert(layer, expert_id, role)
+        bias = self.expert_bias(layer, expert_id, role)
+        chunks[:, 0, 128:192] = bias.view(np.uint8).reshape(90, 64)
+        return chunks
+
     def head_band(self, band: int) -> np.ndarray:
         """Return q4_1 uint8[24,5120] for one 64-logit, 3072-wide head band.
 

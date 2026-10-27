@@ -55,6 +55,8 @@ def export(source: GptOssSource, layer: int, out: Path,
                 put(f"experts/{expert_id:02d}/{role}.bin", source.expert(layer, expert_id, role))
                 put(f"experts/{expert_id:02d}/{role}_bias.bin",
                     source.expert_bias(layer, expert_id, role))
+                put(f"experts/{expert_id:02d}/{role}_npu.bin",
+                    source.expert_input(layer, expert_id, role))
         manifest = {"format": "gptoss-20b-checked-npu-source-v1", "layer": layer,
                     "experts": list(experts), "files": files,
                     "scope": "one-layer source inputs for checked kernels; no model runtime"}

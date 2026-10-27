@@ -35,6 +35,14 @@ The public `Atomic-Germ/GPT-OSS-20B-NPU2` and
 2026-10-27. Their required tensor names, dtypes, and shapes match; the
 validator read bounded headers and no weight payloads.
 
+The source adapter now builds a complete expert GEMV input by inserting the
+selected expert's 2880 BF16 bias values into bytes 128–191 of each band's
+first MXFP4 chunk. The layer exporter records both the raw projection and
+the bias-filled NPU stream. A 90-band NPU projection using this source stream
+passed an independent FP64 decoded-MXFP4 reference with maximum relative
+error `6.45e-7`. The check used fixture weights and nonzero fixture bias;
+real model payload arithmetic is still pending.
+
 Remaining model work includes a complete layer and token scheduler, real
 container weight export and NPU arithmetic checks, and model-output
 acceptance. Keep both registry entries at `missing_recipe` until those checks
