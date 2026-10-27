@@ -81,11 +81,18 @@ weighted mix, and residual. The 19-call NPU fixture selected experts
 `[17, 9, 3, 26]`; the final residual matched the independently decoded
 MXFP4 and FP64 router reference at maximum relative error `1.28e-6`.
 The fixture verifies source bias insertion for gate, up, and down streams.
+`gptoss_layer_run.py` joins the two halves with post-attention RMSNorm. The
+41-call layer-0 check at position 128 passed with the same four experts.
+Relative error against the independently decoded end-to-end oracle was
+`1.60e-2`; the synthetic expert weights amplify earlier attention and norm
+rounding. Against a decoded MoE reference conditioned on the actual NPU
+inputs, the final error was `3.10e-7`. The checker records both boundaries
+and keeps the strict conditioned kernel bound separate from propagated drift.
 These checks use fixture activations and weights to verify the source/kernel
 ABI. The per-layer cache and 24-layer token schedule still need to consume
 these inputs with actual model weights.
 
-Remaining model work includes a complete layer and token scheduler, real
+Remaining model work includes a 24-layer and token scheduler, real
 container weight export and NPU arithmetic checks, and model-output
 acceptance. Keep both registry entries at `missing_recipe` until those checks
 pass. Matching header geometry does not imply the variants share weight
