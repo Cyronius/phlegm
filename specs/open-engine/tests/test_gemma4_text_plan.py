@@ -1,6 +1,9 @@
 import unittest
 
-from open_kernels.gemma4_text_plan import Gemma4PlanError, from_hf_config
+from open_kernels.gemma4_text_plan import (Gemma4PlanError, from_hf_config,
+                                            projections, projection_geometries,
+                                            projection_image_geometry, Projection)
+from open_kernels.build_gemma4_text_projections import image_plan
 
 
 def config(variant):
@@ -61,6 +64,35 @@ class Gemma4TextPlanTest(unittest.TestCase):
         cfg["num_global_key_value_heads"] = 8
         with self.assertRaisesRegex(Gemma4PlanError, "num_global_key_value_heads"):
             from_hf_config(cfg)
+
+    def test_projection_inventory_accounts_for_sharing_ple_and_k_eq_v(self):
+        e2b = from_hf_config(config("E2B"))
+        e4b = from_hf_config(config("E4B"))
+        b12 = from_hf_config(config("12B"))
+        self.assertEqual(len(projections(e2b)), 1 + 35 * 9 - 20 * 2)
+        self.assertEqual(len(projections(e4b)), 1 + 42 * 9 - 18 * 2)
+        self.assertEqual(len(projections(b12)), 48 * 7 - 8)
+        self.assertIn((8960, 1536), projection_geometries(e2b))
+        self.assertIn((10752, 2560), projection_geometries(e4b))
+        self.assertIn((12288, 1536), projection_geometries(e2b))
+        self.assertIn((1536, 12288), projection_geometries(e2b))
+        self.assertIn((15360, 3840), projection_geometries(b12))
+        self.assertNotIn((512, 3840), {(p.rows, p.cols) for p in projections(b12)
+                                           if p.layer == 5 and p.name == "v"})
+        self.assertEqual(projection_image_geometry(Projection(15, "down", 1536, 12288)),
+                         (1536, 6144, 2))
+        self.assertEqual(projection_image_geometry(Projection(1, "down", 2560, 10240)),
+                         (2560, 5120, 2))
+        self.assertEqual(projection_image_geometry(Projection(1, "down", 3840, 15360)),
+                         (3840, 7680, 2))
+
+    def test_image_plan_deduplicates_layers_and_names_split_calls(self):
+        plan = image_plan(config("12B"))
+        self.assertEqual(len(plan["images"]), 8)
+        self.assertEqual(plan["projection_count"], 328)
+        self.assertEqual(plan["images"]["n3840_k7680"]["cores"], 8)
+        down = [p for p in plan["projections"] if p["layer"] == 5 and p["name"] == "down"]
+        self.assertEqual((down[0]["image"], down[0]["calls"]), ("n3840_k7680", 2))
 
 
 if __name__ == "__main__":

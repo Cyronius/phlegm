@@ -17,6 +17,8 @@ compositions, not an exported model or native generation path.
 | E2B/E4B per-layer input GELU gate | `open_kernels/designs/gemma4_ple_gate/` | BF16-rounded 256-value NPU check matched exactly |
 | Hidden RMSNorm and residual | `open_kernels/designs/gemma4_hidden_norm/` | E2B/E4B/12B widths passed with residual and plain norm modes |
 | Text layer scheduler plan | `open_kernels/gemma4_text_plan.py` | Published E2B/E4B/12B geometry, shared-K/V providers, K=V routing, MLP widths, and local/full sequence checked by four CPU tests |
+| q4 text Q/K/V/O, MLP and PLE projections | `open_kernels/build_gemma4_text_projections.py` | All distinct published geometries compiled: 11 E2B, 11 E4B, 8 12B images; NPU arithmetic checks pending |
+| Per-layer context norm and token mix | `open_kernels/designs/gemma4_ple_input/` | E2B/E4B with-token and context-only variants compiled; NPU arithmetic checks pending |
 
 The attention state image processes 1, 128, 512, or 1024 rows per call. Its
 FP32 carry output supports consecutive full-attention chunks. The caller
@@ -34,12 +36,21 @@ were `4.01e-5`, `4.05e-5`, and `7.06e-5` respectively. These checks use the
 generic 5120-byte q4_1 pool format; the actual Gemma 4 package's source
 layout and any required transcode remain unverified.
 
+The text projection inventory has 276 E2B, 343 E4B, and 328 12B logical
+matrices. It omits K/V projections in shared layers and the full-attention V
+projection in 12B. A 12288-wide E2B down projection exceeded AIE tile memory
+as one call; the plan splits it into two 6144-wide calls. E4B's 10240-wide
+and 12B's 15360-wide down projections similarly use two calls. The complete
+12B, E2B, and E4B projection image sets compiled from pinned configuration
+fixtures on 2026-10-27. Compiling establishes image feasibility, not matrix
+arithmetic correctness; the corresponding NPU checks are still pending.
+
 ## Remaining work for a model recipe
 
-The three model entries need source-weight mapping and packing, text Q/K/V/O
-and MLP projections, residual and sandwich-norm wiring, and a scheduler that
-executes the validated layer plan. E2B and E4B also need the per-layer input
-projection and shared-K/V state routing in that scheduler. The 12B full
+The three model entries need source-weight mapping and packing, NPU arithmetic
+checks of the new projection images, residual and sandwich-norm wiring, and a
+scheduler that executes the validated layer plan. E2B and E4B also need the
+per-layer input and shared-K/V state routing in that scheduler. The 12B full
 attention path needs its K=V alternative in the exporter and scheduler.
 All three require real-container arithmetic checks, complete
 generation, and model-output acceptance. Vision and audio routes for the

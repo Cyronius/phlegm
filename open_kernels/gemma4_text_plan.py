@@ -57,6 +57,65 @@ class TextPlan:
     layers: tuple[Layer, ...]
 
 
+@dataclass(frozen=True)
+class Projection:
+    layer: int | None
+    name: str
+    rows: int
+    cols: int
+
+
+def projections(plan: TextPlan) -> tuple[Projection, ...]:
+    """All text GEMVs required by the published layer schedule.
+
+    Shared layers consume provider K/V states rather than recomputing them.
+    Matrix naming here is a logical role; source-container names are separate.
+    """
+    out = []
+    if plan.layers[0].per_layer_input_width:
+        out.append(Projection(None, "per_layer_model_projection",
+                              len(plan.layers) * plan.layers[0].per_layer_input_width, plan.hidden))
+    for layer in plan.layers:
+        i, hidden, ff = layer.index, plan.hidden, layer.mlp_width
+        out.append(Projection(i, "q", layer.query_width, hidden))
+        if layer.computes_kv:
+            out.append(Projection(i, "k", layer.kv_width, hidden))
+            if layer.has_v_projection:
+                out.append(Projection(i, "v", layer.kv_width, hidden))
+        out.append(Projection(i, "o", hidden, layer.query_width))
+        out.extend((Projection(i, "gate", ff, hidden),
+                    Projection(i, "up", ff, hidden),
+                    Projection(i, "down", hidden, ff)))
+        if layer.per_layer_input_width:
+            out.extend((Projection(i, "per_layer_input_gate", layer.per_layer_input_width, hidden),
+                        Projection(i, "per_layer_projection", hidden, layer.per_layer_input_width)))
+    return tuple(out)
+
+
+def projection_geometries(plan: TextPlan) -> tuple[tuple[int, int], ...]:
+    """Distinct (rows, cols) image geometries, sorted for deterministic builds."""
+    shapes = {(p.rows, p.cols) for p in projections(plan)}
+    if any(n % 64 or k % 256 for n, k in shapes):
+        raise Gemma4PlanError("a projection is outside the q4 GEMV tile geometry")
+    return tuple(sorted(shapes))
+
+
+def projection_image_geometry(projection: Projection) -> tuple[int, int, int]:
+    """(rows, cols per image, number of calls) for the 64 KiB AIE tile budget.
+
+    The existing q4 GEMV holds the BF16 activation, preparation table, two
+    10 KiB weight FIFOs, output FIFOs and stack in one tile. The largest
+    verified safe input width is 8192; wider reductions run equal K stripes.
+    """
+    n, k = projection.rows, projection.cols
+    if n % 64 or k % 256:
+        raise Gemma4PlanError("a projection is outside the q4 GEMV tile geometry")
+    calls = (k + 8191) // 8192
+    if k % calls or (k // calls) % 256:
+        raise Gemma4PlanError(f"cannot split {k}-wide q4 reduction evenly")
+    return n, k // calls, calls
+
+
 # Pin the published text geometries. A different configuration must be
 # investigated before we build images or interpret its tensors as one of these.
 _PROFILES = {
