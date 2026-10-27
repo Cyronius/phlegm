@@ -12,17 +12,17 @@ compositions, not an exported model or native generation path.
 | Decode attention with online softmax state | `open_kernels/designs/gemma4_attention/` | Eight width/chunk images passed; 512-wide state carried through 4096 rows |
 | Composed norm, RoPE, GQA attention | `open_kernels/designs/gemma4_attention/check_chain.py` | All six E2B/E4B/12B local/full head layouts passed at position 127 |
 | q4 full-vocabulary LM head | `open_kernels/designs/lm_head_q4/` and `open_kernels/gemma4_lm_head_check.py` | Full 262144-logit images passed at K=1536, 2560, 3840; 12B's FLM source uses q8 instead |
-| 12B q8 full-vocabulary LM head | `open_kernels/designs/lm_head_q8/` | K=3840, N=262144 image compiled; NPU arithmetic check pending |
+| 12B q8 full-vocabulary LM head | `open_kernels/designs/lm_head_q8/` | K=3840, N=262144 image compiled; representative 128-logit band passed at maximum relative error `4.43e-6` |
 | Final logit softcap | `open_kernels/designs/gemma4_logit_cap/` | Full 262144 logits passed against `30*tanh(logit/30)` |
 | Composed head and softcap | `open_kernels/gemma4_logits_check.py` | All three text widths passed across the full vocabulary |
 | E2B/E4B per-layer input GELU gate | `open_kernels/designs/gemma4_ple_gate/` | BF16-rounded 256-value NPU check matched exactly |
 | Hidden RMSNorm and residual | `open_kernels/designs/gemma4_hidden_norm/` | E2B/E4B/12B widths passed with residual and plain norm modes |
 | Text layer scheduler plan | `open_kernels/gemma4_text_plan.py` | Published E2B/E4B/12B geometry, shared-K/V providers, K=V routing, MLP widths, and local/full sequence checked by eight CPU tests |
-| q4 text Q/K/V/O and MLP projections | `open_kernels/build_gemma4_text_projections.py` | Published geometries compiled; NPU arithmetic checks pending |
-| E2B/E4B BF16 per-layer projections | `open_kernels/designs/gemma4_bf16_gemv/` | All four source-layout geometries compiled; NPU arithmetic checks pending |
+| q4 text Q/K/V/O and MLP projections | `open_kernels/build_gemma4_text_projections.py` | Published geometries compiled; E2B Q and split down, plus 12B split down, passed representative NPU arithmetic checks |
+| E2B/E4B BF16 per-layer projections | `open_kernels/designs/gemma4_bf16_gemv/` | All four source-layout geometries compiled and passed representative NPU arithmetic checks (maximum relative error `7.27e-7`) |
 | FLM text weight mapping | `open_kernels/gemma4_source.py` | Public E2B, E4B, and 12B q4nx headers passed 597, 727, and 668 required tensor shape/byte checks; 12B's signed q4 and q8 16-row tile repackers passed exact synthetic value checks |
-| Per-layer context norm and token mix | `open_kernels/designs/gemma4_ple_input/` | E2B/E4B with-token and context-only variants compiled; NPU arithmetic checks pending |
-| Full-width MLP GELU-tanh and up product | `open_kernels/designs/gemma4_gelu_mul/` | All four 6144/10240/12288/15360-wide images compiled from the checked 256-value gate arithmetic; NPU checks pending |
+| Per-layer context norm and token mix | `open_kernels/designs/gemma4_ple_input/` | E2B/E4B with-token and context-only variants compiled and passed NPU checks |
+| Full-width MLP GELU-tanh and up product | `open_kernels/designs/gemma4_gelu_mul/` | All four 6144/10240/12288/15360-wide images compiled and passed NPU checks (maximum absolute error `3.05e-5`) |
 
 The attention state image processes 1, 128, 512, or 1024 rows per call. Its
 FP32 carry output supports consecutive full-attention chunks. The caller
@@ -54,19 +54,18 @@ and 12B's 15360-wide down projections similarly use two calls. The complete
 12B, E2B, and E4B all-q4 projection image sets compiled from pinned configuration
 fixtures on 2026-10-27. Corrected E2B and E4B text kernel bundles compiled
 with BF16 PLE projection images. The corrected 12B bundle also compiled with
-a q8 LM head. Compiling establishes image feasibility, not matrix
-arithmetic correctness; the corresponding NPU checks are still pending.
+a q8 LM head. The representative arithmetic checks above cover source-layout
+families and selected shapes, not every layer or real weight payload.
 
 ## Remaining work for a model recipe
 
-The three model entries need source-weight mapping and packing, NPU arithmetic
-checks of the new projection images, residual and sandwich-norm wiring, and a
+The three model entries need real source-weight payload checks, residual and sandwich-norm wiring, and a
 scheduler that executes the validated layer plan. E2B and E4B also need the
 per-layer input and shared-K/V state routing in that scheduler. The 12B full
 attention path needs its K=V alternative in the exporter and scheduler.
 All three require real-container arithmetic checks, complete
-generation, and model-output acceptance. Vision and audio routes for the
-multimodal entries are still separate coverage gaps. Do not change their
+generation, and model-output acceptance. Vision and audio progress is recorded
+in `gemma4-multimodal-kernels.md`. Do not change their
 `missing_recipe` matrix state until those pieces form a deployable recipe.
 
 Architecture references: the published [12B configuration](https://huggingface.co/google/gemma-4-12B-it/blob/main/config.json),
