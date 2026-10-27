@@ -33,10 +33,10 @@ Phlegm kernel implementation or a compatible ABI.
 | `embed-gemma:300m` | `embed-gemma` | `embedding-gemma-matmul` | `special_source` | embedding runtime route and model validation remain open |
 | `whisper-v3:turbo` | `whisper-v3` | `whisper` | `special_source` | model-specific build and validation |
 | `gemma3:1b` | `gemma3-text` | `gemma3` | `recipe_source` | model-specific build and validation |
-| `gemma3:4b` | `gemma3` | `gemma3` | `recipe_source` | 4B vision patch/embed and projector images built; transformer tower and variant geometry checks remain |
-| `translategemma:4b` | `gemma3` | `gemma3` | `recipe_source` | 4B vision patch/embed and projector images built; transformer tower and variant geometry checks remain |
-| `medgemma:4b` | `gemma3` | `gemma3` | `recipe_source` | 4B vision patch/embed and projector images built; transformer tower and variant geometry checks remain |
-| `medgemma1.5:4b` | `gemma3` | `gemma3` | `recipe_source` | 4B vision patch/embed and projector images built; transformer tower and variant geometry checks remain |
+| `gemma3:4b` | `gemma3` | `gemma3` | `recipe_source` | 4B vision patch, tower norm/matrix, projector images built; tower attention/activation and variant checks remain |
+| `translategemma:4b` | `gemma3` | `gemma3` | `recipe_source` | 4B vision patch, tower norm/matrix, projector images built; tower attention/activation and variant checks remain |
+| `medgemma:4b` | `gemma3` | `gemma3` | `recipe_source` | 4B vision patch, tower norm/matrix, projector images built; tower attention/activation and variant checks remain |
+| `medgemma1.5:4b` | `gemma3` | `gemma3` | `recipe_source` | 4B vision patch, tower norm/matrix, projector images built; tower attention/activation and variant checks remain |
 | `llama3.2:1b` | `llama3` | `llama3` | `recipe_source` | model-specific build and validation |
 | `llama3.2:3b` | `llama3` | `llama3` | `recipe_source` | model-specific build and validation |
 | `llama3.1:8b` | `llama3` | `llama3` | `recipe_source` | model-specific build and validation |

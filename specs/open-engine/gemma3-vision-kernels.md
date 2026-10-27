@@ -40,8 +40,27 @@ FP32 NPU input, and composed output maximum relative error `0.00164`.
 `test_gemma3_vision_patch_pack.py` checks RGB/channel/patch ordering and
 weight padding.
 
-Remaining work includes the SigLIP transformer layers, real FLM tensor-layout
-conversion for patch and projector weights, variant-specific geometry checks,
-and image-to-text output acceptance. These 4B entries remain
+The [SigLIP encoder source](https://github.com/huggingface/transformers/blob/main/src/transformers/models/siglip/modeling_siglip.py)
+uses LayerNorm, Q/K/V and output projections, then a two-matrix MLP within
+each transformer layer. The 4B vision geometry used here is 1152 channels,
+16 heads, 27 layers, and 4304 MLP channels; these dimensions also appear in a
+[public repack's configuration](https://huggingface.co/onnx-community/gemma-3-4b-it-ONNX/blob/main/config.json).
+`build_gemma3_vision_tower_mm.py` builds a hashed five-image bundle:
+LayerNorm[256,1152], QKV M256×K1152×N3584, attention output
+M256×K1152×N1280, FC1 M256×K1152×N4352, and FC2 M256×K4352×N1280.
+`gemma3_vision_tower_weights.py` pads logical matrices and concatenates Q/K/V
+in that order. This bundle is in `target/npu-dev/gemma3_vision_tower_mm_bundle_v2`.
+
+The NPU LayerNorm check passed across 256 rows including a constant row,
+with maximum relative error `0.00140` and `99.98%` exact BF16 values. All
+four matrix images passed sampled FP64 checks across first, interior and last
+rows and first/last columns; their maximum sampled relative errors were
+`4.72e-7`, `5.65e-7`, `6.04e-7`, and `9.91e-7` respectively. Padded output
+columns were zero. The matrix source remains synthetic.
+
+Remaining work includes full SigLIP attention, matrix bias/activation and
+residual boundaries, real FLM tensor-layout conversion for all vision
+weights, variant-specific geometry checks, and image-to-text output
+acceptance. These 4B entries remain
 text-only recipe routes in the coverage matrix until the full vision path is
 validated.
