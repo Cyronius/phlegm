@@ -1,6 +1,6 @@
 """Run the Gemma 3 4B SigLIP tower and projector on Phlegm's NPU images.
 
-Input is FLM's preprocessed BF16 CHW[3,896,896] image and vision_weights.q4nx.
+Input is FLM's preprocessed BF16 CHW[3,896,896] image and vision_weight.q4nx.
 The runner keeps one layer's scratch files and two alternating hidden-state
 files, so 27 layers do not multiply the scratch storage requirement.
 """
@@ -18,9 +18,38 @@ from open_kernels.gemma3_vision_attention_check import maxrel, run_image
 from open_kernels.gemma3_vision_layer_run import layernorm_ref, run as run_layer
 from open_kernels.gemma3_vision_patch_pack import pack_pixels, pad_weight
 from open_kernels.gemma3_vision_pool_pack import pack as pack_groups
-from open_kernels.gemma3_vision_source import patch_embedding, post_layernorm, projector
+from open_kernels.gemma3_vision_source import (patch_embedding, post_layernorm,
+                                                projector, validate_header)
 from open_kernels.gemma4_mm_source import npu_weight_row_major
 from open_kernels.model.q4nx import Q4NX
+
+VISION_CONFIG = {
+    "vision_model_weight": "vision_weight.q4nx",
+    "vision_conv2d_stride": 14,
+    "vision_conv2d_padding": 0,
+    "vision_conv2d_kernel": 14,
+    "vision_conv2d_Cin": 3,
+    "vision_conv2d_Cout": 1152,
+    "vision_average_pooling_kernel": 4,
+    "vision_average_pooling_stride": 4,
+    "vision_average_pooling_padding": 0,
+    "vision_layer_norm_eps": 1e-6,
+    "vision_rms_norm_eps": 1e-6,
+    "vision_intermediate_size": 4304,
+    "vision_hidden_size": 1152,
+    "vision_head_dim": 72,
+    "vision_num_attention_heads": 16,
+    "vision_num_key_value_heads": 16,
+    "vision_num_hidden_layers": 27,
+}
+
+
+def validate_config(path: Path) -> dict:
+    config = json.loads(path.read_text())
+    for key, expected in VISION_CONFIG.items():
+        if config.get(key) != expected:
+            raise ValueError(f"{key}: expected {expected!r}, got {config.get(key)!r}")
+    return {key: config[key] for key in VISION_CONFIG}
 
 
 def read_bf16(path: Path, shape: tuple[int, ...]) -> np.ndarray:
@@ -28,6 +57,25 @@ def read_bf16(path: Path, shape: tuple[int, ...]) -> np.ndarray:
     if value.size != int(np.prod(shape)):
         raise ValueError(f"{path}: expected BF16{shape}")
     return value.reshape(shape)
+
+
+def validate_images(patch: Path, tower: Path, post: Path, attention: Path,
+                    residual: Path, pool: Path, projector_image: Path) -> int:
+    images = ([patch / name for name in ("patch_mm_m256_k640_n1280",
+                                         "patch_bias_position_256x1152")] +
+              [tower / name for name in ("layernorm_256x1152", "qkv_m256_k1152_n3584",
+                                         "attention_out_m256_k1152_n1280",
+                                         "mlp_fc1_m256_k1152_n4352",
+                                         "mlp_fc2_m256_k4352_n1280")] +
+              [post / name for name in ("qkv_bias_n3584", "attention_out_bias_n1280",
+                                        "fc1_bias_gelu_n4352", "fc2_bias_n1280")] +
+              [attention / name for name in ("qk_m256_k128_n4096",
+                                             "softmax_256x4096", "pv_m256_k4096_n256")] +
+              [residual, pool, projector_image])
+    for image in images:
+        if not all((image / part).is_file() for part in ("final.xclbin", "insts.bin")):
+            raise FileNotFoundError(f"missing NPU image: {image}")
+    return len(images)
 
 
 def patch_run(driver: Path, bundle: Path, image: np.ndarray, weights: dict,
@@ -97,12 +145,16 @@ def finish_run(driver: Path, layernorm_image: Path, pool_image: Path,
 
 def run(driver: Path, patch_bundle: Path, tower_bundle: Path, post_bundle: Path,
         attention_bundle: Path, residual_image: Path, pool_image: Path,
-        projector_image: Path, vision_weights: Path, image_path: Path,
+        projector_image: Path, vision_weights: Path, config_path: Path, image_path: Path,
         out: Path) -> dict:
     if out.exists():
         raise FileExistsError(out)
+    config = validate_config(config_path)
+    validate_images(patch_bundle, tower_bundle, post_bundle, attention_bundle,
+                    residual_image, pool_image, projector_image)
     image = read_bf16(image_path, (3, 896, 896))
     weights = Q4NX(vision_weights)
+    validate_header(weights)
     patch_weights = patch_embedding(weights)
     out.mkdir(parents=True)
     first = patch_run(driver, patch_bundle, image, patch_weights, out / "patch")
@@ -121,7 +173,8 @@ def run(driver: Path, patch_bundle: Path, tower_bundle: Path, post_bundle: Path,
     finish = finish_run(driver, tower_bundle / "layernorm_256x1152",
                         pool_image, projector_image, current, weights,
                         out / "finish")
-    report = {"model": "Gemma 3 4B SigLIP tower", "layers": len(reports),
+    report = {"model": "Gemma 3 4B SigLIP tower", "configuration": config,
+              "layers": len(reports),
               "tokens": 256, "hidden": 2560, "finish": finish,
               "passed": bool(all(layer["passed"] for layer in reports) and finish["passed"])}
     (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -134,11 +187,11 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     for key in ("driver", "patch-bundle", "tower-bundle", "post-bundle",
                 "attention-bundle", "residual-image", "pool-image",
-                "projector-image", "vision-weights", "image", "out"):
+                "projector-image", "vision-weights", "config", "image", "out"):
         p.add_argument(f"--{key}", required=True, type=Path)
     a = p.parse_args()
     print(json.dumps(run(*(getattr(a, key.replace("-", "_")).resolve() for key in
                            ("driver", "patch-bundle", "tower-bundle", "post-bundle",
                             "attention-bundle", "residual-image", "pool-image",
-                            "projector-image", "vision-weights", "image", "out"))),
+                            "projector-image", "vision-weights", "config", "image", "out"))),
                      indent=2))

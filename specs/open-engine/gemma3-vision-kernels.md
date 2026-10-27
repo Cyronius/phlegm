@@ -94,21 +94,36 @@ exactly. This establishes the kernel schedule for one layer, not a real
 checkpoint result.
 
 `gemma3_vision_source.py` reads the BF16 tensors from FLM's
-`vision_weights.q4nx`, validates the 4B shapes, and undoes FLM's 64×256
+`vision_weight.q4nx`, validates the 4B shapes, and undoes FLM's 64×256
 matrix tiling. It exposes patch embedding, all 27 encoder layers, final
 post-LayerNorm, and projector weights. The layer runner accepts
 `--vision-weights`, `--input` (BF16[4096,1152] patch embeddings), and
 `--layer-index` for a real-weight layer check. The tile inverse and padding
-rejection have CPU tests. No local FLM vision-weight payload was available
-for an end-to-end real-weight run.
+rejection have CPU tests.
 
 `gemma3_vision_tower_run.py` now schedules the 16 patch panels, 27 encoder
 layers, 16 post-LayerNorm panels, one 4×4 spatial pool/norm image, and one
 projector matrix image. It alternates two hidden-state files and reuses one
 layer scratch directory. Input is FLM's preprocessed BF16 CHW[3,896,896]
-image. Output is a BF16[256,2560] projected image-token file alongside the
+image, `vision_weight.q4nx`, and its `config.json`. Output is a
+BF16[256,2560] projected image-token file alongside the
 FP32 projector output. The 27-layer chaining test checks every layer index
 and the final input to the projector.
+
+The runner checks `config.json` against 17 vision geometry fields, all 439
+required q4nx tensor headers and byte extents, and all 17 NPU image paths
+before dispatch. The published FLM configs for
+[Gemma3 4B](https://huggingface.co/FastFlowLM/Gemma3-4B-NPU2/blob/a5ad9dbc7bdf9cdf83b4ddfd951372953da0969a/config.json),
+[Translategemma 4B](https://huggingface.co/Atomic-Germ/Translategemma-4B-Instruct-NPU2/blob/main/config.json),
+[Medgemma 4B](https://huggingface.co/OpenFlowLM/medgemma-4b-it-NPU2/blob/main/config.json),
+and [Medgemma 1.5 4B](https://huggingface.co/OpenFlowLM/medgemma-1.5-4b-it-NPU2/blob/main/config.json)
+passed the same geometry check. The public
+Gemma3 4B `vision_weight.q4nx` at FastFlowLM revision
+`a5ad9dbc7bdf9cdf83b4ddfd951372953da0969a` has SHA-256
+`2ad25d01edb6b31bab7e487e496f4652cc098738d8a726d69854fb5408d351e6`.
+Its 439 required tensor headers passed, and all 27 layers decoded with zero
+padding and finite values. The other three variants' weight payloads have
+not been checked.
 
 For the new full-image path, a synthetic 4096-patch NPU run passed FP64/BF16
 checks at patches 0, 257, 2047, and 4095 with exact BF16 results. The
@@ -118,7 +133,19 @@ relative error was `0.003125`, and sampled projector matrix maximum relative
 error was `6.62e-7`. These checks establish the endpoints of the scheduled
 tower; they do not validate propagation through a real 27-layer checkpoint.
 
-Remaining work includes real-weight 27-layer execution, variant-specific
-geometry checks, and image-to-text output acceptance. These 4B entries remain
+With the public Gemma3 4B FLM weights and a deterministic normalized RGB
+image, all 4096 patch embeddings ran on NPU; four sampled patches matched the
+FP64/BF16 CPU calculation exactly. Encoder layer 0 completed all 16 heads and
+both residual paths. Three sampled QKV rows reached maximum relative error
+`7.58e-5`, all 16 heads at three rows reached `0.00129`, and three sampled
+layer-output rows reached `0.000481`. The real final post-LayerNorm,
+pool/norm, and projector weights also passed NPU arithmetic checks when fed
+that layer-0 output: sampled LayerNorm rows were exact BF16, pool/norm maximum
+relative error was `0.000635`, and sampled projector matrix maximum relative
+error was `3.90e-7`. This last probe uses layer-0 output as input to the
+final stages; it does not represent the 27-layer model output.
+
+Remaining work includes real-weight 27-layer execution, the other three
+variants' weight checks, and image-to-text output acceptance. These 4B entries remain
 text-only recipe routes in the coverage matrix until the full vision path is
 validated.

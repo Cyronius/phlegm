@@ -67,6 +67,20 @@ def downstream_reference(row: int, x: np.ndarray, attention: np.ndarray,
     return (fc2.astype(np.float64) + residual.astype(np.float64)).astype(bfloat16)
 
 
+def selected_qkv_reference(x: np.ndarray, qkv: np.ndarray,
+                           weights: dict[str, np.ndarray]) -> list[dict]:
+    matrix = weights["qkv_weight"].astype(np.float64)
+    bias = weights["qkv_bias"].astype(np.float32)
+    checks = []
+    for row in (0, 257, 4095):
+        normalized = layernorm_ref(x[row], weights["ln1_gamma"], weights["ln1_beta"])
+        projected = (matrix @ normalized.astype(np.float64)).astype(np.float32)
+        expected = (projected + bias).astype(bfloat16)
+        checks.append({"row": row,
+                       "max_relative_error": maxrel(qkv[row, :3456], expected)})
+    return checks
+
+
 def read(path: Path, dtype, shape: tuple[int, ...]) -> np.ndarray:
     return np.fromfile(path, dtype).reshape(shape)
 
@@ -106,6 +120,7 @@ def run(driver: Path, tower: Path, post: Path, attention_bundle: Path,
                               256 * 3584 * 2)
         qkv[start:start + 256] = read(bias_path, bfloat16, (256, 3584))
     (out / "qkv.bin").write_bytes(qkv.tobytes())
+    qkv_checks = selected_qkv_reference(x, qkv, weights)
     run_attention(driver, attention_bundle, out / "attention", out / "qkv.bin")
     attended = read(out / "attention/result.bin", bfloat16, (4096, 1152))
     attention_reference = selected_reference(qkv, attended)
@@ -154,9 +169,11 @@ def run(driver: Path, tower: Path, post: Path, attention_bundle: Path,
     report = {"model": "Gemma 3 4B SigLIP encoder layer",
               "synthetic": synthetic, "layer_index": layer_index,
               "tokens": 4096, "hidden": 1152, "heads": 16,
+              "qkv_checks": qkv_checks,
               "attention": attention_reference,
               "downstream_checks": checks,
               "passed": bool(np.isfinite(final.astype(np.float32)).all() and
+                             all(item["max_relative_error"] < 0.005 for item in qkv_checks) and
                              attention_reference["max_relative_error"] < 0.01 and
                              all(item["max_relative_error"] < 0.02 for item in checks))}
     (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -170,7 +187,7 @@ if __name__ == "__main__":
     for key in ("driver", "tower", "post", "attention", "residual", "out"):
         p.add_argument(f"--{key}", required=True, type=Path)
     p.add_argument("--vision-weights", type=Path,
-                   help="FLM vision_weights.q4nx; synthetic weights if absent")
+                   help="FLM vision_weight.q4nx; synthetic weights if absent")
     p.add_argument("--input", type=Path,
                    help="BF16[4096,1152] patch embeddings for a real-weight layer")
     p.add_argument("--layer-index", type=int, default=0)

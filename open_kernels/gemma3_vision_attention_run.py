@@ -25,7 +25,7 @@ def synthetic_qkv() -> np.ndarray:
 
 def selected_reference(qkv: np.ndarray, output: np.ndarray) -> dict:
     cases = []
-    for head in (0, 5, 15):
+    for head in range(16):
         first = head * 72
         for row in (0, 257, 4095):
             query = qkv[row, first:first + 72].astype(np.float64)

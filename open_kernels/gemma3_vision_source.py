@@ -16,6 +16,56 @@ VISION = "vision_tower.vision_model."
 PROJECTOR = "multi_modal_projector."
 
 
+def required_header() -> dict[str, tuple[int, ...]]:
+    """Shapes of all 4B vision tensors needed by the complete NPU tower."""
+    expected = {
+        VISION + "embeddings.patch_embedding.weight": (1152, 3, 14, 14),
+        VISION + "embeddings.patch_embedding.bias": (1152,),
+        VISION + "embeddings.position_embedding.weight": (4096, 1152),
+        VISION + "post_layernorm.weight": (1152,),
+        VISION + "post_layernorm.bias": (1152,),
+        PROJECTOR + "mm_soft_emb_norm.weight": (1152,),
+        PROJECTOR + "mm_input_projection_weight": (40, 5, 16384),
+    }
+    for index in range(27):
+        root = f"{VISION}encoder.layers.{index}."
+        for norm in ("layer_norm1", "layer_norm2"):
+            for suffix in ("weight", "bias"):
+                expected[root + norm + "." + suffix] = (1152,)
+        for part in "qkvo":
+            stem = root + f"self_attn.{part if part != 'o' else 'out'}_proj."
+            expected[stem + "weight"] = (20, 5, 16384)
+            expected[stem + "bias"] = (1152,)
+        for name, rows, cols in (("fc1", 4304, 1152), ("fc2", 1152, 4304)):
+            stem = root + f"mlp.{name}."
+            expected[stem + "weight"] = ((rows + 255) // 256 * 4,
+                                           (cols + 255) // 256, 16384)
+            expected[stem + "bias"] = (rows,)
+    return expected
+
+
+def validate_header(reader) -> int:
+    """Reject an incomplete or differently packed vision container before NPU work."""
+    expected = required_header()
+    extents = []
+    for name, shape in expected.items():
+        meta = reader.tensors.get(name)
+        if meta is None or meta.get("dtype") != "BF16" or tuple(meta.get("shape", ())) != shape:
+            raise ValueError(f"{name}: expected BF16{shape}, got {meta}")
+        offsets = meta.get("data_offsets")
+        size = 2 * int(np.prod(shape))
+        if (not isinstance(offsets, (list, tuple)) or len(offsets) != 2 or
+                offsets[0] < 0 or offsets[1] - offsets[0] != size or
+                reader.data_base + offsets[1] > len(reader.mm)):
+            raise ValueError(f"{name}: invalid BF16 byte extent")
+        extents.append((offsets[0], offsets[1], name))
+    extents.sort()
+    for previous, current in zip(extents, extents[1:]):
+        if previous[1] > current[0]:
+            raise ValueError(f"overlapping vision tensors: {previous[2]} and {current[2]}")
+    return len(expected)
+
+
 def _tensor(reader, name: str, dtype: str, shape: tuple[int, ...]) -> np.ndarray:
     header = reader.tensors.get(name)
     if header is None or header.get("dtype") != dtype or tuple(header.get("shape", ())) != shape:
