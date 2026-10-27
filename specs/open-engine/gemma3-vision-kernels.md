@@ -79,8 +79,21 @@ matches with maximum absolute error `3.81e-6`, PV maximum relative error
 `1.47e-6`, and composed output maximum relative error `0.000182`.
 The 184 padded output channels were zero.
 
-Remaining work includes a full 16-head, 4096-query SigLIP attention schedule
-and a 27-layer tower schedule,
+`gemma3_vision_attention_run.py` schedules all 16 heads and 16 query panels
+from a BF16[4096,3584] QKV input. The full synthetic 4096-query run completed
+768 NPU kernel dispatches. Nine sampled head/row CPU comparisons passed, with
+maximum relative error `0.00347`. It produces an interleaved
+BF16[4096,1152] attention output for the layer's output projection.
+
+`gemma3_vision_layer_run.py` composes one complete 4096-token SigLIP encoder
+layer with synthetic BF16 weights: both LayerNorms, QKV, all attention panels,
+output projection and residual, FC1/GELU, FC2 and residual. NPU attention
+samples passed with maximum relative error `0.00132`; three downstream
+row checks using captured attention matched the BF16 CPU reconstruction
+exactly. This establishes the kernel schedule for one layer, not a real
+checkpoint result.
+
+Remaining work includes a 27-layer tower schedule and final post-LayerNorm,
 real FLM tensor-layout conversion for all vision
 weights, variant-specific geometry checks, and image-to-text output
 acceptance. These 4B entries remain
