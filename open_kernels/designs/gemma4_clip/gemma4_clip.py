@@ -26,7 +26,7 @@ ROWS = 256
 def gemma4_clip(values: In, bounds: In, output: Out,
                 *, width: CompileTime[int], post_linear: CompileTime[int],
                 srchash: CompileTime[int] = 0):
-    assert width in (768, 1024, 2048, 3072, 4096)
+    assert width in (256, 768, 1024, 1536, 2048, 2560, 3072, 3840, 4096)
     assert post_linear in (0, 1)
     input_dtype = np.float32 if post_linear else bfloat16
     in_ty = np.ndarray[(width,), np.dtype[input_dtype]]

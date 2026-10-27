@@ -29,13 +29,14 @@ OPERATIONS = {
     "audio_relative_attn_8x12x24": ("gemma4_audio_attn/gemma4_audio_attn.py", {}),
     "audio_qk_scale_8x12x24": ("gemma4_audio_qk_scale/gemma4_audio_qk_scale.py", {}),
     "audio_hidden_norm_1024": ("gemma4_hidden_norm/gemma4_hidden_norm.py", {"PHLEGM_HIDDEN": "1024"}),
+    "audio_preprojection_norm_1536": ("gemma4_hidden_norm/gemma4_hidden_norm.py", {"PHLEGM_HIDDEN": "1536"}),
     "audio_subnorm_128": ("gemma4_audio_subnorm/gemma4_audio_subnorm.py", {"PHLEGM_CHANNELS": "128"}),
     "audio_subnorm_32": ("gemma4_audio_subnorm/gemma4_audio_subnorm.py", {"PHLEGM_CHANNELS": "32"}),
     "audio_glu_1024": ("gemma4_audio_act/gemma4_audio_act.py", {"PHLEGM_WIDTH": "1024", "PHLEGM_GLU": "1"}),
     "audio_silu_1024": ("gemma4_audio_act/gemma4_audio_act.py", {"PHLEGM_WIDTH": "1024", "PHLEGM_GLU": "0"}),
     "audio_silu_4096": ("gemma4_audio_act/gemma4_audio_act.py", {"PHLEGM_WIDTH": "4096", "PHLEGM_GLU": "0"}),
 }
-for _width in (768, 1024, 2048, 3072, 4096):
+for _width in (256, 768, 1024, 1536, 2048, 2560, 3072, 3840, 4096):
     for _mode, _post in (("pre", "0"), ("post", "1")):
         OPERATIONS[f"linear_clip_{_mode}_{_width}"] = (
             "gemma4_clip/gemma4_clip.py",
@@ -44,7 +45,7 @@ for _width in (768, 1024, 2048, 3072, 4096):
 
 
 def plan() -> dict:
-    return {"format": "phlegm-gemma4-multimodal-ops-v5", "images": {
+    return {"format": "phlegm-gemma4-multimodal-ops-v6", "images": {
         name: {"design": design, "environment": env}
         for name, (design, env) in sorted(OPERATIONS.items())}}
 
