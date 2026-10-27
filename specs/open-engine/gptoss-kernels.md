@@ -49,6 +49,11 @@ This stream passed the 16-band Q NPU image at maximum relative error
 `9.86e-7` against the decoded q4 reference. It packs the router activation
 with the layer's 32 BF16 router biases; the NPU top-four check selected
 experts `[17, 9, 3, 26]` and reached maximum logit error `5.33e-6`.
+`gptoss_qkv_run.py` now schedules all ten 16-band Q/K/V image calls for one
+layer from the source adapter, then writes the 4608-channel BF16 Q/K stream
+for RoPE and the 512-channel BF16 V stream. Its complete ten-call NPU fixture
+check passed an independently decoded q4 reference with maximum relative
+error `1.11e-8`. It has not yet run with a public model weight payload.
 These checks use fixture activations and weights to verify the source/kernel
 ABI. The attention cache and 24-layer token schedule still need to consume
 these inputs with actual model weights.
