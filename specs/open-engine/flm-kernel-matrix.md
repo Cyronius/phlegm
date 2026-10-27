@@ -48,8 +48,8 @@ Phlegm kernel implementation or a compatible ABI.
 | `qwen3:8b` | `qwen3` | `qwen3` | `recipe_source` | model-specific build and validation |
 | `qwen3-tk:4b` | `qwen3-tk` | `qwen3` | `recipe_source` | verify model config and packed geometry |
 | `qwen3-it:4b` | `qwen3-it` | `qwen3` | `recipe_source` | verify model config and packed geometry |
-| `gpt-oss:20b` | `gpt-oss` | `—` | `missing_recipe` | no complete NPU recipe; 13-image NPU bundle, ten-call source QKV runner, router/expert input ABIs checked; scheduler and real-weight output checks remain |
-| `gpt-oss-sg:20b` | `gpt-oss` | `—` | `missing_recipe` | no complete NPU recipe; 13-image NPU bundle, ten-call source QKV runner, router/expert input ABIs checked; scheduler and real-weight output checks remain |
+| `gpt-oss:20b` | `gpt-oss` | `—` | `missing_recipe` | no complete NPU recipe; 13-image NPU bundle, source QKV and output/residual runners, router/expert input ABIs checked; scheduler and real-weight output checks remain |
+| `gpt-oss-sg:20b` | `gpt-oss` | `—` | `missing_recipe` | no complete NPU recipe; 13-image NPU bundle, source QKV and output/residual runners, router/expert input ABIs checked; scheduler and real-weight output checks remain |
 | `qwen2.5-it:3b` | `qwen2` | `qwen2` | `recipe_source` | model-specific build and validation |
 | `qwen2.5vl-it:3b` | `qwen2vl` | `qwen2` | `recipe_source` | vision tower kernel route not established |
 | `bge-base:en-v1.5` | `bge` | `bert` | `special_source` | model-specific build and validation |

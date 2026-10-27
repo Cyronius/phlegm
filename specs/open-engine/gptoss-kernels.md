@@ -54,6 +54,11 @@ layer from the source adapter, then writes the 4608-channel BF16 Q/K stream
 for RoPE and the 512-channel BF16 V stream. Its complete ten-call NPU fixture
 check passed an independently decoded q4 reference with maximum relative
 error `1.11e-8`. It has not yet run with a public model weight payload.
+`gptoss_o_run.py` takes the BF16[4096] attention result, schedules all six
+output projection bands, discards the final 192 padded channels, and passes
+the 2880 projected values, source bias, and residual through the NPU residual
+image. Its seven-call fixture check matched an independent decoded q4
+projection and FP32 residual reference at maximum relative error `1.68e-6`.
 These checks use fixture activations and weights to verify the source/kernel
 ABI. The attention cache and 24-layer token schedule still need to consume
 these inputs with actual model weights.
