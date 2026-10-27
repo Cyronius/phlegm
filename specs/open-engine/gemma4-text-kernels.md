@@ -14,6 +14,7 @@ compositions, not an exported model or native generation path.
 | q4 full-vocabulary LM head | `open_kernels/designs/lm_head_q4/` and `open_kernels/gemma4_lm_head_check.py` | Full 262144-logit images passed at K=1536, 2560, 3840 |
 | Final logit softcap | `open_kernels/designs/gemma4_logit_cap/` | Full 262144 logits passed against `30*tanh(logit/30)` |
 | Composed head and softcap | `open_kernels/gemma4_logits_check.py` | All three text widths passed across the full vocabulary |
+| E2B/E4B per-layer input GELU gate | `open_kernels/designs/gemma4_ple_gate/` | BF16-rounded 256-value NPU check matched exactly |
 
 The attention state image processes 1, 128, 512, or 1024 rows per call. Its
 FP32 carry output supports consecutive full-attention chunks. The caller
@@ -35,7 +36,7 @@ layout and any required transcode remain unverified.
 
 The three model entries need source-weight mapping and packing, text Q/K/V/O
 and MLP projections, residual and sandwich-norm wiring, and a layer scheduler.
-E2B and E4B also need per-layer input and shared-K/V routing. The 12B full
+E2B and E4B also need per-layer input projection and shared-K/V routing. The 12B full
 attention path needs its K=V alternative represented in the exporter and
 scheduler. All three require real-container arithmetic checks, complete
 generation, and model-output acceptance. Vision and audio routes for the
