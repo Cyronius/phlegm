@@ -29,3 +29,24 @@ against the checked FP64 GPT-OSS replica. Their maximum relative errors were
 7.63e-8, 5.57e-7 and 6.87e-7. A direct 4096-row image compiled but its NPU
 run failed after about two seconds; longer contexts use the bounded state
 kernel in `../gptoss_attention_state/`.
+
+`check_chain.py` composes the separate QKV q4_1 projection, YaRN RoPE and
+128-row sink-attention images with one shared BF16 activation. It checks all
+ten Q/K/V projection calls and the attention output against quantized-weight
+decode and the FP64 replica. For example:
+
+```bash
+dibs run npu --label 'Check GPT-OSS attention chain' --eta 15m -- \
+  python open_kernels/designs/gptoss_attention/check_chain.py \
+  --driver target/npu-dev/harness-build/run_kernel \
+  --qkv-build target/npu-dev/gptoss-qkv-b16 \
+  --rope-build target/npu-dev/gptoss-rope-v3 \
+  --attn-build target/npu-dev/gptoss-attn-r128-v2 \
+  --out target/npu-dev/gptoss-chain-p127 --pos 127
+```
+
+The 2026-10-27 runs passed at positions 127 and 65535. Their attention
+maximum relative errors were 8.396e-4 and 2.011e-7 respectively, with
+cosines above 0.99999998. The fixture uses synthetic quantized weights in
+the real container layout and an artificial 128-row cache; it is a composed
+arithmetic check, not model acceptance.

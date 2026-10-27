@@ -16,7 +16,8 @@ from q4nx import dq_chunks_q4_1  # noqa: E402
 from pack import CHUNK, K_BLOCKS, ROLE_ROWS, projection  # noqa: E402
 
 
-def fixture(role: str, start_band: int, bands: int):
+def fixture(role: str, start_band: int, bands: int,
+            activation: np.ndarray | None = None):
     rng = np.random.default_rng(20261027 + start_band + {"q": 0, "k": 1, "v": 2}[role])
     total = ROLE_ROWS[role] // 32
     source = rng.integers(0, 256, (total * K_BLOCKS, CHUNK), dtype=np.uint8)
@@ -31,7 +32,12 @@ def fixture(role: str, start_band: int, bands: int):
     oracle_chunks = source[oracle_index].reshape(bands, K_BLOCKS, CHUNK)
     if not np.array_equal(selected, oracle_chunks):
         raise AssertionError("container supertile selection differs from the source raster")
-    x = rng.normal(0, 0.5, 2880).astype(np.float32).astype(bfloat16)
+    if activation is None:
+        x = rng.normal(0, 0.5, 2880).astype(np.float32).astype(bfloat16)
+    else:
+        x = np.asarray(activation)
+        if x.shape != (2880,) or x.dtype != bfloat16:
+            raise ValueError("shared QKV activation must be BF16[2880]")
     bias = rng.normal(0, 0.2, (bands, 32)).astype(np.float32).astype(bfloat16)
     x_bias = np.concatenate((x, np.zeros(64, bfloat16), bias.ravel()))
 
@@ -49,13 +55,14 @@ def fixture(role: str, start_band: int, bands: int):
     return x_bias, selected, expected.astype(np.float32)
 
 
-def run(driver: Path, build: Path, out: Path, role: str, start_band: int, bands: int) -> dict:
+def run(driver: Path, build: Path, out: Path, role: str, start_band: int, bands: int,
+        activation: np.ndarray | None = None) -> dict:
     if not driver.is_file():
         raise FileNotFoundError(driver)
     for name in ("final.xclbin", "insts.bin"):
         if not (build / name).is_file():
             raise FileNotFoundError(build / name)
-    x_bias, chunks, expected = fixture(role, start_band, bands)
+    x_bias, chunks, expected = fixture(role, start_band, bands, activation)
     out.mkdir(parents=True, exist_ok=True)
     (out / "x_bias.bin").write_bytes(x_bias.tobytes())
     (out / "chunks.bin").write_bytes(chunks.tobytes())
