@@ -12,7 +12,7 @@ pre-tiled B layout while preserving BF16 bits. The bundle builder found and
 compiled all 15 unique matrix shapes across the E2B vision/audio, E4B
 vision/audio, and unified 12B image/audio headers. The updated matrix plan
 also includes two im2col shapes for the audio subsampling convolutions.
-`build_gemma4_multimodal_ops.py` builds 14 additional operation images into a
+`build_gemma4_multimodal_ops.py` builds 15 additional operation images into a
 manifest with image hashes.
 
 | Primitive | Source | NPU check on 2026-10-27 |
@@ -23,6 +23,7 @@ manifest with image hashes.
 | Vision axial 2D RoPE, 24 Q/K heads×64 lanes | `open_kernels/designs/gemma4_vision_rope/` | Position pairs (23,47) and (1023,2047) passed with exact BF16 output |
 | Vision FP32 online attention, 64-lane query with 2520 keys | `open_kernels/designs/gemma4_attention/`, `gemma4_vision_online_check.py` | 1024+1024+472 rows carried across NPU images; normalized-magnitude Q/K passed with maximum absolute error `3.37e-7` |
 | Vision 768-wide RMSNorm/residual and 3072-wide GELU gate | `open_kernels/designs/gemma4_hidden_norm/`, `gemma4_gelu_mul/` | Both passed; RMSNorm/residual exact BF16, GELU gate maximum absolute error `3.81e-6` |
+| Vision 3×3 patch pooling, 2520 patches→280 tokens×768 channels | `open_kernels/designs/gemma4_vision_pool/`, `gemma4_vision_pool_pack.py` | Full 280-token NPU check passed exactly against FP32 sum/9, BF16 average boundary, and √768 output scaling; one empty spatial group checked |
 | Audio 5-tap depthwise convolution, 256 frames×1024 channels | `open_kernels/designs/gemma4_audio_dw/`, `gemma4_audio_dw_pack.py` | BF16 inputs and weights, FP32 output passed with maximum relative error `4.05e-8` |
 | Audio stride-2, pad-1 3×3 subsampling convolutions | `open_kernels/gemma4_audio_subsample.py`, `gemma4_audio_subsample_check.py` | Both 1→128 and 128→32 channel stages passed 256-pixel NPU checks; maximum relative errors `3.11e-8` and `5.40e-7` |
 | Audio subsampler LayerNorm/ReLU, 128 and 32 channels | `open_kernels/designs/gemma4_audio_subnorm/` | Both passed with exact BF16 output |
@@ -31,8 +32,8 @@ manifest with image hashes.
 
 The single-query vision online path is numerically accurate, while the
 bidirectional image has a precision gap at realistic normalized inputs. The
-remaining multimodal kernel gaps include image patch processing, tower pooling,
-and model-specific residual/normalization wiring. The audio
+remaining multimodal kernel gaps include image patch processing and
+model-specific residual/normalization wiring. The audio
 relative-key projection uses the compiled 1024×1024 matrix shape; its output
 still needs model-level packing and clipped-linear handling. Model-level work
 also needs tensor-by-tensor weight export, a scheduler connecting these
