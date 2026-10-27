@@ -253,6 +253,7 @@ def flash_attn(
     num_heads_per_unroll: CompileTime[int],
     num_cascade_stages: CompileTime[int],
     valid_len: CompileTime[int],
+    attention_scale_one: CompileTime[bool] = False,
 ):
     NQ = 4  # q-tile columns per head-group -- fixed, matches attn_npu2.py main()
     NS = num_cascade_stages
@@ -313,6 +314,8 @@ def flash_attn(
         "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         "-DROUND_CONV_EVEN",
     ]
+    if attention_scale_one:
+        compile_flags.append("-DFA_ATTENTION_SCALE_ONE")
 
     def bf(n):
         return np.ndarray[(n,), np.dtype[BF16]]
@@ -935,6 +938,7 @@ SPECIALIZE = dict(
     num_heads_per_unroll=int(os.environ.get("FA_HEADS_PER_UNROLL", 2)),
     num_cascade_stages=int(os.environ.get("FA_CASCADE_STAGES", 4)),
     valid_len=int(os.environ.get("FA_VALID_LEN", 1500)),
+    attention_scale_one=bool(int(os.environ.get("FA_SCALE_ONE", "0"))),
 )
 
 

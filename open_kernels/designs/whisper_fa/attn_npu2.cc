@@ -354,7 +354,11 @@ static_assert(dk_full == 64 || dk_full == 128 || dk_full == 256 ||
                   dk_full == 512,
               "Unsupported dk_full value: update constexpr_sqrt_dk");
 
+#ifdef FA_ATTENTION_SCALE_ONE
+#define log2e 1.44269504089
+#else
 #define log2e (1.44269504089 / constexpr_sqrt_dk)
+#endif
 
 __attribute__((always_inline)) v8bfloat16 getExpBf16(v8bfloat16 x) {
 

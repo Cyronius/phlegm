@@ -56,6 +56,9 @@ python open_kernels\build_design.py open_kernels\designs\whisper_fa\attn_fa.py <
 `FA_HEADS_PER_UNROLL`/`FA_CASCADE_STAGES`/`FA_VALID_LEN` override the production shape
 (defaults above) for a smoke build; `export_whisper_kernels.py` never sets them, so the
 shipped kernel set always builds the production shape.
+`FA_SCALE_ONE=1` compiles the same attention primitive with unit softmax scale
+for Gemma 4 vision attention; the unset default retains Whisper's
+`1/sqrt(head_dim)` scaling.
 
 ## Test it on hardware
 
