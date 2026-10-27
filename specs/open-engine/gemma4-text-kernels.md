@@ -20,7 +20,7 @@ compositions, not an exported model or native generation path.
 | Text layer scheduler plan | `open_kernels/gemma4_text_plan.py` | Published E2B/E4B/12B geometry, shared-K/V providers, K=V routing, MLP widths, and local/full sequence checked by eight CPU tests |
 | q4 text Q/K/V/O and MLP projections | `open_kernels/build_gemma4_text_projections.py` | Published geometries compiled; NPU arithmetic checks pending |
 | E2B/E4B BF16 per-layer projections | `open_kernels/designs/gemma4_bf16_gemv/` | All four source-layout geometries compiled; NPU arithmetic checks pending |
-| FLM text weight mapping | `open_kernels/gemma4_source.py` | Public E2B, E4B, and 12B q4nx headers passed 317, 391, and 331 required tensor shape/byte checks; 12B's signed q4 and q8 16-row tile repackers passed exact synthetic value checks |
+| FLM text weight mapping | `open_kernels/gemma4_source.py` | Public E2B, E4B, and 12B q4nx headers passed 597, 727, and 668 required tensor shape/byte checks; 12B's signed q4 and q8 16-row tile repackers passed exact synthetic value checks |
 | Per-layer context norm and token mix | `open_kernels/designs/gemma4_ple_input/` | E2B/E4B with-token and context-only variants compiled; NPU arithmetic checks pending |
 | Full-width MLP GELU-tanh and up product | `open_kernels/designs/gemma4_gelu_mul/` | All four 6144/10240/12288/15360-wide images compiled from the checked 256-value gate arithmetic; NPU checks pending |
 

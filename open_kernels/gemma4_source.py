@@ -69,9 +69,20 @@ def validate_header(plan: TextPlan, header: Mapping[str, dict]) -> dict:
     for p in projections(plan):
         dtype, shape = source_shape(plan, p)
         require(tensor_name(p), dtype, shape)
+    for layer in plan.layers:
+        prefix = f"model.layers.{layer.index}."
+        for suffix in ("input_layernorm.weight", "post_attention_layernorm.weight",
+                       "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight"):
+            require(prefix + suffix, "BF16", (plan.hidden,))
+        require(prefix + "layer_output_scale.weight", "BF16", (1,))
+        require(prefix + "self_attn.q_norm.weight", "BF16", (layer.head_dim,))
+        require(prefix + "self_attn.k_norm.weight", "BF16", (layer.head_dim,))
+        if layer.per_layer_input_width:
+            require(prefix + "post_layernorm.weight", "BF16", (plan.hidden,))
     if plan.variant == "12B":
         require("lm_head.weight", "I8", (plan.vocab // 16, plan.hidden // 256, 4352))
         require("model.embed_tokens.weight", "BF16", (plan.vocab, plan.hidden))
+        require("rope_freqs.weight", "F32", (256,))
     else:
         require("lm_head.weight", "I8", (plan.vocab * plan.hidden // (32 * 256), 5120))
         require("model.embed_tokens.weight", "I8", (plan.vocab, plan.hidden))
@@ -123,6 +134,42 @@ def pair_q8_16row(source: np.ndarray) -> np.ndarray:
     out[..., :512] = d.view(np.uint8).reshape(pairs, kt, 512)
     out[..., 512:] = halves[..., 256:].reshape(pairs, kt, 8192)
     return out
+
+
+def q4_projection_pool(source: np.ndarray, rows: int, cols: int,
+                       *, source_tile_bytes: int) -> np.ndarray:
+    """FLM source -> 64-row band, K-tile, 32-row-half order of q4 GEMV.
+
+    E2B/E4B supply flat 5120-byte q4_1 chunks in rowblock-major order. 12B
+    supplies [row16,Ktile,2304] signed q4 tiles, paired losslessly first.
+    """
+    if rows % 64 or cols % 256 or source_tile_bytes not in (5120, 2304):
+        raise ValueError("q4 projection requires 64 rows and 256-column tiles")
+    kt = cols // 256
+    raw = np.asarray(source, np.uint8)
+    if source_tile_bytes == 5120:
+        if raw.size != rows * kt // 32 * 5120:
+            raise ValueError("wrong q4_1 source byte count")
+        chunks = raw.reshape(rows // 32, kt, 5120)
+    else:
+        if raw.size != rows * kt // 16 * 2304:
+            raise ValueError("wrong signed q4 source byte count")
+        chunks = pair_q4_0_16row(raw.reshape(rows // 16, kt, 2304))
+    return np.ascontiguousarray(chunks.reshape(rows // 64, 2, kt, 5120)
+                                 .transpose(0, 2, 1, 3)).reshape(-1)
+
+
+def q8_head_pool(source: np.ndarray, rows: int, cols: int) -> np.ndarray:
+    """12B FLM 16-row q8 head -> 128-row band, K-tile, 32-row-quarter order."""
+    if rows % 128 or cols % 256:
+        raise ValueError("q8 head requires 128 rows and 256-column tiles")
+    kt = cols // 256
+    raw = np.asarray(source, np.uint8)
+    if raw.size != rows * kt // 16 * 4352:
+        raise ValueError("wrong q8 source byte count")
+    chunks = pair_q8_16row(raw.reshape(rows // 16, kt, 4352))
+    return np.ascontiguousarray(chunks.reshape(rows // 128, 4, kt, 8704)
+                                 .transpose(0, 2, 1, 3)).reshape(-1)
 
 
 if __name__ == "__main__":
