@@ -1,0 +1,538 @@
+diff --git a/src/common/AutoModel/automodel.cpp b/src/common/AutoModel/automodel.cpp
+index 05fa290..0151655 100644
+--- a/src/common/AutoModel/automodel.cpp
++++ b/src/common/AutoModel/automodel.cpp
+@@ -661,7 +661,15 @@ void AutoModel::set_sampler(sampler_config& sampler_config) {
+     if (this->sampler != nullptr) {
+         this->sampler.reset();
+     }
+-    this->sampler = std::make_unique<Sampler>(this->lm_config->get("vocab_size"), sampler_config);
++    // get() reads 0 for a missing key, and a sampler over 0 logits faults on the first
++    // token. A config.json with the text fields nested under text_config (HuggingFace's
++    // layout, not the flat one the app reads) is how that happens.
++    const u32 vocab = this->lm_config->get("vocab_size");
++    if (vocab == 0) {
++        throw std::runtime_error("config.json has no top-level vocab_size (" + this->lm_config->model_path +
++                                 "): the app reads the flat config, not HuggingFace's text_config layout");
++    }
++    this->sampler = std::make_unique<Sampler>(vocab, sampler_config);
+ }
+ 
+ void AutoModel::snapshot_request_defaults() {
+diff --git a/src/common/AutoModel/modeling_gemma4_12b.cpp b/src/common/AutoModel/modeling_gemma4_12b.cpp
+index e1cfcf4..2379425 100644
+--- a/src/common/AutoModel/modeling_gemma4_12b.cpp
++++ b/src/common/AutoModel/modeling_gemma4_12b.cpp
+@@ -24,12 +24,21 @@ void Gemma4_12B::load_model(std::string model_path, json model_info, int default
+     this->_shared_load_model(model_path, model_info, default_context_length, enable_preemption,
+                              oflm::config::g_resolved_settings ? *oflm::config::g_resolved_settings : nlohmann::json::object());
+ 
+-    this->q4nx = std::make_unique<Q4NX>(this->model_path);
+-    this->lm_engine = std::make_unique<gemma4_12b_npu>(*this->lm_config, this->npu.get(), this->MAX_L);
++    // The open kernels when installed for this model (text only: the decoder runs there, the
++    // image and audio towers do not yet), the closed gemma4_12b_npu DLL otherwise
++    // (AutoModel::_shared_select_open_engine).
++    auto open_engine = this->_shared_select_open_engine("OFLM_GEMMA4_ENGINE", "Gemma 4 12B");
++    if (open_engine) {
++        this->lm_engine = std::move(open_engine);
++    }
++    else {
++        this->q4nx = std::make_unique<Q4NX>(this->model_path);
++        this->lm_engine = std::make_unique<gemma4_12b_npu>(*this->lm_config, this->npu.get(), this->MAX_L);
+ 
+-    this->lm_engine->load_weights(*this->q4nx);
+-    // free the q4nx
+-    this->q4nx.reset();
++        this->lm_engine->load_weights(*this->q4nx);
++        // free the q4nx
++        this->q4nx.reset();
++    }
+     // The soft token budget is a preprocessing constant (processor_config.json
+     // image_seq_length / image_processor.max_soft_tokens), read by the engine
+     // along with the rest of the image front end parameters.
+@@ -113,6 +122,26 @@ bool Gemma4_12B::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input,
+     }
+ 
+ 
++    // The open engine runs the decoder only; every image/audio path below reads the closed
++    // engine's front-end constants through a cast that is null there.
++    if (dynamic_cast<gemma4_12b_npu*>(this->lm_engine.get()) == nullptr) {
++        // A key is not media: the server's own text replies carry "images": null, and a
++        // client sends them back with the conversation.
++        const auto carries = [](const nlohmann::json& message, const char* key) {
++            if (!message.contains(key)) return false;
++            const auto& v = message[key];
++            return !(v.is_null() || (v.is_array() && v.empty()));
++        };
++        bool media = !input.images.empty() || !input.audios.empty();
++        for (const auto& message : input.messages)
++            media = media || carries(message, "images") || carries(message, "audios");
++        if (media) {
++            header_print("ERROR", "Gemma 4 12B on the open kernels is text only: images and audio need the "
++                                  "closed engine (OFLM_GEMMA4_ENGINE=closed)");
++            return false;
++        }
++    }
++
+     gemma4_12b_image_payload_t image_payload;
+     gemma4_12b_audio_payload_t audio_payload;
+     audio_payload.num_audios = 0;
+@@ -476,10 +505,9 @@ bool Gemma4_12B::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input,
+ 
+     // hardware
+     int restore_idx = -1;
+-    gemma4_12b_npu *gemma4_12b_engine = dynamic_cast<gemma4_12b_npu*>(this->lm_engine.get());
+ 
+     if (meta_info.restore_allowed) {
+-        restore_idx = gemma4_12b_engine->restore();
++        restore_idx = this->lm_engine->restore();
+         this->total_tokens = restore_idx;
+         this->token_history = checkpoint_his; // restore the token history to be consistent with the restored KV cache, which is crucial for correct functioning of _shared_insert's prefix-matching logic
+     }
+@@ -508,7 +536,7 @@ bool Gemma4_12B::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input,
+         : this->_shared_insert(meta_info, tokens, is_cancelled, nullptr);
+ 
+     checkpoint_his = token_history;
+-    int checkpoint_idx = gemma4_12b_engine->checkpoint();
++    int checkpoint_idx = this->lm_engine->checkpoint();
+     return success;
+ }
+ 
+diff --git a/src/open_qwen36/core.cpp b/src/open_qwen36/core.cpp
+index 3ed9c64..12904e4 100644
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -172,9 +172,15 @@ nlohmann::json derive_config(const GgufFile& g) {
+         c["vocab_size"] = u("vocab_size");
+     else
+         c["vocab_size"] = g.tensor("token_embd.weight").dims.at(1);
++    // A per-layer value is an ARRAY in the metadata (Gemma 4's head_count_kv is 8 on sliding
++    // layers, 1 on full ones) and reads back as ""; it has no single value to derive, so it is
++    // left to config.json, and check_model refuses by name if nothing supplies it.
++    auto scalar = [&](const char* key, const std::string& k) {
++        if (g.kv_has(arch + "." + k) && !g.kv_str(arch + "." + k).empty()) c[key] = u(k);
++    };
+     c["num_attention_heads"] = u("attention.head_count");
+-    c["num_key_value_heads"] = u("attention.head_count_kv");
+-    c["intermediate_size"] = u("feed_forward_length");
++    scalar("num_key_value_heads", "attention.head_count_kv");
++    scalar("intermediate_size", "feed_forward_length");
+     if (g.kv_has(arch + ".attention.key_length")) c["head_dim"] = g.kv_u64(arch + ".attention.key_length");
+     else c["head_dim"] = u("embedding_length") / u("attention.head_count");
+     if (g.kv_has(arch + ".attention.sliding_window"))
+@@ -231,6 +237,12 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
+     if (cf) {
+         j = nlohmann::json::parse(cf, nullptr, false);
+         if (!j.is_object()) throw std::runtime_error("open_qwen36: bad config.json in " + cfg_.model_dir);
++        // A multimodal config nests the decoder's fields under text_config (Gemma 4 12B's
++        // gemma4_unified); the kernel set checks the decoder, so lift them -- a top-level key
++        // of the same name wins, which keeps the wrapper's own model_type.
++        if (j.contains("text_config") && j["text_config"].is_object())
++            for (const auto& [key, value] : j["text_config"].items())
++                if (!j.contains(key)) j[key] = value;
+         if (gguf_) {
+             const auto derived = derive_config(*static_cast<GgufFile*>(file_.get()));
+             for (const auto& [key, value] : derived.items())
+@@ -524,8 +536,12 @@ void Core::load_kernel(const std::string& name, const KernelDesc& d) {
+         k.moe2 = stream_patch::moe2_table(k.words, name, g);
+         for (const auto& p : k.moe2) k.slots = std::max(k.slots, static_cast<size_t>((p.slot & 0xff) + 1));
+     } else if (d.patch == "attnpos") {
+-        k.attn = stream_patch::attn_table(k.words, name, w_->attn);
+-        k.geom = w_->attn;
++        // the kernel's own rows: Gemma 4's two layer types have different ones
++        stream_patch::AttnGeometry g = w_->attn;
++        g.kv_row = d.kv_row;
++        g.ptab_row = d.ptab_row;
++        k.attn = stream_patch::attn_table(k.words, name, g);
++        k.geom = g;
+         k.geom.window = d.window;
+         k.geom.rb = d.rb;
+     } else if (d.patch == "attnrows") {
+@@ -2053,6 +2069,7 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
+         xrt::bo& lg = buffer("logits", 0);
+         read_back(lg, w_->vocab * 4, 0);
+         std::memcpy(logits_host_.data(), lg.map<uint8_t*>(), w_->vocab * 4);
++        softcap_logits();
+         timing_.lmhead_ms = ms_since(t1);
+     }
+     ++pos_;
+@@ -2267,9 +2284,19 @@ void Core::tail_logits(const float* row) {
+     xrt::bo& lg = buffer("logits", 0);
+     read_back(lg, w_->vocab * 4, 0);
+     std::memcpy(logits_host_.data(), lg.map<uint8_t*>(), w_->vocab * 4);
++    softcap_logits();
+     timing_.lmhead_ms = ms_since(t1);
+ }
+ 
++// Gemma 4's final_logit_softcapping: c * tanh(z / c), on the host, on the real logits. Monotone,
++// so a greedy argmax is the same with or without it; sampling at temperature is not.
++void Core::softcap_logits() {
++    const double c = w_->final_logit_softcapping;
++    if (c <= 0.0) return;
++    const float cf = static_cast<float>(c), inv = static_cast<float>(1.0 / c);
++    for (float& z : logits_host_) z = cf * std::tanh(z * inv);
++}
++
+ void Core::shuttle_buf(xrt::bo& wide, xrt::bo& scratch1, size_t token, size_t act_bytes, bool wide_to_scratch,
+                        size_t region_off, size_t region_bytes) {
+     // `wide` is an explicit argument rather than a fixed per-layer buffer
+diff --git a/src/open_qwen36/core.hpp b/src/open_qwen36/core.hpp
+index 2ebf5ca..7663b12 100644
+--- a/src/open_qwen36/core.hpp
++++ b/src/open_qwen36/core.hpp
+@@ -566,6 +566,7 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
+     const float* gemm_run(const Step& s, const float* x, size_t T, size_t K, size_t N, int layer);
+     /// The tail (final norm, lm_head) for one residual row into logits_host_.
+     void tail_logits(const float* row);
++    void softcap_logits();                  ///< the manifest's final_logit_softcapping, in place
+     /// Host-side shuttle of one token's `act_bytes` slice between a GLOBAL
+     /// T-wide scratch buffer (`wide`, e.g. "gact") and an ordinary T=1
+     /// per-layer scratch buffer (`scratch1`, e.g. "act").
+diff --git a/src/open_qwen36/engine.cpp b/src/open_qwen36/engine.cpp
+index 054e903..325e3b4 100644
+--- a/src/open_qwen36/engine.cpp
++++ b/src/open_qwen36/engine.cpp
+@@ -49,8 +49,17 @@ std::string Engine::find_kernels(const LM_Config& config, std::string* how) {
+         if (complete(env, &why)) { chose("OFLM_OPEN_KERNELS_DIR"); return env; }
+         std::fprintf(stderr, "open_qwen36: OFLM_OPEN_KERNELS_DIR=%s is not a kernel set: %s\n", env, why.c_str());
+     }
++    // A directory that exists but fails the check is named with the reason: otherwise the
++    // caller reports "no open kernels installed" for a set that is there and incomplete
++    // (a GGUF-only build has no q4nx-route xclbins, and the check counts both routes).
++    auto incomplete = [](const fs::path& dir, const std::string& reason) {
++        std::error_code ec;
++        if (fs::exists(dir, ec))
++            std::fprintf(stderr, "open_qwen36: %s is not a complete kernel set: %s\n", dir.string().c_str(), reason.c_str());
++    };
+     fs::path local = fs::path(config.model_path) / "open_kernels";
+     if (complete(local, &why)) { chose("beside the model"); return local.string(); }
++    incomplete(local, why);
+     // Every xclbins root the closed path would consider, not just the first one
+     // find_xclbin_path() happens to return: oflm-add links a set under the user
+     // root ($OFLM_XCLBIN_PATH / ~/.config/oflm) while the shipped sets live in the
+@@ -65,6 +74,7 @@ std::string Engine::find_kernels(const LM_Config& config, std::string* how) {
+     for (const std::string& r : roots) {
+         fs::path cand = fs::path(r) / "xclbins" / config.model_name / "open_kernels";
+         if (complete(cand, &why)) { chose("an xclbins root"); return cand.string(); }
++        incomplete(cand, why);
+     }
+     return {};
+ }
+diff --git a/src/open_qwen36/gguf_pack_test.cpp b/src/open_qwen36/gguf_pack_test.cpp
+index 57d2802..53fa411 100644
+--- a/src/open_qwen36/gguf_pack_test.cpp
++++ b/src/open_qwen36/gguf_pack_test.cpp
+@@ -13,7 +13,10 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <map>
+ #include <random>
++#include <stdexcept>
++#include <string>
+ #include <vector>
+ 
+ #include "open_qwen36/gguf_file.hpp"
+@@ -259,6 +262,31 @@ uint32_t f32_bits(float f) {
+     return u;
+ }
+ 
++// A container in memory: just the tensors' bytes, as a .q4nx stores small weights (bf16 or f32).
++class MemFile : public WeightFile {
++public:
++    std::map<std::string, std::vector<uint8_t>> t;
++    bool has(const std::string& name) const override { return t.count(name) != 0; }
++    const uint8_t* raw(const std::string& name, size_t* nbytes) const override {
++        const auto& b = t.at(name);
++        if (nbytes) *nbytes = b.size();
++        return b.data();
++    }
++    void embed_row(const std::string&, size_t, size_t, float*) const override { throw std::logic_error("unused"); }
++    std::vector<float> bf16(const std::string&) const override { throw std::logic_error("unused"); }
++    std::vector<float> f32(const std::string&) const override { throw std::logic_error("unused"); }
++    const TensorMeta& meta(const std::string&) const override { throw std::logic_error("unused"); }
++    void bf16_row(const std::string&, size_t, size_t, float*) const override { throw std::logic_error("unused"); }
++    void drop_pages() override {}
++};
++
++template <typename T>
++std::vector<uint8_t> bytes_of(const std::vector<T>& v) {
++    std::vector<uint8_t> b(v.size() * sizeof(T));
++    std::memcpy(b.data(), v.data(), b.size());
++    return b;
++}
++
+ }  // namespace
+ 
+ int main() {
+@@ -377,6 +405,27 @@ int main() {
+         std::printf("ok    pack_norm f32 -> bf16 (RNE)\n");
+     }
+ 
++    // ---- pack_norm with div_running's product (Gemma 4's layer_output_scale). The same case,
++    // and the same expected bits, as test_gemma4.py's test_put_div_running_matches_pools_cpp.
++    {
++        const std::vector<uint16_t> norm16 = {0x3F80, 0x3FC0, 0xC030, 0x3DCD, 0x4049, 0x3F81};
++        const std::vector<uint16_t> want = {0x4099, 0x40E5, 0xC152, 0x3EF4, 0x4170, 0x409A};
++        MemFile mf;
++        mf.t["norm"] = bytes_of(norm16);
++        mf.t["scale.0"] = bytes_of(std::vector<uint16_t>{0x3F33});   // bf16
++        mf.t["scale.1"] = bytes_of(std::vector<float>{0.3f});         // f32
++        double div = 1.0;
++        for (int j = 0; j < 2; ++j) div *= pools::scalar_value(mf, "scale." + std::to_string(j));
++        std::vector<uint16_t> got(norm16.size());
++        pools::pack_norm(mf, "norm", got.size() * 2, reinterpret_cast<uint8_t*>(got.data()), div);
++        if (got != want) {
++            for (size_t i = 0; i < got.size(); ++i)
++                std::printf("FAIL pack_norm div[%zu]: got %04x want %04x\n", i, got[i], want[i]);
++            return 1;
++        }
++        std::printf("ok    pack_norm divided by the running scale product\n");
++    }
++
+     // ---- embed_row (Q8_0, bit-exact)
+     {
+         std::vector<float> row(256);
+diff --git a/src/open_qwen36/manifest.cpp b/src/open_qwen36/manifest.cpp
+index cacf565..1c99e82 100644
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -60,6 +60,9 @@ PackOp parse_op(const json& j, const std::string& where) {
+     p.dst_rows = j.value("dst_rows", 0ull);
+     p.split = j.value("split", "");
+     p.via = j.value("via", "");
++    p.div_running = j.value("div_running", "");
++    if (!p.div_running.empty() && (p.op != "put" || p.div_running.find("{j}") == std::string::npos))
++        fail(where, p.op + " " + p.tensor + ": div_running names a per-layer {j} tensor, on a put");
+     if (!p.via.empty() && (p.op != "bf16_gemm" || p.via != "q4_1"))
+         fail(where, p.op + " " + p.tensor + ": via must be q4_1, on a bf16_gemm");
+     if (!p.split.empty() && (p.op != "std_perm" || (p.split != "hi" && p.split != "lo")))
+@@ -169,6 +172,9 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+     m.rope_inv_freq = get<std::vector<double>>(lay, "rope_inv_freq", lw);
+     if (m.rope_inv_freq.size() != m.rotary_dim / 2) fail(lw, "rope_inv_freq has " + std::to_string(m.rope_inv_freq.size()) + " values, the rotary dim wants " + std::to_string(m.rotary_dim / 2));
+     m.rout_idx_off = lay.value("rout_idx_off", 1024ull);
++    m.final_logit_softcapping = lay.value("final_logit_softcapping", 0.0);
++    if (m.final_logit_softcapping < 0.0 || !std::isfinite(m.final_logit_softcapping))
++        fail(lw, "final_logit_softcapping must be finite and non-negative");
+     m.has_moe = lay.contains("moe");
+     if (m.has_moe) {
+     const json& moe = lay["moe"];
+@@ -197,6 +203,9 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+         d.patch = v.value("patch", "");
+         d.window = v.value("window", 0ull);
+         d.rb = v.value("rb", 1ull);
++        d.kv_row = v.value("kv_row", static_cast<uint64_t>(m.kv_row));
++        d.ptab_row = v.value("ptab_row", static_cast<uint64_t>(m.ptab_row));
++        if (!d.kv_row || !d.ptab_row) fail(where, "kernel " + k + ": a zero kv_row / ptab_row");
+         // attn_stepb*.cc build RB 2 and 4 only; any other count would pad the stream for
+         // rows the kernel never takes, and the core waits on its fifo forever
+         if (d.rb != 1 && d.rb != 2 && d.rb != 4)
+@@ -605,14 +614,18 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+             rg.inv_freq = v.value("inv_freq", m.rope_inv_freq);
+             rg.scale = v.value("scale", 1.0);
+             rg.window = v.value("window", 0ull);
+-            if (rg.inv_freq.size() != m.rotary_dim / 2) fail(where, "global " + k + ": inv_freq has " + std::to_string(rg.inv_freq.size()) + " values");
++            rg.rotary_dim = v.value("rotary_dim", static_cast<uint64_t>(m.rotary_dim));
++            if (rg.inv_freq.size() != rg.rotary_dim / 2) fail(where, "global " + k + ": inv_freq has " + std::to_string(rg.inv_freq.size()) + " values");
++            if (512 + 8 * (rg.rotary_dim / 2) > rg.per_row)
++                fail(where, "global " + k + ": " + std::to_string(rg.rotary_dim) + " rotated dims do not fit a " +
++                     std::to_string(rg.per_row) + "-byte record");
+             const bool has_long = v.contains("long_inv_freq"), has_switch = v.contains("switch_row");
+             if (has_long != has_switch)
+                 fail(where, "global " + k + ": long_inv_freq and switch_row must be given together");
+             if (has_long) {
+                 rg.long_inv_freq = v["long_inv_freq"].get<std::vector<double>>();
+                 rg.switch_row = v["switch_row"].get<uint64_t>();
+-                if (rg.long_inv_freq.size() != m.rotary_dim / 2)
++                if (rg.long_inv_freq.size() != rg.rotary_dim / 2)
+                     fail(where, "global " + k + ": long_inv_freq has " + std::to_string(rg.long_inv_freq.size()) + " values");
+             }
+             m.per_row_globals[k] = rg;
+diff --git a/src/open_qwen36/manifest.hpp b/src/open_qwen36/manifest.hpp
+index d7804d8..ee831fa 100644
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -44,6 +44,10 @@ struct PackOp {
+                                                                         ///< "lo", one half of its exact q4_1
+                                                                         ///< split ("" = the whole tensor)
+     std::string via;                                                    ///< bf16_gemm: "q4_1" reads a q8 source as the q4 ops do
++    std::string div_running;                                            ///< put: divide the values by the product,
++                                                                        ///< over the layers BEFORE this one, of this
++                                                                        ///< one-value tensor ("{j}" = that layer) --
++                                                                        ///< Gemma 4's layer_output_scale, folded
+     uint64_t dst_rows = 0;                                              ///< transpose: pad the
+                                                                         ///< destination row to this
+                                                                         ///< many values, tail zeroed
+@@ -188,6 +192,10 @@ struct KernelDesc {
+     /// (attn.h ATTN_RB with ATTN_BLOCK_ONLY). The kernel derives its own block count from
+     /// the position record, so the two must agree or the fifo deadlocks; 1 = unblocked.
+     uint64_t rb = 1;
++    /// attnpos / attnrows: this kernel's KV row and position record, in bytes. A model whose
++    /// layer types have different attention geometry (Gemma 4: head dim 256 and 512) builds a
++    /// kernel per type, each patched with its own; absent in the manifest = the layout's.
++    uint64_t kv_row = 0, ptab_row = 0;
+ };
+ 
+ // OPEN-DECODE-ROWS: `kernel` reuses each layer's pool / consts / state / ptab; l == 0 means no rows pass.
+@@ -208,6 +216,9 @@ struct RowsDesc {
+ struct RowGlobal {
+     uint64_t per_row = 0;
+     std::vector<double> inv_freq;            ///< its RoPE frequencies (rotary_dim / 2)
++    /// the pairs its record carries x 2; 0 = the layout's rotary_dim. Gemma 4's global table
++    /// rotates 128 dims of a 512-dim head while the sliding one rotates all 256.
++    uint64_t rotary_dim = 0;
+     double scale = 1.0;                      ///< on cos and sin (longrope's attention factor)
+     uint64_t window = 0;                     ///< the row counts follow this window
+     /// Phi-3's longrope: row r takes `long_inv_freq` once r >= switch_row, `inv_freq` before
+@@ -229,6 +240,7 @@ struct Manifest {
+     size_t kv_row = 0, ptab_row = 0, rotary_dim = 0, rout_idx_off = 1024;
+     double rope_theta = 0;
+     std::vector<double> rope_inv_freq;       ///< per rotary pair (rotary_dim / 2 values; Llama 3's scaling is in here)
++    double final_logit_softcapping = 0;      ///< logits = c * tanh(logits / c) on the host (Gemma 4: 30); 0 = none
+     bool has_moe = false;                    ///< layout.moe present (a family with routed experts)
+     stream_patch::MoeGeometry moe;
+     stream_patch::AttnGeometry attn;
+diff --git a/src/open_qwen36/pools.cpp b/src/open_qwen36/pools.cpp
+index 8c3c85b..368cadb 100644
+--- a/src/open_qwen36/pools.cpp
++++ b/src/open_qwen36/pools.cpp
+@@ -252,21 +252,32 @@ void split_q4_1_chunks(const uint8_t* src, size_t nch, bool hi, uint8_t* dst) {
+     }
+ }
+ 
+-void pack_norm(const WeightFile& f, const std::string& name, size_t bytes, uint8_t* dst) {
++void pack_norm(const WeightFile& f, const std::string& name, size_t bytes, uint8_t* dst, double div) {
+     // A small weight (a layernorm) as bf16: the q4nx container stores it bf16;
+     // a GGUF may store it f32 / f16 / bf16 -- convert exactly as the container does.
++    // `div` divides in double before the single rounding, so a folded scale costs no extra one.
+     size_t n = 0;
+     const uint8_t* src = raw(f, name, 0, &n);
+     auto* g = dynamic_cast<const GgufFile*>(&f);
++    auto bf16_div = [&](size_t count) {
++        for (size_t i = 0; i < count; ++i) {
++            uint16_t u;
++            std::memcpy(&u, src + 2 * i, 2);
++            const uint16_t b = f32_to_bf16(static_cast<float>(bf16_to_f32(u) / div));
++            std::memcpy(dst + 2 * i, &b, 2);
++        }
++    };
+     if (!g) {
+         if (n != bytes) fail(name + " is " + std::to_string(n) + " B, the slot holds " + std::to_string(bytes));
+-        std::memcpy(dst, src, n);
++        if (div == 1.0) std::memcpy(dst, src, n);
++        else bf16_div(n / 2);
+         return;
+     }
+     switch (g->tensor(name).type) {
+         case GgufFile::Type::BF16: {
+             if (n != bytes) fail(name + " is " + std::to_string(n) + " B, the slot holds " + std::to_string(bytes));
+-            std::memcpy(dst, src, n);
++            if (div == 1.0) std::memcpy(dst, src, n);
++            else bf16_div(n / 2);
+             break;
+         }
+         case GgufFile::Type::F16: {
+@@ -274,7 +285,7 @@ void pack_norm(const WeightFile& f, const std::string& name, size_t bytes, uint8
+             for (size_t i = 0; i < bytes / 2; ++i) {
+                 uint16_t u;
+                 std::memcpy(&u, src + 2 * i, 2);
+-                const float v = fp16_to_f32(u);
++                const float v = static_cast<float>(fp16_to_f32(u) / div);
+                 const uint16_t b = f32_to_bf16(v);
+                 std::memcpy(dst + 2 * i, &b, 2);
+             }
+@@ -285,7 +296,7 @@ void pack_norm(const WeightFile& f, const std::string& name, size_t bytes, uint8
+             for (size_t i = 0; i < bytes / 2; ++i) {
+                 float v;
+                 std::memcpy(&v, src + 4 * i, 4);
+-                const uint16_t b = f32_to_bf16(v);
++                const uint16_t b = f32_to_bf16(div == 1.0 ? v : static_cast<float>(v / div));
+                 std::memcpy(dst + 2 * i, &b, 2);
+             }
+             break;
+@@ -295,6 +306,19 @@ void pack_norm(const WeightFile& f, const std::string& name, size_t bytes, uint8
+     }
+ }
+ 
++double scalar_value(const WeightFile& f, const std::string& name) {
++    size_t n = 0;
++    const uint8_t* src = raw(f, name, 0, &n);
++    auto* g = dynamic_cast<const GgufFile*>(&f);
++    const bool f32 = g ? g->tensor(name).type == GgufFile::Type::F32 : n == 4;
++    const bool f16 = g && g->tensor(name).type == GgufFile::Type::F16;
++    if ((f32 && n != 4) || (!f32 && n != 2)) fail(name + " is " + std::to_string(n) + " B, not one value");
++    if (f32) { float v; std::memcpy(&v, src, 4); return v; }
++    uint16_t u;
++    std::memcpy(&u, src, 2);
++    return f16 ? fp16_to_f32(u) : bf16_to_f32(u);
++}
++
+ namespace {
+ // row r, column k of a tensor's chunks (32-row blocks major, then 256-k tiles), as the q8 / q4_1 GEMMs read it
+ float q8_value(const uint8_t* src, size_t ncol, size_t r, size_t k) {
+@@ -700,10 +724,21 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+         }
+     } else if (op.op == "put") {
+         const std::string name = with_layer(op.tensor, layer);
+-        if (dynamic_cast<const GgufFile*>(&m)) {
++        // div_running: the product of a per-layer scalar over every layer before this one
++        // (Gemma 4's layer_output_scale; the residual is carried divided by it, which the
++        // RMSNorms that read it cannot see, so the block outputs added to it are divided too)
++        double div = 1.0;
++        if (!op.div_running.empty())
++            for (int j = 0; j < layer; ++j) {
++                std::string s = op.div_running;
++                s.replace(s.find("{j}"), 3, std::to_string(j));
++                div *= scalar_value(m, s);
++            }
++        if (!(div > 0.0) || !std::isfinite(div)) fail(name + ": div_running product " + std::to_string(div));
++        if (dynamic_cast<const GgufFile*>(&m) || div != 1.0) {
+             // a GGUF's small weights may be f32/f16: convert to the blob's bf16 layout
+             bounds(op, op.cap, dst_bytes);
+-            pack_norm(m, name, op.cap, dst + op.dst);
++            pack_norm(m, name, op.cap, dst + op.dst, div);
+         } else {
+             size_t n = 0;
+             const uint8_t* src = raw(m, name, 0, &n);
+@@ -812,9 +847,12 @@ void build_ptab_record(const Manifest& m, const RowGlobal& g, size_t row, const
+                        const std::vector<int>& section, bool interleaved, uint8_t* r) {
+     // RoPE over the first rotary_dim dims of a head, half-split pairs (i, i + rot/2), the recipe's theta:
+     // [i32 pos | i32 nf | cos f32[rot/2] @512 | sin f32[rot/2] right after] (attn.h reads [cos | sin] at +512)
+-    const size_t half = m.rotary_dim / 2;
+-    if (512 + 8 * half > m.ptab_row) fail("the rotary dim does not fit the position record");
+-    std::memset(r, 0, m.ptab_row);
++    // the table's own pairs and record size (Gemma 4 has two tables of different widths);
++    // a table that names neither is the layout's, which is every other family
++    const size_t half = (g.rotary_dim ? g.rotary_dim : m.rotary_dim) / 2;
++    const size_t row_bytes = g.per_row ? g.per_row : m.ptab_row;
++    if (512 + 8 * half > row_bytes) fail("the rotary dim does not fit the position record");
++    std::memset(r, 0, row_bytes);
+     uint64_t start, nf64;
+     stream_patch::attn_window(row, g.window, &start, &nf64);
+     int32_t valid = static_cast<int32_t>(row - start), nf = static_cast<int32_t>(nf64);
+@@ -835,7 +873,7 @@ void build_ptab_record(const Manifest& m, const RowGlobal& g, size_t row, const
+ void build_ptab(const Manifest& m, const RowGlobal& g, size_t rows, uint8_t* t) {
+     for (size_t p = 0; p < rows; ++p) {
+         const double pos[3] = {static_cast<double>(p), static_cast<double>(p), static_cast<double>(p)};
+-        build_ptab_record(m, g, p, pos, {}, false, t + p * m.ptab_row);
++        build_ptab_record(m, g, p, pos, {}, false, t + p * (g.per_row ? g.per_row : m.ptab_row));
+     }
+ }
+ 
+diff --git a/src/open_qwen36/pools.hpp b/src/open_qwen36/pools.hpp
+index 85b5bba..dd43244 100644
+--- a/src/open_qwen36/pools.hpp
++++ b/src/open_qwen36/pools.hpp
+@@ -120,7 +120,11 @@ void pack_consts(const Manifest& m, const LayerType& lt, const WeightFile& f, in
+ void pack_lmhead(const Manifest& m, const WeightFile& f, uint8_t* dst);
+ /// A small weight (a layernorm) as bf16: the q4nx container stores it bf16, a
+ /// GGUF may store f32/f16 — converted exactly as the container does.
+-void pack_norm(const WeightFile& f, const std::string& name, size_t bytes, uint8_t* dst);
++/// `div`: every value is divided by it before the one rounding to bf16 (Gemma 4's folded
++/// layer_output_scale, PackOp::div_running); 1.0 is the plain conversion, byte for byte.
++void pack_norm(const WeightFile& f, const std::string& name, size_t bytes, uint8_t* dst, double div = 1.0);
++/// The one value of a single-element tensor (f32 / f16 / bf16), as a double.
++double scalar_value(const WeightFile& f, const std::string& name);
+ /// A position record table: row p = [valid | nf | cos | sin] for the window's row counts
+ /// (stream_patch::attn_window) and these RoPE frequencies, `rows` rows of m.ptab_row.
+ void build_ptab(const Manifest& m, const RowGlobal& g, size_t rows, uint8_t* dst);

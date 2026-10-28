@@ -63,10 +63,39 @@ with BF16 PLE projection images. The corrected 12B bundle also compiled with
 a q8 LM head. The representative arithmetic checks above cover source-layout
 families and selected shapes, not every layer or real weight payload.
 
+## Dense recipe route from openflowlm-next #225
+
+The `gemma4` family in `open_kernels/recipes/gemma4.py` was imported on
+2026-10-28 from openflowlm-next PR #225 (head `beccd46`). It builds the fused
+`designs/dense/dx.py` layer once per layer type, for 12B only. Requirement,
+upstream hardware result and open items are in `OPEN-FAMILY-GEMMA4` in
+`spec.md`; import validation is in `open_kernels/UPSTREAM.md`. Upstream
+measured that route on the GGUF container. Phlegm has not run it on hardware.
+
+The two implementations agree on 12B's layer types, global geometry, K=V
+before separate norms, unit score scale, V norm, proportional RoPE pairing and
+the whole-stream output scale. The per-operation images above can serve as
+independent references when the recipe's two attention points go through
+catalogue validation. Three differences matter for that work:
+
+- The fused route keeps the residual stream in FP32 and folds the layer scale
+  into the post norms. `gemma4_12b_layer_run.py` rounds the residual to BF16
+  after each layer and applies the scale on the host.
+- The recipe's `model.q4nx` route does not read FLM's 12B package format. The
+  12B header has 16-row signed-q4 tiles (2304 B), a 16-row q8 head (4352 B)
+  and a BF16 embedding table, which `gemma4_text_source.py` treats as
+  unscaled. Both packers at the PR head, `pack.q4_chunks_of` and `pools.cpp`,
+  read 5120, 8704 and 4736-byte chunks only. The plan also packs the head as
+  q4, and its q4nx embedding entry has no sqrt(hidden) scale. `gemma4_source.py`'s
+  `pair_q4_0_16row`, `pair_q8_16row` and `q8_head_pool` repack those tiles
+  losslessly; they are checked on synthetic tiles, not real payload bytes.
+- E2B and E4B remain refused by the recipe. Their per-layer input and
+  shared-K/V pieces exist only as the primitives and plan above.
+
 ## Remaining work for a model recipe
 
 The three model entries need real source-weight payload checks and a scheduler
-that executes the validated layer plan. The 12B local/full decoder layer now
+that executes the validated layer plan; for 12B that is the dense route above. The 12B local/full decoder layer now
 composes the sandwich norms, projections, attention, MLP and output scale; its
 zero-weight two-position check covers wiring only. E2B and E4B also need the
 per-layer input and shared-K/V state routing in that scheduler. The 12B full

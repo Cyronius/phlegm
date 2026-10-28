@@ -1670,6 +1670,57 @@ engine -- the open one has no vision path.
 
 **Result 2026-09-06 (Gemma3-4B-Text-NPU2, medgemma-1.5-4b-it-NPU2, Translategemma-4B-Instruct-NPU2):** three fine-tunes whose specs are identical to Gemma3-4B's in every field but `extra` -- step 2 logits corr 0.999998-0.999999 at both positions, same argmax, residual corr 1.000000 in all six layers (maxrel <= 6.1e-4); step 3 identical through the engine, request 2 reproduced request 1; a finite step at position 1101 through the window path for each; step 4 a coherent answer ending in `<end_of_turn>` at tokens 43 / 62 / 27. Each model's own export is byte-identical to `src/xclbins/Gemma3-4B-NPU2/open_kernels` (3/3 `insts.bin`, xclbins stamps only, manifests differing only in `spec.extra.model` and `build_key`), and the same slice passed against that directory directly first. medgemma's top-5 reorders in slots 2-4 at position 1 on a 0.02-logit tie, identically through harness and engine. Gemma3-4B-Text reproduces the reference model's answer token for token. Details: `.claude/plans/p0-p1-results.md`.
 
+### OPEN-FAMILY-GEMMA4: Gemma 4 12B's text decoder on two dense geometries
+**Applies to:** openflowlm-next (`open_kernels/recipes/gemma4.py`, `spec.py`, `pack.py`, `dense.py`, `designs/attn/attn.h`, `designs/dense/dx.py`, `src/open_qwen36/`, `src/common/AutoModel/modeling_gemma4_12b.cpp`)
+**Test category:** manual (needs the NPU and a Gemma 4 12B container); the derivation, the proportional RoPE table, both geometries, the global pack plan, `div_running`, the `rope_parameters` load check and the per-kernel manifest rows are unit-tested in `tests/test_gemma4.py`
+
+Gemma 4 12B's text decoder (`gemma4_unified`) shall run on the open kernels
+from its `config.json` through `designs/dense/dx.py`, built once per layer type
+(`G4_KIND` local or global), each with its own context, layout and position
+table. The 40 sliding layers have Gemma 3 12B's shape; the 8 global layers have
+head dim 512, one kv head, K = V and proportional RoPE. Four `attn.h` switches,
+all off for every other family, carry what is new:
+
+- `ATTN_VNORM`: a weightless RMSNorm on V, every layer.
+- `ATTN_SCALE`: the score scale replacing 1/sqrt(HD); Gemma 4 uses 1.0.
+- `ATTN_ROPE_PAIR`: the rotation partner. The global layers turn 64 pairs of a
+  512-wide head at `1e6^(-2i/512)`, pairing dim i with i + 256.
+- `ATTN_QLOCAL`: each attention core stores only its own q heads.
+
+The global layers have no `v_proj`: k_proj is packed into both the K and V
+slots, and twice into each to fill the attention element's two kv heads.
+`layer_output_scale` is folded into the post-attention and post-FFN norm
+weights by the product of the earlier layers' scales (`div_running`), which
+the residual's RMSNorm readers do not see up to eps. `final_logit_softcapping`
+is applied to the host logits. E2B / E4B (`gemma4`) are refused by name:
+per-layer embeddings and KV sharing across layers have no recipe here.
+
+**Acceptance criteria (unit):**
+- The 12B derives 8 global layers (every sixth), local `(256, 8, 256)` and global `(512, 1, 128)` head geometry, scale 1.0, a V norm, softcap 30 and windows 1024 / 0.
+- The global table has 64 entries `1e6^(-2i/512)`; the local 128 `1e4^(-2i/256)`. The layout carries the local table.
+- The global pack plan is `q, k, k, k, k, o, up, gate, down`; both post norms carry `div_running`, and the Python packer's bits equal `pools.cpp`'s.
+- A config with another theta or rotation width no longer matches `hf_config_check`.
+- Both attention points are refused by the catalogue until this procedure has run (`OPEN_KERNELS_UNVALIDATED` for development), including the sliding layers that share Gemma 3 12B's shape.
+
+**Procedure (manual):** greedy decode against a dequantised reference at a
+short prompt and at a prompt past the 1024 window, the latter also against a
+reference without the window; then window-boundary positions 1023, 1024 and
+1025 against HF's `q - kv < 1024` mask, with logits compared after the cap;
+then `oflm serve` with a two-turn chat.
+
+**Result (reported upstream, openflowlm-next #225, 2026-10-27; not reproduced in Phlegm):**
+Strix Point, `FastFlowLM/gemma-4-12B-it-qat-q4_0-gguf` (the GGUF route). The
+short prompt's greedy tokens match a dequantised-GGUF reference, logit cosine
+>= 0.99996. A 1188-token prompt reaches cosine >= 0.99997; the no-window
+reference gives 0.997-0.999. `oflm serve` answers a two-turn chat, the second
+turn served from the cached prompt. The boundary positions are not reported.
+
+**Open:** the `model.q4nx` route has not run. FLM's 12B package stores 16-row
+signed-q4 tiles (2304 B), a 16-row q8 head (4352 B) and a BF16 embedding
+table; both packers (`pack.q4_chunks_of`, `pools.cpp`) read 5120, 8704 and
+4736-byte chunks only, and the plan packs the head as q4 (`gemma4-text-kernels.md`). Also open: catalogue
+validation, block prefill (decode one token at a time), vision and audio.
+
 ### OPEN-FAMILY-HUNYUAN: HunYuan dense on the dense recipe
 **Applies to:** openflowlm-next (`open_kernels/recipes/dense.py`, `spec.py`, `designs/attn/attn.h`, `designs/dense/dx.py`, `utilities/q4nx-build`)
 **Test category:** manual (needs the NPU and a converted `Hy-MT2-7B-NPU2`); the derivation, the folded RoPE base, the post-RoPE norm order and the 7B layout are unit-tested in `tests/test_hunyuan.py`

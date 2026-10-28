@@ -26,6 +26,7 @@ sync is a plain diff of these two directories.
 | 2026-10-23 | PR #207 Granite attention tiling knob | `ed5e3c6e1cadbe8974493aa04bb3873ae0753644` |
 | 2026-10-23 | PR #213 Qwen3.8-27B precision and reference validation (upstream draft) | `5eda57ee98556df439c91e44c334325a82ab3362` |
 | 2026-10-23 | PR #223 GGUF-direct, dense split shapes and Qwen3 size specs | `0c22864a5258019b7a885fb4be962ec62e3cc276` |
+| 2026-10-28 | PR #225 Gemma 4 12B text decoder on two dense geometries (open, not merged upstream): its five `open_kernels/`/`specs/open-engine/` commits, cherry-picked with `-x` | `beccd4699d812642b63741255322d19a0c1dd738` |
 
 ## Not pulled in yet
 
@@ -45,6 +46,9 @@ sync is a plain diff of these two directories.
 | 2026-10-23 | Preserve the recovered attention cache key's head-width component and Qwen3-0.6B's 128-wide heads; #223's checked-in 0.6B spec instead used 64. |
 | 2026-10-23 | Keep Bonsai/Hadamard on its existing attention and linear ABI; #213's precision selection is limited to the non-Hadamard geometry. Keep #193's default DIT route on measured q/k-normalized attention rather than promoting the recovered Llama rope-only route. |
 | 2026-10-23 | Normalize config paths and compiler dependency parsing for Windows, and compare generated source text independently of line endings. Native/runtime tests declare missing prerequisites explicitly. |
+| 2026-10-28 | #225's four Gemma 4 attention flags live in `recipes/dense.attn_flags`, phlegm's one flag source for `dx.py` and the attention gate; `recipes/gemma4.py` re-exports it. `attn.h` refuses `ATTN_QLOCAL` with the `ATTN_TREE8` / `ATTN_G5` scorers, which postdate #225's base and index q by global head. |
+| 2026-10-28 | `dx.py` streams o's og elements only when they outnumber the norms' x depth (`OG_STREAM`), not at og > 2 as #225 does: phlegm's x fifo already holds og elements, so #225's condition moved Qwen3-14B (og 3, from #223) onto the new path. At depth 4 Gemma 4's global layer would also overflow its main cores. Upstream needs the same condition once #223 lands. |
+| 2026-10-28 | `OPEN-FAMILY-GEMMA4` is defined in `specs/open-engine/spec.md`; #225's test traces the ID, but the PR does not add it. |
 
 ## Pushed out to openflowlm-next
 
@@ -154,3 +158,36 @@ Fresh KV-sliced Llama 1B decode matches all 300 and 4137 prefill logits, plus
 Real-prefix model gates pass at 4137 positions and independently on the 47-token
 4096 boundary slice. These development results do not establish recall quality,
 HTTP performance, or clean-release benchmark parity.
+
+
+## PR #225 Gemma 4 import (2026-10-28)
+
+Imported from openflowlm-next PR #225 at head `beccd46` (base `24bd049`). The
+five commits that touch `open_kernels/` or `specs/open-engine/` (`a1edd18`,
+`523a96e`, `f7b928b`, `a5f310f` and `ec560e4`) were cherry-picked with `-x`
+and keep their author. Their `src/` changes, and the five runtime-only commits
+(`81c719c`, `ad128bb`, `5f86381`, `24dd54c` and `beccd46`), are in
+`upstream-patches/pr225-gemma4-runtime.patch`: one standalone diff against
+`24bd049`, recorded in `sources.json`. The patch passes `git apply --check
+--3way` at that base. It was not built here.
+
+Validation (Fedora, Strix Halo development checkout; offline, no NPU run):
+
+- Full offline suite: `python -m pytest -q` gives 1953 passed, 64 skipped and
+  8 deselected. The unmodified HEAD gave 1943 passed, with the same skips. The
+  difference is `test_gemma4.py`'s 10 tests.
+- All 24 shipped specs that derive have unchanged `to_dict`, build
+  environments, attention flags and manifests except `build_key`, which hashes
+  the changed sources. `qwen3-14b` refuses at `lm_head_q4` K=5120 before and after.
+- `emit_mlir.py designs/dense/dx.py` emits byte-identical MLIR before and after
+  for the 17 dense specs plus LFM2 1.2B, in both q4nx and GGUF-direct
+  variants. Qwen3-14B was compared with `OPEN_KERNELS_UNVALIDATED=1`; #225's
+  unmodified og condition changes it.
+- `G4_KIND=global GEMV_SCALES_F32=1` (`dxg_f32`) compiles in 88 s. The fullest
+  core has 12704 of 16384 B of program memory, matching upstream's report. The
+  main GEMV cores place buffers up to 65280 of 65536 B; the attention cores up
+  to 41744 B. Both local and global, q4nx and GGUF, MLIR emit.
+
+Not established here: hardware arithmetic, model output, catalogue validation
+and the q4nx route. See `OPEN-FAMILY-GEMMA4` and
+`specs/open-engine/gemma4-text-kernels.md`.

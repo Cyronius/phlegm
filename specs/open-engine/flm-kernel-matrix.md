@@ -17,7 +17,7 @@ Phlegm kernel implementation or a compatible ABI.
 | `qwen3vl-it:4b` | `qwen3vl` | `qwen3` | `recipe_source` | vision tower kernel route not established |
 | `gemma4-it:e2b` | `gemma4e` | `—` | `missing_recipe` | no complete NPU recipe; text and multimodal NPU primitives built; scheduler and real-weight output checks remain |
 | `gemma4-it:e4b` | `gemma4e` | `—` | `missing_recipe` | no complete NPU recipe; text and multimodal NPU primitives built; scheduler and real-weight output checks remain |
-| `gemma4-it:12b` | `gemma4-12b` | `—` | `missing_recipe` | no complete NPU recipe; text and multimodal matrix images built; scheduler and real-weight output checks remain |
+| `gemma4-it:12b` | `gemma4-12b` | `—` | `missing_recipe` | no complete NPU recipe; text and multimodal matrix images built; dense recipe imported from openflowlm-next #225 reads GGUF, not FLM q4nx's 16-row tiles and q8 head; real-weight output checks remain |
 | `qwen3.5:0.8b` | `qwen3.5` | `qwen35` | `recipe_source` | vision tower kernel route not established |
 | `qwen3.5:2b` | `qwen3.5` | `qwen35` | `recipe_source` | vision tower kernel route not established |
 | `qwen3.5:4b` | `qwen3.5` | `qwen35` | `recipe_source` | vision tower kernel route not established |
