@@ -155,6 +155,8 @@ def bt(total, off, n):
 ATTN_FLAGS = QR.attn_flags(G, QR.probe_env().items())
 QKVB = G.QKVB
 QLOCAL = bool(G.QLOCAL)                                # attn.h ATTN_QLOCAL (Gemma 4): see _attn
+X_DEPTH = max(2, G.XN_ELEMS, G.XM_ELEMS)                # x elements the norms take in one go
+OG_STREAM = G.OG_ELEMS > X_DEPTH                        # o's og elements one at a time (Gemma 4 global)
 NPTAB, CSE = G.PTAB_ELEMS, G.PTAB_CS_ELEM      # elements per position record; which holds cos / sin
 ACORES, NHL, RB = G.ACORES, G.NHL, G.RB
 NSHIM = 8                                              # NPU2 shim columns, two MM2S channels each
@@ -321,7 +323,8 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
     # The x stream: the activation elements the main cores take in one go (the layer's
     # norms and the o projection's table). At HID 4096 that is two elements; at HID 5120
     # (Qwen3-14B) it is three, and the fifo has to hold as many as the largest acquire.
-    of_x = ObjectFifo(x_ty, name="x", depth=max(2, G.XN_ELEMS, G.OG_ELEMS, G.XM_ELEMS))
+    # o's table streams instead (OG_STREAM) when og alone is wider than the norms.
+    of_x = ObjectFifo(x_ty, name="x", depth=X_DEPTH if OG_STREAM else max(X_DEPTH, G.OG_ELEMS))
     of_lni = ObjectFifo(u8_ln, name="lni", depth=3 if G.NORM_SPLIT else 5)
     of_lno = ObjectFifo(u8_ln, name="lno", depth=1)      # one output element at a time (8 KB elements at 4096 wide)
     of_ain = ObjectFifo(u8_a, name="ain", depth=max(4, 1 + NPTAB + 1) if KVSL else max(4, 2 * RB + 2, 1 + NPTAB + 1))   # a block is acquired at once
@@ -429,7 +432,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
 
     def layer_tail(win, xin, yout, tab, ms, K, band, f_prep, f_prepf, f_silu, ng_u):
         # o against og (K = QW)
-        if G.OG_ELEMS <= 2:
+        if not OG_STREAM:
             oe = acq(xin, G.OG_ELEMS)
             for i in range(G.OG_ELEMS):
                 f_prep(oe[i], tab, QW, i)
@@ -439,7 +442,8 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             # Gemma 4's global layers: q is 16 x 512 wide, so og is four x elements and the
             # depth-2 x fifo cannot hold it at once. The prep places each element in the
             # table by its index, so taking them one at a time -- as down's h already does --
-            # builds the same table; every family with og <= 2 elements is untouched.
+            # builds the same table. phlegm: OG_STREAM (og wider than the norms' X_DEPTH)
+            # rather than upstream's og > 2, so Qwen3-14B's og 3 keeps its one-go acquire.
             for i in range(G.OG_ELEMS):
                 oe1 = xin.acquire(1)
                 f_prep(oe1, tab, QW, i)
