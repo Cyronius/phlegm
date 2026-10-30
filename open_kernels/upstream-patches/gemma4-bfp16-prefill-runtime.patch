@@ -1,0 +1,672 @@
+diff --git a/src/open_qwen36/bfp16.hpp b/src/open_qwen36/bfp16.hpp
+new file mode 100644
+index 0000000..51fc946
+--- /dev/null
++++ b/src/open_qwen36/bfp16.hpp
+@@ -0,0 +1,84 @@
++/// \file bfp16.hpp
++/// \brief bfp16ebs8 operands of gemm_bfp16 (open_kernels/designs/gemm_bfp16, pack.py is the NumPy twin):
++///        eight values along K share one exponent byte, each a signed 8-bit mantissa, nine bytes a block.
++///
++/// Derived from ggml-xdna's src/npu/bfp16_pack.{h,cpp} (Cyrus Attoun, MIT). Header-only so the pool packer
++/// (pools.cpp, no AVX2 flag) and the activation packer (block_host.cpp) share one layout.
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#ifdef __AVX2__
++#include <immintrin.h>
++#endif
++
++namespace open_qwen36 {
++
++constexpr size_t BFP16_BLOCK_BYTES = 9;
++
++/// The kernel's compiled tile: A is m rows x k, B is n rows x k, over rows x cols cores.
++struct Bfp16Tiling {
++    size_t m = 64, k = 64, n = 128, cols = 8, rows = 4;
++};
++
++/// Eight floats -> exponent byte (the largest float exponent) + eight signed mantissas
++/// q = round-half-even(x * 2^(133 - e)) saturated to [-128, 127]; decoded q * 2^(e - 133).
++inline void bfp16_encode_block(const float* x, uint8_t* out) {
++    uint32_t u[8];
++    std::memcpy(u, x, 32);
++    uint32_t maxe = 0;
++    for (int i = 0; i < 8; i++) maxe = std::max(maxe, (u[i] >> 23) & 0xffu);
++    out[0] = static_cast<uint8_t>(maxe);
++    const int sexp = 133 - static_cast<int>(maxe) + 127;     // biased exponent of the scale 2^(133 - maxe)
++#ifdef __AVX2__
++    if (sexp >= 1 && sexp <= 254) {
++        const __m256 scale = _mm256_castsi256_ps(_mm256_set1_epi32(sexp << 23));
++        __m256i q = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x), scale));      // nearest even
++        q = _mm256_min_epi32(_mm256_max_epi32(q, _mm256_set1_epi32(-128)), _mm256_set1_epi32(127));
++        const __m128i q16 = _mm_packs_epi32(_mm256_castsi256_si128(q), _mm256_extracti128_si256(q, 1));
++        _mm_storel_epi64(reinterpret_cast<__m128i*>(out + 1), _mm_packs_epi16(q16, q16));
++        return;
++    }
++#endif
++    const int sh = 133 - static_cast<int>(maxe);     // also zeros, and exponents so small the scale is not a normal float
++    for (int i = 0; i < 8; i++) {
++        const float q = std::nearbyint(std::ldexp(x[i], sh));
++        out[1 + i] = static_cast<uint8_t>(static_cast<int8_t>(std::min(127.0f, std::max(-128.0f, q))));
++    }
++}
++
++namespace bfp16_detail {
++/// inside a tile: row pairs (16 rows) by block column, then the pair's 16 rows
++inline size_t in_tile(size_t rr, size_t cb, const Bfp16Tiling& t) {
++    const size_t tkb = t.k / 8;
++    return ((rr / 16) * tkb + cb % tkb) * 16 + rr % 16;
++}
++}  // namespace bfp16_detail
++
++/// Byte offset of the block holding columns [8 cb, 8 cb + 8) of row r of an A operand (K columns): for each
++/// block of m rows, for each chunk of k, one m x k tile.
++inline size_t bfp16_a_offset(size_t r, size_t cb, size_t K, const Bfp16Tiling& t) {
++    const size_t nk = K / t.k, tile = (r / t.m) * nk + cb / (t.k / 8);
++    return (tile * t.m * (t.k / 8) + bfp16_detail::in_tile(r % t.m, cb, t)) * BFP16_BLOCK_BYTES;
++}
++
++/// ... of a B operand (N rows, K columns): for each array column c, for each of its n-row groups (rows
++/// (c + cols * g) * n onward), for each chunk of k, one n x k tile.
++inline size_t bfp16_b_offset(size_t r, size_t cb, size_t N, size_t K, const Bfp16Tiling& t) {
++    const size_t per_col = N / t.n / t.cols, nk = K / t.k, g = r / t.n;
++    const size_t tile = ((g % t.cols) * per_col + g / t.cols) * nk + cb / (t.k / 8);
++    return (tile * t.n * (t.k / 8) + bfp16_detail::in_tile(r % t.n, cb, t)) * BFP16_BLOCK_BYTES;
++}
++
++/// Float offset of output (row r, column n) in the kernel's c-tiled fp32 C of an M x N product: each array
++/// column c holds M * N / cols floats, for each block of m * rows rows its n-groups in order, each block
++/// row-major (rows of n floats), so a row's n columns of one tile are contiguous.
++inline size_t bfp16_c_offset(size_t r, size_t n, size_t M, size_t N, const Bfp16Tiling& t) {
++    const size_t rb = t.m * t.rows, ct = n / t.n, J = N / (t.n * t.cols);
++    return (ct % t.cols) * (M * N / t.cols) + ((r / rb) * J + ct / t.cols) * rb * t.n + (r % rb) * t.n + n % t.n;
++}
++
++}  // namespace open_qwen36
+diff --git a/src/open_qwen36/block_host.cpp b/src/open_qwen36/block_host.cpp
+index f1c7146..5c15d16 100644
+--- a/src/open_qwen36/block_host.cpp
++++ b/src/open_qwen36/block_host.cpp
+@@ -13,6 +13,7 @@
+ #include <omp.h>
+ #include <chrono>
+ #include <cmath>
++#include <cstring>
+ #include <limits>
+ #include <stdexcept>
+ #include <vector>
+@@ -263,6 +264,53 @@ void act_tile(const double* act, const float* up, size_t T, size_t K, uint16_t*
+         }
+ }
+ 
++void bfp16_pack_a(const float* x, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out) {
++    if (T % (t.m * t.rows) || K % t.k) throw std::runtime_error("open_qwen36: bfp16_pack_a: T or K does not tile");
++#pragma omp parallel for
++    for (long long r = 0; r < static_cast<long long>(T); ++r)
++        for (size_t cb = 0; cb < K / 8; ++cb)
++            bfp16_encode_block(x + static_cast<size_t>(r) * K + cb * 8, out + bfp16_a_offset(static_cast<size_t>(r), cb, K, t));
++}
++
++void bfp16_untile_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t n_real, float* y) {
++    const size_t rb = t.m * t.rows, blk = rb * t.n, J = N / (t.n * t.cols);
++#pragma omp parallel for
++    for (long long nn = 0; nn < static_cast<long long>(n_real); ++nn) {
++        const size_t n = static_cast<size_t>(nn), ct = n / t.n, j = n % t.n;
++        const float* base = c + (ct % t.cols) * (M * N / t.cols) + (ct / t.cols) * blk + j;
++        float* o = y + n * M;
++        for (size_t r = 0; r < M; ++r) o[r] = base[(r / rb) * J * blk + (r % rb) * t.n];
++    }
++}
++
++void bfp16_rows_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t rows, size_t n_real, float* y) {
++    if (rows > M || n_real > N) throw std::runtime_error("open_qwen36: bfp16_rows_c: more rows or columns than C has");
++#pragma omp parallel for
++    for (long long rr = 0; rr < static_cast<long long>(rows); ++rr) {
++        const size_t r = static_cast<size_t>(rr);
++        for (size_t n0 = 0; n0 < n_real; n0 += t.n)
++            std::memcpy(y + r * n_real + n0, c + bfp16_c_offset(r, n0, M, N, t), std::min(t.n, n_real - n0) * 4);
++    }
++}
++
++void act_bfp16_a(const double* act, const float* up, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out) {
++    if (T % (t.m * t.rows) || K % (t.n * t.cols) || t.n % 8)
++        throw std::runtime_error("open_qwen36: act_bfp16_a: T or K does not tile");
++#pragma omp parallel for
++    for (long long rr = 0; rr < static_cast<long long>(T); ++rr) {
++        const size_t r = static_cast<size_t>(rr);
++        float h[8];
++        for (size_t n0 = 0; n0 < K; n0 += t.n) {
++            const size_t o = bfp16_c_offset(r, n0, T, K, t);       // the tile's row: t.n contiguous columns
++            for (size_t j = 0; j < t.n; j += 8) {
++                for (size_t i = 0; i < 8; ++i)
++                    h[i] = static_cast<float>(act[o + j + i] * static_cast<double>(up[o + j + i]));
++                bfp16_encode_block(h, out + bfp16_a_offset(r, (n0 + j) / 8, K, t));
++            }
++        }
++    }
++}
++
+ void sandwich_rows(const float* y, const double* x, size_t T, size_t hid, size_t groups, const float* w_post,
+                    const float* w_next, double eps, double* res, float* next) {
+     if (!groups || hid % groups) throw std::runtime_error("open_qwen36: sandwich_rows: groups does not divide the row");
+diff --git a/src/open_qwen36/block_host.hpp b/src/open_qwen36/block_host.hpp
+index 6717bec..af19846 100644
+--- a/src/open_qwen36/block_host.hpp
++++ b/src/open_qwen36/block_host.hpp
+@@ -16,6 +16,8 @@
+ #include <cstdint>
+ #include <vector>
+ 
++#include "open_qwen36/bfp16.hpp"
++
+ namespace open_qwen36 {
+ namespace host {
+ 
+@@ -50,6 +52,18 @@ void act_tile(const double* act, const float* up, size_t T, size_t K, uint16_t*
+ void sandwich_rows(const float* y, const double* x, size_t T, size_t hid, size_t groups, const float* w_post,
+                    const float* w_next, double eps, double* res, float* next);
+ 
++/// OPEN-PREFILL-BFP16, gemm_bfp16's operands (bfp16.hpp). x [T, K] fp32 -> the A operand, T * K / 8 * 9
++/// bytes. T a multiple of m * rows, K of k.
++void bfp16_pack_a(const float* x, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out);
++/// The kernel's c-tiled fp32 output of an M x N product -> y [n_real, M] (the q4 GEMM's own [N, T] order).
++void bfp16_untile_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t n_real, float* y);
++/// ... -> y [rows, n_real], token rows: the first `rows` of the M, the first n_real of the N (padding dropped).
++void bfp16_rows_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t rows, size_t n_real, float* y);
++/// act_tile for the bfp16 route: act (act_fp64 of the gate) and up, both c-tiled T x K outputs, give
++/// h = act * up rounded to fp32, encoded as the down projection's A operand -- bfp16_pack_a of the [T, K] h,
++/// byte for byte, without untiling either input or holding h.
++void act_bfp16_a(const double* act, const float* up, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out);
++
+ struct DeltaGeom {
+     size_t T = 0, t_real = 0, hid = 0;
+     size_t key_heads = 0, value_heads = 0, head_dim = 0, taps = 0;
+diff --git a/src/open_qwen36/block_host_test.cpp b/src/open_qwen36/block_host_test.cpp
+index 7c8593e..521c7a2 100644
+--- a/src/open_qwen36/block_host_test.cpp
++++ b/src/open_qwen36/block_host_test.cpp
+@@ -423,6 +423,57 @@ int main(int argc, char** argv) {
+         check(ok, "transpose: [N, T] -> [T, N]");
+     }
+ 
++    // ---- OPEN-PREFILL-BFP16: the activation packer matches the NumPy one, the output untiles invert the kernel's
++    // order, and the fused act * up encode is the packer over the untiled product
++    {
++        const size_t T2 = 256, K2 = 128;
++        std::vector<float> x(T2 * K2);
++        for (size_t r = 0; r < T2; ++r)
++            for (size_t c = 0; c < K2; ++c) x[r * K2 + c] = static_cast<float>(static_cast<int>((r * 37 + c * 11) % 251) - 125) / 16.f * (1 + (c / 8) % 5);
++        std::vector<uint8_t> a(T2 * K2 / 8 * BFP16_BLOCK_BYTES);
++        host::bfp16_pack_a(x.data(), T2, K2, Bfp16Tiling{}, a.data());
++        uint64_t h = 1469598103934665603ull;
++        for (uint8_t b : a) h = (h ^ b) * 1099511628211ull;
++        std::printf("      bfp16_pack_a fnv1a = 0x%016llx\n", static_cast<unsigned long long>(h));
++        check(h == 0x8b24e0b36ad1f427ull, "bfp16_pack_a: byte-identical to the NumPy packer");
++
++        const size_t M = 512, N = 2048, rb = 256, J = N / 1024;
++        std::vector<float> c(M * N), un(N * M), rows(M * N);
++        for (size_t col = 0; col < 8; ++col)
++            for (size_t rbi = 0; rbi < M / rb; ++rbi)
++                for (size_t t = 0; t < J; ++t)
++                    for (size_t rr = 0; rr < rb; ++rr)
++                        for (size_t j = 0; j < 128; ++j)
++                            c[((col * (M / rb) + rbi) * J + t) * rb * 128 + rr * 128 + j] =
++                                static_cast<float>((rbi * rb + rr) * N + (col + 8 * t) * 128 + j);
++        host::bfp16_untile_c(c.data(), M, N, Bfp16Tiling{}, 1920, un.data());
++        bool ok = true;
++        for (size_t n = 0; n < 1920; ++n)
++            for (size_t r = 0; r < M; ++r) ok = ok && un[n * M + r] == static_cast<float>(r * N + n);
++        check(ok, "bfp16_untile_c: the c-tiled output back to [N, T], padding rows dropped");
++        host::bfp16_rows_c(c.data(), M, N, Bfp16Tiling{}, 300, 1920, rows.data());
++        ok = true;
++        for (size_t r = 0; r < 300; ++r)
++            for (size_t n = 0; n < 1920; ++n) ok = ok && rows[r * 1920 + n] == static_cast<float>(r * N + n);
++        check(ok, "bfp16_rows_c: the c-tiled output back to token rows, padding rows and columns dropped");
++
++        // act and up c-tiled as gate | up come off the kernel: [T, ff] = [256, 2048]
++        const size_t TT = 256, FF = 2048;
++        std::vector<double> act(TT * FF);
++        std::vector<float> up(TT * FF), hrow(TT * FF);
++        for (size_t r = 0; r < TT; ++r)
++            for (size_t f = 0; f < FF; ++f) {
++                const size_t o = bfp16_c_offset(r, f, TT, FF, Bfp16Tiling{});
++                act[o] = std::sin(0.37 * static_cast<double>(r * FF + f)) * (1 + (f / 8) % 7);
++                up[o] = static_cast<float>(std::cos(0.11 * static_cast<double>(r + 3 * f)) * 3.0);
++                hrow[r * FF + f] = static_cast<float>(act[o] * static_cast<double>(up[o]));
++            }
++        std::vector<uint8_t> fused(TT * FF / 8 * BFP16_BLOCK_BYTES), ref(fused.size());
++        host::act_bfp16_a(act.data(), up.data(), TT, FF, Bfp16Tiling{}, fused.data());
++        host::bfp16_pack_a(hrow.data(), TT, FF, Bfp16Tiling{}, ref.data());
++        check(fused == ref, "act_bfp16_a: bfp16_pack_a of the untiled act * up, byte for byte");
++    }
++
+     std::printf("%s\n", failures ? "FAIL" : "PASS");
+     return failures ? 1 : 0;
+ }
+diff --git a/src/open_qwen36/core.cpp b/src/open_qwen36/core.cpp
+index 644e942..a7a3e79 100644
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -208,9 +208,13 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
+     // OPEN-PREFILL-MODE: swapped in before the kernel list and the packing, so the other route costs nothing
+     if (cfg_.prefill_mode != "fast" && cfg_.prefill_mode != "lean")
+         throw std::runtime_error("open_qwen36: prefill mode '" + cfg_.prefill_mode + "' is not fast or lean");
++    // in both views: a GGUF-direct set (Gemma 4) carries its routes in the gguf section only
+     bool has_lean = false;
+-    for (const auto& [name, t] : man_.layer_types) has_lean = has_lean || t.gemm_block_variants.count("lean");
+-    man_.select_prefill_route(cfg_.prefill_mode == "lean" ? "lean" : "");
++    for (Manifest* view : {&man_, man_.gguf.get()}) {
++        if (!view) continue;
++        for (const auto& [name, t] : view->layer_types) has_lean = has_lean || t.gemm_block_variants.count("lean");
++        view->select_prefill_route(cfg_.prefill_mode == "lean" ? "lean" : "");
++    }
+     if (has_lean) prefill_route_ = cfg_.prefill_mode;
+     else if (cfg_.prefill_mode == "lean") log("this kernel set has one prefill route; lean changes nothing");
+     fs::path md(cfg_.model_dir);
+@@ -2674,15 +2678,25 @@ void Core::step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, siz
+             throw std::runtime_error("open_qwen36: gemm route: T=" + std::to_string(T) +
+                                      " exceeds the kernel set's compiled " + std::to_string(gb.t));
+         xrt::bo& xb = buffer(s.args[1], 0);
++        // OPEN-PREFILL-BFP16: a bfp16 step's x is gemm_bfp16's A operand, nine bytes per eight values
++        const bool bfp = s.fmt == "bfp16";
++        const size_t x_bytes = bfp ? gb.t * K / 8 * BFP16_BLOCK_BYTES : gb.t * K * 2;
++        if (xb.size() < x_bytes)
++            throw std::runtime_error("open_qwen36: gemm " + s.kernel + ": the x global " + s.args[1] + " is smaller than [" +
++                                     std::to_string(gb.t) + ", " + std::to_string(K) + "]");
++        auto pack = [&](const float* xs) {
++            if (bfp) host::bfp16_pack_a(xs, gb.t, K, Bfp16Tiling{}, xb.map<uint8_t*>());
++            else host::tile_x(xs, gb.t, K, xb.map<uint16_t*>());
++        };
+         if (T == gb.t) {
+-            host::tile_x(x.data(), T, K, xb.map<uint16_t*>());      // straight into the mapped buffer
++            pack(x.data());      // straight into the mapped buffer
+         } else {
+             std::vector<float> xp(gb.t * K, 0.f);
+             for (size_t r = 0; r < T; ++r)
+                 for (size_t c = 0; c < K; ++c) xp[r * K + c] = x[r * K + c];
+-            host::tile_x(xp.data(), gb.t, K, xb.map<uint16_t*>());
++            pack(xp.data());
+         }
+-        xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, gb.t * K * 2, 0);
++        xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, x_bytes, 0);
+         timing_.gemm_tile_ms += ms_since(tt);
+     };
+     // Stage x (unless x is null: the step's x global already holds it, tiled and on the device),
+@@ -2692,21 +2706,33 @@ void Core::step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, siz
+         const Step& s = gb.program[idx];
+         if (x) stage_x(idx, *x, K);
+         Kern& k = kerns_.at(s.kernel);
++        // a bfp16 step's y is c-tiled over the weight's padded rows
++        const size_t rows = s.fmt == "bfp16" ? s.n_pad : N;
++        xrt::bo& yb = buffer(s.args[2], 0);
++        if (rows < N || yb.size() < rows * gb.t * 4)
++            throw std::runtime_error("open_qwen36: gemm " + s.kernel + ": the y global " + s.args[2] + " is smaller than [" +
++                                     std::to_string(rows) + ", " + std::to_string(gb.t) + "]");
+         timing_.part0_ms += run(k, s.args, l);
+         auto tt = std::chrono::steady_clock::now();
+-        read_back(buffer(s.args[2], 0), N * gb.t * 4, 0);
++        read_back(yb, rows * gb.t * 4, 0);
+         timing_.gemm_tr_ms += ms_since(tt);
+         return static_cast<size_t>(gb.t);
+     };
+     // The output as the kernel wrote it, [N, T]: the fused input projection, whose three parts
+     // the attention paths split by row range.
+     auto run_gemm = [&](size_t idx, const std::vector<float>& x, size_t K, size_t N, std::vector<float>& y_out) {
++        const Step& s = gb.program[idx];
+         const size_t Tk = gemm_dispatch(idx, &x, K, N);
+         auto tt = std::chrono::steady_clock::now();
+-        const float* y = buffer(gb.program[idx].args[2], 0).map<float*>();
++        const float* y = buffer(s.args[2], 0).map<float*>();
+         y_out.resize(N * T);
++        if (s.fmt == "bfp16") {
++            float* un = Tk == T ? y_out.data() : BlockScratch::fit(bs_.d_un, N * Tk);
++            host::bfp16_untile_c(y, Tk, s.n_pad, Bfp16Tiling{}, N, un);
++            y = un;
++        }
+         if (Tk == T) {
+-            std::memcpy(y_out.data(), y, N * T * 4);
++            if (y != y_out.data()) std::memcpy(y_out.data(), y, N * T * 4);
+         } else {
+             for (size_t n = 0; n < N; ++n)
+                 for (size_t t = 0; t < T; ++t) y_out[n * T + t] = y[n * Tk + t];
+@@ -2716,9 +2742,12 @@ void Core::step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, siz
+     // The output as token rows, [T, N] (rows past T are padding): everything after the attention
+     // reads a token's row at a time, which over [N, T] is a T-float stride per element.
+     auto run_gemm_rows = [&](size_t idx, const std::vector<float>* x, size_t K, size_t N, std::vector<float>& out) {
++        const Step& s = gb.program[idx];
+         const size_t Tk = gemm_dispatch(idx, x, K, N);
+         auto tt = std::chrono::steady_clock::now();
+-        host::transpose(buffer(gb.program[idx].args[2], 0).map<float*>(), N, Tk, BlockScratch::fit(out, Tk * N));
++        const float* y = buffer(s.args[2], 0).map<float*>();
++        if (s.fmt == "bfp16") host::bfp16_rows_c(y, Tk, s.n_pad, Bfp16Tiling{}, Tk, N, BlockScratch::fit(out, Tk * N));
++        else host::transpose(y, N, Tk, BlockScratch::fit(out, Tk * N));
+         timing_.gemm_tr_ms += ms_since(tt);
+     };
+ 
+@@ -2899,13 +2928,21 @@ void Core::step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, siz
+         timing_.gemm_tr_ms += ms_since(th);
+         th = std::chrono::steady_clock::now();
+         xrt::bo& xd = buffer(sd.args[1], 0);
+-        if (xd.size() < ff * T * 2)
++        // the bfp16 route's gate and up are c-tiled; act_fp64 is elementwise, so act is too, and
++        // act_bfp16_a reads both in that order straight into down's A operand
++        const bool bfp = sd.fmt == "bfp16";
++        if (bfp != (sg.fmt == "bfp16") || bfp != (su.fmt == "bfp16") || (bfp && (sg.n_pad != ff || su.n_pad != ff)))
++            throw std::runtime_error("open_qwen36: gemm route: gate, up and down are not one GEMM format, or gate / up "
++                                     "is padded past ff");
++        const size_t xd_bytes = bfp ? T * ff / 8 * BFP16_BLOCK_BYTES : ff * T * 2;
++        if (xd.size() < xd_bytes)
+             throw std::runtime_error("open_qwen36: gemm route: the down projection's x global is smaller than [" +
+                                      std::to_string(ff) + "] x " + std::to_string(T));
+-        host::act_tile(act, yu.map<const float*>(), T, ff, xd.map<uint16_t*>());
++        if (bfp) host::act_bfp16_a(act, yu.map<const float*>(), T, ff, Bfp16Tiling{}, xd.map<uint8_t*>());
++        else host::act_tile(act, yu.map<const float*>(), T, ff, xd.map<uint16_t*>());
+         timing_.tail_ms += ms_since(th);
+         th = std::chrono::steady_clock::now();
+-        xd.sync(XCL_BO_SYNC_BO_TO_DEVICE, ff * T * 2, 0);
++        xd.sync(XCL_BO_SYNC_BO_TO_DEVICE, xd_bytes, 0);
+         timing_.gemm_tile_ms += ms_since(th);
+         run_gemm_rows(4, nullptr, ff, hid, y_down);
+     } else {
+diff --git a/src/open_qwen36/core.hpp b/src/open_qwen36/core.hpp
+index e523177..8a85cfa 100644
+--- a/src/open_qwen36/core.hpp
++++ b/src/open_qwen36/core.hpp
+@@ -444,7 +444,8 @@ private:
+         std::vector<float> d_o, d_gate, d_up, d_down, d_h;
+         std::vector<double> d_res;
+         std::vector<float> d_xn, d_xm, d_w;   ///< the entry and FFN norms' rows; a sandwich norm's f32 weight
+-        std::vector<double> d_act;      ///< a whole block's act(gate) [ff, T], between gate and up
++        std::vector<double> d_act;      ///< a whole block's act(gate) [ff, T] (c-tiled on bfp16), between gate and up
++        std::vector<float> d_un;        ///< a short block's bfp16 output untiled to [N, t] (OPEN-PREFILL-BFP16)
+         std::vector<size_t> pos;        ///< attention_npu: each product row's absolute position
+         /// `v` grown to at least `n` (never shrunk) and its data pointer.
+         template <class T>
+diff --git a/src/open_qwen36/gguf_pack_test.cpp b/src/open_qwen36/gguf_pack_test.cpp
+index fd1dc27..01ddff2 100644
+--- a/src/open_qwen36/gguf_pack_test.cpp
++++ b/src/open_qwen36/gguf_pack_test.cpp
+@@ -417,6 +417,44 @@ int main() {
+         }
+         std::printf("%s std_perm_gguf refuses a pool chunk of neither law\n", refused ? "ok   " : "FAIL");
+         if (!refused) return 1;
++
++        // bfp16_gemm (OPEN-PREFILL-BFP16) from the GGUF's own Q4_0 blocks: the [64, 512] tensor at row 256 of a
++        // 1024-row B operand. Checked against pack.py's order (pack_b's reshape / transpose written out) and a
++        // frexp encoder: every written block is the GGUF values' encoding, every other block zero.
++        PackOp bo;
++        bo.op = "bfp16_gemm";
++        bo.tensor = op.tensor;
++        bo.in_dim = 512;
++        bo.nch = op.nch;
++        bo.row0 = 256;
++        bo.n_total = 1024;
++        std::vector<uint8_t> bb(bo.n_total * bo.in_dim / 8 * 9, 0);
++        pools::apply(bo, g0, 0, bb.data(), bb.size(), 5120);
++        const size_t n = 128, kt = 64, cols = 8, nk = bo.in_dim / kt, ntg = bo.n_total / (n * cols);
++        size_t badb = 0, nonzero = 0;
++        for (size_t R = 0; R < bo.n_total; ++R)
++            for (size_t cb = 0; cb < bo.in_dim / 8; ++cb) {
++                const size_t t = R / (n * cols), c = (R / n) % cols, rr = R % n;
++                const size_t blk = (((((c * ntg + t) * nk + cb / (kt / 8)) * (n / 16) + rr / 16) * (kt / 8) + cb % (kt / 8)) * 2 +
++                                    (rr % 16) / 8) * 8 + rr % 8;
++                const uint8_t* b = bb.data() + blk * 9;
++                uint8_t want[9] = {0};
++                if (R >= bo.row0 && R < bo.row0 + 64) {
++                    const float* v = mm0.values.data() + (R - bo.row0) * mm0.cols + cb * 8;
++                    int e = 0;
++                    for (int i = 0; i < 8; ++i) e = std::max(e, static_cast<int>((f32_bits(v[i]) >> 23) & 0xFF));
++                    want[0] = static_cast<uint8_t>(e);
++                    for (int i = 0; i < 8; ++i) {
++                        const double q = std::nearbyint(static_cast<double>(v[i]) * std::ldexp(1.0, 133 - e));
++                        want[1 + i] = static_cast<uint8_t>(static_cast<int8_t>(std::min(127.0, std::max(-128.0, q))));
++                    }
++                }
++                badb += std::memcmp(b, want, 9) != 0;
++                for (int i = 0; i < 9; ++i) nonzero += b[i] != 0;
++            }
++        std::printf("%s bfp16_gemm from GGUF Q4_0 (%zu of %zu blocks differ; %zu nonzero bytes)\n", badb ? "FAIL" : "ok",
++                    badb, static_cast<size_t>(bo.n_total * bo.in_dim / 8), nonzero);
++        if (badb || !nonzero) return 1;
+     }
+ 
+     // ---- pack_norm: f32 -> bf16 (RNE)
+diff --git a/src/open_qwen36/manifest.cpp b/src/open_qwen36/manifest.cpp
+index afb1031..3836779 100644
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -60,6 +60,8 @@ PackOp parse_op(const json& j, const std::string& where) {
+     p.dst_rows = j.value("dst_rows", 0ull);
+     p.split = j.value("split", "");
+     p.via = j.value("via", "");
++    p.row0 = j.value("row0", 0ull);
++    p.n_total = j.value("n_total", 0ull);
+     p.div_running = j.value("div_running", "");
+     if (!p.div_running.empty() && (p.op != "put" || p.div_running.find("{j}") == std::string::npos))
+         fail(where, p.op + " " + p.tensor + ": div_running names a per-layer {j} tensor, on a put");
+@@ -73,7 +75,7 @@ PackOp parse_op(const json& j, const std::string& where) {
+         for (const auto& [name, v] : fs)
+             if (v == 0) fail(where, p.op + " " + (p.tensor.empty() ? p.up : p.tensor) + " without " + name);
+     };
+-    if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm" ||
++    if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm" || p.op == "bfp16_gemm" ||
+         p.op == "put" || p.op == "expert_down" || p.op == "conv_transpose" || p.op == "lmhead_q8" ||
+         p.op == "transpose" || p.op == "transpose_banked") {
+         if (p.tensor.empty()) fail(where, p.op + " without a tensor");
+@@ -84,6 +86,7 @@ PackOp parse_op(const json& j, const std::string& where) {
+     }
+     if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm")
+         need_all({{"nch", p.nch}, {"in_dim", p.in_dim}});
++    else if (p.op == "bfp16_gemm") need_all({{"nch", p.nch}, {"in_dim", p.in_dim}, {"n_total", p.n_total}});
+     else if (p.op == "std_fuse") need_all({{"nch", p.nch}, {"in_dim", p.in_dim}, {"src_dim", p.src_dim}, {"rg", p.rg}});
+     else if (p.op == "transpose" || p.op == "transpose_banked")
+         need_all({{"rows", p.rows}, {"cols", p.cols}, {"elem", p.elem}});
+@@ -106,6 +109,11 @@ std::vector<Step> parse_program(const json& j, const std::string& where) {
+             st.args = get<std::vector<std::string>>(s, "args", where);
+             if (st.args.empty() || st.args.size() > 8) fail(where, "run " + st.kernel + ": " + std::to_string(st.args.size()) + " buffer args (1..8)");
+             st.split = s.value("split", false);
++            st.fmt = s.value("fmt", "");
++            st.n_pad = s.value("n_pad", 0ull);
++            if (!st.fmt.empty() && st.fmt != "bfp16") fail(where, "run " + st.kernel + ": fmt '" + st.fmt + "' (bfp16 or nothing)");
++            if (st.fmt == "bfp16" && (st.n_pad == 0 || st.split))
++                fail(where, "run " + st.kernel + ": a bfp16 step needs n_pad and cannot be split");
+         } else if (st.op == "moeroute2") {
+             st.act_off = get<uint64_t>(s, "act_off", where);
+         } else {
+@@ -149,8 +157,9 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+     // ignore `split` and use the hi half of each such weight, so the recipe writes 2 exactly when
+     // a step is split, and an older engine refuses the set by name instead of misreading it.
+     // 3 adds the bf16_gemm pack op, which an engine that reads 2 cannot pack.
+-    if (m.version < 1 || m.version > 3)
+-        fail(where, "manifest_version " + std::to_string(m.version) + " (this engine reads 1 to 3)");
++    // 4 adds the bfp16_gemm pack op and the `bfp16` step format (OPEN-PREFILL-BFP16).
++    if (m.version < 1 || m.version > 4)
++        fail(where, "manifest_version " + std::to_string(m.version) + " (this engine reads 1 to 4)");
+     m.family = get<std::string>(j, "family", where);
+     m.spec_hash = j.value("spec_hash", "");
+     m.build_key = j.value("build_key", "");
+@@ -285,8 +294,8 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+                         // one format per weight: the q4_1 band law, or one GEMM pool the kernel was built for
+                         const std::string& kind = w.pack.front().op;
+                         for (const auto& o : w.pack)
+-                            if (o.op != "std_perm" && o.op != "bf16_gemm")
+-                                fail(gw, "weight " + name + ": a packed weight is std_perm or bf16_gemm ops, not " + o.op);
++                            if (o.op != "std_perm" && o.op != "bf16_gemm" && o.op != "bfp16_gemm")
++                                fail(gw, "weight " + name + ": a packed weight is std_perm, bf16_gemm or bfp16_gemm ops, not " + o.op);
+                         for (const auto& o : w.pack)
+                             if (o.op != kind)
+                                 fail(gw, "weight " + name + " mixes " + kind + " and " + o.op + " ops; the GEMM reads one format");
+@@ -556,6 +565,31 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+             check_split(g.program, g.weights, "program");
+             check_split(g.shared_program, g.shared_weights, "shared");
+             check_split(g.ffn_program, g.ffn_weights, "ffn");
++            // OPEN-PREFILL-BFP16: a bfp16 step reads a bfp16_gemm weight and nothing else does (the q4 GEMMs
++            // would read its 9-byte blocks as q4_1 chunks); only the dense route's chain packs its x and
++            // reads its c-tiled y
++            auto check_bfp16 = [&](const std::vector<Step>& prog, const std::map<std::string, GemmWeight>& ws,
++                                   const char* what) {
++                for (const auto& s : prog) {
++                    const GemmWeight& w = ws.at(s.args[0]);
++                    const bool packed = w.from == "pack" && !w.pack.empty() && w.pack.front().op == "bfp16_gemm";
++                    if ((s.fmt == "bfp16") != packed)
++                        fail(gw, std::string(what) + " step " + s.kernel + (packed ? " reads the bfp16_gemm weight " + s.args[0] +
++                                                                                       " without fmt bfp16"
++                                                                                 : " is fmt bfp16, but its weight " + s.args[0] +
++                                                                                       " is not packed by bfp16_gemm"));
++                    if (s.fmt == "bfp16" && g.kind != "dense")
++                        fail(gw, std::string(what) + " step " + s.kernel + ": only the dense route runs bfp16 steps");
++                    if (packed)
++                        for (const auto& o : w.pack)
++                            if (o.n_total != s.n_pad)
++                                fail(gw, std::string(what) + " step " + s.kernel + ": n_pad " + std::to_string(s.n_pad) +
++                                             ", but " + o.tensor + " packs into a " + std::to_string(o.n_total) + "-row weight");
++                }
++            };
++            check_bfp16(g.program, g.weights, "program");
++            check_bfp16(g.shared_program, g.shared_weights, "shared");
++            check_bfp16(g.ffn_program, g.ffn_weights, "ffn");
+         };
+         if (v.contains("gemm_block")) parse_gemm_block(v["gemm_block"], tw + " gemm_block", t.gemm_block);
+         // OPEN-PREFILL-MODE: whole routes the engine may load in place of gemm_block
+@@ -580,7 +614,10 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+             for (const auto& [name, w] : *ws) {
+                 if (w.from == "pack") {
+                     for (const auto& o : w.pack)
+-                        if (o.op == "bf16_gemm" && m.version < 3)
++                        if (o.op == "bfp16_gemm" && m.version < 4)
++                            fail(tw, "gemm_block weight " + name + " packs " + o.op + " in a manifest_version " +
++                                         std::to_string(m.version) + " manifest; an engine that reads 3 cannot pack it, so it needs version 4");
++                        else if (o.op == "bf16_gemm" && m.version < 3)
+                             fail(tw, "gemm_block weight " + name + " packs " + o.op + " in a manifest_version " +
+                                          std::to_string(m.version) + " manifest; an engine that reads 2 cannot pack it, so it needs version 3");
+                     continue;
+diff --git a/src/open_qwen36/manifest.hpp b/src/open_qwen36/manifest.hpp
+index 0b9c716..281a4be 100644
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -44,6 +44,8 @@ struct PackOp {
+                                                                         ///< "lo", one half of its exact q4_1
+                                                                         ///< split ("" = the whole tensor)
+     std::string via;                                                    ///< bf16_gemm: "q4_1" reads a q8 source as the q4 ops do
++    uint64_t row0 = 0, n_total = 0;                                     ///< bfp16_gemm: this tensor's first row in the stacked
++                                                                        ///< weight, and the weight's padded row count
+     std::string div_running;                                            ///< put: divide the values by the product,
+                                                                         ///< over the layers BEFORE this one, of this
+                                                                         ///< one-value tensor ("{j}" = that layer) --
+@@ -60,6 +62,9 @@ struct Step {
+     std::string kernel;
+     std::vector<std::string> args;           ///< run: buffer names (per-layer: pool consts act state; else globals)
+     uint64_t act_off = 0;                    ///< moeroute2: the router record's offset in `act`
++    std::string fmt;                         ///< run, dense block route: "" = the q4_1 GEMMs, "bfp16" = gemm_bfp16
++                                             ///< (x packed bfp16, y c-tiled with `n_pad` rows; OPEN-PREFILL-BFP16)
++    uint64_t n_pad = 0;                      ///< fmt bfp16: the weight's rows padded to a whole number of tile groups
+     bool split = false;                      ///< run, block route: the weight is a q8 projection's exact q4_1
+                                              ///< split, [hi | lo]; the GEMM runs twice the rows and the halves add
+ };
+diff --git a/src/open_qwen36/pools.cpp b/src/open_qwen36/pools.cpp
+index c18abf4..dd7aeff 100644
+--- a/src/open_qwen36/pools.cpp
++++ b/src/open_qwen36/pools.cpp
+@@ -10,6 +10,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "open_qwen36/bfp16.hpp"
+ #include "open_qwen36/gguf_file.hpp"
+ #include "open_qwen36/q4nx_file.hpp"
+ 
+@@ -360,7 +361,22 @@ void bf16_gemm_pack(const uint8_t* src, bool q8, size_t rows, size_t cols, uint1
+     }
+ }
+ 
++void bfp16_gemm_pack(const uint8_t* src, size_t rows, size_t cols, size_t row0, size_t n_total, uint8_t* dst) {
++    const Bfp16Tiling t;
++    const size_t ncol = cols / 256;
++#pragma omp parallel for
++    for (long long rr = 0; rr < static_cast<long long>(rows); ++rr) {
++        const size_t r = static_cast<size_t>(rr);
++        float w[8];
++        for (size_t cb = 0; cb < cols / 8; ++cb) {
++            for (size_t i = 0; i < 8; ++i) w[i] = q4_1_value(src, ncol, r, cb * 8 + i);
++            bfp16_encode_block(w, dst + bfp16_b_offset(row0 + r, cb, n_total, cols, t));
++        }
++    }
++}
++
+ uint64_t op_bytes(const PackOp& op, size_t chunk_bytes) {
++    if (op.op == "bfp16_gemm") return op.n_total * op.in_dim / 8 * BFP16_BLOCK_BYTES;
+     return op.op == "bf16_gemm" ? op.nch * 2 * 8192 : op.nch * chunk_bytes;
+ }
+ 
+@@ -682,6 +698,51 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+             std::vector<uint8_t> tmp;
+             bf16_gemm_pack(q4_source(m, name, op.chunk0, op.nch, Q4_CHUNK, tmp), false, rows, op.in_dim, out);
+         }
++    } else if (op.op == "bfp16_gemm") {
++        // rows [row0, row0 + rows) of an `n_total`-row gemm_bfp16 B operand (OPEN-PREFILL-BFP16), rows = nch / (in_dim
++        // / 256) * 32 of the tensor from source chunk `chunk0` (a whole number of 32-row blocks). A q4nx tensor is its
++        // q4_1 chunks' values; a GGUF one its own blocks' (GgufFile::embed_row: Q4_0 / Q4_1 / Q8_0 exactly, the
++        // K-quants as GGML dequantises them), not the pool's requantised q4_1.
++        const std::string name = with_layer(op.tensor, layer);
++        const Bfp16Tiling t;
++        if (op.in_dim == 0 || op.in_dim % 256 || op.in_dim % t.k)
++            fail("bfp16_gemm " + name + ": in_dim " + std::to_string(op.in_dim) + " does not tile");
++        const size_t ncol = op.in_dim / 256;
++        if (op.nch == 0 || op.nch % ncol || op.chunk0 % ncol)
++            fail("bfp16_gemm " + name + ": " + std::to_string(op.nch) + " chunks from " + std::to_string(op.chunk0) +
++                 " is not whole rows of a " + std::to_string(op.in_dim) + "-wide tensor");
++        const size_t rows = op.nch / ncol * 32, src_row0 = op.chunk0 / ncol * 32;
++        if (op.row0 % t.n || op.row0 + rows > op.n_total || op.n_total % (t.n * t.cols))
++            fail("bfp16_gemm " + name + ": rows [" + std::to_string(op.row0) + ", " + std::to_string(op.row0 + rows) +
++                 ") of " + std::to_string(op.n_total) + " do not tile by " + std::to_string(t.n) + " rows x " +
++                 std::to_string(t.cols) + " columns");
++        bounds(op, op_bytes(op, ch), dst_bytes);
++        uint8_t* out = dst + op.dst;
++        if (const auto* g = dynamic_cast<const GgufFile*>(&m)) {
++            const GgufFile::TensorInfo& ti = g->tensor(name);
++            const uint64_t nrows = ti.dims.size() >= 2 ? ti.dims[1] : 1u;
++            if (ti.dims.empty() || ti.dims[0] != op.in_dim || src_row0 + rows > nrows)
++                fail("bfp16_gemm " + name + ": rows [" + std::to_string(src_row0) + ", " + std::to_string(src_row0 + rows) +
++                     ") of " + std::to_string(op.in_dim) + " columns are not in the GGUF tensor");
++#pragma omp parallel
++            {
++                std::vector<float> w(op.in_dim);
++#pragma omp for
++                for (long long rr = 0; rr < static_cast<long long>(rows); ++rr) {
++                    const size_t r = static_cast<size_t>(rr);
++                    g->embed_row(name, src_row0 + r, op.in_dim, w.data());
++                    for (size_t cb = 0; cb < op.in_dim / 8; ++cb)
++                        bfp16_encode_block(w.data() + cb * 8, out + bfp16_b_offset(op.row0 + r, cb, op.n_total, op.in_dim, t));
++                }
++            }
++        } else {
++            const auto* q4 = dynamic_cast<const Q4nxFile*>(&m);
++            if (!q4) fail("bfp16_gemm " + name + " is in neither a q4nx container nor a GGUF");
++            if (q4->chunk_bytes(name) == Q8_CHUNK)
++                fail("bfp16_gemm " + name + ": the container stores this tensor at q8; only q4_1 sources are packed to bfp16");
++            std::vector<uint8_t> tmp;
++            bfp16_gemm_pack(q4_source(m, name, op.chunk0, op.nch, Q4_CHUNK, tmp), rows, op.in_dim, op.row0, op.n_total, out);
++        }
+     } else if (op.op == "q8_perm") {
+         // The projection stays at q8: `nch` counts POOL half-tiles (5120 B each, twice the
+         // q4_1 bytes of the same tensor) and `chunk0` is a SOURCE file-chunk offset, as it
+diff --git a/src/open_qwen36/pools.hpp b/src/open_qwen36/pools.hpp
+index dd43244..c5af8cd 100644
+--- a/src/open_qwen36/pools.hpp
++++ b/src/open_qwen36/pools.hpp
+@@ -81,6 +81,10 @@ void requant_q4_1_chunks(const uint8_t* src, size_t nch, uint8_t* dst);
+ void split_q4_1_chunks(const uint8_t* src, size_t nch, bool hi, uint8_t* dst);
+ /// q8 (code * scale) or q4_1 (m + n * d) chunks, 32-row blocks major -> the bf16 GEMM pool (twin: recipes/pack.py)
+ void bf16_gemm_pack(const uint8_t* src, bool q8, size_t rows, size_t cols, uint16_t* dst);
++/// q4_1 chunks ([rows, cols], 32-row blocks major) -> rows [row0, row0 + rows) of the B operand of gemm_bfp16, an
++/// `n_total`-row weight in bfp16ebs8 (bfp16.hpp; twin: open_kernels/designs/gemm_bfp16/pack.py). Rows it does not
++/// write stay as `dst` holds them: zero blocks are a zero weight.
++void bfp16_gemm_pack(const uint8_t* src, size_t rows, size_t cols, size_t row0, size_t n_total, uint8_t* dst);
+ /// Bytes `op` writes at its dst: `nch` chunks of the pool's format, or of the GEMM pool it builds.
+ uint64_t op_bytes(const PackOp& op, size_t chunk_bytes);
+ /// `nch` Q4_K chunks (4736 B each) -> `nch` q4_1 chunks (5120 B each), in the SAME chunk

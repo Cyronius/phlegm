@@ -219,6 +219,17 @@ For persistence across logins, configure an appropriate memlock policy and
 restart the application session; that persistent system configuration has not
 been changed. No credentials were requested or stored.
 
+On 2026-10-29, `/etc/security/limits.d/` already set memlock to unlimited
+(`90-amdxdna-memlock.conf`, `99-npu-memlock.conf`), yet a desktop terminal's
+processes still had 8 MiB. Those files apply only to PAM logins. Desktop
+terminals descend from the systemd user manager instead, which gets
+`LimitMEMLOCK=8M` on `user@1000.service` and passes
+`DefaultLimitMEMLOCK=8M` to its children. A persistent fix is
+`LimitMEMLOCK=infinity` in an `/etc/systemd/system/user@.service.d/` drop-in,
+plus `DefaultLimitMEMLOCK=infinity` in `/etc/systemd/user.conf.d/`, taking
+effect at the next login. Whether that has been applied is not recorded here.
+`prlimit` remains the only fix for an already running process.
+
 Then rerun XRT enumeration and model smoke, resolve runtime/manifest/quality
 failures, and establish reset/serving gates before matched ArtLite trials.
 Qwen3 0.6B weights/kernels and all performance matrix cells remain open.

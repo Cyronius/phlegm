@@ -58,10 +58,11 @@ ATTN = HERE.parent / "attn"
 sys.path.insert(0, str(HERE.parent.parent))
 from ironutil import Pipeline, include_dirs  # noqa: E402
 from recipes.load import current_spec  # noqa: E402
-from recipes import dense as QR  # noqa: E402
+from recipes.families import for_spec  # noqa: E402
 from aie.helpers.taplib import TensorAccessPattern  # noqa: E402
 
 SPEC = current_spec()
+QR = for_spec(SPEC)      # dense, or gemma4 for the layer type its G4_KIND names (as dx.py)
 R = QR.recipe(SPEC)
 L, G = R.layout, R.geo
 E_A = L.E_A
@@ -70,22 +71,12 @@ HID = G.HID
 QKVB = G.QKVB
 NPTAB, CSE = G.PTAB_ELEMS, G.PTAB_CS_ELEM   # elements per position record; which holds cos / sin
 
-# ---- verbatim from dx.py: ATTN_FLAGS / ACORES / NHL / RB (same derivation,
-# same module-level constants dx.py's own attention kernels are compiled
-# against -- a mismatched flag set would be a DIFFERENT kernel, not a reused
-# one, so this is copied character-for-character rather than re-derived).
-ATTN_FLAGS = [f"-DATTN_NH={G.NH}", f"-DATTN_KVH={G.KVH}", f"-DATTN_HD={G.HD}", f"-DATTN_ROT={G.ROT}", "-DATTN_GATE=0",
-              f"-DATTN_QKNORM={1 if G.QKNORM else 0}", f"-DATTN_QKNORM_POST={1 if G.QKNORM_POST else 0}",
-              f"-DATTN_EPS={G.EPS:g}f", f"-DATTN_VEXP={G.VEXP}", f"-DATTN_NHL={G.NHL}"]
-if G.RB > 1:
-    ATTN_FLAGS.append(f"-DATTN_RB={G.RB}")
-if QKVB:                                               # same as dx.py: only a family with a bias sees the flag
-    ATTN_FLAGS.append("-DATTN_QKV_BIAS=1")
-if NPTAB > 1:                                          # same as dx.py
-    ATTN_FLAGS.append("-DATTN_PTAB_SPLIT=1")
-for _k, _v in QR.probe_env().items():               # ATTN_NULL / ATTN_ABL, same as dx.py
-    if _k != "ATTN_RB":
-        ATTN_FLAGS.append(f"-D{_k}={_v}")
+# ---- ATTN_FLAGS / ACORES / NHL / RB: dx.py's own derivation (the recipe's attn_flags), so
+# this dispatch compiles exactly the attention kernels dx.py does -- a mismatched flag set
+# would be a DIFFERENT kernel, not a reused one. For a family without Gemma 4's switches the
+# list is the one this file used to spell out by hand, flag for flag.
+ATTN_FLAGS = QR.attn_flags(G, QR.probe_env().items())
+QLOCAL = bool(G.QLOCAL)                                # attn.h ATTN_QLOCAL (Gemma 4), as dx.py
 ACORES, NHL, RB = G.ACORES, G.NHL, G.RB
 # og elements, as dx.py has them now: attn_fin writes kOGH = min(NHL, HPO) heads per element,
 # and each core -- core 0 included -- emits its own N_OG of them on its own fifo. The earlier
@@ -129,8 +120,9 @@ def dx_attn(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, 
     og_ty = np.ndarray[(OGH * G.HD,), np.dtype[bfloat16]]   # attn_fin writes kOGH heads at a time
     fcs = np.ndarray[(G.ROT,), np.dtype[np.float32]]
     fhd = np.ndarray[(G.HD,), np.dtype[np.float32]]
-    fq = (np.ndarray[(2 * QW,), np.dtype[bfloat16]]
-          if G.VEXP else np.ndarray[(QW,), np.dtype[np.float32]])
+    QWL = NHL * G.HD if QLOCAL else QW                 # ATTN_QLOCAL: this core's heads only (dx.py)
+    fq = (np.ndarray[(2 * QWL,), np.dtype[bfloat16]]
+          if G.VEXP else np.ndarray[(QWL,), np.dtype[np.float32]])
     fml = np.ndarray[(2 * G.MLS,), np.dtype[np.float32]]
     foacc = np.ndarray[(NHL * G.HD,), np.dtype[np.float32]]
     i32 = np.int32
@@ -181,15 +173,31 @@ def dx_attn(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, 
         else:
             f_meta(e[0], e[1], qn, kn, cs, pb)
         ain.release(1 + NPTAB)
-        for h in range_(G.Q_AIN_ELEMS):
-            e = ain.acquire(1)
-            if bias_in is None:
-                f_q(e, qn, cs, qs, h)
-            else:
-                b = bias_in.acquire(1)
-                f_q(e, b, qn, cs, qs, h)
-                bias_in.release(1)
-            ain.release(1)
+        if QLOCAL:
+            # dx.py's: every core takes every q element off the broadcast, but stores only its
+            # own heads' -- numbered from 0, which is where attn.h ATTN_QLOCAL looks for them
+            assert bias_in is None and h0 % G.HPE == 0 and NHL % G.HPE == 0
+            e0, ne = h0 // G.HPE, NHL // G.HPE
+            for n_skip in (e0, None, G.Q_AIN_ELEMS - e0 - ne):
+                if n_skip is None:
+                    for h in range_(ne):
+                        e = ain.acquire(1)
+                        f_q(e, qn, cs, qs, h)
+                        ain.release(1)
+                elif n_skip > 0:
+                    for _ in range_(n_skip):
+                        ain.acquire(1)
+                        ain.release(1)
+        else:
+            for h in range_(G.Q_AIN_ELEMS):
+                e = ain.acquire(1)
+                if bias_in is None:
+                    f_q(e, qn, cs, qs, h)
+                else:
+                    b = bias_in.acquire(1)
+                    f_q(e, b, qn, cs, qs, h)
+                    bias_in.release(1)
+                ain.release(1)
         for h in range_(G.K_AIN_ELEMS):
             e = ain.acquire(1)
             if bias_in is None:

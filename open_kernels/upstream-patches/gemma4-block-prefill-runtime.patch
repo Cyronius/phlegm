@@ -1,0 +1,62 @@
+diff --git a/src/open_qwen36/core.cpp b/src/open_qwen36/core.cpp
+index 12904e4..cfb83d4 100644
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -637,8 +637,24 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
+                     // two are additional to the plain chain's two, and pack_plan only ever
+                     // packs them into consts.CD_PREFFN/CD_POSTFFN when sandwich_norms is set,
+                     // so their offsets are family-specific in a way the other two are not.
+-                    pre_ffn_w_[l] = file_->bf16(const_tensor(lt, "pre_feedforward_layernorm.weight", l));
+-                    post_ffn_w_[l] = file_->bf16(const_tensor(lt, "post_feedforward_layernorm.weight", l));
++                    // ... unless the manifest names their consts offsets (Gemma 4, whose post norms
++                    // carry the folded layer_output_scale only there): then the packed bf16 bytes.
++                    auto from_consts = [&](int64_t off) {
++                        if (off < 0 || static_cast<uint64_t>(off) + w_->hidden * 2 > lt.consts_bytes)
++                            throw std::runtime_error("open_qwen36: layer " + std::to_string(l) +
++                                                     ": a sandwich norm offset is outside the consts");
++                        std::vector<float> v(w_->hidden);
++                        const uint16_t* b = reinterpret_cast<const uint16_t*>(c_host + off);
++                        for (size_t i = 0; i < w_->hidden; ++i) {
++                            const uint32_t u = static_cast<uint32_t>(b[i]) << 16;
++                            std::memcpy(&v[i], &u, 4);
++                        }
++                        return v;
++                    };
++                    pre_ffn_w_[l] = lt.gemm_block.cd_preffn >= 0 ? from_consts(lt.gemm_block.cd_preffn)
++                        : file_->bf16(const_tensor(lt, "pre_feedforward_layernorm.weight", l));
++                    post_ffn_w_[l] = lt.gemm_block.cd_postffn >= 0 ? from_consts(lt.gemm_block.cd_postffn)
++                        : file_->bf16(const_tensor(lt, "post_feedforward_layernorm.weight", l));
+                     if (pre_ffn_w_[l].size() != w_->hidden || post_ffn_w_[l].size() != w_->hidden)
+                         throw std::runtime_error("open_qwen36: layer " + std::to_string(l) +
+                                                  ": sandwich norm weight is not [hidden]");
+diff --git a/src/open_qwen36/manifest.cpp b/src/open_qwen36/manifest.cpp
+index 1c99e82..a9468c9 100644
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -356,6 +356,10 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+                 g.attn_kernel = gj.value("attn_kernel", std::string("dxB"));
+                 g.attn_args = gj.value("attn_args", std::vector<std::string>{"pool", "xres", "consts", "state", "act", "ptab"});
+                 g.sandwich = gj.value("sandwich", false);
++                g.cd_preffn = gj.value("cd_preffn", int64_t{-1});
++                g.cd_postffn = gj.value("cd_postffn", int64_t{-1});
++                if ((g.cd_preffn >= 0 || g.cd_postffn >= 0) && !g.sandwich)
++                    fail(gw, "cd_preffn / cd_postffn name sandwich norms, but sandwich is false");
+                 g.act = gj.value("act", std::string("silu"));
+                 if (g.attn_args.size() != 6) fail(gw, "attn_args wants exactly 6 buffer names, has " + std::to_string(g.attn_args.size()));
+                 auto ak = m.kernels.find(g.attn_kernel);
+diff --git a/src/open_qwen36/manifest.hpp b/src/open_qwen36/manifest.hpp
+index ee831fa..7822400 100644
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -134,6 +134,11 @@ struct GemmBlockProgram {
+     std::string attn_kernel = "dxB";
+     std::vector<std::string> attn_args = {"pool", "xres", "consts", "state", "act", "ptab"};
+     bool sandwich = false;
++    // sandwich: where the consts hold the FFN-side norms (pre_feedforward / post_feedforward
++    // layernorm), or -1 to read them from the file by name (Gemma 3). Gemma 4 needs the consts
++    // copy: its packer folds layer_output_scale into the post norms (div_running), and the
++    // file's post_feedforward weight is not folded.
++    int64_t cd_preffn = -1, cd_postffn = -1;
+     std::string act = "silu";
+     // >1: the route's HOST norms split each row into `norm_groups` equal groups and
+     // RMS each group separately (K2's GroupRMSNorm(2)), the same split the `ln`

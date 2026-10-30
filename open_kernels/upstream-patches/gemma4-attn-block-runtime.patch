@@ -1,0 +1,600 @@
+--- a/src/open_qwen36/block_host.cpp
++++ b/src/open_qwen36/block_host.cpp
+@@ -45,6 +45,18 @@
+     for (size_t j = 0; j < d; ++j) out[j] = x[j] * r * w[j];
+ }
+ 
++// `pairs` rotated pairs, dim i with dim i + dist (Gemma 4's proportional rotation: rot / 2 pairs
++// at distance hd / 2); rope() below is the half-split case, dist == pairs
++void rope_pairs(float* x, size_t pairs, size_t dist, const double* inv_freq, double pos) {
++    for (size_t i = 0; i < pairs; ++i) {
++        const double a = pos * inv_freq[i];
++        const float c = static_cast<float>(std::cos(a)), s = static_cast<float>(std::sin(a));
++        const float x1 = x[i], x2 = x[dist + i];
++        x[i] = x1 * c - x2 * s;
++        x[dist + i] = x2 * c + x1 * s;
++    }
++}
++
+ // the partial rotation over the first 2 * half dims, half-split (Qwen's layout)
+ void rope(float* x, size_t half, const double* inv_freq, double pos) {
+     for (size_t i = 0; i < half; ++i) {
+@@ -458,9 +470,10 @@
+ void attention_prep(const AttnGeom& g, const float* q, const float* k, const float* v, const float* qn,
+                     const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems, float* Q) {
+     const size_t qw = g.nh * g.hd, kvw = g.kvh * g.hd, half = g.rot / 2, R = g.t_real;
+-    if (g.nh % g.kvh || g.t_real > g.T || g.rot > g.hd || kv_row_elems < 2 * kvw)
++    const size_t dist = g.pair ? g.pair : half;
++    if (g.nh % g.kvh || g.t_real > g.T || g.rot > g.hd || kv_row_elems < 2 * kvw || dist < half || dist + half > g.hd)
+         throw std::runtime_error("open_qwen36: attention_prep: inconsistent geometry");
+-    const float scale = 1.0f / std::sqrt(static_cast<float>(g.hd));
++    const float scale = g.scale > 0 ? static_cast<float>(g.scale) : 1.0f / std::sqrt(static_cast<float>(g.hd));
+     std::fill(Q, Q + g.T * qw, 0.f);
+ #pragma omp parallel
+     {
+@@ -473,18 +486,27 @@
+             const float* src = q + t * qw + h * g.hd;
+             if (qn) rms_vec(src, g.hd, qn, g.eps, dst);
+             else std::copy(src, src + g.hd, dst);
+-            rope(dst, half, inv_freq, static_cast<double>(p));
+-            for (size_t j = 0; j < g.hd; ++j) dst[j] *= scale;
++            rope_pairs(dst, half, dist, inv_freq, static_cast<double>(p));
++            if (scale != 1.0f)
++                for (size_t j = 0; j < g.hd; ++j) dst[j] *= scale;
+         }
+         for (size_t h = 0; h < g.kvh; ++h) {
+             const float* src = k + t * kvw + h * g.hd;
+             if (kn) rms_vec(src, g.hd, kn, g.eps, kh.data() + h * g.hd);
+             else std::copy(src, src + g.hd, kh.data() + h * g.hd);
+-            rope(kh.data() + h * g.hd, half, inv_freq, static_cast<double>(p));
++            rope_pairs(kh.data() + h * g.hd, half, dist, inv_freq, static_cast<double>(p));
+         }
+-        for (size_t j = 0; j < kvw; ++j) {
+-            kv[p * kv_row_elems + j] = f32_to_bf16(kh[j]);
+-            kv[p * kv_row_elems + kvw + j] = f32_to_bf16(v[t * kvw + j]);
++        for (size_t j = 0; j < kvw; ++j) kv[p * kv_row_elems + j] = f32_to_bf16(kh[j]);
++        for (size_t h = 0; h < g.kvh; ++h) {
++            const float* src = v + t * kvw + h * g.hd;
++            uint16_t* dst = kv + p * kv_row_elems + kvw + h * g.hd;
++            float r = 1.f;
++            if (g.vnorm) {                       // x / sqrt(mean(x^2) + eps), no weight
++                double ss = 0;
++                for (size_t j = 0; j < g.hd; ++j) ss += static_cast<double>(src[j]) * src[j];
++                r = static_cast<float>(1.0 / std::sqrt(ss / static_cast<double>(g.hd) + g.eps));
++            }
++            for (size_t j = 0; j < g.hd; ++j) dst[j] = f32_to_bf16(g.vnorm ? src[j] * r : src[j]);
+         }
+     }
+     }
+@@ -527,19 +549,22 @@
+ }
+ 
+ void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, const size_t* pos, float* m, float* l,
+-                   float* acc, uint16_t* p) {
++                   float* acc, uint16_t* p, size_t window) {
+ #pragma omp parallel for
+     for (long long rr = 0; rr < static_cast<long long>(M); ++rr) {
+         const size_t r = static_cast<size_t>(rr);
+         const float* sr = s + r * L;
+         uint16_t* pr = p + r * L;
+         const size_t valid = pos[r] >= c0 ? std::min(L, pos[r] - c0 + 1) : 0;
+-        if (valid == 0) {                       // the whole chunk is past this row's position
++        // under a sliding window the row reads (pos - window, pos]: columns before j0 are masked too
++        const size_t lo = window && pos[r] + 1 > window ? pos[r] + 1 - window : 0;
++        const size_t j0 = lo > c0 ? std::min(lo - c0, valid) : 0;
++        if (valid == j0) {                      // the whole chunk is outside this row's window
+             std::fill(pr, pr + L, uint16_t{0});
+             continue;
+         }
+         float mc = -std::numeric_limits<float>::infinity();
+-        for (size_t j = 0; j < valid; ++j) mc = std::max(mc, sr[j]);
++        for (size_t j = j0; j < valid; ++j) mc = std::max(mc, sr[j]);
+         const float m_new = std::max(m[r], mc);
+         if (m[r] != m_new && l[r] != 0.f) {    // an earlier chunk's max is beaten: rescale what it accumulated
+             const float a = std::exp(m[r] - m_new);
+@@ -548,7 +573,8 @@
+             for (size_t j = 0; j < hd; ++j) ar[j] *= a;
+         }
+         double sum = 0;
+-        for (size_t j = 0; j < valid; ++j) {
++        std::fill(pr, pr + j0, uint16_t{0});
++        for (size_t j = j0; j < valid; ++j) {
+             const uint16_t b = f32_to_bf16(std::exp(sr[j] - m_new));
+             pr[j] = b;
+             sum += bf16_to_f32(b);
+--- a/src/open_qwen36/block_host.hpp
++++ b/src/open_qwen36/block_host.hpp
+@@ -87,8 +87,18 @@
+     size_t T = 0, t_real = 0, nh = 0, kvh = 0, hd = 0, rot = 0;
+     size_t pos0 = 0;        ///< the block's first position (and KV row)
+     double eps = 1e-6;      ///< the q / k norms' eps
++    // Gemma 4's attention (attention_prep / softmax_chunk); the defaults are every other family's
++    double scale = 0;       ///< the score scale folded into Q; 0 = 1 / sqrt(hd)
++    size_t pair = 0;        ///< the rotation's pair distance (dim i turns with i + pair); 0 = rot / 2
++    size_t window = 0;      ///< a sliding window's rows: position p reads rows (p - window, p]; 0 = all
++    bool vnorm = false;     ///< a weightless RMSNorm on V before it is cached
+ };
+ 
++/// The first cached row any query of the block reads: 0, or pos0 + 1 - window under a window.
++inline size_t attn_first_row(const AttnGeom& g) {
++    return g.window && g.pos0 + 1 > g.window ? g.pos0 + 1 - g.window : 0;
++}
++
+ /// The full-attention layer's middle over a block. q / gate [T, nh*hd], k / v [T, kvh*hd]
+ /// are the fused projection's outputs; qn / kn [hd]; inv_freq [rot/2]. kv is the layer's
+ /// cache: rows of kv_row_elems bf16, [K_t | V_t] each kvh*hd wide, rows [0, pos0) valid on
+@@ -103,7 +113,9 @@
+ /// normed and roped with 1/sqrt(hd) folded in (a power of two at every head dim here, so the
+ /// bf16 the kernel sees rounds exactly as the unscaled value would); the block's k / v normed,
+ /// roped and written to the cache rows [pos0, pos0 + t_real) in bf16. Rows of Q past t_real are zero.
+-/// A null qn / kn skips that norm (a family with no q/k norm, prep "rope").
++/// A null qn / kn skips that norm (a family with no q/k norm, prep "rope"). g.scale, g.pair and
++/// g.vnorm give Gemma 4's unit score scale, its proportional rotation (rot / 2 pairs at distance
++/// hd / 2 on the global layers) and its weightless V norm.
+ void attention_prep(const AttnGeom& g, const float* q, const float* k, const float* v, const float* qn,
+                     const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems, float* Q);
+ 
+@@ -116,11 +128,11 @@
+ 
+ /// One window chunk of the causal row softmax, with the running (max, sum) carried across chunks:
+ /// s [M, L] fp32 scores whose column 0 is window row c0; row r's query sits at pos[r], so columns
+-/// c0 + j > pos[r] are masked. Writes p [M, L] bf16 = exp(s - m_new) (zero where masked), scales
++/// c0 + j > pos[r] are masked, and under a sliding window (window > 0) so are c0 + j <= pos[r] - window. Writes p [M, L] bf16 = exp(s - m_new) (zero where masked), scales
+ /// acc [M, hd] and l [M] by exp(m_old - m_new), and folds the bf16-rounded p into l -- what the
+ /// kernel will multiply is what the denominator counts. Start with m = -inf, l = 0, acc = 0.
+ void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, const size_t* pos, float* m, float* l,
+-                   float* acc, uint16_t* p);
++                   float* acc, uint16_t* p, size_t window = 0);
+ 
+ /// The MoE router over a block: softmax of xm [T, hid] @ Wr [hid, E] into probs [T, E], the
+ /// top-k by probability (lowest index on a tie, as the kernel's router_fin picks) into
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -663,7 +663,24 @@
+                 // f32, from the file by name as the full layers' does. The consts plan `put`s the
+                 // same bf16 bytes for the dxB kernel, so both routes norm with one weight.
+                 const AttnBlock& ab = lt.gemm_block.attn_block;
+-                if (ab.prep == "qknorm_rope") {
++                if (ab.prep == "qkvnorm_rope") {
++                    // Gemma 4: the consts' bf16 bytes, the very weights dx.py's attention core norms with
++                    HostConsts& h = hc_[l];
++                    auto head_norm = [&](int64_t off) {
++                        if (static_cast<uint64_t>(off) + ab.hd * 2 > lt.consts_bytes)
++                            throw std::runtime_error("open_qwen36: layer " + std::to_string(l) +
++                                                     ": a q / k norm offset is outside the consts");
++                        std::vector<float> v(ab.hd);
++                        const uint16_t* b = reinterpret_cast<const uint16_t*>(c_host + off);
++                        for (size_t i = 0; i < ab.hd; ++i) {
++                            const uint32_t u = static_cast<uint32_t>(b[i]) << 16;
++                            std::memcpy(&v[i], &u, 4);
++                        }
++                        return v;
++                    };
++                    h.qn = head_norm(ab.cd_qnorm);
++                    h.kn = head_norm(ab.cd_knorm);
++                } else if (ab.prep == "qknorm_rope") {
+                     HostConsts& h = hc_[l];
+                     h.qn = file_->bf16(const_tensor(lt, "q_norm.weight", l));
+                     h.kn = file_->bf16(const_tensor(lt, "k_norm.weight", l));
+@@ -2556,9 +2573,12 @@
+     const HostConsts& hc = hc_[l];
+     const size_t qw = gb.qw, kvw = gb.kvw, hd = ab.hd;
+     // The geometry the products were built for, against what this layer's projection produces;
+-    // attention_npu checks m against the group size times T.
+-    const bool qknorm = ab.prep == "qknorm_rope";
+-    if ((!qknorm && ab.prep != "rope") || qw % hd || kvw % hd || (qw / hd) % (kvw / hd) || w_->rotary_dim > hd ||
++    // attention_npu checks m against the group size times T. qkvnorm_rope (Gemma 4) carries its
++    // own rotation, scale and window per layer type; the others take the layout's rotation.
++    const bool g4 = ab.prep == "qkvnorm_rope";
++    const bool qknorm = ab.prep == "qknorm_rope" || g4;
++    const size_t rot = g4 ? ab.rot : w_->rotary_dim;
++    if ((!qknorm && ab.prep != "rope") || qw % hd || kvw % hd || (qw / hd) % (kvw / hd) || rot > hd ||
+         (qknorm && (hc.qn.size() != hd || hc.kn.size() != hd)))
+         throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": the dense attention products were built for "
+                                  "head dim " + std::to_string(hd) + ", which this layer's q / k / v widths do not divide into");
+@@ -2574,16 +2594,21 @@
+     // the device, so read them back on every block that has any.
+     xrt::bo& st = state_[l];
+     const size_t row = lt.state_row, pos0 = static_cast<size_t>(pos_);
+-    tt = std::chrono::steady_clock::now();
+-    if (pos0 > 0) read_back(st, pos0 * row, 0);
+-    timing_.state_ms += ms_since(tt);
+     host::AttnGeom g;
+-    g.T = T; g.t_real = t_real; g.nh = qw / hd; g.kvh = kvw / hd; g.hd = hd; g.rot = w_->rotary_dim;
++    g.T = T; g.t_real = t_real; g.nh = qw / hd; g.kvh = kvw / hd; g.hd = hd; g.rot = rot;
+     g.pos0 = pos0; g.eps = gb.eps;
++    if (g4) {
++        g.scale = ab.scale; g.pair = ab.rope_pair; g.window = ab.window; g.vnorm = true;
++    }
++    // only the rows a window reaches: [first, pos0)
++    const size_t first = host::attn_first_row(g);
++    tt = std::chrono::steady_clock::now();
++    if (pos0 > first) read_back(st, (pos0 - first) * row, first * row);
++    timing_.state_ms += ms_since(tt);
+     tt = std::chrono::steady_clock::now();
+     float* Q = BlockScratch::fit(bs_.qrope, T * qw);
+     host::attention_prep(g, q, k, v, qknorm ? hc.qn.data() : nullptr, qknorm ? hc.kn.data() : nullptr,
+-                         w_->rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, Q);
++                         g4 ? ab.inv_freq.data() : w_->rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, Q);
+     timing_.mid_ms += ms_since(tt);
+     og.assign(T * qw, 0.f);
+     // attention_npu books its dispatches as part0 and its host stages as part1, the full layers'
+@@ -3227,6 +3252,8 @@
+         throw std::runtime_error("open_qwen36: attn_block was built for " + std::to_string(ab.m) + " rows of head dim " +
+                                  std::to_string(ab.hd) + ", this layer has " + std::to_string(M) + " of " + std::to_string(hd));
+     const size_t rows = g.pos0 + g.t_real;                  // the window: every cached row and the block's own
++    const size_t first = host::attn_first_row(g);           // ... from the first one a sliding window reaches
++    kv += first * kv_row_elems;
+     xrt::bo& ba = buffer(ab.args[0], 0);
+     xrt::bo& bb = buffer(ab.args[1], 0);
+     xrt::bo& bc = buffer(ab.args[2], 0);
+@@ -3237,7 +3264,8 @@
+     for (size_t r = 0; r < M; ++r) pos[r] = g.pos0 + r % T;
+     uint16_t* qb = BlockScratch::fit(bs_.qb, M * hd);
+     // no q/k norm leaves the scores unbounded, so Q goes in as a bf16 hi/lo pair, as attn.h's decode does
+-    uint16_t* ql = ab.prep == "rope" ? BlockScratch::fit(bs_.qlo, M * hd) : nullptr;
++    // (and as Gemma 4's decode takes it at score scale 1, `qsplit`)
++    uint16_t* ql = ab.prep == "rope" || ab.qsplit ? BlockScratch::fit(bs_.qlo, M * hd) : nullptr;
+     float* acc = BlockScratch::fit(bs_.acc, M * hd);
+     std::fill(og, og + T * qw, 0.f);
+     // The kv group's queries as the scores' A operand: row hl * T + t is query head hl of the group
+@@ -3291,8 +3319,8 @@
+     // bit for bit; only the dispatch order differs. It matters where the two products sit on
+     // different xclbins (a dense head dim of 128: scores 8 columns wide, values 4), which the
+     // per-group order switches between twice a group.
+-    if (rows <= ab.l_max) {
+-        const size_t L = (rows + 255) / 256 * 256;
++    if (rows - first <= ab.l_max) {
++        const size_t L = (rows - first + 255) / 256 * 256;
+         float* m_all = BlockScratch::fit(bs_.m, g.kvh * M);
+         float* l_all = BlockScratch::fit(bs_.lsum, g.kvh * M);
+         uint16_t* p_all = BlockScratch::fit(bs_.p_all, g.kvh * M * L);
+@@ -3302,7 +3330,7 @@
+             std::fill(m_all + gh * M, m_all + (gh + 1) * M, -std::numeric_limits<float>::infinity());
+             std::fill(l_all + gh * M, l_all + (gh + 1) * M, 0.f);
+             std::memcpy(ba.map<uint16_t*>(), qb, M * hd * 2);
+-            host::tile_rows_as_bt(kv + gh * hd, kv_row_elems, rows, L, hd, bb.map<uint16_t*>());
++            host::tile_rows_as_bt(kv + gh * hd, kv_row_elems, rows - first, L, hd, bb.map<uint16_t*>());
+             ba.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * hd * 2, 0);
+             bb.sync(XCL_BO_SYNC_BO_TO_DEVICE, hd * L * 2, 0);
+             timing_.mid_ms += ms_since(th);
+@@ -3315,14 +3343,15 @@
+             const float* s = with_lo(L);
+             th = std::chrono::steady_clock::now();
+             // acc only takes a rescale from an earlier chunk, and there is none
+-            host::softmax_chunk(M, L, hd, 0, s, pos, m_all + gh * M, l_all + gh * M, acc, p_all + gh * M * L);
++            host::softmax_chunk(M, L, hd, first, s, pos, m_all + gh * M, l_all + gh * M, acc, p_all + gh * M * L,
++                                g.window);
+             timing_.mid_ms += ms_since(th);
+             timing_.part1_ms += ms_since(th);
+         }
+         for (size_t gh = 0; gh < g.kvh; ++gh) {
+             auto th = std::chrono::steady_clock::now();
+             std::memcpy(ba.map<uint16_t*>(), p_all + gh * M * L, M * L * 2);
+-            host::tile_rows_as_b(kv + kvw + gh * hd, kv_row_elems, rows, L, hd, bb.map<uint16_t*>());
++            host::tile_rows_as_b(kv + kvw + gh * hd, kv_row_elems, rows - first, L, hd, bb.map<uint16_t*>());
+             ba.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * L * 2, 0);
+             bb.sync(XCL_BO_SYNC_BO_TO_DEVICE, L * hd * 2, 0);
+             timing_.mid_ms += ms_since(th);
+@@ -3353,12 +3382,12 @@
+         timing_.mid_ms += ms_since(th);
+         timing_.part1_ms += ms_since(th);
+         // the window in chunks of the widest stream, the softmax merged across them
+-        for (size_t c0 = 0; c0 < rows; c0 += ab.l_max) {
++        for (size_t c0 = first; c0 < rows; c0 += ab.l_max) {
+             const size_t lreal = std::min(ab.l_max, rows - c0);
+             const size_t L = (lreal + 255) / 256 * 256;
+             th = std::chrono::steady_clock::now();
+             std::memcpy(ba.map<uint16_t*>(), qb, M * hd * 2);
+-            host::tile_rows_as_bt(kv + c0 * kv_row_elems + gh * hd, kv_row_elems, lreal, L, hd, bb.map<uint16_t*>());
++            host::tile_rows_as_bt(kv + (c0 - first) * kv_row_elems + gh * hd, kv_row_elems, lreal, L, hd, bb.map<uint16_t*>());
+             ba.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * hd * 2, 0);
+             bb.sync(XCL_BO_SYNC_BO_TO_DEVICE, hd * L * 2, 0);
+             timing_.mid_ms += ms_since(th);
+@@ -3370,8 +3399,8 @@
+             timing_.part1_ms += ms_since(th);
+             const float* s = with_lo(L);
+             th = std::chrono::steady_clock::now();
+-            host::softmax_chunk(M, L, hd, c0, s, pos, m, lsum, acc, ba.map<uint16_t*>());
+-            host::tile_rows_as_b(kv + c0 * kv_row_elems + kvw + gh * hd, kv_row_elems, lreal, L, hd, bb.map<uint16_t*>());
++            host::softmax_chunk(M, L, hd, c0, s, pos, m, lsum, acc, ba.map<uint16_t*>(), g.window);
++            host::tile_rows_as_b(kv + (c0 - first) * kv_row_elems + kvw + gh * hd, kv_row_elems, lreal, L, hd, bb.map<uint16_t*>());
+             ba.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * L * 2, 0);
+             bb.sync(XCL_BO_SYNC_BO_TO_DEVICE, L * hd * 2, 0);
+             timing_.mid_ms += ms_since(th);
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -315,8 +315,23 @@
+                 a.args = get<std::vector<std::string>>(aj, "args", aw);
+                 if (dense_ab) {
+                     a.prep = get<std::string>(aj, "prep", aw);
+-                    if (a.prep != "qknorm_rope" && a.prep != "rope")
+-                        fail(aw, "prep " + a.prep + " is not one this engine computes (qknorm_rope, rope)");
++                    if (a.prep != "qknorm_rope" && a.prep != "rope" && a.prep != "qkvnorm_rope")
++                        fail(aw, "prep " + a.prep + " is not one this engine computes (qknorm_rope, rope, qkvnorm_rope)");
++                    if (a.prep == "qkvnorm_rope") {
++                        a.scale = aj.value("scale", 0.0);
++                        a.window = aj.value("window", uint64_t{0});
++                        a.rot = get<uint64_t>(aj, "rot", aw);
++                        a.rope_pair = aj.value("rope_pair", uint64_t{0});
++                        a.inv_freq = get<std::vector<double>>(aj, "inv_freq", aw);
++                        a.qsplit = aj.value("qsplit", false);
++                        a.cd_qnorm = get<int64_t>(aj, "cd_qnorm", aw);
++                        a.cd_knorm = get<int64_t>(aj, "cd_knorm", aw);
++                        const size_t half = a.rot / 2, dist = a.rope_pair ? a.rope_pair : half;
++                        if (a.rot == 0 || a.rot % 2 || a.inv_freq.size() != half || dist < half || dist + half > a.hd ||
++                            a.cd_qnorm < 0 || a.cd_knorm < 0 || a.scale < 0)
++                            fail(aw, "qkvnorm_rope wants rot / 2 inv_freq values, a pair distance inside the head, "
++                                     "the consts offsets of both norms and a non-negative scale");
++                    }
+                 }
+                 // the products tile K^T by (64, 32) and V by (64, 32): a dense head dim of 64 or
+                 // 128 is a narrower product, the full layers' 256 the widest
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -113,9 +113,17 @@
+     std::vector<std::string> args;                         ///< the a / b / c globals
+     size_t m = 0, hd = 0, l_max = 0;                       ///< rows per product (heads per kv head x T), head dim
+     /// A dense layer's host half before the products: "qknorm_rope" (q/k RMSNorm, then the
+-    /// half-split rotation; no bias, no gate) or "rope" (the rotation alone). Empty on a
+-    /// full-attention layer, whose is fixed.
++    /// half-split rotation; no bias, no gate), "rope" (the rotation alone) or "qkvnorm_rope"
++    /// (Gemma 4: q/k RMSNorm with the consts' weights, a weightless V norm, then the fields
++    /// below). Empty on a full-attention layer, whose is fixed.
+     std::string prep;
++    // qkvnorm_rope's own geometry, per layer type (each has its own rotation and window)
++    double scale = 0;                 ///< the score scale; 0 = 1 / sqrt(hd)
++    size_t window = 0;                ///< a sliding window's rows; 0 = every cached row
++    size_t rot = 0, rope_pair = 0;    ///< rotated dims and the pair distance (0 = rot / 2)
++    std::vector<double> inv_freq;     ///< rot / 2 frequencies (empty = the layout's)
++    bool qsplit = false;              ///< Q as a bf16 hi / lo pair, as the decode kernel takes it
++    int64_t cd_qnorm = -1, cd_knorm = -1;   ///< the q / k norms' bf16 [hd] in the consts
+     bool present() const { return !kernels_s.empty(); }
+ };
+ 
+--- a/src/open_qwen36/CMakeLists.txt
++++ b/src/open_qwen36/CMakeLists.txt
+@@ -57,10 +57,13 @@
+ # block_host_test (no XRT): the block prefill's host stages against replica_block.py's fixture
+ add_executable(block_host_test block_host_test.cpp block_host.cpp)
+ target_include_directories(block_host_test PRIVATE ${_inc})
++# attn_window_test (no XRT, no fixture): the block attention's host half with Gemma 4's options
++add_executable(attn_window_test attn_window_test.cpp block_host.cpp)
++target_include_directories(attn_window_test PRIVATE ${_inc})
+ 
+ # block_host.cpp uses AVX2/FMA intrinsics in both targets. The parent app and
+ # Windows build.cmd already enable them; the standalone CMake build must too.
+-foreach(t open_qwen36_cli block_host_test)
++foreach(t open_qwen36_cli block_host_test attn_window_test)
+     target_link_libraries(${t} PRIVATE OpenMP::OpenMP_CXX)
+     if(MSVC)
+         target_compile_options(${t} PRIVATE /arch:AVX2)
+@@ -69,7 +72,7 @@
+     endif()
+ endforeach()
+ 
+-foreach(t open_qwen36_cli manifest_test gguf_pack_test vit_test block_host_test)
++foreach(t open_qwen36_cli manifest_test gguf_pack_test vit_test block_host_test attn_window_test)
+     if(MSVC)
+         target_compile_options(${t} PRIVATE /EHsc /Zc:__cplusplus /bigobj)
+         target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
+@@ -81,6 +84,7 @@
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures")
+ add_test(NAME OPEN-VISION-VIT-WINDOWED COMMAND vit_test --window-index)
+ add_test(NAME GGUF-PACK COMMAND gguf_pack_test)
++add_test(NAME OPEN-PREFILL-ATTN-WINDOW COMMAND attn_window_test)
+ add_test(NAME OPEN-MANIFEST COMMAND manifest_test
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures/manifest_qwen36.json"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures/manifest_qwen3_4b.json"
+--- /dev/null
++++ b/src/open_qwen36/attn_window_test.cpp
+@@ -0,0 +1,209 @@
++/// attn_window_test (no XRT, no fixture): the block attention's host half with Gemma 4's options
++/// -- the q / k norms, a weightless V norm, the unit score scale, the proportional rotation
++/// (rot / 2 pairs at a distance of hd / 2) and a sliding window -- against a direct fp64 loop.
++/// The products the NPU runs (S = Q K^T over the bf16 cache, O = P V) are computed here in fp32
++/// from the same bf16 operands, in window chunks as Core::attention_npu walks them, so the
++/// window's first row, the chunk carry and the softmax mask are what is under test.
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++
++#include "open_qwen36/block_host.hpp"
++
++using namespace open_qwen36;
++
++namespace {
++int failures = 0;
++void check(bool ok, const std::string& what) {
++    std::printf("%s %s\n", ok ? "ok  " : "FAIL", what.c_str());
++    if (!ok) ++failures;
++}
++uint16_t to_bf16(float x) {
++    uint32_t u;
++    std::memcpy(&u, &x, 4);
++    return static_cast<uint16_t>((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
++}
++float from_bf16(uint16_t h) {
++    const uint32_t u = static_cast<uint32_t>(h) << 16;
++    float f;
++    std::memcpy(&f, &u, 4);
++    return f;
++}
++
++struct Case {
++    size_t T, t_real, nh, kvh, hd, rot, pair, pos0, window, chunk;
++    double scale;
++};
++
++// og [t_real, nh*hd] the way attention_npu computes it, chunks of `chunk` rows from the first
++// row the window reaches; kv is the cache after attention_prep
++std::vector<float> npu_like(const host::AttnGeom& g, const std::vector<float>& Q, const std::vector<uint16_t>& kv,
++                            size_t row, size_t chunk) {
++    const size_t grp = g.nh / g.kvh, M = grp * g.T, qw = g.nh * g.hd, kvw = g.kvh * g.hd, hd = g.hd;
++    const size_t rows = g.pos0 + g.t_real, first = host::attn_first_row(g);
++    std::vector<float> og(g.t_real * qw, 0.f);
++    std::vector<size_t> pos(M);
++    for (size_t r = 0; r < M; ++r) pos[r] = g.pos0 + r % g.T;
++    for (size_t gh = 0; gh < g.kvh; ++gh) {
++        std::vector<float> m(M, -INFINITY), l(M, 0.f), acc(M * hd, 0.f);
++        for (size_t c0 = first; c0 < rows; c0 += chunk) {
++            const size_t L = std::min(chunk, rows - c0);
++            std::vector<float> s(M * L);
++            for (size_t r = 0; r < M; ++r) {
++                const float* q = Q.data() + (r % g.T) * qw + (gh * grp + r / g.T) * hd;
++                for (size_t j = 0; j < L; ++j) {
++                    const uint16_t* k = kv.data() + (c0 + j) * row + gh * hd;
++                    float hi = 0, lo = 0;     // Q as a bf16 hi / lo pair, two passes over one K^T
++                    for (size_t d = 0; d < hd; ++d) {
++                        const uint16_t qh = to_bf16(q[d]);
++                        hi += from_bf16(qh) * from_bf16(k[d]);
++                        lo += from_bf16(to_bf16(q[d] - from_bf16(qh))) * from_bf16(k[d]);
++                    }
++                    s[r * L + j] = hi + lo;
++                }
++            }
++            std::vector<uint16_t> p(M * L);
++            host::softmax_chunk(M, L, hd, c0, s.data(), pos.data(), m.data(), l.data(), acc.data(), p.data(), g.window);
++            for (size_t r = 0; r < M; ++r)
++                for (size_t j = 0; j < L; ++j) {
++                    const float pj = from_bf16(p[r * L + j]);
++                    const uint16_t* v = kv.data() + (c0 + j) * row + kvw + gh * hd;
++                    for (size_t d = 0; d < hd; ++d) acc[r * hd + d] += pj * from_bf16(v[d]);
++                }
++        }
++        for (size_t hl = 0; hl < grp; ++hl)
++            for (size_t t = 0; t < g.t_real; ++t) {
++                const size_t r = hl * g.T + t;
++                for (size_t d = 0; d < hd; ++d) og[t * qw + (gh * grp + hl) * hd + d] = acc[r * hd + d] / l[r];
++            }
++    }
++    return og;
++}
++
++double maxrel(const std::vector<float>& a, const std::vector<double>& b) {
++    double num = 0, den = 0;
++    for (size_t i = 0; i < a.size(); ++i) {
++        num = std::max(num, std::fabs(a[i] - b[i]));
++        den = std::max(den, std::fabs(b[i]));
++    }
++    return num / (den > 0 ? den : 1);
++}
++
++void run(const Case& c, std::mt19937& rng) {
++    std::normal_distribution<float> nd(0.f, 1.f);
++    const size_t qw = c.nh * c.hd, kvw = c.kvh * c.hd, row = 2 * kvw, cap = c.pos0 + c.T;
++    std::vector<float> q(c.T * qw), k(c.T * kvw), v(c.T * kvw), qn(c.hd), kn(c.hd);
++    for (auto* x : {&q, &k, &v}) for (auto& e : *x) e = 3.f * nd(rng);
++    for (auto& e : qn) e = from_bf16(to_bf16(1.f + 0.3f * nd(rng)));
++    for (auto& e : kn) e = from_bf16(to_bf16(1.f + 0.3f * nd(rng)));
++    std::vector<double> inv(c.rot / 2);
++    for (size_t i = 0; i < inv.size(); ++i) inv[i] = std::pow(1e4, -2.0 * static_cast<double>(i) / static_cast<double>(2 * c.pair));
++    std::vector<uint16_t> kv(cap * row);
++    for (auto& e : kv) e = to_bf16(nd(rng));                    // the cached rows before the block
++    const std::vector<uint16_t> kv_in = kv;
++
++    host::AttnGeom g;
++    g.T = c.T; g.t_real = c.t_real; g.nh = c.nh; g.kvh = c.kvh; g.hd = c.hd; g.rot = c.rot; g.pos0 = c.pos0;
++    g.eps = 1e-6; g.scale = c.scale; g.pair = c.pair; g.window = c.window; g.vnorm = true;
++    std::vector<float> Q(c.T * qw);
++    host::attention_prep(g, q.data(), k.data(), v.data(), qn.data(), kn.data(), inv.data(), kv.data(), row, Q.data());
++
++    // the fp64 reference: norms, the rotation at distance `pair`, the window, an exact softmax
++    auto rms = [&](const float* x, const float* w, double* out) {
++        double ss = 0;
++        for (size_t d = 0; d < c.hd; ++d) ss += static_cast<double>(x[d]) * x[d];
++        const double r = 1.0 / std::sqrt(ss / static_cast<double>(c.hd) + 1e-6);
++        for (size_t d = 0; d < c.hd; ++d) out[d] = x[d] * r * (w ? w[d] : 1.0);
++    };
++    auto rotate = [&](double* x, size_t p) {
++        for (size_t i = 0; i < c.rot / 2; ++i) {
++            const double a = static_cast<double>(p) * inv[i], x1 = x[i], x2 = x[c.pair + i];
++            x[i] = x1 * std::cos(a) - x2 * std::sin(a);
++            x[c.pair + i] = x2 * std::cos(a) + x1 * std::sin(a);
++        }
++    };
++    std::vector<double> Kr(cap * kvw), Vr(cap * kvw);
++    for (size_t r = 0; r < c.pos0; ++r)
++        for (size_t j = 0; j < kvw; ++j) {
++            Kr[r * kvw + j] = from_bf16(kv_in[r * row + j]);
++            Vr[r * kvw + j] = from_bf16(kv_in[r * row + kvw + j]);
++        }
++    bool rows_ok = true;
++    for (size_t t = 0; t < c.t_real; ++t) {
++        const size_t p = c.pos0 + t;
++        for (size_t h = 0; h < c.kvh; ++h) {
++            double* kh = Kr.data() + p * kvw + h * c.hd;
++            double* vh = Vr.data() + p * kvw + h * c.hd;
++            rms(k.data() + t * kvw + h * c.hd, kn.data(), kh);
++            rotate(kh, p);
++            rms(v.data() + t * kvw + h * c.hd, nullptr, vh);
++            for (size_t d = 0; d < c.hd; ++d) {        // the cache holds them in bf16, to an ulp
++                const double kc = from_bf16(kv[p * row + h * c.hd + d]), vc = from_bf16(kv[p * row + kvw + h * c.hd + d]);
++                rows_ok = rows_ok && std::fabs(kc - kh[d]) <= std::fabs(kh[d]) / 128 + 1e-6 &&
++                          std::fabs(vc - vh[d]) <= std::fabs(vh[d]) / 128 + 1e-6;
++                kh[d] = kc;                              // the reference attends over what is cached
++                vh[d] = vc;
++            }
++        }
++    }
++    bool rest_ok = true;
++    for (size_t i = 0; i < c.pos0 * row; ++i) rest_ok = rest_ok && kv[i] == kv_in[i];
++    for (size_t i = (c.pos0 + c.t_real) * row; i < kv.size(); ++i) rest_ok = rest_ok && kv[i] == kv_in[i];
++    std::vector<double> ref(c.t_real * qw, 0.0);
++    const size_t grp = c.nh / c.kvh;
++    for (size_t t = 0; t < c.t_real; ++t) {
++        const size_t p = c.pos0 + t, lo = c.window && p + 1 > c.window ? p + 1 - c.window : 0;
++        for (size_t h = 0; h < c.nh; ++h) {
++            std::vector<double> qh(c.hd);
++            rms(q.data() + t * qw + h * c.hd, qn.data(), qh.data());
++            rotate(qh.data(), p);
++            const size_t kh = h / grp;
++            std::vector<double> s;
++            double mx = -INFINITY;
++            for (size_t r = lo; r <= p; ++r) {
++                double d = 0;
++                for (size_t j = 0; j < c.hd; ++j) d += qh[j] * Kr[r * kvw + kh * c.hd + j];
++                s.push_back(d * c.scale);
++                mx = std::max(mx, s.back());
++            }
++            double den = 0;
++            for (auto& e : s) den += (e = std::exp(e - mx));
++            for (size_t r = lo; r <= p; ++r)
++                for (size_t j = 0; j < c.hd; ++j)
++                    ref[t * qw + h * c.hd + j] += s[r - lo] / den * Vr[r * kvw + kh * c.hd + j];
++        }
++    }
++    const auto og = npu_like(g, Q, kv, row, c.chunk);
++    const std::string at = " (hd " + std::to_string(c.hd) + ", rot " + std::to_string(c.rot) + " at distance " +
++                           std::to_string(c.pair) + ", window " + std::to_string(c.window) + ", pos0 " +
++                           std::to_string(c.pos0) + ", chunks of " + std::to_string(c.chunk) + ")";
++    check(rows_ok, "attention_prep: K normed + rotated, V normed, cached in bf16" + at);
++    check(rest_ok, "attention_prep: rows before the block and past t_real are untouched" + at);
++    const double e = maxrel(og, ref);
++    check(e < 2e-2, "windowed products + softmax vs fp64 (maxrel " + std::to_string(e) + ")" + at);
++    // a window at least as long as the cache changes nothing, bit for bit
++    host::AttnGeom wide = g;
++    wide.window = 0;
++    const auto og0 = npu_like(wide, Q, kv, row, c.chunk);
++    wide.window = cap + 1;
++    const auto og1 = npu_like(wide, Q, kv, row, c.chunk);
++    check(og0 == og1, "a window past every row is no window, bit for bit" + at);
++    if (c.window && c.pos0 + c.t_real > c.window) check(og0 != og, "the window changes the output" + at);
++}
++}  // namespace
++
++int main() {
++    std::mt19937 rng(20261029);
++    // Gemma 4 12B's two geometries, shrunk: local (rotation over the whole head, half-split, a window)
++    // and global (a quarter of the head rotated, pairs half a head apart, no window)
++    run({8, 6, 4, 2, 64, 64, 32, 7, 5, 4, 1.0}, rng);       // window starts inside the cached rows
++    run({8, 8, 4, 2, 64, 64, 32, 2, 5, 3, 1.0}, rng);       // window starts at row 0 for the first tokens
++    run({8, 5, 4, 1, 64, 16, 32, 9, 0, 6, 1.0}, rng);       // proportional rotation, no window
++    run({8, 6, 4, 2, 64, 64, 32, 7, 5, 64, 0.125}, rng);    // one chunk, and a non-unit scale
++    std::printf("%s\n", failures ? "FAIL" : "PASS");
++    return failures ? 1 : 0;
++}

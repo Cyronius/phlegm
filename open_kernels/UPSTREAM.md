@@ -191,3 +191,71 @@ Validation (Fedora, Strix Halo development checkout; offline, no NPU run):
 Not established here: hardware arithmetic, model output, catalogue validation
 and the q4nx route. See `OPEN-FAMILY-GEMMA4` and
 `specs/open-engine/gemma4-text-kernels.md`.
+
+### Gemma 4 block prefill and bring-up patches (2026-10-29)
+
+Two more standalone diffs against #225's head `beccd46`, recorded in `sources.json`:
+
+- `upstream-patches/gemma4-block-prefill-runtime.patch` adds the dense `gemm_block` fields
+  `cd_preffn` / `cd_postffn`. With them, the block route's host chain reads the FFN-side
+  sandwich norms from the consts rather than the file. Gemma 4 needs this because only the
+  consts copy of `post_feedforward_layernorm` carries the folded `layer_output_scale`. Absent,
+  the fields keep Gemma 3's file read.
+- `upstream-patches/gemma4-bringup-dumps-runtime.patch` adds two bring-up options to
+  `open_qwen36_cli`: `--dump-act all:<prefix>` and `--dump-kv <prefix>`.
+- `upstream-patches/gemma4-compact-gguf-runtime.patch` makes `std_perm_gguf` follow the
+  pool's chunk law: 6144-byte f32 scales, or 5120-byte BF16 ones rounded to nearest even.
+  That is `linux-runtime-pr209.patch`'s branch without its Llama rotary permute, plus a
+  `gguf_pack_test` case. Gemma 4's GGUF view needs it by default (`gemma4.compact_on`); a
+  runtime without it packs 6144-byte chunks into a 5120-byte pool, so it must not run those
+  kernel sets.
+- `upstream-patches/gemma4-attn-block-runtime.patch` adds dense `attn_block` prep `qkvnorm_rope`
+  for Gemma 4's block attention products. It reads the q / k norms from the consts and adds a
+  weightless V norm, the score scale, a rotation per layer type (pair distance and frequencies),
+  the sliding window and Q as a BF16 hi / lo pair. The window is honoured in the first row read,
+  the softmax mask and the KV read-back. It adds `attn_window_test`, which checks the host half
+  against an fp64 loop. Unlike the other three, this diff applies over `beccd46` plus those three
+  (`sources.json` `applies_after`). A runtime without it refuses the prep at manifest load.
+- `upstream-patches/gemma4-prefill-host-runtime.patch` speeds up the dense block route's host
+  stages without changing a bit of output. Each sandwich join is one pass over a token row.
+  The FFN activation's fp64 half runs while the up projection does, and `h = act * up` goes
+  straight into the down projection's tiled x. `attention_npu`'s row loops and the K / V tilers
+  are spread over the host threads. A new dense layer-major prompt runs every block's qkv3, then
+  their attention, then the rest of each layer. It is on for `qkvnorm_rope` sets;
+  `OFLM_OPEN_DENSE_LAYER_MAJOR=1` forces it for the other dense families, which have not been
+  gated on it, and `=0` turns it off. It applies over `beccd46` plus the four patches above.
+  Kernel sets need nothing new: an older runtime runs them block-major.
+- `upstream-patches/gemma4-bfp16-prefill-runtime.patch` (2026-10-30) runs the dense block route's
+  five projections on `designs/gemm_bfp16` (OPEN-PREFILL-BFP16). It reads manifest_version 4:
+  the `bfp16_gemm` pack op and the `bfp16` step format. A bfp16 step must read a `bfp16_gemm`
+  weight, and only dense routes may have one. The pack op also reads a GGUF tensor's own blocks.
+  The x global is packed bfp16, and the c-tiled y is read back as `[N, T]` or as token rows.
+  `act * up` is encoded straight into the down projection's operand. The prefill mode is now
+  chosen in the GGUF view as well, which is where a GGUF-direct set keeps its routes. Gemma 4's
+  recipe emits the bfp16 route as `gemm_block` (`fast`, the default) and the q4 route as `lean`.
+  A runtime without this patch refuses those sets at version 4. `G4_BFP16=0` at export emits the
+  q4 route alone, which such a runtime still loads. `bfp16.hpp` is the openflowlm-next Granite
+  branch's (`07e635b`) plus a c-tile offset helper. The diff applies over `beccd46` plus the
+  five patches above.
+- `upstream-patches/gemma4-prefill-pipeline-runtime.patch` (2026-10-30) runs the dense
+  layer-major prompt step-major: each GEMM step over every block, and the attention products
+  over every block and kv head. One run is outstanding at a time. Each x, y and attention global
+  has a `#1` twin, so the host fills or reads one while the NPU runs the other. Every block
+  sees the same operations on the same data, so the output bits do not change.
+  `OFLM_OPEN_STAGE_MAJOR=0` restores the block-at-a-time stages. On the bfp16 route the
+  GELU-tanh act runs in fp32 on AVX2, fused with `act * up` and the encode (`gelu_bfp16_a`).
+  That changes a few mantissas a layer; `OFLM_OPEN_GELU32=0` keeps the fp64 act. An optional
+  `attn_block.kernels_shl` stacks Q's hi and lo halves into one scores product of twice the
+  rows (`OFLM_OPEN_ATTN_SHL=0` keeps two). The `bfp16_gemm` packer no longer divides per
+  block, and a pack-built weight zeroes only the bytes no op writes. `--prefill-mode accurate`
+  is another name for `lean` in the engine and CLI; `oflm`'s own flag parser is outside this
+  clone and still takes `fast|lean|bfp16`. Kernel sets need nothing new: without
+  `kernels_shl` the scores take two dispatches. The diff applies over `beccd46` plus the six
+  patches above.
+
+`designs/dense/dx_attn.py` now takes its recipe module from `for_spec` and its flags from the
+recipe's `attn_flags`, and gained `dx.py`'s ATTN_QLOCAL q loop. It emits byte-identical MLIR
+for the 15 shipped dense specs with a block route that emit at all; `qwen3-14b` refuses at
+`lm_head_q4` K=5120 before and after. The full offline suite gives 1954 passed, 53 skipped and
+8 deselected. The 12 GPT-OSS and Qwen3.5-glue failures also fail at clean HEAD in this
+environment.

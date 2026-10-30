@@ -1,0 +1,140 @@
+diff --git a/src/open_qwen36/gguf_pack_test.cpp b/src/open_qwen36/gguf_pack_test.cpp
+index 53fa411..fd1dc27 100644
+--- a/src/open_qwen36/gguf_pack_test.cpp
++++ b/src/open_qwen36/gguf_pack_test.cpp
+@@ -385,6 +385,38 @@ int main() {
+         }
+         std::printf("%s std_perm_gguf Q4_0 (%zu values differ)\n", bad0 ? "FAIL" : "ok", bad0);
+         if (bad0) return 1;
++
++        // The q4_1 law (5120 B, the compact GGUF view): the same codes, and each f32 scale
++        // plane value RNE-rounded to bf16 -- what the f32-scale kernels narrow it to on the core.
++        std::vector<uint8_t> pc(static_cast<size_t>(op.nch) * 5120, 0);
++        pools::apply(op, g0, 0, pc.data(), pc.size(), 5120);
++        size_t badc = 0;
++        for (size_t c = 0; c < op.nch; ++c) {
++            const uint8_t* w = p0.data() + c * 6144;
++            const uint8_t* n = pc.data() + c * 5120;
++            for (size_t j = 0; j < 512; ++j) {          // 256 d then 256 m
++                float f;
++                std::memcpy(&f, w + 4 * j, 4);
++                uint32_t u;
++                std::memcpy(&u, &f, 4);
++                const uint16_t want = static_cast<uint16_t>((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
++                uint16_t got;
++                std::memcpy(&got, n + 2 * j, 2);
++                badc += got != want;
++            }
++            badc += std::memcmp(w + 2048, n + 1024, 4096) != 0;
++        }
++        std::printf("%s std_perm_gguf Q4_0 into the q4_1 law (%zu mismatches)\n", badc ? "FAIL" : "ok", badc);
++        if (badc) return 1;
++        std::vector<uint8_t> odd(static_cast<size_t>(op.nch) * 4736, 0);
++        bool refused = false;
++        try {
++            pools::apply(op, g0, 0, odd.data(), odd.size(), 4736);
++        } catch (const std::exception&) {
++            refused = true;
++        }
++        std::printf("%s std_perm_gguf refuses a pool chunk of neither law\n", refused ? "ok   " : "FAIL");
++        if (!refused) return 1;
+     }
+ 
+     // ---- pack_norm: f32 -> bf16 (RNE)
+diff --git a/src/open_qwen36/pools.cpp b/src/open_qwen36/pools.cpp
+index 368cadb..c18abf4 100644
+--- a/src/open_qwen36/pools.cpp
++++ b/src/open_qwen36/pools.cpp
+@@ -100,6 +100,7 @@ const uint8_t* raw(const WeightFile& m, const std::string& name, size_t need, si
+ 
+ constexpr size_t Q8_CHUNK = 8704;    // 256 bf16 scales then 8192 int8 codes
+ constexpr size_t Q4_CHUNK = 5120;    // 256 bf16 d, 256 bf16 m, then 4096 B of nibbles
++constexpr size_t GGUF_CHUNK = 6144;  // the GGUF-direct twin's f32-scale law: 1024 B d, 1024 B m, codes
+ constexpr size_t Q4_HALF = 2560;     // GPT-OSS's chunk: the same layout over 32 rows x 128 columns
+ constexpr size_t Q4K_CHUNK = 4736;   // 256 uint8 scales, 256 uint8 mins, 4096 B of nibbles, 32 bf16 S, 32 bf16 M
+ constexpr size_t Q8H_SCALES = 256;   // a half-tile's 128 bf16 scales
+@@ -544,9 +545,14 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+         }
+     } else if (op.op == "std_perm_gguf") {
+         // A GGUF [out, in] matmul tensor (Q4_0 / Q4_1 blocks, row-major, fp16
+-        // scales) into the pool's band order of f32-scale chunks (6144 B): the
+-        // codes permute into the chunk's 16-lane interleave, the fp16 block
+-        // scales widen EXACTLY to f32 (open_kernels/gguf_pool.py). Zero loss.
++        // scales) into the pool's band order: the codes permute into the
++        // chunk's 16-lane interleave. The pool's chunk law (m.chunk_bytes) says
++        // where the block scales go. The f32-scale twin (6144 B) widens the fp16
++        // scales EXACTLY to f32 (open_kernels/gguf_pool.py). The q4_1 law
++        // (5120 B, the compact GGUF view) stores them RNE-rounded to bf16, which
++        // is the value the f32-scale kernels narrow them to on the core
++        // (gemv_q4.h load_scale, gemm_q4_dequant.h gqd_scale), so both views
++        // compute the same products.
+         const std::string name = with_layer(op.tensor, layer);
+         if (op.nch == 0 || op.in_dim == 0) fail("std_perm_gguf " + name + " without nch / in_dim");
+         const GgufFile& g = dynamic_cast<const GgufFile&>(m);
+@@ -563,6 +569,22 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+                  "requantizes Q8_0/Q4_K/Q6_K (convert K-quants with q4nx-build otherwise)");
+         const bool has_min = t.type == GgufFile::Type::Q4_1 || kq;
+         const size_t blk = has_min ? 20 : 18;
++        if (ch != Q4_CHUNK && ch != GGUF_CHUNK)
++            fail("std_perm_gguf " + name + ": pool chunk " + std::to_string(ch) +
++                 " is neither the q4_1 law nor the GGUF-direct twin's f32 one");
++        const bool f32_law = ch == GGUF_CHUNK;
++        const size_t M_OFF = f32_law ? 1024 : 512, CODES = f32_law ? 2048 : 1024;
++        // one block scale pair (plane index j = kb*32 + r) in the pool's law
++        auto put_scales = [&](uint8_t* d, size_t j, float df, float mf) {
++            if (f32_law) {
++                std::memcpy(d + 4 * j, &df, 4);
++                std::memcpy(d + M_OFF + 4 * j, &mf, 4);
++            } else {
++                const uint16_t db = bf16_rne(df), mb = bf16_rne(mf);
++                std::memcpy(d + 2 * j, &db, 2);
++                std::memcpy(d + M_OFF + 2 * j, &mb, 2);
++            }
++        };
+         const size_t nb = op.in_dim / 32;                        // k blocks per row
+         size_t n = 0;
+         const uint8_t* src = raw(m, name, 0, &n);
+@@ -602,8 +624,7 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+                         um = f32_to_fp16(mraw);
+                         const float df = fp16_to_f32(ud), mf = fp16_to_f32(um);
+                         const float inv = df > 0.f ? 1.f / df : 0.f;
+-                        std::memcpy(d + 4 * (kb * 32 + r), &df, 4);
+-                        std::memcpy(d + 1024 + 4 * (kb * 32 + r), &mf, 4);
++                        put_scales(d, kb * 32 + r, df, mf);
+                         // codes: value i at nibble (kb*32+i, r), i+16 at (p0+256)
+                         uint8_t nib[16];
+                         for (size_t i = 0; i < 16; ++i) {
+@@ -614,10 +635,10 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+                         }
+                         for (size_t i = 0; i < 16; ++i) {
+                             const size_t p0 = rb * 4096 + (kb * 32 + i) * 16 + rl;
+-                            d[2048 + (p0 >> 1)] |= (p0 & 1) ? static_cast<uint8_t>(nib[i] << 4)
+-                                                            : (nib[i] & 0xF);
++                            d[CODES + (p0 >> 1)] |= (p0 & 1) ? static_cast<uint8_t>(nib[i] << 4)
++                                                             : (nib[i] & 0xF);
+                             const size_t p1 = p0 + 256;              // i + 16: the block's high half
+-                            d[2048 + (p1 >> 1)] |= (p1 & 1) ? (nib[i] & 0xF0) : (nib[i] >> 4);
++                            d[CODES + (p1 >> 1)] |= (p1 & 1) ? (nib[i] & 0xF0) : (nib[i] >> 4);
+                         }
+                         continue;
+                     }
+@@ -625,16 +646,15 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+                     if (has_min) std::memcpy(&um, b + 2, 2);
+                     const float df = fp16_to_f32(ud);
+                     const float mf = has_min ? fp16_to_f32(um) : -8.f * df;
+-                    std::memcpy(d + 4 * (kb * 32 + r), &df, 4);
+-                    std::memcpy(d + 1024 + 4 * (kb * 32 + r), &mf, 4);
++                    put_scales(d, kb * 32 + r, df, mf);
+                     // codes: block nibbles (two K per byte) -> two rows per byte at one K
+                     for (size_t i = 0; i < 16; ++i) {
+                         const uint8_t byte = b[(has_min ? 4 : 2) + i];
+                         const uint8_t lo = byte & 0xF, hi = byte >> 4;   // GGUF: value i | value i+16
+                         const size_t p0 = rb * 4096 + (kb * 32 + i) * 16 + rl;
+-                        d[2048 + (p0 >> 1)] |= (p0 & 1) ? lo << 4 : lo;   // value j = lo
++                        d[CODES + (p0 >> 1)] |= (p0 & 1) ? lo << 4 : lo;   // value j = lo
+                         const size_t p1 = p0 + 256;              // i + 16: the block's high half
+-                        d[2048 + (p1 >> 1)] |= (p1 & 1) ? hi << 4 : hi;   // value j + 16 = hi
++                        d[CODES + (p1 >> 1)] |= (p1 & 1) ? hi << 4 : hi;   // value j + 16 = hi
+                     }
+                 }
+             }

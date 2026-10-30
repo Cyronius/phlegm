@@ -1715,11 +1715,347 @@ short prompt's greedy tokens match a dequantised-GGUF reference, logit cosine
 reference gives 0.997-0.999. `oflm serve` answers a two-turn chat, the second
 turn served from the cached prompt. The boundary positions are not reported.
 
+**Result (measured in Phlegm, 2026-10-29, development run):** Strix Halo
+(Ryzen AI MAX+ 395, NPU firmware 1.1.2.65, XRT 2.27.0 `a29919c`, Linux
+7.2.11), the GGUF route: #225's `open_qwen36_cli` at `beccd46`, kernels
+exported from Phlegm `d170281`, the same GGUF, and Google's config and
+tokenizer. The reference is an independent numpy forward over the dequantised
+GGUF, written from transformers 5.15. It uses FP32 GEMMs and FP64 RoPE and
+softmax. On the first 512-token chunk of the long prompt's document its
+perplexity is 53.65, against 54.93 from llama.cpp build 11852 on the same file.
+
+- Greedy decode: 32 of 32 tokens match the teacher-forced reference on a
+  26-token prompt and on a 1450-token prompt. Decode logit cosine is at least
+  0.99973 and 0.99962 respectively, median 0.99997 and 0.99996.
+- Every prefill position of the 1450-token prompt: median cosine 0.99993; 27
+  argmax flips, mostly near ties. Past 1024, the NPU is closer to the windowed
+  reference than to the no-window one at 425 of 426 positions. At position 1449
+  the NPU differs from the windowed reference by 3.0e-5 (1 - cos); the two
+  references differ from each other by 2.5e-2.
+- Window boundary: capped logits cannot resolve it. On the reference, a window
+  one row off moves them by at most 4.8e-5 (1 - cos) at 1023-1025, inside the
+  NPU's own 3e-5 to 1e-4 difference. Layer 0's attention output (`--dump-act`)
+  does resolve it. At all three positions the NPU is closest to HF's
+  `kv > q - 1024`, at 2.8e-6, 3.7e-6 and 3.4e-6. The alternatives each show at
+  one position: one row narrower 9.3e-5 at 1023, one row wider 1.5e-4 at 1024,
+  no window 3.9e-4 at 1025.
+- Prefill error beyond BF16 rounding: a control reference that rounds GEMM
+  inputs and K/V rows to BF16, keeping the residual in FP32, reaches median KL
+  1.6e-4, against the NPU's 2.8e-4. The control has 8 positions above KL 0.1,
+  the NPU 16. The two follow the same sensitive positions (log-KL correlation
+  0.86). The NPU's worst position, 713, has KL 4.54; the control has 1.9e-3
+  there. Per-layer act and KV dumps show the cause is not one kernel.
+  Attention recomputed on the host over the NPU's own cache reproduces its
+  output for every head at layer 22 (1 - cos <= 6e-6). The error comes from
+  cache rows written at earlier positions. From layer 21 on, the model
+  amplifies small errors at some positions, and the control does the same. In
+  the deep layers it pushes as many K/V rows past 1 - cos 1e-3 as the NPU
+  does (52 vs 50 at layer 40), some of them to 0.4-0.6. The NPU's error is
+  1.5-2x the control's at every layer and stage from layer 0, so its
+  amplified positions are more frequent and larger. Which positions blow up
+  depends on the noise.
+
+Prefill ran one token per step, at 277-325 ms/token; this kernel set has no
+`gemm_block` program. Decode ran at 293 ms/token over positions 26-57 and
+396 ms/token over 1450-1481. These timings were taken alongside other host
+load and are not benchmarks. `oflm serve` was not run. Evidence is in ignored
+`target/npu-dev/gemma4-12b-run/`; its `evidence.json` hashes the inputs,
+scripts and summaries (SHA-256 `ec966186…3919bd`).
+
+Decode profile (same day, same host load, so ratios rather than rates).
+Per-kernel traces (`OFLM_OPEN_STEP_TRACE`) show the step is the layer kernels
+back to back:
+
+- A local layer takes 6.3 ms at position 26 and 7.9 ms from 1024, where the
+  window is full. A global layer takes 6.7 ms at 26 and 12.7 ms at 3000. The
+  head takes 24 ms.
+- The KV walk is the broadcast one: about 5 GB/s on local layers and 2.1 GB/s
+  on global layers. The global rows hold the one K = V head four times.
+- `DX_STOP` builds put about 2 ms of each local layer outside weight streaming:
+  norm round trips, attention and phase waits.
+- A memtile weight ring (`DX_WRING=16`) gave the same output bits and no gain.
+- Early weight issue with that ring (`DX_WORDER=1`, which a sandwich family
+  takes only when forced) did not hang and gave the same output bits over 24
+  decoded tokens in two alternating pairs. Local-layer dispatch minima fell
+  6-9% (6.16 and 5.95 to 5.81 and 5.42 ms). The step changed by +0.1% and
+  -3.9% (322.4 and 325.9 to 322.8 and 313.3 ms) at load average 31, which is
+  within this host's noise, so it stays opt-in.
+- Timing-only runs of the q4nx 5120-byte images, which give wrong output on the
+  6144-byte GGUF pools, were 10-11% faster per layer. Fitting both formats puts
+  the weight stream at about 39 GB/s plus that 2 ms fixed cost.
+
+Block prefill (`gemma4.gemm_route`; GGUF only, on by default since the window
+check below, `DENSE_GGUF_GEMM=0` at export leaves it out). Each layer
+type has its own qkv3 and o GEMMs, its own `dx_attn.py` build and its own
+tables. The host chain reads the FFN-side sandwich norms from the consts
+(`cd_preffn` / `cd_postffn`, `upstream-patches/gemma4-block-prefill-runtime.patch`).
+Without that, the unfolded file copy of `post_feedforward_layernorm` broke
+every position.
+
+- With it, greedy decode after the 26- and 1450-token prompts gives the
+  sequential route's 32 tokens, which equal the reference's.
+- Prefill logits against the reference: median KL 3.3e-4 against sequential's
+  2.8e-4, but 31 positions above KL 0.1 against 16, and a maximum of 6.05 at
+  position 713.
+- The 1450-token prompt prefilled at 147 ms/token, against 325 sequentially.
+- Each 256-token block took 4.2-4.4 s of GEMMs and 6-27 s of single-token
+  attention dispatches, growing with the window. The host chain took 4.4 s,
+  and about 14 s of host time is unattributed.
+- Window check on the block route (1026-token prompt, so 1023 ends the fourth
+  block and 1024-1025 start the fifth). Layer 1's cached K | V rows depend on
+  layer 0's attention output at that position, so they were compared with the
+  reference's rows under layer-0 windows of 1022-1026 rows and none
+  (`gemma4-12b-ref/layer1_kv.py`, 1 - cosine). The NPU is closest to the
+  1024-row window at all three positions. At 1024 it excludes row 0 (4.2e-6
+  against 1.8e-5 with it); at 1025 it excludes rows 0 and 1 (4.7e-6 against
+  1.5e-5). At 1023 the 1023-row alternative is weaker evidence: 7.0e-6
+  against 4.4e-6 for 1024, with the two references 2.3e-6 apart.
+
+Compact GGUF pools (`gemma4.finalize_gguf_manifest`, on by default after the
+check below; `DENSE_GGUF_COMPACT=0` at export keeps the f32-scale twin). The
+f32-scale kernels round each block scale to BF16 (nearest even) on the core,
+so the GGUF view can store that BF16 in 5120-byte q4_1-law chunks and run the
+q4_1 decode, head and GEMM builds. The packer change is
+`upstream-patches/gemma4-compact-gguf-runtime.patch`. The per-layer pool
+falls from 178 to 148 MB and the head pool from 720 to 600 MB.
+
+- Every logit file matched the f32-scale twin byte for byte: 75 in three
+  alternating pairs of 24 sequential tokens, and 1540 for block prefill plus
+  32 tokens on both prompts. The patched runtime gives the unpatched one's
+  logits on the twin.
+- Sequential decode at load average 34-38: step median 326.0-331.5 to
+  288.5-293.3 ms (-11%), head 23.4-23.7 to 19.9-20.0 ms. At position 1024:
+  412.1 to 376.5 ms (-9%).
+
+Block attention on the NPU (`gemma4._attn_block`; on by default after the
+checks below; `G4_ATTN_BLOCK=0` at export or `OFLM_OPEN_ATTN_BLOCK=0` at run
+time keeps one dxB dispatch a token). The block route's attention is two BF16
+GEMMs per kv head (OPEN-PREFILL-ATTN's `attn_block`,
+`designs/attn_block/attn_gemm.py`) with the softmax on the host. Before them
+the host does what `dx.py`'s attention core does: q / k RMSNorm with the
+consts' weights, the weightless V norm, the unit score scale, the layer type's
+rotation (the global one turns 64 pairs 256 dims apart) and the sliding window.
+Q goes in as a BF16 hi / lo pair. The runtime change is
+`upstream-patches/gemma4-attn-block-runtime.patch` (prep `qkvnorm_rope`), with
+`attn_window_test` against an fp64 loop. Each product has 5 local tiers (256 to
+1280 rows, 512 rows a product, head 256) and 16 global ones (256 to 4096, 2048
+rows, head 512).
+
+- Greedy decode after both prompts gives the dxB route's 32 tokens, which equal
+  the reference's.
+- Long prompt, prefill logits against the reference, NPU products against
+  dxB: median KL 3.29e-4 for both; mean 0.0118 against 0.0205; 27 positions
+  above 0.1 against 31 and 3 above 1 against 6; maximum 4.36 against 6.05, both
+  at 713. Next-token loss 5.4865 against 5.4818 (reference 5.4901).
+- The window check above gives the same result: closest to 1024 rows at
+  1023-1025, with the same separations.
+- Adjacent runs without per-position logits, load average 33-46: 1450 tokens
+  prefilled in 81.4 s (56 ms/token) against 194.8 s (134 ms/token) for dxB.
+  Attention per block fell from 8.0-30.0 s to 2.5-4.2 s. A block is now GEMMs
+  4.2-4.4 s and 5.7-6.1 s of host stages outside the attention. That figure,
+  the CLI's residue, was first read as unattributed time on top of the host
+  tail; it contains the tail (4.2-4.4 s), GEMM tiling and read-back
+  (1.4-1.8 s) and the entry norm. All of these runs had one host thread:
+  `target/npu-dev/env.sh` exports `OMP_NUM_THREADS=1`.
+
+**Result (measured in Phlegm, 2026-10-29, development runs; host stages and
+schedule):** same machine and kernels, the long prompt, 4 decode tokens, load
+average 16-40 from another session's CPU job holding a shared CPU lease.
+Pairs alternate; each change was checked for bit identity of the prefill's
+last logits and four decode steps against the run before it. The full gate
+ran at the end: every prefill logit of both prompts (1482 and 58 files) and
+both 32-token greedy runs, byte-identical to the 1-thread NPU-attention gate
+above.
+
+- Host threads, `kernels/gemma4-12b-attnblock`, same binary, 1450 tokens:
+  1 thread 78.6 s (54 ms/token), 8 threads 41.2-42.0 s (28-29 ms/token),
+  16 threads 49.1-50.8 s. On the first host-stage build below, 4 threads took
+  40.0 s against 38.4 s at 8. The runtime's own count (32 with
+  SMT, the variable unset) took 133.6-138.4 s (92-95 ms/token) at load
+  average 18-28. Output bits are the same at every count. The dxB route at
+  16 threads took 156.3 s (108 ms/token). The runs below use 8 threads.
+- Host stages (`upstream-patches/gemma4-prefill-host-runtime.patch`):
+  - each sandwich join is one pass over a token row;
+  - the FFN activation's fp64 half (the tanh) runs while the up projection
+    does, and `h = act * up` goes straight into the down projection's tiled x;
+  - `attention_npu`'s row loops and the K / V tilers use every host thread.
+  Two pairs gave 41.3 / 41.0 s against 36.0 / 36.4 s (28 to 25 ms/token).
+  The host time outside the attention fell from 1.2-1.3 s to 0.5-0.7 s a block.
+- One hardware context for every attention product of both kinds (recipe
+  `gemma4.gemm_route`): the 42 xclbins differ only in build stamps by the
+  export's own test (`xclbin_equivalent`). Each local layer's P.V dispatch
+  stops paying a context switch (3.9 against 0.17-0.33 ms). Two pairs: 35.7 /
+  36.1 s against 34.7 / 35.2 s.
+- Dense layer-major schedule (`step_gemm_prompt_dense`): every block's qkv3
+  GEMM, then every block's attention in order, then the rest, so a layer
+  switches context twice instead of twice a block. Two pairs against
+  `--block-major`: 35.2 / 34.4 s against 33.4 / 32.4 s (22-23 ms/token). The
+  o projection takes 5.8 ms in the GEMM context and 9.6 ms after a switch.
+- Of the layer-major run's 32.4 s, GEMM dispatches take 23.8 s (73%) and
+  attention 5.5 s, 2.8 s of it on the host; the remaining host stages take 3.1 s.
+  The q4 GEMMs run at about 1.4 TFLOPS (`gemm_n15360_k3840`: 15.1 GMAC in
+  21.2-21.8 ms).
+
+**The bfp16 prefill route is the default (2026-10-30).** The GGUF view's
+`gemm_block` runs the same five projections on `designs/gemm_bfp16`
+(OPEN-PREFILL-BFP16). That route is prefill mode `fast`, the default. The q4
+route above is the `lean` variant (`--prefill-mode lean`,
+`OFLM_OPEN_PREFILL_MODE=lean`), unchanged, for users who want its accuracy.
+Each weight is its pool ops' tensors, read from the GGUF's own blocks at load,
+stacked in the pool's row order (q, the four `k_proj` copies, v) and padded
+to whole 1024-row groups with zero blocks (o and down: 3840 to 4096 rows).
+The activations are packed to bfp16 on the host. `act * up` goes straight
+into the down projection's operand. The attention products, host stages and
+schedule are the q4 route's. The set is manifest_version 4 in the GGUF
+section. `G4_BFP16=0` at export emits the q4 route alone, at version 1. The
+runtime side is `upstream-patches/gemma4-bfp16-prefill-runtime.patch`.
+
+Gates, declared before the first model run:
+- every shape's output equals the product of its decoded operands;
+- lean's logits and greedy tokens are byte-identical to the q4 route's gate;
+- on both prompts, fast's teacher-forced NLL is within 1% of lean's, and its
+  top-1 agreement with the FP32 reference is at most 5 points lower.
+
+**Result (measured in Phlegm, 2026-10-30, development runs):** same machine,
+kernels `kernels/gemma4-12b-bfp16` (the ag1 set plus the six bfp16 GEMMs),
+8 host threads, load average 48-58 from another session's CPU jobs.
+
+- Kernels: all six shapes (`make_test.py`, random operands, M = 256) match the
+  decoded-operand product exactly (rel_fro 0; `n4096_k15360` 8.2e-10, fp32
+  sum order) and the float product to 8.7e-3. They take 0.84-2.67 ms (min of
+  the last four of five runs), 8.8-12.1 TFLOPS counting the padded rows;
+  `n15360_k3840` takes 2.60 ms against the q4 GEMM's 21.2-21.8. The six
+  xclbins differ only in build stamps, so they share one context.
+- Lean, every prefill logit of both prompts (1482 and 58 files) and both
+  32-token greedy runs: byte-identical to the q4 route's gate.
+- Fast against the FP32 reference, long prompt (1450 positions; lean in
+  brackets):
+  - NLL 5.4711 (5.4865; reference 5.4901), -0.28%;
+  - top-1 agreement 0.949 (0.974);
+  - KL median 3.2e-3 (3.3e-4), mean 0.044 (0.012), 84 (27) positions above
+    0.1, 13 (3) above 1, maximum 6.92 at 992 (4.36 at 713).
+  - Past the 1024-row window the figures are similar: KL median 3.3e-3
+    (3.8e-4), top-1 0.953 (0.970). KL at positions 1021-1027 is 6e-6 to
+    2.0e-2 (4e-7 to 1.1e-3).
+- Short prompt (26 positions): NLL 6.7982 (6.8115; reference 6.7622), top-1
+  25 of 26 (26), KL maximum 0.06 (0.07).
+- Greedy 32 tokens after both prompts: identical to lean's and the
+  reference's.
+- Both gates pass. Fast is about 10x further from the reference than lean by
+  median KL, and its KL tail is heavier.
+- Prefill, 1450 tokens, alternating pairs: fast 18.8 / 17.8 s (12-13
+  ms/token) against lean 41.8 / 42.4 s (29 ms/token), 2.3x. The lean figure
+  was 32.4-33.4 s at load 16-40 the day before, so these absolutes are
+  load-inflated; only the ratio is comparable. The short prompt (one block)
+  takes 3.3-4.2 s against 6.4-7.7 s.
+- Where fast's 18.8 s goes:
+  - The GEMM column is 6.6 s. The up GEMM's mean is 7.9 ms against a 2.5 ms
+    minimum, because it now waits for the host's fp64 GELU (~10 ms a
+    block), which no longer fits under it.
+  - The attention column is 8.6 s.
+  - The other host stages are 3.6 s.
+- Loading: fast 19-24 s against lean 14-16 s (one fast run 35 s). The
+  bfp16 weights are about 12.6 GB (9 bytes per 8 weights). They replace the
+  q4 route's per-layer GEMM weight copies, about 6.8 GB, which `lean` makes
+  from the pool. Sampled `Shmem` rose 21.1 GB under fast against 15.8 GB
+  under lean with the weights resident, 5.3 GB more. The process RSS
+  (6.6 GB) does not see NPU buffers.
+
+**The prefill pipeline (2026-10-30).** Four changes to the runtime and one to
+the kernel set, in `upstream-patches/gemma4-prefill-pipeline-runtime.patch`:
+
+- **Step-major layers.** The dense layer-major prompt now runs each step over
+  every block (`dense_layer_staged`): qkv3 for every block, with each block's
+  attention host half under the next block's GEMM. Then the attention
+  products for every (block, kv head), then o, up, gate and down over the
+  blocks in pairs. One run is outstanding at a time, and every x, y and
+  attention global has a `#1` twin, so the host fills or reads one while the
+  NPU runs the other. Each block sees step_gemm_block_layer's operations on
+  the same data. `OFLM_OPEN_STAGE_MAJOR=0` restores the old stages.
+- **fp32 GELU on the bfp16 route.** The act runs in fp32 on AVX2, fused with
+  `act * up` and the encode (`gelu_bfp16_a`), as `g / (1 + exp(-2z))` without
+  the tanh form's cancellation. `OFLM_OPEN_GELU32=0` keeps the fp64 act; lean
+  is unchanged. The A-operand encoders now write in memory order.
+- **Stacked scores.** `attn_block.kernels_shl` (21 new streams `ag_shl*`, on
+  the `ag` image, AG_M = 2m) puts Q's hi and lo halves in one scores product
+  of twice the rows, so each (block, kv head) takes two dispatches, not three.
+  `OFLM_OPEN_ATTN_SHL=0` keeps three.
+- **Load.** The `bfp16_gemm` packer no longer divides per block, and a
+  pack-built weight zeroes only its padding rows (`pools::unwritten`), not
+  the whole buffer first.
+- **`accurate`** is another name for `lean` (OPEN-PREFILL-MODE).
+
+Gates, declared before the runs:
+- the schedule and the stacked scores leave every prefill logit and both
+  32-token greedy runs byte-identical, fast (with the fp64 act) and lean;
+- the fp32 GELU passes the bfp16 route's own gates (NLL within 1% of lean's,
+  top-1 at most 5 points below), and its distance from the fp64 act is
+  reported.
+
+**Result (measured in Phlegm, 2026-10-30, development runs):** kernels
+`kernels/gemma4-12b-shl` (the bfp16 set plus the 21 `ag_shl` streams),
+binaries `pipe1` (01f6aa44) and `pipe2` (a0797d80, which the patch's
+sources rebuild exactly), 8 host threads, load average 33-40.
+
+- Bit identity: fast with the fp64 act on the new schedule, against the
+  morning's fast route, 0 of 1482 (long) and 0 of 58 (short) dumps differ.
+  Lean 0 of 1482, `accurate` against lean 0 of 58. Stacked scores against two
+  products: fast 0 of 1482 and 0 of 58, lean 0 of 1482. The weights from the
+  new packer are therefore the old ones too. Host unit tests: the reordered
+  encoders and the vector exponent maximum give the same bytes.
+- The fp32 GELU on real activations: 0-3 of the 3.9 M A-operand mantissas of
+  a layer's block differ from the fp64 act's, each by one (short prompt, all
+  48 layers, a one-off probe). The model amplifies even that: KL(fp64 act ||
+  fp32 act) has median 2.2e-3 on the long prompt and 1.2e-3 on the short.
+  Against the FP32 reference, long prompt (fp64 act; lean in brackets):
+  - NLL 5.5141 (5.4711; 5.4865), 0.50% above lean's;
+  - top-1 0.952 (0.949; 0.974);
+  - KL median 3.0e-3 (3.2e-3), 69 (84) positions above 0.1, 10 (13) above 1,
+    maximum 7.08 at 992 (6.92);
+  - KL at positions 1021-1027 is 1e-5 to 2.5e-2.
+  Short prompt: NLL 6.7761 (6.7982; lean 6.8115), top-1 25 of 26. Both
+  32-token greedy runs equal lean's. The gates pass. The two acts are about
+  equally far from the reference, and the difference between them is the
+  size of the bfp16 route's own error.
+- Prefill, 1450 tokens, alternating in one run (pipe2):
+  - old stages with the fp64 act: 16.3 / 16.1 s (11 ms/token);
+  - new, two scores products: 10.0 / 9.7 s;
+  - new, stacked scores: 10.0 / 9.2 s, and 9.3 s traced (6-7 ms/token).
+  - 1.6-1.75x in all. The stacked scores take the attention column from
+    4.7-4.9 s to 4.1-4.8 s, which is within this load's spread of the total.
+  - Lean: 37.5 s old against 28.4 s new (1.32x). A pipe1 pair gave 37.4 /
+    37.7 against 29.8 and 61.8 s; the 61.8 s run's host stages were 3-10x
+    slower than its neighbours' (mid 29.5 s against 3.2 s), from other load.
+- Where 9.2 s goes (stacked, pair b): the attention column 4.1 s, the host
+  blocked on GEMMs 1.6 s, and 3.5 s of host work in the GEMM steps that the
+  NPU does not cover. Inferred, not timed per step: the o and qkv3 GEMMs take
+  0.8-1.4 ms, less than the host work after each. The local layers'
+  attention dispatches average 0.6-1.0 ms against 0.2-0.5 ms minima, and the
+  host waits on them, not they on it.
+- Loading: fast 17-18 s with the new packer, against 20 s for pipe1 at the
+  same load; lean 14-15 s. The packer's microbenchmark on layer 0 gave 12.8
+  against 52.8 ms for gate_proj, the same bytes. The rest of the load is the
+  decode pools, the head and the reads.
+- Memory: sampled `Shmem` peaks 22.3 GB above the run's floor on the new
+  schedule against 22.1 GB on the old (fast) and 16.7 against 16.6 GB
+  (lean): the twins add about 0.15 GB.
+
 **Open:** the `model.q4nx` route has not run. FLM's 12B package stores 16-row
 signed-q4 tiles (2304 B), a 16-row q8 head (4352 B) and a BF16 embedding
 table; both packers (`pack.q4_chunks_of`, `pools.cpp`) read 5120, 8704 and
 4736-byte chunks only, and the plan packs the head as q4 (`gemma4-text-kernels.md`). Also open: catalogue
-validation, block prefill (decode one token at a time), vision and audio.
+validation, vision and audio. Block prefill is GGUF-only. Its softmax and
+layer tail stay on the host, and its KL tail is still heavier than sequential
+decode's (more so on the default bfp16 route). On the step-major schedule the
+attention products (about 3,900 dispatches for 1450 tokens) and the host
+halves of the o and qkv3 steps are most of a prefill. The step-major schedule
+has run only on Gemma 4: the other dense families reach it only through
+`OFLM_OPEN_DENSE_LAYER_MAJOR=1`, ungated. Runs that source `env.sh` must
+set `OMP_NUM_THREADS`. The best count under other load is not settled: 8
+measured best here, and an idle machine has not been measured. In Phlegm, `oflm serve`'s two-turn chat has not
+run. The source of the NPU's 1.5-2x per-stage error over BF16 rounding is
+unknown. The procedure's logit form of the boundary check cannot detect a
+one-row window error.
 
 ### OPEN-FAMILY-HUNYUAN: HunYuan dense on the dense recipe
 **Applies to:** openflowlm-next (`open_kernels/recipes/dense.py`, `spec.py`, `designs/attn/attn.h`, `designs/dense/dx.py`, `utilities/q4nx-build`)
@@ -5343,7 +5679,11 @@ registered, only its weights are packed, and the globals only the other route
 names are not allocated. Changing it means reloading the model. On a set with
 one route, `lean` logs `this kernel set has one prefill route; lean changes
 nothing` and runs that route. The route line reads `block prefill route: T = 256
-(fast)` or `(lean)` on a set that carries both.
+(fast)` or `(lean)` on a set that carries both. In Phlegm's runtime patch and in `phlegm bench`
+and `phlegm run`, `accurate` is another name for `lean` (2026-10-30): the engine maps it to
+`lean` before choosing, and reports record `lean`. `oflm`'s own flag parser is outside the
+patched files and still takes `fast|lean|bfp16`. On the Gemma 4 set, `--prefill-mode accurate`
+gave `lean`'s 58 short-prompt dumps byte for byte.
 
 **Acceptance criteria (unit):**
 - `Manifest::select_prefill_route("lean")` gives every layer type the variant's programs, keeps the globals the variant names and drops those only `gemm_block` named; `select_prefill_route("")` keeps `gemm_block` and drops the variant and the globals only it named; on a set without the variant it returns false and changes nothing (`manifest_test.cpp`).
@@ -5383,6 +5723,13 @@ and refuses to load otherwise (its attention is OPEN-PREFILL-ATTN-FA's where the
 without); `oflm run|serve|bench --prefill-mode bfp16` selects it (the NPU glue of OPEN-PREFILL-GLUE-PREP comes with it).
 **The default route is the single constant `kDefaultPrefillRoute` in `core.cpp`** (`"fast"`; set it to `"bfp16"` to flip
 the default for Granite, nothing else needs to change).
+
+Gemma 4 12B (OPEN-FAMILY-GEMMA4, 2026-10-30) is the exception in Phlegm. Its recipe carries the bfp16 route as the GGUF
+view's `gemm_block`, so `fast` (the default) runs it, and the q4 route as `lean`. That route is on the dense chain
+(`step_gemm_block_layer`, or its step-major `dense_layer_staged`), not the MoE kinds' `gemm_phase`. Its weights come from
+the GGUF's own blocks, and its FFN keeps the five steps because the `glu` epilogue computes SiLU, not Gemma's GELU-tanh.
+On this route alone the GELU-tanh act runs in fp32 on the host's vector unit (`gelu_bfp16_a`, `OFLM_OPEN_GELU32=0` keeps
+the fp64 act); the q4 route keeps fp64.
 
 Why bfp16 and not int8 (the question this requirement answers): the q4_1 weight carries a scale and a min per (row, 32 k), so an
 int8 product needs an int32 rescale every 32 k or a second, per-row weight quantisation; bfp16 has the per-8-k exponent in

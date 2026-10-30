@@ -31,7 +31,7 @@ Options:
   --output-tokens N           output tokens, including the first (default 128)
   --context N                 context capacity (default 8192)
   --prefill-route MODE        auto | sequential | block (default auto)
-  --prefill-mode MODE         fast | lean (default fast)
+  --prefill-mode MODE         fast | lean | accurate (= lean; default fast)
   --threads N                 OpenMP threads (default logical CPU count)
   --driver-version VERSION    override detected NPU driver version
   --machine-info FILE         use explicitly supplied machine JSON

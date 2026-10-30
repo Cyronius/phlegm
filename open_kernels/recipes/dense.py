@@ -318,9 +318,10 @@ def stream_knobs(spec: ModelSpec) -> tuple[int, bool]:
     """(memtile ring depth in weight elements, 0 = shim straight to the core; early weight issue)."""
     on = spec.family in STREAM_MEASURED and not spec.sandwich_norms and spec.quant == "q4_1"
     ring = int(os.environ.get("DX_WRING", WRING_DEPTH if on else 0))
+    # A sandwich family (Gemma 3 / 4) gets the early issue only when DX_WORDER=1 forces it, for
+    # an A/B build: its two extra norm round trips sit between o and up | gate, where no weight
+    # await depends on them (o needs xn, up | gate band 0 needs xm), but it has not been measured.
     order = os.environ.get("DX_WORDER", "1" if on else "0") == "1"
-    if order and spec.sandwich_norms:
-        raise OpRangeError("dense: DX_WORDER covers the plain norm sequence only")
     return ring, order
 
 

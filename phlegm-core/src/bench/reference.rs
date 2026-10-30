@@ -39,6 +39,15 @@ pub struct ReferenceInfo {
     pub model_config_sha256: Option<String>,
 }
 
+/// `accurate` is the lean prefill route by what it buys (OPEN-PREFILL-MODE); reports record `lean`.
+fn canonical_prefill_mode(mode: &str) -> String {
+    if mode == "accurate" {
+        "lean".into()
+    } else {
+        mode.into()
+    }
+}
+
 impl ReferenceInfo {
     pub fn validate(&self) -> Result<(), String> {
         if self.engine != BACKEND_NAME
@@ -322,7 +331,8 @@ pub struct ReferenceBackend {
 }
 
 impl ReferenceBackend {
-    pub fn load(options: ReferenceOptions) -> Result<Self, String> {
+    pub fn load(mut options: ReferenceOptions) -> Result<Self, String> {
+        options.prefill_mode = canonical_prefill_mode(&options.prefill_mode);
         if options.threads == 0
             || options.request_timeout.is_zero()
             || options.dispatch_timeout_ms == 0
@@ -601,6 +611,14 @@ mod tests {
     }
 
     #[test]
+    fn accurate_is_the_lean_prefill_mode() {
+        assert_eq!(canonical_prefill_mode("accurate"), "lean");
+        assert_eq!(canonical_prefill_mode("lean"), "lean");
+        assert_eq!(canonical_prefill_mode("fast"), "fast");
+        assert_eq!(canonical_prefill_mode("other"), "other");
+    }
+
+    #[test]
     fn power_mode_parser_requires_an_explicit_mode() {
         assert_eq!(
             parse_power_mode("Platform\n  Power Mode : Turbo\n").unwrap(),
@@ -648,6 +666,7 @@ pub struct NpuOptions {
 
 impl NpuBackend {
     pub fn load(mut options: NpuOptions) -> Result<Self, String> {
+        options.prefill_mode = canonical_prefill_mode(&options.prefill_mode);
         if options.threads == 0
             || options.request_timeout.is_zero()
             || options.dispatch_timeout_ms == 0

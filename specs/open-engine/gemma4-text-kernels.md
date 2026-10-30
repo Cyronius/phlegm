@@ -70,7 +70,33 @@ The `gemma4` family in `open_kernels/recipes/gemma4.py` was imported on
 `designs/dense/dx.py` layer once per layer type, for 12B only. Requirement,
 upstream hardware result and open items are in `OPEN-FAMILY-GEMMA4` in
 `spec.md`; import validation is in `open_kernels/UPSTREAM.md`. Upstream
-measured that route on the GGUF container. Phlegm has not run it on hardware.
+measured that route on the GGUF container on Strix Point. Phlegm ran it on
+Strix Halo on 2026-10-29. Greedy decode matched an independent reference, and
+layer 0 confirmed the 1024-row window at positions 1023-1025. The same day, a
+block prefill route (`gemma4.gemm_route`) gave the same greedy tokens at 147
+instead of 325 ms per prompt token and passed the same window check. It is on
+by default for the GGUF route; `DENSE_GGUF_GEMM=0` at export leaves it out. The
+GGUF route also stores its weights in 5120-byte chunks by default, with the
+same output bits and about 11% faster decode. Block prefill's attention then
+moved to NPU matrix products per kv head: 56 instead of 134 ms per prompt
+token in adjacent runs, the same greedy tokens and a lighter KL tail. Those
+runs had one host thread, because the dev environment exports
+`OMP_NUM_THREADS=1`. At 8 threads, with bit-identical host stages, one
+hardware context for all attention products and a layer-major schedule, the
+same prompt takes 22-23 ms per token with every prefill logit unchanged. On
+2026-10-30 the default prefill moved its five projections to bfp16 GEMMs
+(`designs/gemm_bfp16`), with the q4 route kept as `--prefill-mode lean`. In
+adjacent runs under heavier load, that took 12-13 against 29 ms per prompt
+token. Both greedy runs were unchanged. Next-token loss was within 0.3% of
+lean's, top-1 agreement with the reference was 2.5 points lower, and the KL
+distribution was about 10 times wider. Later that day each layer ran step by
+step over every block, with the host's work under the next dispatch, and the
+bfp16 route's GELU moved to fp32. The scores of Q's two halves also became one
+product. The schedule and the stacked scores left every logit unchanged.
+Fast took 9.2-10.0 s for the 1450-token prompt (6-7 ms per token) against
+16.1-16.3 s on the old stages, and lean 28.4 against 37.5 s. Both gates still
+pass with the fp32 GELU. The measured results and the decode profile are in
+`OPEN-FAMILY-GEMMA4`.
 
 The two implementations agree on 12B's layer types, global geometry, K=V
 before separate norms, unit score scale, V norm, proportional RoPE pairing and
