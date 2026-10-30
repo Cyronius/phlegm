@@ -2040,15 +2040,50 @@ sources rebuild exactly), 8 host threads, load average 33-40.
   schedule against 22.1 GB on the old (fast) and 16.7 against 16.6 GB
   (lean): the twins add about 0.15 GB.
 
+**Host copies cut (2026-10-30, later).** Four more changes, none to the
+arithmetic:
+- attention_prep takes each position's rope angles once, not once a head;
+- up writes its own output pair, so gate's post reads it in place;
+- gate's post encodes h straight into its block's down input, and gate
+  reuses the x twin up packed;
+- qkv3's rows go straight into q, k and v, and the stacked scores' softmax
+  adds hi and lo as it reads them.
+`OFLM_OPEN_PIPE_LOG=1` prints each step's host stage and post time and its
+wait on the NPU.
+
+**Result (measured in Phlegm, 2026-10-30, development runs, load average
+33-37):** binary `pipe4` (3dba4894), kernels `gemma4-12b-shl`.
+- Every prefill logit unchanged: fast 0 of 1482 and 0 of 58 dumps differ
+  against the earlier fast runs, lean 0 of 1482. The angle tables alone
+  (`pipe3`) also gave 0 of 1482 and 0 of 58. Host unit tests: the row parts
+  and the summed softmax match the paths they replace bit for bit.
+- Prefill, 1450 tokens, alternating with `pipe2`: 9.7 / 9.4 s against 10.0 /
+  10.1 s, 4-7% faster.
+- The host now mostly waits on the NPU: 1.9-2.0 s blocked on GEMMs and 1.9 s
+  on attention products, against 1.5-1.6 s and 1.7 s with `pipe3`. Each kernel runs
+  slower inside the prefill than alone (`--bench-kernel`, same machine, mean):
+  - `ag_pv1280_local`: 0.73 ms inside against 0.33 alone;
+  - `ag_shl1280_local`: 1.07 against 0.69;
+  - `gemm_bfp16_n15360_k3840`: 3.0-3.3 against 2.61.
+  Where the difference comes from is not measured. Candidates are memory
+  traffic and package power from the host work running beside each dispatch,
+  and from the other session's processes.
+- Host threads on this schedule, two interleaved runs each: 4 threads 9.4 /
+  9.2 s, 6 9.4 / 9.0, 8 9.4 / 9.2, 12 10.3 / 11.5. Four to eight are equal
+  within this load's spread; twelve is slower.
+- The attention products run at 1.1-1.4 TFLOPS alone (`ag_shl1280_local`
+  0.67 GFLOP in 0.49 ms minimum), against 8.8-12.1 for the bfp16 GEMMs.
+
 **Open:** the `model.q4nx` route has not run. FLM's 12B package stores 16-row
 signed-q4 tiles (2304 B), a 16-row q8 head (4352 B) and a BF16 embedding
 table; both packers (`pack.q4_chunks_of`, `pools.cpp`) read 5120, 8704 and
 4736-byte chunks only, and the plan packs the head as q4 (`gemma4-text-kernels.md`). Also open: catalogue
 validation, vision and audio. Block prefill is GGUF-only. Its softmax and
 layer tail stay on the host, and its KL tail is still heavier than sequential
-decode's (more so on the default bfp16 route). On the step-major schedule the
-attention products (about 3,900 dispatches for 1450 tokens) and the host
-halves of the o and qkv3 steps are most of a prefill. The step-major schedule
+decode's (more so on the default bfp16 route). On the step-major schedule a
+prefill is mostly NPU time: the attention products (about 3,900 small
+dispatches for 1450 tokens, at about a tenth of the GEMMs' rate) and every
+kernel's slowdown inside the prefill against alone. The step-major schedule
 has run only on Gemma 4: the other dense families reach it only through
 `OFLM_OPEN_DENSE_LAYER_MAJOR=1`, ungated. Runs that source `env.sh` must
 set `OMP_NUM_THREADS`. The best count under other load is not settled: 8

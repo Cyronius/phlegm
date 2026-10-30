@@ -247,7 +247,11 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   That changes a few mantissas a layer; `OFLM_OPEN_GELU32=0` keeps the fp64 act. An optional
   `attn_block.kernels_shl` stacks Q's hi and lo halves into one scores product of twice the
   rows (`OFLM_OPEN_ATTN_SHL=0` keeps two). The `bfp16_gemm` packer no longer divides per
-  block, and a pack-built weight zeroes only the bytes no op writes. `--prefill-mode accurate`
+  block, and a pack-built weight zeroes only the bytes no op writes. Later the same day the
+  host stopped four copies without changing a logit: rope angles once a position, up's own
+  output pair, gate's h straight into down's input, qkv3's rows straight into q / k / v.
+  The stacked softmax also adds hi and lo as it reads them. `OFLM_OPEN_PIPE_LOG=1` prints
+  per-step host and wait times. `--prefill-mode accurate`
   is another name for `lean` in the engine and CLI; `oflm`'s own flag parser is outside this
   clone and still takes `fast|lean|bfp16`. Kernel sets need nothing new: without
   `kernels_shl` the scores take two dispatches. The diff applies over `beccd46` plus the six

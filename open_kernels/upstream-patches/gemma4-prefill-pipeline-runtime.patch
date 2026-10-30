@@ -45,10 +45,40 @@ index 51fc946..4c1b23b 100644
  /// column c holds M * N / cols floats, for each block of m * rows rows its n-groups in order, each block
  /// row-major (rows of n floats), so a row's n columns of one tile are contiguous.
 diff --git a/src/open_qwen36/block_host.cpp b/src/open_qwen36/block_host.cpp
-index 5c15d16..d5127e5 100644
+index 5c15d16..a70f7eb 100644
 --- a/src/open_qwen36/block_host.cpp
 +++ b/src/open_qwen36/block_host.cpp
-@@ -264,12 +264,32 @@ void act_tile(const double* act, const float* up, size_t T, size_t K, uint16_t*
+@@ -46,15 +46,23 @@ void rms_vec(const float* x, size_t d, const float* w, double eps, float* out) {
+     for (size_t j = 0; j < d; ++j) out[j] = x[j] * r * w[j];
+ }
+ 
+-// `pairs` rotated pairs, dim i with dim i + dist (Gemma 4's proportional rotation: rot / 2 pairs
+-// at distance hd / 2); rope() below is the half-split case, dist == pairs
+-void rope_pairs(float* x, size_t pairs, size_t dist, const double* inv_freq, double pos) {
++// one position's rotation: pair i (dim i with dim i + dist, Gemma 4's proportional rotation turning
++// rot / 2 pairs at distance hd / 2) by pos * inv_freq[i], its cos and sin rounded to f32. Every head
++// at the position turns by the same angles, so they are taken once a position
++void rope_angles(size_t pairs, const double* inv_freq, double pos, float* c, float* s) {
+     for (size_t i = 0; i < pairs; ++i) {
+         const double a = pos * inv_freq[i];
+-        const float c = static_cast<float>(std::cos(a)), s = static_cast<float>(std::sin(a));
++        c[i] = static_cast<float>(std::cos(a));
++        s[i] = static_cast<float>(std::sin(a));
++    }
++}
++
++// the `pairs` rotations from rope_angles' tables; rope() below is the half-split case, dist == pairs
++void rope_pairs_cs(float* x, size_t pairs, size_t dist, const float* c, const float* s) {
++    for (size_t i = 0; i < pairs; ++i) {
+         const float x1 = x[i], x2 = x[dist + i];
+-        x[i] = x1 * c - x2 * s;
+-        x[dist + i] = x2 * c + x1 * s;
++        x[i] = x1 * c[i] - x2 * s[i];
++        x[dist + i] = x2 * c[i] + x1 * s[i];
+     }
+ }
+ 
+@@ -264,12 +272,32 @@ void act_tile(const double* act, const float* up, size_t T, size_t K, uint16_t*
          }
  }
  
@@ -86,16 +116,23 @@ index 5c15d16..d5127e5 100644
  }
  
  void bfp16_untile_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t n_real, float* y) {
-@@ -294,21 +314,60 @@ void bfp16_rows_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size
+@@ -293,24 +321,80 @@ void bfp16_rows_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size
+     }
  }
  
- void act_bfp16_a(const double* act, const float* up, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out) {
+-void act_bfp16_a(const double* act, const float* up, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out) {
 -    if (T % (t.m * t.rows) || K % (t.n * t.cols) || t.n % 8)
-+    if (T % (t.m * t.rows) || K % (t.n * t.cols) || t.n % 8 || t.m % 16)
-         throw std::runtime_error("open_qwen36: act_bfp16_a: T or K does not tile");
--#pragma omp parallel for
+-        throw std::runtime_error("open_qwen36: act_bfp16_a: T or K does not tile");
++void bfp16_rows_parts(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t rows, const TransposePart* parts,
++                      size_t n_parts) {
++    if (rows > M) throw std::runtime_error("open_qwen36: bfp16_rows_parts: more rows than C has");
++    for (size_t i = 0; i < n_parts; ++i)
++        if (parts[i].off % t.n || parts[i].width % t.n || parts[i].off + parts[i].width > N)
++            throw std::runtime_error("open_qwen36: bfp16_rows_parts: a part is not whole c-tiles of C");
+ #pragma omp parallel for
 -    for (long long rr = 0; rr < static_cast<long long>(T); ++rr) {
--        const size_t r = static_cast<size_t>(rr);
++    for (long long rr = 0; rr < static_cast<long long>(rows); ++rr) {
+         const size_t r = static_cast<size_t>(rr);
 -        float h[8];
 -        for (size_t n0 = 0; n0 < K; n0 += t.n) {
 -            const size_t o = bfp16_c_offset(r, n0, T, K, t);       // the tile's row: t.n contiguous columns
@@ -103,6 +140,18 @@ index 5c15d16..d5127e5 100644
 -                for (size_t i = 0; i < 8; ++i)
 -                    h[i] = static_cast<float>(act[o + j + i] * static_cast<double>(up[o + j + i]));
 -                bfp16_encode_block(h, out + bfp16_a_offset(r, (n0 + j) / 8, K, t));
+-            }
++        for (size_t i = 0; i < n_parts; ++i) {
++            const TransposePart& pt = parts[i];
++            for (size_t n0 = 0; n0 < pt.width; n0 += t.n)
++                std::memcpy(pt.dst + r * pt.width + n0, c + bfp16_c_offset(r, pt.off + n0, M, N, t), t.n * 4);
+         }
+     }
+ }
+ 
++void act_bfp16_a(const double* act, const float* up, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out) {
++    if (T % (t.m * t.rows) || K % (t.n * t.cols) || t.n % 8 || t.m % 16)
++        throw std::runtime_error("open_qwen36: act_bfp16_a: T or K does not tile");
 +    encode_a_tiles(T, K, t, out, [&](size_t r0, size_t col, float* h) {
 +        // 16 rows of one c-tile (r0 is a multiple of 16, inside one m * rows block): t.n floats apart
 +        const size_t o0 = bfp16_c_offset(r0, col, T, K, t);
@@ -110,7 +159,7 @@ index 5c15d16..d5127e5 100644
 +            for (size_t j = 0; j < 8; ++j) {
 +                const size_t o = o0 + i * t.n + j;
 +                h[8 * i + j] = static_cast<float>(act[o] * static_cast<double>(up[o]));
-             }
++            }
 +    });
 +}
 +
@@ -153,17 +202,110 @@ index 5c15d16..d5127e5 100644
 +            const __m256 m2z = _mm256_mul_ps(_mm256_mul_ps(c, g), _mm256_fmadd_ps(c3, _mm256_mul_ps(g, g), one));
 +            const __m256 act = _mm256_div_ps(g, _mm256_add_ps(one, exp8(m2z)));
 +            _mm256_store_ps(h + 8 * i, _mm256_mul_ps(act, _mm256_loadu_ps(up + o)));
-         }
--    }
++        }
 +    });
++}
++
+ void sandwich_rows(const float* y, const double* x, size_t T, size_t hid, size_t groups, const float* w_post,
+                    const float* w_next, double eps, double* res, float* next) {
+     if (!groups || hid % groups) throw std::runtime_error("open_qwen36: sandwich_rows: groups does not divide the row");
+@@ -590,16 +674,17 @@ void attention_prep(const AttnGeom& g, const float* q, const float* k, const flo
+     std::fill(Q, Q + g.T * qw, 0.f);
+ #pragma omp parallel
+     {
+-    std::vector<float> kh(kvw);                 // once a thread, not once a token
++    std::vector<float> kh(kvw), cs(2 * half);  // once a thread, not once a token
+ #pragma omp for
+     for (long long tt = 0; tt < static_cast<long long>(R); ++tt) {
+         const size_t t = static_cast<size_t>(tt), p = g.pos0 + t;
++        rope_angles(half, inv_freq, static_cast<double>(p), cs.data(), cs.data() + half);
+         for (size_t h = 0; h < g.nh; ++h) {
+             float* dst = Q + t * qw + h * g.hd;
+             const float* src = q + t * qw + h * g.hd;
+             if (qn) rms_vec(src, g.hd, qn, g.eps, dst);
+             else std::copy(src, src + g.hd, dst);
+-            rope_pairs(dst, half, dist, inv_freq, static_cast<double>(p));
++            rope_pairs_cs(dst, half, dist, cs.data(), cs.data() + half);
+             if (scale != 1.0f)
+                 for (size_t j = 0; j < g.hd; ++j) dst[j] *= scale;
+         }
+@@ -607,7 +692,7 @@ void attention_prep(const AttnGeom& g, const float* q, const float* k, const flo
+             const float* src = k + t * kvw + h * g.hd;
+             if (kn) rms_vec(src, g.hd, kn, g.eps, kh.data() + h * g.hd);
+             else std::copy(src, src + g.hd, kh.data() + h * g.hd);
+-            rope_pairs(kh.data() + h * g.hd, half, dist, inv_freq, static_cast<double>(p));
++            rope_pairs_cs(kh.data() + h * g.hd, half, dist, cs.data(), cs.data() + half);
+         }
+         for (size_t j = 0; j < kvw; ++j) kv[p * kv_row_elems + j] = f32_to_bf16(kh[j]);
+         for (size_t h = 0; h < g.kvh; ++h) {
+@@ -662,12 +747,14 @@ void tile_rows_as_b(const uint16_t* rows, size_t stride, size_t k_real, size_t k
+     }
  }
  
- void sandwich_rows(const float* y, const double* x, size_t T, size_t hid, size_t groups, const float* w_post,
+-void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, const size_t* pos, float* m, float* l,
+-                   float* acc, uint16_t* p, size_t window) {
++namespace {
++// softmax_chunk's rows with the score of (row r, column j) read through `score`
++template <class Score>
++void softmax_rows(size_t M, size_t L, size_t hd, size_t c0, const Score& score, const size_t* pos, float* m, float* l,
++                  float* acc, uint16_t* p, size_t window) {
+ #pragma omp parallel for
+     for (long long rr = 0; rr < static_cast<long long>(M); ++rr) {
+         const size_t r = static_cast<size_t>(rr);
+-        const float* sr = s + r * L;
+         uint16_t* pr = p + r * L;
+         const size_t valid = pos[r] >= c0 ? std::min(L, pos[r] - c0 + 1) : 0;
+         // under a sliding window the row reads (pos - window, pos]: columns before j0 are masked too
+@@ -678,7 +765,7 @@ void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, con
+             continue;
+         }
+         float mc = -std::numeric_limits<float>::infinity();
+-        for (size_t j = j0; j < valid; ++j) mc = std::max(mc, sr[j]);
++        for (size_t j = j0; j < valid; ++j) mc = std::max(mc, score(r, j));
+         const float m_new = std::max(m[r], mc);
+         if (m[r] != m_new && l[r] != 0.f) {    // an earlier chunk's max is beaten: rescale what it accumulated
+             const float a = std::exp(m[r] - m_new);
+@@ -689,7 +776,7 @@ void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, con
+         double sum = 0;
+         std::fill(pr, pr + j0, uint16_t{0});
+         for (size_t j = j0; j < valid; ++j) {
+-            const uint16_t b = f32_to_bf16(std::exp(sr[j] - m_new));
++            const uint16_t b = f32_to_bf16(std::exp(score(r, j) - m_new));
+             pr[j] = b;
+             sum += bf16_to_f32(b);
+         }
+@@ -698,6 +785,18 @@ void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, con
+         m[r] = m_new;
+     }
+ }
++}  // namespace
++
++void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, const size_t* pos, float* m, float* l,
++                   float* acc, uint16_t* p, size_t window) {
++    softmax_rows(M, L, hd, c0, [s, L](size_t r, size_t j) { return s[r * L + j]; }, pos, m, l, acc, p, window);
++}
++
++void softmax_chunk_sum(size_t M, size_t L, size_t hd, size_t c0, const float* hi, const float* lo, const size_t* pos,
++                       float* m, float* l, float* acc, uint16_t* p, size_t window) {
++    softmax_rows(M, L, hd, c0, [hi, lo, L](size_t r, size_t j) { return hi[r * L + j] + lo[r * L + j]; }, pos, m, l, acc, p,
++                 window);
++}
+ 
+ void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, const float* Wr, float* probs,
+                   int32_t* idx, float* w) {
 diff --git a/src/open_qwen36/block_host.hpp b/src/open_qwen36/block_host.hpp
-index af19846..bc3fce1 100644
+index af19846..71fa7bb 100644
 --- a/src/open_qwen36/block_host.hpp
 +++ b/src/open_qwen36/block_host.hpp
-@@ -63,6 +63,12 @@ void bfp16_rows_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size
+@@ -59,10 +59,20 @@ void bfp16_pack_a(const float* x, size_t T, size_t K, const Bfp16Tiling& t, uint
+ void bfp16_untile_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t n_real, float* y);
+ /// ... -> y [rows, n_real], token rows: the first `rows` of the M, the first n_real of the N (padding dropped).
+ void bfp16_rows_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t rows, size_t n_real, float* y);
++/// bfp16_rows_c into the ranges the caller reads them as: columns [off, off + width) of each of the first `rows`
++/// rows land in dst as [rows, width], as transpose_parts does from [N, T]. Every off and width a multiple of t.n.
++void bfp16_rows_parts(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t rows, const TransposePart* parts,
++                      size_t n_parts);
+ /// act_tile for the bfp16 route: act (act_fp64 of the gate) and up, both c-tiled T x K outputs, give
  /// h = act * up rounded to fp32, encoded as the down projection's A operand -- bfp16_pack_a of the [T, K] h,
  /// byte for byte, without untiling either input or holding h.
  void act_bfp16_a(const double* act, const float* up, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out);
@@ -176,11 +318,37 @@ index af19846..bc3fce1 100644
  
  struct DeltaGeom {
      size_t T = 0, t_real = 0, hid = 0;
+@@ -160,6 +170,9 @@ void tile_rows_as_b(const uint16_t* rows, size_t stride, size_t k_real, size_t k
+ /// kernel will multiply is what the denominator counts. Start with m = -inf, l = 0, acc = 0.
+ void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, const size_t* pos, float* m, float* l,
+                    float* acc, uint16_t* p, size_t window = 0);
++/// softmax_chunk of s = hi + lo (each [M, L]), the f32 sum taken as each score is read, never stored
++void softmax_chunk_sum(size_t M, size_t L, size_t hd, size_t c0, const float* hi, const float* lo, const size_t* pos,
++                       float* m, float* l, float* acc, uint16_t* p, size_t window = 0);
+ 
+ /// The MoE router over a block: softmax of xm [T, hid] @ Wr [hid, E] into probs [T, E], the
+ /// top-k by probability (lowest index on a tie, as the kernel's router_fin picks) into
 diff --git a/src/open_qwen36/block_host_test.cpp b/src/open_qwen36/block_host_test.cpp
-index 521c7a2..575a659 100644
+index 521c7a2..81222b7 100644
 --- a/src/open_qwen36/block_host_test.cpp
 +++ b/src/open_qwen36/block_host_test.cpp
-@@ -472,6 +472,37 @@ int main(int argc, char** argv) {
+@@ -456,6 +456,15 @@ int main(int argc, char** argv) {
+         for (size_t r = 0; r < 300; ++r)
+             for (size_t n = 0; n < 1920; ++n) ok = ok && rows[r * 1920 + n] == static_cast<float>(r * N + n);
+         check(ok, "bfp16_rows_c: the c-tiled output back to token rows, padding rows and columns dropped");
++        std::vector<float> p0(300 * 1024), p1(300 * 768);
++        const host::TransposePart parts[2] = {{p0.data(), 0, 1024}, {p1.data(), 1152, 768}};
++        host::bfp16_rows_parts(c.data(), M, N, Bfp16Tiling{}, 300, parts, 2);
++        ok = true;
++        for (size_t r = 0; r < 300; ++r) {
++            for (size_t n = 0; n < 1024; ++n) ok = ok && p0[r * 1024 + n] == static_cast<float>(r * N + n);
++            for (size_t n = 0; n < 768; ++n) ok = ok && p1[r * 768 + n] == static_cast<float>(r * N + 1152 + n);
++        }
++        check(ok, "bfp16_rows_parts: column ranges of the token rows, each into its own [rows, width]");
+ 
+         // act and up c-tiled as gate | up come off the kernel: [T, ff] = [256, 2048]
+         const size_t TT = 256, FF = 2048;
+@@ -472,6 +481,56 @@ int main(int argc, char** argv) {
          host::act_bfp16_a(act.data(), up.data(), TT, FF, Bfp16Tiling{}, fused.data());
          host::bfp16_pack_a(hrow.data(), TT, FF, Bfp16Tiling{}, ref.data());
          check(fused == ref, "act_bfp16_a: bfp16_pack_a of the untiled act * up, byte for byte");
@@ -215,6 +383,25 @@ index 521c7a2..575a659 100644
 +                    "worst %.2f quanta\n", blocks_diff, fused.size() / BFP16_BLOCK_BYTES, vals_diff, TT * FF, worst);
 +        check(worst <= 1.0 && vals_diff * 1000 < TT * FF,
 +              "gelu_bfp16_a: within one quantum of the fp64 act's encode, on under 0.1% of the values");
++    }
++
++    // ---- the stacked scores' softmax: hi + lo as it reads them, the bits of the softmax over the stored sum
++    {
++        const size_t M = 64, L = 512, hd = 32, c0 = 256, window = 300;
++        std::vector<float> hi(M * L), lo(M * L), sum(M * L);
++        for (size_t i = 0; i < M * L; ++i) {
++            hi[i] = static_cast<float>(std::sin(0.37 * static_cast<double>(i)) * 9.0);
++            lo[i] = static_cast<float>(std::cos(0.11 * static_cast<double>(i)) * 3e-3);
++            sum[i] = hi[i] + lo[i];
++        }
++        std::vector<size_t> pos(M);
++        for (size_t r = 0; r < M; ++r) pos[r] = 400 + r * 5;
++        std::vector<float> m1(M, -INFINITY), l1(M, 0.f), m2(M, -INFINITY), l2(M, 0.f), acc(M * hd, 0.f);
++        std::vector<uint16_t> pa(M * L), pb(M * L);
++        host::softmax_chunk(M, L, hd, c0, sum.data(), pos.data(), m1.data(), l1.data(), acc.data(), pa.data(), window);
++        host::softmax_chunk_sum(M, L, hd, c0, hi.data(), lo.data(), pos.data(), m2.data(), l2.data(), acc.data(), pb.data(), window);
++        check(pa == pb && std::memcmp(m1.data(), m2.data(), M * 4) == 0 && std::memcmp(l1.data(), l2.data(), M * 4) == 0,
++              "softmax_chunk_sum: softmax_chunk of the stored hi + lo, bit for bit (window and causal mask)");
      }
  
      std::printf("%s\n", failures ? "FAIL" : "PASS");
@@ -232,7 +419,7 @@ index c73fd47..5c3550b 100644
      }
      return a;
 diff --git a/src/open_qwen36/core.cpp b/src/open_qwen36/core.cpp
-index a7a3e79..bc6ad58 100644
+index a7a3e79..2cc7e44 100644
 --- a/src/open_qwen36/core.cpp
 +++ b/src/open_qwen36/core.cpp
 @@ -206,8 +206,10 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
@@ -255,16 +442,17 @@ index a7a3e79..bc6ad58 100644
      }
      for (const auto& s : w_->tail) wanted[s.kernel] = true;
      if (rows_l()) {
-@@ -386,6 +389,8 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
+@@ -386,6 +389,9 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
      if (const char* env = std::getenv("OFLM_OPEN_ATTN_BLOCK")) attn_block_on_ = std::string(env) != "0";
      if (const char* env = std::getenv("OFLM_OPEN_LAYER_MAJOR")) layer_major_on_ = std::string(env) != "0";
      if (const char* env = std::getenv("OFLM_OPEN_STAGE_MAJOR")) stage_major_on_ = std::string(env) != "0";
 +    if (const char* env = std::getenv("OFLM_OPEN_GELU32")) gelu32_on_ = std::string(env) != "0";
 +    if (const char* env = std::getenv("OFLM_OPEN_ATTN_SHL")) attn_shl_on_ = std::string(env) != "0";
++    pipe_log_ = std::getenv("OFLM_OPEN_PIPE_LOG") != nullptr;
      if (const char* env = std::getenv("OFLM_OPEN_DENSE_LAYER_MAJOR")) dense_layer_major_ = std::string(env) != "0";
      dispatch_log_ = std::getenv("OFLM_OPEN_DISPATCH_LOG") != nullptr;
      // Stage 2.5 Gate A: per-dxB-dispatch phase CSV (layer,pos,patch,prep,submit,wait,read).
-@@ -481,7 +486,10 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
+@@ -481,7 +487,10 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
                                    : "not in this kernel set (attention on the host)"));
      if (gemm_block_t_)
          log(std::string("prefill schedule: ") +
@@ -276,7 +464,7 @@ index a7a3e79..bc6ad58 100644
                   ? std::string("layer-major (the whole prompt through each layer), stage-major inside it (every block's"
                                 " qkv3, then their attention, then the rest: two context switches a layer)")
               : layer_major_ok() ? std::string(any_moe ? "layer-major (the whole prompt through each layer, one MoE pass a layer)"
-@@ -609,7 +617,9 @@ void Core::load_weights(const std::function<void(int, int)>& progress) {
+@@ -609,7 +618,9 @@ void Core::load_weights(const std::function<void(int, int)>& progress) {
                  size_t bytes = 0;
  for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::op_bytes(o, w_->chunk_bytes));
                  xrt::bo w = xrt::ext::bo(*dev_, padup(bytes));
@@ -287,7 +475,7 @@ index a7a3e79..bc6ad58 100644
                  for (const PackOp& o : gw.pack) pools::apply(o, *file_, l, w.map<uint8_t*>(), bytes, w_->chunk_bytes);
                  w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                  v[l] = std::move(w);
-@@ -814,13 +824,18 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
+@@ -814,13 +825,24 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
          }
      }
      // a "#1" twin per staged GEMM step's x / y, so the host fills or reads one while the NPU uses the other
@@ -301,13 +489,19 @@ index a7a3e79..bc6ad58 100644
                  for (const Step& s : *prog)
                      for (const std::string& name : {s.args[1], s.args[2]})
                          if (!globals_.count(name + "#1")) globals_[name + "#1"] = alloc(w_->globals.at(name));
-+            if (dense_staged)
++            if (dense_staged) {
 +                for (const std::string& name : gb.attn_block.args)
 +                    if (!globals_.count(name + "#1")) globals_[name + "#1"] = alloc(w_->globals.at(name));
++                // up's own output pair where it shares gate's, so gate's post reads up where it landed
++                const std::string& yu = gb.program[3].args[2];
++                if (yu == gb.program[2].args[2])
++                    for (const std::string& name : {yu + "@up", yu + "@up#1"})
++                        if (!globals_.count(name)) globals_[name] = alloc(w_->globals.at(yu));
++            }
          }
      for (const auto& [name, rg] : w_->per_row_globals) {
          std::vector<uint8_t> pt(cfg_.max_ctx * rg.per_row);
-@@ -1364,7 +1379,7 @@ void Core::bench_kernel(const std::string& name, int reps, int layer, int warm_t
+@@ -1364,7 +1386,7 @@ void Core::bench_kernel(const std::string& name, int reps, int layer, int warm_t
          for (int l = 0; l < nl_ && !args; ++l) {
              const AttnBlock& ab = types_[l]->gemm_block.attn_block;
              if (!ab.present()) continue;
@@ -316,7 +510,7 @@ index a7a3e79..bc6ad58 100644
                  for (const auto& [len, kn] : *m)
                      if (kn == name) args = &ab.args;
          }
-@@ -2912,11 +2927,19 @@ void Core::step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, siz
+@@ -2912,11 +2934,19 @@ void Core::step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, siz
          std::memcpy(gate, buffer(sg.args[2], 0).map<const float*>(), ff * T * 4);
          timing_.gemm_tr_ms += ms_since(th);
          if (su.args[1] != sg.args[1]) stage_x(3, xm, hid);   // else up's x is gate's, already on the device
@@ -338,7 +532,7 @@ index a7a3e79..bc6ad58 100644
          timing_.tail_ms += ms_since(th);                       // under the up dispatch
          const double submit = f.submit_ms;
          const double elapsed = wait_run(f).first;
-@@ -2928,17 +2951,12 @@ void Core::step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, siz
+@@ -2928,17 +2958,12 @@ void Core::step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, siz
          timing_.gemm_tr_ms += ms_since(th);
          th = std::chrono::steady_clock::now();
          xrt::bo& xd = buffer(sd.args[1], 0);
@@ -358,11 +552,12 @@ index a7a3e79..bc6ad58 100644
          else host::act_tile(act, yu.map<const float*>(), T, ff, xd.map<uint16_t*>());
          timing_.tail_ms += ms_since(th);
          th = std::chrono::steady_clock::now();
-@@ -3162,7 +3180,12 @@ void Core::step_gemm_prompt_dense(const std::vector<int>& ids, bool want_logits)
+@@ -3162,7 +3187,13 @@ void Core::step_gemm_prompt_dense(const std::vector<int>& ids, bool want_logits)
      }
      timing_.setup_ms += ms_since(tsetup);
      auto t_real = [&](size_t b) { return std::min(T, N - b * T); };
 +    const bool staged = dense_staged_ok();
++    pipe_stats_.clear();
      for (int l = 0; l < nl_; ++l) {
 +        if (staged) {
 +            dense_layer_staged(l, x, B, T, N, pos0);
@@ -371,10 +566,19 @@ index a7a3e79..bc6ad58 100644
          for (size_t b = 0; b < B; ++b) step_gemm_block_layer(l, x[b], T, t_real(b), kStageQkv, &y[b], nullptr);
          for (size_t b = 0; b < B; ++b) {
              pos_ = static_cast<int>(pos0 + b * T);       // the attention reads its block's position from pos_
-@@ -3191,6 +3214,450 @@ void Core::step_gemm_prompt_dense(const std::vector<int>& ids, bool want_logits)
+@@ -3189,6 +3220,492 @@ void Core::step_gemm_prompt_dense(const std::vector<int>& ids, bool want_logits)
+         tail_logits(row.data());
+     }
      timing_.total_ms = ms_since(t0);
- }
- 
++    if (pipe_log_ && !pipe_stats_.empty()) {
++        std::fprintf(stderr, "open_qwen36: pipeline steps (host stage / post, blocked on the NPU, start to wait's return; ms)\n");
++        std::fprintf(stderr, "  %-20s %6s %9s %9s %9s %9s\n", "step", "jobs", "stage", "post", "blocked", "elapsed");
++        for (const auto& [tag, ps] : pipe_stats_)
++            std::fprintf(stderr, "  %-20s %6zu %9.1f %9.1f %9.1f %9.1f\n", tag.c_str(), ps.n, ps.stage_ms, ps.post_ms,
++                         ps.blocked_ms, ps.elapsed_ms);
++    }
++}
++
 +bool Core::dense_staged_ok() const {
 +    if (!stage_major_on_ || !dense_layer_major_ok() || host_attn_on_ || !attn_block_on_) return false;
 +    for (int l = 0; l < nl_; ++l) {
@@ -396,24 +600,37 @@ index a7a3e79..bc6ad58 100644
 +        wait_ms += f.submit_ms;
 +        return f;
 +    };
++    // the host's halves, timed per step for OFLM_OPEN_PIPE_LOG
++    auto timed = [&](const std::function<void(size_t)>& f, size_t j, double PipeStat::*field) {
++        if (!pipe_log_) return f(j);
++        const auto t0 = std::chrono::steady_clock::now();
++        f(j);
++        pipe_stats_[jobs[j].tag].*field += ms_since(t0);
++    };
 +    // One run outstanding: a second run of a kernel queued behind the first gave different bits run to run.
-+    stage(0);
++    timed(stage, 0, &PipeStat::stage_ms);
 +    Inflight cur = launch(0);
 +    for (size_t j = 0; j < jobs.size(); ++j) {
 +        const bool more = j + 1 < jobs.size();
 +        const bool ahead = more && jobs[j + 1].dep != static_cast<long>(j);
-+        if (ahead) stage(j + 1);
++        if (ahead) timed(stage, j + 1, &PipeStat::stage_ms);
 +        const double submit = cur.submit_ms;
 +        const auto [elapsed, blocked] = wait_run(cur);
 +        wait_ms += blocked;
 +        if (dispatch_log_) dispatch_stats_[jobs[j].k->name].add(submit + elapsed);
++        if (pipe_log_) {
++            PipeStat& ps = pipe_stats_[jobs[j].tag];
++            ++ps.n;
++            ps.blocked_ms += submit + blocked;
++            ps.elapsed_ms += elapsed;
++        }
 +        auto ts = std::chrono::steady_clock::now();
 +        read_back(buffer(jobs[j].out, l), jobs[j].out_bytes, 0);
 +        timing_.sync_ms += ms_since(ts);
 +        if (ahead) cur = launch(j + 1);
-+        post(j);
++        timed(post, j, &PipeStat::post_ms);
 +        if (more && !ahead) {
-+            stage(j + 1);
++            timed(stage, j + 1, &PipeStat::stage_ms);
 +            cur = launch(j + 1);
 +        }
 +    }
@@ -505,7 +722,10 @@ index a7a3e79..bc6ad58 100644
 +    // ---- qkv3 over the blocks; block b's attention host half (norms, rotation, its KV rows) under b + 1's GEMM
 +    {
 +        std::vector<PipeJob> jobs(B);
-+        for (size_t b = 0; b < B; ++b) jobs[b] = gemm_job(0, hid, n_qkv3, b, -1);
++        for (size_t b = 0; b < B; ++b) {
++            jobs[b] = gemm_job(0, hid, n_qkv3, b, -1);
++            jobs[b].tag = ab.window ? "qkv3 local" : "qkv3 global";
++        }
 +        pipeline(l, jobs,
 +                 [&](size_t b) {
 +                     const auto tn = now();
@@ -518,19 +738,10 @@ index a7a3e79..bc6ad58 100644
 +                     float* q = BlockScratch::fit(bs_.part[0], T * qw);
 +                     float* k = BlockScratch::fit(bs_.part[1], T * kvw);
 +                     float* v = BlockScratch::fit(bs_.part[2], T * kvw);
-+                     if (gb.program[0].fmt == "bfp16") {
-+                         const float* r = y_rows(0, jobs[b], n_qkv3, bs_.d_un);
-+#pragma omp parallel for
-+                         for (long long tk = 0; tk < static_cast<long long>(T); ++tk) {
-+                             const float* src = r + static_cast<size_t>(tk) * n_qkv3;
-+                             std::memcpy(q + tk * qw, src, qw * 4);
-+                             std::memcpy(k + tk * kvw, src + qw, kvw * 4);
-+                             std::memcpy(v + tk * kvw, src + qw + kvw, kvw * 4);
-+                         }
-+                     } else {
-+                         const host::TransposePart parts[3] = {{q, 0, qw}, {k, qw, kvw}, {v, qw + kvw, kvw}};
-+                         host::transpose_parts(buffer(jobs[b].out, 0).map<const float*>(), T, parts, 3);
-+                     }
++                     const host::TransposePart parts[3] = {{q, 0, qw}, {k, qw, kvw}, {v, qw + kvw, kvw}};
++                     const float* y = buffer(jobs[b].out, 0).map<const float*>();
++                     if (gb.program[0].fmt == "bfp16") host::bfp16_rows_parts(y, T, gb.program[0].n_pad, bt, T, parts, 3);
++                     else host::transpose_parts(y, T, parts, 3);
 +                     timing_.gemm_tr_ms += ms_since(tt);
 +                     const auto ta = now();
 +                     host::attention_prep(geom(b), q, k, v, qknorm ? hc.qn.data() : nullptr, qknorm ? hc.kn.data() : nullptr,
@@ -585,6 +796,9 @@ index a7a3e79..bc6ad58 100644
 +                    p.out = p.args[2];
 +                    p.out_bytes = kind == 2 ? M * hd * 4 : kind == 3 ? 2 * M * L * 4 : M * L * 4;
 +                    p.dep = aj[j].kind == 2 ? last_s[aj[j].gh] : -1;
++                    static const char* const tags[2][4] = {{"scores global", "scores lo global", "values global", "scores hi+lo global"},
++                                                           {"scores local", "scores lo local", "values local", "scores hi+lo local"}};
++                    p.tag = tags[ab.window ? 1 : 0][kind];
 +                    jobs.push_back(std::move(p));
 +                }
 +            }
@@ -616,21 +830,23 @@ index a7a3e79..bc6ad58 100644
 +                         xrt::bo& ba = buffer(jobs[j].args[0], 0);
 +                         xrt::bo& bb = buffer(jobs[j].args[1], 0);
 +                         if (a.kind == 0 || a.kind == 3) {
-+                             // the kv group's queries as the scores' A operand: row hl * T + t is query head hl at token t
++                             // the kv group's queries as the scores' A operand: row hl * T + t is query head hl at token t;
++                             // stacked (kind 3), straight into A with the lo half's M rows after the hi half's
 +                             const float* Q = ds_.q[a.b].data();
++                             uint16_t* hi_rows = a.kind == 3 ? ba.map<uint16_t*>() : qb;
++                             uint16_t* lo_rows = a.kind == 3 ? hi_rows + M * hd : ql;
 +#pragma omp parallel for
 +                             for (long long rr = 0; rr < static_cast<long long>(M); ++rr) {
 +                                 const size_t hl = static_cast<size_t>(rr) / T, t = static_cast<size_t>(rr) % T;
 +                                 const float* src = Q + t * qw + (a.gh * grp + hl) * hd;
-+                                 uint16_t* dst = qb + (hl * T + t) * hd;
++                                 uint16_t* dst = hi_rows + (hl * T + t) * hd;
 +                                 for (size_t i = 0; i < hd; ++i) dst[i] = f32_to_bf16(src[i]);
-+                                 if (ql) {
-+                                     uint16_t* lo = ql + (hl * T + t) * hd;
++                                 if (lo_rows) {
++                                     uint16_t* lo = lo_rows + (hl * T + t) * hd;
 +                                     for (size_t i = 0; i < hd; ++i) lo[i] = f32_to_bf16(src[i] - bf16_to_f32(dst[i]));
 +                                 }
 +                             }
-+                             std::memcpy(ba.map<uint16_t*>(), qb, M * hd * 2);
-+                             if (a.kind == 3) std::memcpy(ba.map<uint16_t*>() + M * hd, ql, M * hd * 2);
++                             if (a.kind == 0) std::memcpy(ba.map<uint16_t*>(), qb, M * hd * 2);
 +                             host::tile_rows_as_bt(kv + a.gh * hd, kv_row_elems, nrows, a.L, hd, bb.map<uint16_t*>());
 +                             ba.sync(XCL_BO_SYNC_BO_TO_DEVICE, (a.kind == 3 ? 2 : 1) * M * hd * 2, 0);
 +                             bb.sync(XCL_BO_SYNC_BO_TO_DEVICE, hd * a.L * 2, 0);
@@ -676,17 +892,16 @@ index a7a3e79..bc6ad58 100644
 +                             for (long long i = 0; i < static_cast<long long>(ML); ++i) s_hi[i] += c[i];
 +                             softmax(s_hi);
 +                         } else if (a.kind == 3) {
-+                             // hi + lo as kinds 0 and 1 add them, from the stacked product's two halves
-+#pragma omp parallel for
-+                             for (long long i = 0; i < static_cast<long long>(ML); ++i) s_hi[i] = c[i] + c[ML + i];
-+                             softmax(s_hi);
++                             // hi + lo as kinds 0 and 1 add them, from the stacked product's two halves, as the softmax reads them
++                             for (size_t r = 0; r < M; ++r) pos[r] = g.pos0 + r % T;
++                             float* m = m_all + a.gh * M;
++                             float* lsum = l_all + a.gh * M;
++                             std::fill(m, m + M, -std::numeric_limits<float>::infinity());
++                             std::fill(lsum, lsum + M, 0.f);
++                             host::softmax_chunk_sum(M, a.L, hd, first, c, c + ML, pos, m, lsum, acc, p_all + a.gh * ML, g.window);
 +                         } else {
-+#pragma omp parallel for
-+                             for (long long i = 0; i < static_cast<long long>(M * hd); ++i) {
-+                                 acc[i] = 0.f;
-+                                 acc[i] += c[i];
-+                             }
-+                             // og for the group's real tokens: the merged sum over the denominator
++                             // og for the group's real tokens: the merged sum (0 + the product, as attention_npu
++                             // accumulates its one chunk) over the denominator
 +                             const float* lsum = l_all + a.gh * M;
 +                             float* og = ds_.og[a.b].data();
 +#pragma omp parallel for
@@ -695,7 +910,7 @@ index a7a3e79..bc6ad58 100644
 +                                 const size_t r = hl * T + t, h = a.gh * grp + hl;
 +                                 const float inv = 1.0f / lsum[r];
 +                                 float* out = og + t * qw + h * hd;
-+                                 for (size_t i = 0; i < hd; ++i) out[i] = acc[r * hd + i] * inv;
++                                 for (size_t i = 0; i < hd; ++i) out[i] = (0.f + c[r * hd + i]) * inv;
 +                             }
 +                         }
 +                         timing_.mid_ms += ms_since(th);
@@ -711,7 +926,9 @@ index a7a3e79..bc6ad58 100644
 +
 +    // ---- o, up, gate and down over the blocks in pairs: O b, O b+1, U b, U b+1, G b, G b+1, D b, D b+1.
 +    // Each block's operations are step_gemm_block_layer's rest stage, in its order (gate and up
-+    // only swap dispatches); a pair's blocks keep their rows in slot b & 1.
++    // only swap dispatches); a pair's blocks keep their rows in slot b & 1. Up writes its own
++    // output pair (`@up`) where it shares gate's, gate's post encodes h straight into the input
++    // of its block's down job, and gate takes up's x where up left it in the same twin.
 +    const Step& sg = gb.program[2];
 +    const Step& su = gb.program[3];
 +    const Step& sd = gb.program[4];
@@ -722,6 +939,7 @@ index a7a3e79..bc6ad58 100644
 +    const bool gelu_tanh = gb.act == "gelu_tanh";
 +    const bool g32 = bfp && gelu_tanh && gelu32_on_;
 +    const size_t a_bytes = bfp ? T * ff / 8 * BFP16_BLOCK_BYTES : ff * T * 2;
++    const bool up_own_y = su.args[2] == sg.args[2] && globals_.count(su.args[2] + "@up");
 +    if (gb.sandwich) {
 +        float* w = BlockScratch::fit(ds_.w_post, hid);
 +        for (size_t c = 0; c < hid; ++c) w[c] = bf16_to_f32(post_ln_w_bf16_[l][c]);
@@ -729,6 +947,7 @@ index a7a3e79..bc6ad58 100644
 +    struct RJ { size_t step, b; };
 +    std::vector<RJ> rj;
 +    std::vector<PipeJob> jobs;
++    std::vector<long> up_job(B), down_job(B);
 +    for (size_t b0 = 0; b0 < B; b0 += 2) {
 +        const size_t nb = std::min<size_t>(2, B - b0), j0 = rj.size();
 +        // job index of step s (0 o, 1 up, 2 gate, 3 down) of the pair's block i
@@ -740,13 +959,24 @@ index a7a3e79..bc6ad58 100644
 +                // up and gate read the o post's xm, down the gate post's operand
 +                const long dep = s == 1 || s == 2 ? at(0, i) : s == 3 ? at(2, i) : -1;
 +                jobs.push_back(gemm_job(idx, K, Nout, rj.size(), dep));
++                if (idx == 3 && up_own_y) {
++                    jobs.back().args[2] = twin(su.args[2] + "@up", rj.size());
++                    jobs.back().out = jobs.back().args[2];
++                }
++                static const char* const tags[2][5] = {{"", "o global", "gate global", "up global", "down global"},
++                                                       {"", "o local", "gate local", "up local", "down local"}};
++                jobs.back().tag = tags[ab.window ? 1 : 0][idx];
++                if (idx == 3) up_job[b0 + i] = static_cast<long>(rj.size());
++                if (idx == 4) down_job[b0 + i] = static_cast<long>(rj.size());
 +                rj.push_back({idx, b0 + i});
 +            }
 +    }
 +    for (size_t s = 0; s < 2; ++s) {
-+        BlockScratch::fit(ds_.a[s], a_bytes);
++        if (!up_own_y) BlockScratch::fit(ds_.up[s], ff * T);
 +        if (gb.sandwich) BlockScratch::fit(ds_.xm[s], T * hid);
 +    }
++    // which block's xm each x twin holds, so gate reuses up's when they share one
++    std::map<std::string, size_t> xm_in;
 +    pipeline(l, jobs,
 +             [&](size_t j) {
 +                 const RJ& r = rj[j];
@@ -754,12 +984,15 @@ index a7a3e79..bc6ad58 100644
 +                 if (r.step == 1) {
 +                     stage_x(1, jobs[j], ds_.og[r.b].data(), qw);
 +                 } else if (r.step == 2 || r.step == 3) {
++                     // the NPU only reads x, so a twin that already holds this block's xm is ready as it is
++                     auto held = xm_in.find(jobs[j].args[1]);
++                     if (held != xm_in.end() && held->second == r.b) return;
 +                     stage_x(r.step, jobs[j], ds_.xm[sl].data(), hid);
++                     xm_in[jobs[j].args[1]] = r.b;
 +                 } else {
++                     // the gate post encoded h into this job's x already
 +                     const auto tt = now();
-+                     xrt::bo& xb = buffer(jobs[j].args[1], 0);
-+                     std::memcpy(xb.map<uint8_t*>(), ds_.a[sl].data(), a_bytes);
-+                     xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, a_bytes, 0);
++                     buffer(jobs[j].args[1], 0).sync(XCL_BO_SYNC_BO_TO_DEVICE, a_bytes, 0);
 +                     timing_.gemm_tile_ms += ms_since(tt);
 +                 }
 +             },
@@ -783,14 +1016,20 @@ index a7a3e79..bc6ad58 100644
 +                     }
 +                     timing_.tail_ms += ms_since(th);
 +                 } else if (r.step == 3) {
++                     if (up_own_y) return;          // gate's post reads it from up's own output
 +                     const auto tt = now();
-+                     std::memcpy(BlockScratch::fit(ds_.up[sl], ff * T), buffer(jobs[j].out, 0).map<const float*>(), ff * T * 4);
++                     std::memcpy(ds_.up[sl].data(), buffer(jobs[j].out, 0).map<const float*>(), ff * T * 4);
 +                     timing_.gemm_tr_ms += ms_since(tt);
 +                 } else if (r.step == 2) {
 +                     const auto th = now();
 +                     const float* gate = buffer(jobs[j].out, 0).map<const float*>();
-+                     const float* up = ds_.up[sl].data();
-+                     uint8_t* a = ds_.a[sl].data();
++                     const float* up = up_own_y ? buffer(jobs[static_cast<size_t>(up_job[r.b])].out, 0).map<const float*>()
++                                                : ds_.up[sl].data();
++                     xrt::bo& xd = buffer(jobs[static_cast<size_t>(down_job[r.b])].args[1], 0);
++                     if (xd.size() < a_bytes)
++                         throw std::runtime_error("open_qwen36: gemm route: the down projection's x global is smaller than [" +
++                                                  std::to_string(ff) + "] x " + std::to_string(T));
++                     uint8_t* a = xd.map<uint8_t*>();
 +                     if (g32) {
 +                         host::gelu_bfp16_a(gate, up, T, ff, bt, a);
 +                     } else {
@@ -817,13 +1056,11 @@ index a7a3e79..bc6ad58 100644
 +             },
 +             gemm_wait);
 +    timing_.part0_ms += gemm_wait;
-+}
-+
+ }
+ 
  void Core::step_gemm_prompt(const std::vector<int>& ids, bool want_logits) {
-     apply_thread_budget();
-     if (dense_layer_major_ok()) {
 diff --git a/src/open_qwen36/core.hpp b/src/open_qwen36/core.hpp
-index 8a85cfa..ed792c0 100644
+index 8a85cfa..a55bbba 100644
 --- a/src/open_qwen36/core.hpp
 +++ b/src/open_qwen36/core.hpp
 @@ -58,7 +58,7 @@ struct CoreConfig {
@@ -860,7 +1097,7 @@ index 8a85cfa..ed792c0 100644
      bool block_logits_all_ = false;
      std::vector<std::vector<float>> block_logits_;     ///< per real token of the last block, when asked
  
-@@ -629,6 +640,30 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
+@@ -629,6 +640,39 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
      /// whose attn_block.prep is "qknorm_rope": y_qkv3 [n_qkv3, T] in, og [T, qw] out, the
      /// layer's KV rows [pos_, pos_ + t_real) written on the host and synced to the device.
      void dense_attention_block(int l, const std::vector<float>& y_qkv3, size_t T, size_t t_real, std::vector<float>& og);
@@ -872,7 +1109,16 @@ index 8a85cfa..ed792c0 100644
 +        std::string out;
 +        size_t out_bytes = 0;
 +        long dep = -1;
++        const char* tag = "";    ///< the step it is, for OFLM_OPEN_PIPE_LOG's table
 +    };
++    /// OFLM_OPEN_PIPE_LOG: per step, the host's stage / post time and how long it waited on the NPU
++    /// (elapsed is start() to the wait's return, so it includes any host work done meanwhile)
++    struct PipeStat {
++        size_t n = 0;
++        double stage_ms = 0, post_ms = 0, blocked_ms = 0, elapsed_ms = 0;
++    };
++    std::map<std::string, PipeStat> pipe_stats_;
++    bool pipe_log_ = false;
 +    /// The jobs in order, one run outstanding: job j + 1's inputs are staged while j runs and
 +    /// j's outputs read while j + 1 runs, unless j + 1 reads what post(j) writes (dep == j),
 +    /// when the two take turns. Neighbours alternate "#1" twins of their buffers. The host's

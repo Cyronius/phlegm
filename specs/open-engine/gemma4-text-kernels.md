@@ -95,7 +95,8 @@ bfp16 route's GELU moved to fp32. The scores of Q's two halves also became one
 product. The schedule and the stacked scores left every logit unchanged.
 Fast took 9.2-10.0 s for the 1450-token prompt (6-7 ms per token) against
 16.1-16.3 s on the old stages, and lean 28.4 against 37.5 s. Both gates still
-pass with the fp32 GELU. The measured results and the decode profile are in
+pass with the fp32 GELU. Cutting four host copies, again without changing a
+logit, took fast to 9.4-9.7 s. The measured results and the decode profile are in
 `OPEN-FAMILY-GEMMA4`.
 
 The two implementations agree on 12B's layer types, global geometry, K=V
