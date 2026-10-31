@@ -107,7 +107,18 @@ fn run(args: &[String]) -> Result<(), String> {
         stop_ids: tokenizer.stop_ids(),
     };
     backend.generate(&ids, &mut params, &mut |id| output.push(id))?;
-    println!("{}", tokenizer.decode(&output)?);
+    let text = tokenizer.decode(&output)?;
+    // A harmony model (GPT-OSS) answers in a final channel after its analysis: the answer on
+    // stdout, the analysis on stderr.
+    match phlegm_core::tokenizer::harmony_split(&text) {
+        Some((analysis, answer)) => {
+            if !analysis.is_empty() {
+                eprintln!("[analysis] {analysis}");
+            }
+            println!("{answer}");
+        }
+        None => println!("{text}"),
+    }
     Ok(())
 }
 

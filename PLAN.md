@@ -129,6 +129,23 @@ timing as separate follow-ups.
 Sources: [monorepo plan, P5](.claude/plans/phlegm-monorepo.md),
 [visualization plan](specs/viz/plans/flow-viz.md).
 
+## GPT-OSS 20B
+
+Runs on the NPU from ggml-org's `gpt-oss-20b-MXFP4.gguf` through `recipes/gptoss.py` and the
+open runtime (`upstream-patches/gptoss-runtime.patch` + `gptoss-prefill-runtime.patch`):
+`phlegm run` and `phlegm serve` answer through the bridge, with the harmony analysis apart
+from the answer. Decode streams the experts as the GGUF's own MXFP4 (`gemv_mx4.h`, decoded on
+the core into the q8 route's exact codes: byte-identical logits, `gx_moe` 4.06 -> 2.49 ms a
+layer, 12.5 GiB of pools instead of ~26). Prompts prefill on a block route (OPEN-PREFILL-GPTOSS):
+q | k | v and o as bfp16 GEMMs, each expert's GEMMs reading MXFP4 natively (decoded to bfp16 in
+L1), every operand hi + lo to ~16 bits, the rest on the host in fp32. 663 tokens in 2.9-3.3 s
+(94 s one token a step), 2000 tokens in ~10 s, 16 tokens in 1.0 s; accuracy against an fp32
+reference at least the sequential route's; the chat prompt's greedy tokens equal llama.cpp's.
+Development timing on a loaded machine. Open: a clean benchmark, NPU attention products for
+long prompts, one shared copy of the experts (the prefill GEMM keeps its own 10.8 GiB), the
+Safeguard variant. Plan: [.plans/gptoss-native.md](.plans/gptoss-native.md); spec:
+OPEN-FAMILY-GPTOSS, OPEN-PREFILL-GPTOSS.
+
 ## Native image model support
 
 Qwen Image 2.1 and FLUX 3 Image Klein are requested for text-to-image and

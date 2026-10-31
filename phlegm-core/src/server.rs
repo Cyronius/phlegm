@@ -159,6 +159,10 @@ impl ServerTokenizer {
         }
     }
 
+    fn harmony(&self) -> bool {
+        matches!(self, ServerTokenizer::Real(t) if t.is_harmony())
+    }
+
     fn stop_ids(&self) -> HashSet<u32> {
         match self {
             ServerTokenizer::Real(t) => t.stop_ids(),
@@ -424,6 +428,14 @@ fn full_response(
     } else {
         "stop"
     };
+    // A harmony model's reply is its final channel; the analysis goes beside it as
+    // reasoning_content (the field llama.cpp's and vLLM's OpenAI servers use).
+    let message = if state.tokenizer.harmony() {
+        let (reasoning, answer) = crate::tokenizer::harmony_progress(&text);
+        json!({"role": "assistant", "content": answer, "reasoning_content": reasoning})
+    } else {
+        json!({"role": "assistant", "content": text})
+    };
     let resp = json!({
         "id": cmpl_id(),
         "object": "chat.completion",
@@ -431,7 +443,7 @@ fn full_response(
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": text},
+            "message": message,
             "finish_reason": finish,
         }],
         "usage": {
@@ -473,6 +485,8 @@ fn stream_response(
     let mut emitted = String::new();
     let mut decode_error = None;
     let mut decoder = state.tokenizer.decode_stream();
+    let harmony = state.tokenizer.harmony();
+    let (mut sent_reasoning, mut sent_answer) = (String::new(), String::new());
     let gen_result = {
         let mut backend = state.backend.lock().unwrap();
         let mut on_token = |tid: u32| {
@@ -489,6 +503,21 @@ fn stream_response(
                 }
             };
             emitted.push_str(&piece);
+            if harmony {
+                // each side's new suffix, re-derived from everything decoded so far
+                let (reasoning, answer) = crate::tokenizer::harmony_progress(&emitted);
+                for (field, now, sent) in [("reasoning_content", reasoning, &mut sent_reasoning),
+                                           ("content", answer, &mut sent_answer)] {
+                    if let Some(delta) = now.strip_prefix(sent.as_str()).filter(|d| !d.is_empty()) {
+                        let _ = sse_write(
+                            &mut *writer,
+                            &sse_frame(&sse_chunk(&cid, created, &model, json!({ field: delta }), None)),
+                        );
+                        *sent = now.clone();
+                    }
+                }
+                return;
+            }
             if !piece.is_empty() {
                 let _ = sse_write(
                     &mut *writer,
@@ -511,6 +540,19 @@ fn stream_response(
         }
         let full = state.tokenizer.final_decode(&out_ids)?;
         let tail = final_stream_tail(&full, &emitted)?;
+        if harmony {
+            // whatever the last token completed, through the same derivation
+            let (reasoning, answer) = crate::tokenizer::harmony_progress(&full);
+            for (field, now, sent) in [("reasoning_content", reasoning, &sent_reasoning),
+                                       ("content", answer, &sent_answer)] {
+                let delta = now.strip_prefix(sent.as_str()).ok_or("harmony stream rewrote emitted text")?;
+                if !delta.is_empty() {
+                    sse_write(&mut *writer, &sse_frame(&sse_chunk(&cid, created, &model, json!({ field: delta }), None)))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            return Ok(());
+        }
         if !tail.is_empty() {
             sse_write(
                 &mut *writer,

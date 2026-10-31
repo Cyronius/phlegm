@@ -275,6 +275,31 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   stream (two fills) at positions 0 to 4095. The diff applies over `beccd46` plus the eight
   patches above.
 
+- `upstream-patches/gptoss-runtime.patch` (2026-10-31) runs GPT-OSS from its GGUF
+  (OPEN-FAMILY-GPTOSS). It adds the MXFP4 GGUF type, zero-extends a GGUF embedding row and an
+  F32 norm into a padded width, and adds four pack ops: `gx_q8` (Q8_0 to q8 half-tiles with
+  the bias in the pad), `gx_ug` and `gx_down` (MXFP4 experts to half-tiles, up and gate per
+  band) and `gx_lmhead` (Q8_0 to `lm_head_q8`'s f32-scale chunks). They write the bytes
+  `recipes/gptoss_pack.py` writes. The `gptoss_route` program step runs the router on the
+  host between `gx_att` and `gx_moe` and patches `gx_moe`'s fills through `moeroute2`'s
+  table. The diff applies over `beccd46` plus the nine patches above; a round trip over the
+  Gemma 4 runtime reproduces the seven files exactly.
+
+- `upstream-patches/gptoss-prefill-runtime.patch` (2026-10-31) gives GPT-OSS its native MXFP4
+  experts and its block prefill (OPEN-FAMILY-GPTOSS, OPEN-PREFILL-GPTOSS). Pack ops `gx_ug_mx4`
+  and `gx_down_mx4` write the experts as mx4 half-tiles (`designs/gemv_q4/gemv_mx4.h`: the
+  GGUF's own nibbles, re-signed for the core's decode); `gp_bfp16` writes a GGUF tensor's rows
+  into a `gemm_bfp16` B operand at any K that is a multiple of 64, optionally as the hi or lo
+  half of a stacked operand; `gp_mx4` writes the experts as `gemm_bfp16` GB_B=mx4 tiles. The
+  manifest's `gptoss_prefill` section names the four GEMMs (and a 128-row expert variant), their
+  weights and the small tensors; the `gxexpert` patch re-points an expert GEMM's buffer-0 fills
+  per dispatch, alternating two copies of the stream so the next run's expert is patched while
+  the last one runs. `Core::step_gptoss_prompt` is the layer-major route `step_gemm_prompt` takes
+  when the set carries it; `block_prefill_min` lets a set state its own crossover, which the
+  engine uses. The diff applies over `beccd46`, the nine Gemma 4 patches and
+  `gptoss-runtime.patch` (sha256 `8a5f808e`, unchanged); `target/npu-dev/gptoss-prefill-patch.sh`
+  regenerates it and checks the chain reproduces the clone.
+
 `designs/dense/dx_attn.py` now takes its recipe module from `for_spec` and its flags from the
 recipe's `attn_flags`, and gained `dx.py`'s ATTN_QLOCAL q loop. It emits byte-identical MLIR
 for the 15 shipped dense specs with a block route that emit at all; `qwen3-14b` refuses at

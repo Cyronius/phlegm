@@ -27,14 +27,14 @@ RECIPE_ROUTE = {
     "qwen2": "qwen2", "qwen2vl": "qwen2",
     "qwen3": "qwen3", "qwen3-it": "qwen3", "qwen3-tk": "qwen3",
     "qwen3vl": "qwen3", "qwen3.5": "qwen35",
-    "qwen3.6-moe": "qwen36moe",
+    "qwen3.6-moe": "qwen36moe", "gpt-oss": "gptoss",
 }
 SPECIAL_ROUTE = {
     "bge": "bert", "gte": "bert", "minilm": "bert", "nomic": "bert",
     "embed-gemma": "embedding-gemma-matmul",
     "flux2-klein": "diffusion", "whisper-v3": "whisper",
 }
-NO_ROUTE = {"gemma4e", "gemma4-12b", "gpt-oss"}
+NO_ROUTE = {"gemma4e", "gemma4-12b"}
 VISION_TEXT_ONLY = {"gemma3", "qwen2vl", "qwen3vl", "qwen3.5", "qwen3.6-moe"}
 ALIAS_NEEDS_CONFIG = {"lfm2.5-tk", "nanbeige", "deepseek-r1", "deepseek-r1-0528",
                       "qwen3-it", "qwen3-tk"}
@@ -69,6 +69,11 @@ def inventory(registry: Path, xclbins_root: Path | None = None) -> dict:
                         gaps.append("vision tower kernel route not established")
                 if name == "qwen3.8:27b":
                     gaps.append("text recipe composes; vision tower route and model validation remain open")
+                if name == "gpt-oss:20b":
+                    gaps.append("GGUF route (ggml-org MXFP4 file) runs on NPU: 32/32 greedy vs llama.cpp, "
+                                "663-token prefill vs fp32 reference; FLM q4nx container not read")
+                elif family == "gpt-oss":
+                    gaps.append("same recipe; this variant's GGUF and outputs not checked")
             elif family in SPECIAL_ROUTE:
                 route = SPECIAL_ROUTE[family]
                 state = "special_source"
@@ -87,9 +92,7 @@ def inventory(registry: Path, xclbins_root: Path | None = None) -> dict:
                 route = None
                 state = "missing_recipe"
                 gaps = ["no complete NPU recipe"]
-                if family == "gpt-oss":
-                    gaps.append("13-image NPU bundle, nonzero source layer, and 24-layer zero-weight token schedule checked; real-weight and model-output checks remain")
-                elif family == "gemma4e":
+                if family == "gemma4e":
                     gaps.append("text and multimodal NPU primitives built; scheduler and real-weight output checks remain")
                 elif family == "gemma4-12b":
                     gaps.append("text and multimodal matrix images built; dense recipe imported from openflowlm-next #225 reads GGUF, not FLM q4nx's 16-row tiles and q8 head; real-weight output checks remain")

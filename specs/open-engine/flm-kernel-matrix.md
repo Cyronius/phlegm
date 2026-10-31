@@ -48,8 +48,8 @@ Phlegm kernel implementation or a compatible ABI.
 | `qwen3:8b` | `qwen3` | `qwen3` | `recipe_source` | model-specific build and validation |
 | `qwen3-tk:4b` | `qwen3-tk` | `qwen3` | `recipe_source` | verify model config and packed geometry |
 | `qwen3-it:4b` | `qwen3-it` | `qwen3` | `recipe_source` | verify model config and packed geometry |
-| `gpt-oss:20b` | `gpt-oss` | `—` | `missing_recipe` | no complete NPU recipe; 13-image NPU bundle, nonzero source layer, and 24-layer zero-weight token schedule checked; real-weight and model-output checks remain |
-| `gpt-oss-sg:20b` | `gpt-oss` | `—` | `missing_recipe` | no complete NPU recipe; 13-image NPU bundle, nonzero source layer, and 24-layer zero-weight token schedule checked; real-weight and model-output checks remain |
+| `gpt-oss:20b` | `gpt-oss` | `gptoss` | `recipe_source` | GGUF route (ggml-org MXFP4 file) runs on NPU: 32/32 greedy vs llama.cpp, 663-token prefill vs fp32 reference; FLM q4nx container not read |
+| `gpt-oss-sg:20b` | `gpt-oss` | `gptoss` | `recipe_source` | same recipe; this variant's GGUF and outputs not checked |
 | `qwen2.5-it:3b` | `qwen2` | `qwen2` | `recipe_source` | model-specific build and validation |
 | `qwen2.5vl-it:3b` | `qwen2vl` | `qwen2` | `recipe_source` | vision tower kernel route not established |
 | `bge-base:en-v1.5` | `bge` | `bert` | `special_source` | model-specific build and validation |
@@ -70,5 +70,3 @@ a shared shape or runtime ABI.
 | `gemma4-it:e2b` | `attn.xclbin`, `audio_conv1d.xclbin`, `dequant.xclbin`, `layer.xclbin`, `lm_head.xclbin`, `mm.xclbin`, `swa.xclbin`, `vision_attn.xclbin`, `vision_mm.xclbin`, `vision_mm_high_precision.xclbin` |
 | `gemma4-it:e4b` | `attn.xclbin`, `audio_conv1d.xclbin`, `dequant.xclbin`, `layer.xclbin`, `lm_head.xclbin`, `mm.xclbin`, `swa.xclbin`, `vision_attn.xclbin`, `vision_mm.xclbin`, `vision_mm_high_precision.xclbin` |
 | `gemma4-it:12b` | `attn_global.xclbin`, `attn_global_image.xclbin`, `attn_sliding.xclbin`, `audio_image_mm.xclbin`, `dequant_mm.xclbin`, `layer.xclbin`, `lm_head.xclbin` |
-| `gpt-oss:20b` | `attn.xclbin`, `dequant.xclbin`, `expert.xclbin`, `layer.xclbin`, `mm.xclbin`, `short_seq_mm.xclbin` |
-| `gpt-oss-sg:20b` | `attn.xclbin`, `dequant.xclbin`, `expert.xclbin`, `layer.xclbin`, `mm.xclbin`, `short_seq_mm.xclbin` |

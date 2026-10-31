@@ -1,5 +1,12 @@
 # GPT-OSS 20B NPU kernel source progress
 
+**2026-10-31: superseded as the running route.** GPT-OSS 20B now runs from ggml-org's GGUF
+through `recipes/gptoss.py` (two dispatches a layer, `designs/gptoss/gx.py`, the router on the
+host) on the open runtime and through `phlegm run` / `serve`; OPEN-FAMILY-GPTOSS in
+`spec.md` has the design, procedure and results. The per-op images below read the FLM q4nx
+container (~986 dispatches over 13 contexts a token) and remain as standalone arithmetic
+evidence only.
+
 Both `gpt-oss:20b` and `gpt-oss-sg:20b` remain `missing_recipe` in the pinned
 46-entry FLM matrix. Phlegm has open NPU primitives for Q/K/V and output
 projection, RoPE, attention state and BF16 finalization, router, expert MXFP4
