@@ -44,7 +44,7 @@ chunk_bytes = D.chunk_bytes  # noqa: F401  (dx.py: chunk_bytes(quant))
 attn_flags = D.attn_flags    # noqa: F401  (phlegm's dx.py: attn_flags(G, probe_env))
 # The build key's probe variables (cache.py reads it off the family module): the attention ones
 # and dense's, DENSE_GGUF_GEMM among them -- it adds the block prefill route's builds.
-G4_PROBE_VARS = ("G4_ATTN_BLOCK", "G4_BFP16", "G4_Q40")
+G4_PROBE_VARS = ("G4_ATTN_BLOCK", "G4_BFP16", "G4_Q40", "G4_ACORES", "G4_RB", "G4_KVSLICE")
 
 
 def probe_env() -> dict[str, str]:
@@ -131,6 +131,41 @@ def geometry(spec: ModelSpec, kind: str | None = None) -> D.DenseGeometry:
                    ROPE_PAIR=(s.head_dim // 2) if (k == "global" and s.rotary_dim < s.head_dim) else 0)
 
 
+DX_ENV = "G4_DX"              # set in the decode layer's builds: recipe() then gives dx.py dx_geometry()
+
+
+def dx_attention() -> tuple[int, int, int]:
+    """(cores, cached rows a call, rows a window element) of the decode layer's attention.
+
+    8 cores of 2 heads on row 4 (og joined in memtiles), 4 rows a call, and each core reading
+    only its own kv heads of the window on a shim channel of its own (OPEN-ATTN-KVSLICE). The
+    four-core, one-row, broadcast walk cost 1.1 ms a local layer at the full 1024-row window and
+    1.26 us a row a global layer; this one took decode after a 1450-token prompt from 237 to
+    199-200 ms a token on a quiet machine, and costs 1-2% at the start of a context
+    (OPEN-FAMILY-GEMMA4). 16 cores (G4_ACORES=16) were as fast deep and slower at the start:
+    every switch into a layer's context reloads twice the attention programs. G4_ACORES=4
+    G4_RB=1 G4_KVSLICE=0 gives the old walk back. The head split and the windows leave every
+    logit as it was; rows a call round the online softmax differently."""
+    cores = int(os.environ.get("G4_ACORES", "8"))
+    rb = int(os.environ.get("G4_RB", "4"))
+    kvs = rb if os.environ.get("G4_KVSLICE", "1") == "1" and rb > 1 else 0
+    if cores not in (4, 8, 16) or rb not in (1, 2, 4):
+        raise OpRangeError(f"gemma4: G4_ACORES={cores} G4_RB={rb} (4 | 8 | 16 cores, 1 | 2 | 4 rows a call)")
+    return cores, rb, kvs
+
+
+def dx_geometry(spec: ModelSpec, kind: str | None = None) -> D.DenseGeometry:
+    """geometry() with dx_attention()'s cores, rows a call and window elements. The block
+    prefill's attention dispatch (dx_attn.py) keeps geometry()'s four cores and one row."""
+    G = geometry(spec, kind)
+    cores, rb, kvs = dx_attention()
+    if (cores, rb, kvs) == (G.ACORES, G.RB, 0):
+        return G
+    if G.NH % cores or (rb > 1 and rb * max(G.NH // cores, 8) not in (8, 16, 32)):
+        raise OpRangeError(f"gemma4: {G.NH} heads over {cores} cores at {rb} rows a call")
+    return replace(G, ACORES=cores, NHL=G.NH // cores, RB=rb, AWIDE=int(cores > D.MAX_ATTN_CORES), KVSLICE=kvs)
+
+
 def layout(spec: ModelSpec, max_ctx: int = 4096, kind: str | None = None) -> D.DenseLayout:
     return D.layout(sub_spec(spec, _kind(kind)), max_ctx)
 
@@ -144,7 +179,7 @@ def recipe(spec: ModelSpec, max_ctx: int = 4096) -> D.DenseRecipe:
     """The recipe dx.py builds: the layer type G4_KIND names (local when unset)."""
     _check(spec)
     k = _kind(None)
-    G = geometry(spec, k)
+    G = dx_geometry(spec, k) if os.environ.get(DX_ENV) == "1" else geometry(spec, k)
     _require(spec, k, G)
     return D.DenseRecipe(spec=sub_spec(spec, k), layout=layout(spec, max_ctx, k), geo=G, max_ctx=max_ctx)
 
@@ -472,6 +507,8 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         out["kernels"][kn] = {"context": ctx, "insts": f"{sets[kind]}/insts.bin", "patch": "attnpos",
                               "build": sets[kind], "window": window,
                               "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW}
+        if dx_geometry(spec, kind).KVSLICE:            # per-core window fills of whole blocks (OPEN-ATTN-KVSLICE)
+            out["kernels"][kn]["kvslice"] = dx_geometry(spec, kind).KVSLICE
         out["globals"][tab] = {"per_row": L.PTAB_ROW, "inv_freq": spec.rope_inv_freq(local=local), "window": window,
                                "rotary_dim": sub_spec(spec, kind).rotary_dim}
         out["layer_types"][lt] = {
@@ -508,12 +545,12 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
                                        "LMHEAD_CORES": str(n), "LMHEAD_Q4_0": "1"}}
     for kind, name in (("local", "dx"), ("global", "dxg")):
         bd = f"dense/build_gemma4_{kind}_h{spec.hidden}"
-        b[name] = {"design": "dense/dx.py", "build_dir": bd, "env": {KIND_ENV: kind}}
+        b[name] = {"design": "dense/dx.py", "build_dir": bd, "env": {KIND_ENV: kind, DX_ENV: "1"}}
         b[name + "_f32"] = {"design": "dense/dx.py", "build_dir": bd + "_f32",
-                            "env": {KIND_ENV: kind, "GEMV_SCALES_F32": "1"}}
+                            "env": {KIND_ENV: kind, DX_ENV: "1", "GEMV_SCALES_F32": "1"}}
         if q40_on():
             b[name + "_q40"] = {"design": "dense/dx.py", "build_dir": bd + "_q40",
-                                "env": {KIND_ENV: kind, "GEMV_Q4_0": "1"}}
+                                "env": {KIND_ENV: kind, DX_ENV: "1", "GEMV_Q4_0": "1"}}
     # the GEMMs the GGUF view runs: Q4_0-native pools, else the compact view's q4_1-law ones or
     # the twin's f32 ones
     if q40_on():

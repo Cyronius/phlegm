@@ -172,7 +172,14 @@ OG_STREAM = G.OG_ELEMS > X_DEPTH                        # o's og elements one at
 NPTAB, CSE = G.PTAB_ELEMS, G.PTAB_CS_ELEM      # elements per position record; which holds cos / sin
 ACORES, NHL, RB = G.ACORES, G.NHL, G.RB
 NSHIM = 8                                              # NPU2 shim columns, two MM2S channels each
-KVSL = kvslice(SPEC, ACORES, RB, QKVB, G.WINDOW) > 0    # per-core windows on their own channels (OPEN-ATTN-KVSLICE)
+# per-core windows on their own channels (OPEN-ATTN-KVSLICE); a recipe may set them itself (gemma4.dx_geometry)
+KVSL = (G.KVSLICE or kvslice(SPEC, ACORES, RB, QKVB, G.WINDOW)) > 0
+AWIDE = bool(G.AWIDE)                                  # attention cores on row 4, og joined in memtiles (gemma4)
+if AWIDE or G.KVSLICE:
+    # the block kernel beside the single-row one at head dim 256 / 512 (and Gemma 4's v norm) overflowed
+    # program memory by up to 448 B at 2 rows a call: the integer scalar routines and one exponential, both
+    # bit-identical, leave 656 B free at 4
+    ATTN_FLAGS.extend(["-DATTN_INTFP=1", "-DATTN_EXP32=1"])
 KVC = kv_cores(SPEC, G.NH, G.KVH, G.HD, RB, KVSL)       # attention cores per kv head (attn.h ATTN_G5): 0, 1 or 2
 GRP = G.NH // G.KVH
 if KVC == 2:
@@ -198,16 +205,22 @@ elif KVC:                                              # TREE8's companions, the
         ATTN_FLAGS = [f for f in ATTN_FLAGS if not f.startswith("-DATTN_EXPA=")]
         ATTN_FLAGS.append("-DATTN_EXPA=0")
 if KVSL:
-    KVS, KVB = kv_slices(G.NH, G.KVH, ACORES, 2 if KVC else 1, CORE_H0)
-    KW_GROUPS = sorted(set(KVB))                       # one window stream per distinct slice, read by its cores
     _mm2s = [0] * NSHIM                                # this design's own shim MM2S producers: lni, w_c, x, ain
     for _c in [0, 1, 2] + list(range(N_CORES)):
         _mm2s[_c] += 1
     KW_COLS = [c for c in range(NSHIM) if _mm2s[c] < 2]
+    # The cores of `share` kv heads read one stream when one slice a core needs more streams than
+    # there are free channels (Gemma 4's local layers on 8 cores: 8 kv heads, 5 free columns -> 4 pairs).
+    KV_SHARE = 2 if KVC else 1
+    while not KVC and len(set(kv_slices(G.NH, G.KVH, ACORES, KV_SHARE, CORE_H0)[1])) > len(KW_COLS) \
+            and G.KVH % (2 * KV_SHARE) == 0 and G.NH // ACORES <= G.NH // G.KVH:
+        KV_SHARE *= 2
+    KVS, KVB = kv_slices(G.NH, G.KVH, ACORES, KV_SHARE, CORE_H0)
+    KW_GROUPS = sorted(set(KVB))                       # one window stream per distinct slice, read by its cores
     assert len(KW_COLS) >= len(KW_GROUPS), (f"dx.py KVSLICE: {len(KW_GROUPS)} window streams need a free shim MM2S "
                                             f"channel each and only columns {KW_COLS} have one; build with ATTN_KVSLICE=0")
     ATTN_FLAGS.append(f"-DATTN_KVS={KVS}")
-    if KVC:
+    if KV_SHARE > 1:
         ATTN_FLAGS.append("-DATTN_KVB_ALIGN=1")
     E_W = RB * 2 * KVS * G.HD * 2                      # one element: RB rows of [K slice | V slice]
 ASTACK = TREE8_STACK if (T8 or KVC) else 0x1800
@@ -351,10 +364,10 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
     # element at HPO -- and with it ACORES at NH/HPO. An og element is now the core's own
     # heads, and core 0 has a fifo like every other core.
     of_aout = ObjectFifo(brow, name="aout", depth=2)
-    if KVC:
+    if KVC or AWIDE:
         # more og streams than free shim S2MM channels: consecutive cores join in memtiles (at most 6 inputs each)
         # the weight ring holds S2MM channel 0 of every memtile, so a join there takes 5 at most
-        OGJ_N = 4 if KVC == 1 or WRING else 6
+        OGJ_N = 4 if KVC == 1 or AWIDE or WRING else 6
         OGJ = [list(range(g, min(g + OGJ_N, ACORES))) for g in range(0, ACORES, OGJ_N)]
         ogj_ty = [np.ndarray[(sum(CORE_NHL[c] for c in cs) * G.HD,), np.dtype[bfloat16]] for cs in OGJ]
         of_ogj = [ObjectFifo(ogj_ty[j], name=f"ogj{j}", depth=1) for j in range(len(OGJ))]
@@ -610,14 +623,21 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
         ain.release(1 + NPTAB)
         if QLOCAL:
             # every core still takes every q element off the broadcast, but stores only its
-            # own heads' -- numbered from 0, which is where attn.h ATTN_QLOCAL looks for them
-            assert bias_in is None and h0 % G.HPE == 0 and NHL % G.HPE == 0
-            e0, ne = h0 // G.HPE, NHL // G.HPE
+            # own heads' -- numbered from 0, which is where attn.h ATTN_QLOCAL looks for them.
+            # A core of fewer heads than an element holds takes its part of one element, and
+            # attn_q's index is then where in it they start.
+            assert bias_in is None
+            if NHL >= G.HPE:
+                assert h0 % G.HPE == 0 and NHL % G.HPE == 0
+                e0, ne = h0 // G.HPE, NHL // G.HPE
+            else:
+                assert G.HPE % NHL == 0 and h0 % NHL == 0
+                e0, ne = h0 // G.HPE, 1
             for n_skip in (e0, None, G.Q_AIN_ELEMS - e0 - ne):
                 if n_skip is None:
                     for h in range_(ne):
                         e = ain.acquire(1)
-                        f_q(e, qn, cs, qs, h)
+                        f_q(e, qn, cs, qs, h if NHL >= G.HPE else h0 % G.HPE)
                         ain.release(1)
                 elif n_skip > 0:
                     for _ in range_(n_skip):
@@ -788,7 +808,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
     bcons = (lambda: [of_abias.cons()]) if QKVB else (lambda: [])
     kwc = (lambda c: [of_kw[KW_GROUPS.index(KVB[c])].cons()]) if KVSL else (lambda c: [])
     # rows 4 and 5 are idle in dx; at two cores a kv head the pair shares a column
-    att_tile = ((lambda c: Tile(c // 2, 4 + c % 2)) if KVC == 2 else (lambda c: Tile(c, 4)) if KVC
+    att_tile = ((lambda c: Tile(c // 2, 4 + c % 2)) if KVC == 2 else (lambda c: Tile(c % 8, 4 + c // 8)) if KVC or AWIDE
                 else (lambda c: Tile(2 + c, 3)))
     workers.append(Worker(attn_body, fn_args=[of_ain.cons()] + kwc(0) + bcons() + [of_aout.prod(), of_og[0].prod()] + abufs(0) + afns(0),
                           tile=att_tile(0), stack_size=ASTACK))
@@ -873,7 +893,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
         pa_out, pa_in = Pipeline(3), Pipeline(3)
         pa_out.drain(aout_c, a_kv, bt(L.KV_BYTES, L.KV_ROW, L.KV_ROW))          # [k' | v'] -> row pos (attnpos)
 
-        if KVC:                                                             # the joined og rows
+        if KVC or AWIDE:                                                    # the joined og rows
             for j, cs in enumerate(OGJ):
                 pa_out.drain(og_cs[j], a_act, bt(L.AD_BYTES, L.AD_OG + CORE_H0[cs[0]] * G.HD * 2,
                                                  sum(CORE_NHL[c] for c in cs) * G.HD * 2))
@@ -1069,7 +1089,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
                             of_x.prod(tile=Tile(1, 0)),
                             [of_y[c].cons(tile=Tile(c, 0)) for c in range(N_CORES)],
                             of_ain.prod(tile=Tile(2, 0))] + bprod + [of_aout.cons(tile=Tile(1, 0)),
-                            ([of_ogj[j].cons(tile=Tile(2 + j, 0)) for j in range(len(OGJ))] if KVC else
+                            ([of_ogj[j].cons(tile=Tile(2 + j, 0)) for j in range(len(OGJ))] if KVC or AWIDE else
                              [of_og[c].cons(tile=Tile(2 + c, 0)) for c in range(ACORES)])]
                  + ([[of_kw[g].prod(tile=Tile(KW_COLS[g], 0)) for g in range(len(KW_GROUPS))]] if KVSL else []))
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()

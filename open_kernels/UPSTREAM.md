@@ -264,6 +264,16 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   `gemv_q4.h` `GEMV_Q4_0_NATIVE`, `gemm_q4_dequant.h` `GQD_Q4_0`). `gguf_pack_test` checks
   it against the 5120-byte law's `d` plane and codes. The diff applies over `beccd46` plus
   the seven patches above.
+- `upstream-patches/gemma4-kvslice-runtime.patch` (2026-10-30) brings OPEN-ATTN-KVSLICE's
+  per-core KV windows to this runtime. A kernel's manifest `kvslice` (2 or 4 rows an element,
+  `attnpos` only, `rb` 1) makes every KV transfer below one row a window fill. Each fill's
+  length is patched to the window, padded to whole elements, times its own words a row; its
+  offset to its compiled in-row base plus the window's first row, so a sliding window works
+  too. The KV buffer keeps `kvslice - 1` rows of slack. The `stream_patch.hpp` hunks are this
+  repository's own header's, without its `rb_win`, slot and `attnposv` additions.
+  `kvslice_patch_test` checks Gemma 4's local stream (four fills, a 1024-row window) and global
+  stream (two fills) at positions 0 to 4095. The diff applies over `beccd46` plus the eight
+  patches above.
 
 `designs/dense/dx_attn.py` now takes its recipe module from `for_spec` and its flags from the
 recipe's `attn_flags`, and gained `dx.py`'s ATTN_QLOCAL q loop. It emits byte-identical MLIR

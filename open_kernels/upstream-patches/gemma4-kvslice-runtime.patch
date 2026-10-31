@@ -1,0 +1,255 @@
+diff --git a/open_kernels/harness/stream_patch.hpp b/open_kernels/harness/stream_patch.hpp
+index 42eb9de..8f08aac 100644
+--- a/open_kernels/harness/stream_patch.hpp
++++ b/open_kernels/harness/stream_patch.hpp
+@@ -56,6 +56,7 @@ struct AttnGeometry {
+     /// blocks AND takes the new position's row as the last block's final slot (attn.h
+     /// ATTN_BLOCK_ONLY). 1 = every other kernel: the row count is the window's own.
+     uint64_t rb = 1;
++    uint64_t kvslice = 0;            ///< rows a per-core window element holds (OPEN-ATTN-KVSLICE); 0 = one window fill
+ };
+ 
+ /// The cached rows position `pos` attends to: [start, pos), streamed as nf rows (>= 1: position 0
+@@ -99,6 +100,8 @@ struct AttnPatch {
+     size_t word;
+     uint8_t kind;
+     uint32_t flags;
++    uint64_t base = 0;        ///< kind 3 with kvslice: the fill's compiled offset inside a row
++    uint64_t row_words = 0;   ///< kind 0 with kvslice: words the fill moves per row
+ };
+ 
+ /// `moeroute`'s table: the moe_experts design's weight fills, built against a
+@@ -171,11 +174,15 @@ inline std::vector<AttnPatch> attn_table(const std::vector<uint32_t>& w, const s
+         uint32_t reg = w[i + 6], arg = w[i + 8];
+         uint64_t off = w[i + 10] & 0x7fffffffu;
+         uint32_t flags = w[i + 10] & 0x80000000u;
+-        if (arg == 3 && off == 0) {
++        if (arg == 3 && (off == 0 || (g.kvslice && off < g.kv_row))) {
+             if (!have_bd || bd_write + 2 >= w.size() || w[bd_write + 2] + 4 != reg)
+                 throw std::runtime_error("attnpos: " + kn + ": no BD write before the KV window fill");
+-            t.push_back({bd_write + 4, 0, 0});
+-            t.push_back({i + 10, 3, flags});
++            const uint64_t len = w[bd_write + 4];
++            if (g.kvslice && (len % g.kvslice || !len))
++                throw std::runtime_error("attnpos: " + kn + ": a window fill of " + std::to_string(len) +
++                                         " words is not " + std::to_string(g.kvslice) + " whole rows");
++            t.push_back({bd_write + 4, 0, 0, 0, g.kvslice ? len / g.kvslice : 0});
++            t.push_back({i + 10, 3, flags, off});
+         } else if (arg == 3 && off == g.kv_row) {
+             t.push_back({i + 10, 1, flags});
+         } else if (arg == 3) {
+@@ -187,13 +194,18 @@ inline std::vector<AttnPatch> attn_table(const std::vector<uint32_t>& w, const s
+     for (uint8_t kind = 0; kind < 4; ++kind) {
+         size_t n = 0;
+         for (const auto& p : t) n += (p.kind == kind);
+-        if (n != 1)
++        // with kvslice each attention core has its own window fill: one length and one offset patch apiece
++        if (g.kvslice && (kind == 0 || kind == 3) ? n == 0 : n != 1)
+             throw std::runtime_error("attnpos: " + kn + ": " + std::to_string(n) + " patches of kind " +
+-                                     std::to_string(kind) + ", expected 1 (window length, row drain, record fill, window offset)");
++                                     std::to_string(kind) + ", expected " + (g.kvslice && (kind == 0 || kind == 3) ? "1 or more" : "1") +
++                                     " (window length, row drain, record fill, window offset)");
+     }
+     return t;
+ }
+ 
++/// nf padded to whole elements: the kernel takes the last one's real rows singly and never reads the rest
++inline uint64_t attn_kvslice_rows(uint64_t nf, uint64_t kvslice) { return kvslice * ((nf + kvslice - 1) / kvslice); }
++
+ /// Bytes this instruction stream moves between DDR and the array, per host
+ /// buffer argument.
+ ///
+@@ -283,10 +295,11 @@ inline void attn_apply(uint32_t* iw, const std::vector<AttnPatch>& table, uint64
+         nf = g.rb * (valid / g.rb + 1) - 1;
+     }
+     for (const auto& p : table) {
+-        uint64_t v = p.kind == 0   ? nf * g.kv_row / 4  // a BD length is in words
++        uint64_t v = p.kind == 0   ? (g.kvslice ? attn_kvslice_rows(nf, g.kvslice) * p.row_words
++                                                : nf * g.kv_row / 4)  // a BD length is in words
+                      : p.kind == 1 ? pos * g.kv_row
+                      : p.kind == 2 ? pos * g.ptab_row
+-                                   : start * g.kv_row;
++                                   : p.base + start * g.kv_row;
+         iw[p.word] = static_cast<uint32_t>(v) | p.flags;
+     }
+ }
+diff --git a/src/open_qwen36/CMakeLists.txt b/src/open_qwen36/CMakeLists.txt
+index 45f82c8..7c2e7d4 100644
+--- a/src/open_qwen36/CMakeLists.txt
++++ b/src/open_qwen36/CMakeLists.txt
+@@ -60,6 +60,9 @@ target_include_directories(block_host_test PRIVATE ${_inc})
+ # attn_window_test (no XRT, no fixture): the block attention's host half with Gemma 4's options
+ add_executable(attn_window_test attn_window_test.cpp block_host.cpp)
+ target_include_directories(attn_window_test PRIVATE ${_inc})
++# kvslice_patch_test (no XRT): attnpos over per-core window fills (OPEN-ATTN-KVSLICE)
++add_executable(kvslice_patch_test kvslice_patch_test.cpp)
++target_include_directories(kvslice_patch_test PRIVATE ${_inc})
+ 
+ # block_host.cpp uses AVX2/FMA intrinsics in both targets. The parent app and
+ # Windows build.cmd already enable them; the standalone CMake build must too.
+@@ -72,7 +75,8 @@ foreach(t open_qwen36_cli block_host_test attn_window_test)
+     endif()
+ endforeach()
+ 
+-foreach(t open_qwen36_cli manifest_test gguf_pack_test vit_test block_host_test attn_window_test)
++foreach(t open_qwen36_cli manifest_test gguf_pack_test vit_test block_host_test attn_window_test
++          kvslice_patch_test)
+     if(MSVC)
+         target_compile_options(${t} PRIVATE /EHsc /Zc:__cplusplus /bigobj)
+         target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
+@@ -85,6 +89,7 @@ add_test(NAME OPEN-VISION-VIT-CONFIG COMMAND vit_test --configs
+ add_test(NAME OPEN-VISION-VIT-WINDOWED COMMAND vit_test --window-index)
+ add_test(NAME GGUF-PACK COMMAND gguf_pack_test)
+ add_test(NAME OPEN-PREFILL-ATTN-WINDOW COMMAND attn_window_test)
++add_test(NAME OPEN-ATTN-KVSLICE-PATCH COMMAND kvslice_patch_test)
+ add_test(NAME OPEN-MANIFEST COMMAND manifest_test
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures/manifest_qwen36.json"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures/manifest_qwen3_4b.json"
+diff --git a/src/open_qwen36/core.cpp b/src/open_qwen36/core.cpp
+index 2cc7e44..fa9f0ae 100644
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -571,6 +571,7 @@ void Core::load_kernel(const std::string& name, const KernelDesc& d) {
+         stream_patch::AttnGeometry g = w_->attn;
+         g.kv_row = d.kv_row;
+         g.ptab_row = d.ptab_row;
++        g.kvslice = d.kvslice;      // per-core window fills (OPEN-ATTN-KVSLICE): the table reads them by it
+         k.attn = stream_patch::attn_table(k.words, name, g);
+         k.geom = g;
+         k.geom.window = d.window;
+@@ -801,6 +802,9 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
+         uint64_t kv_slack = 0;
+         for (const auto& [kn, kd] : w_->kernels)
+             if (kd.patch == "attnpos" && kd.rb > 2) kv_slack = std::max<uint64_t>(kv_slack, kd.rb - 2);
++        // a per-core window is padded to whole elements, up to kvslice - 1 rows past the last cached one
++        for (const auto& [kn, kd] : w_->kernels)
++            if (kd.kvslice > 1) kv_slack = std::max<uint64_t>(kv_slack, kd.kvslice - 1);
+         state_.push_back(alloc(lt.state_kind == "kv" ? (cfg_.max_ctx + kv_slack) * lt.state_row : lt.state_bytes));
+         if (progress) progress(l + 1, nl_ + 1);
+         if ((l + 1) % 10 == 0 || l + 1 == nl_)
+diff --git a/src/open_qwen36/kvslice_patch_test.cpp b/src/open_qwen36/kvslice_patch_test.cpp
+new file mode 100644
+index 0000000..08c07ea
+--- /dev/null
++++ b/src/open_qwen36/kvslice_patch_test.cpp
+@@ -0,0 +1,90 @@
++/// kvslice_patch_test (no XRT): attnpos on a stream with per-core window fills (OPEN-ATTN-KVSLICE),
++/// shaped as dx.py emits them for Gemma 4's local layers -- four fills of one 2- or 4-row element at
++/// in-row offsets 0, 1, 2, 3 KB of an 8 KB row, a 1024-row sliding window -- and for its global
++/// ones (two fills, no window): each fill's length becomes its own words a row times the window
++/// padded to whole elements, each offset its base plus the window's first row.
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <string>
++#include <vector>
++
++#include "stream_patch.hpp"
++
++namespace {
++int failures = 0;
++void check(bool ok, const std::string& what) {
++    std::printf("%s %s\n", ok ? "ok  " : "FAIL", what.c_str());
++    if (!ok) ++failures;
++}
++
++// One DDR transfer as the stream carries it: the BD blockwrite (op 1: register, then the length in
++// words) and the address patch after it (op 0x81: the same register + 4, the buffer arg, the offset).
++void transfer(std::vector<uint32_t>& w, uint32_t reg, uint32_t len_words, uint32_t arg, uint32_t off) {
++    std::vector<uint32_t> bd(12, 0), patch(12, 0);
++    bd[0] = 1;
++    bd[2] = reg;
++    bd[4] = len_words;
++    patch[0] = 0x81;
++    patch[6] = reg + 4;
++    patch[8] = arg;
++    patch[10] = off;
++    w.insert(w.end(), bd.begin(), bd.end());
++    w.insert(w.end(), patch.begin(), patch.end());
++}
++
++struct Kind {
++    uint64_t kv_row, ptab_row, window, kvs_heads, hd;
++    std::vector<uint64_t> bases;     // each fill's first kv head x hd x 2 B
++};
++
++void run(const char* name, const Kind& k, uint64_t rb) {
++    const uint64_t slice = k.kvs_heads * k.hd * 2;            // bytes of one K (or V) slice
++    const uint32_t elem_words = static_cast<uint32_t>(rb * 2 * slice / 4);
++    std::vector<uint32_t> w(4, 0);
++    uint32_t reg = 0x1d000;
++    for (uint64_t b : k.bases) transfer(w, reg += 0x20, elem_words, 3, static_cast<uint32_t>(b));
++    transfer(w, reg += 0x20, static_cast<uint32_t>(k.kv_row / 4), 3, static_cast<uint32_t>(k.kv_row));   // the new row
++    transfer(w, reg += 0x20, static_cast<uint32_t>(k.ptab_row / 4), 5, 0x80000000u | static_cast<uint32_t>(k.ptab_row));
++    stream_patch::AttnGeometry g;
++    g.kv_row = k.kv_row;
++    g.ptab_row = k.ptab_row;
++    g.window = k.window;
++    bool refused = false;
++    try {
++        stream_patch::attn_table(w, name, g);
++    } catch (const std::exception&) {
++        refused = true;
++    }
++    check(refused, std::string(name) + ": a plain table refuses several window fills");
++    g.kvslice = rb;
++    const auto t = stream_patch::attn_table(w, name, g);
++    check(t.size() == 2 * k.bases.size() + 2, std::string(name) + ": a length and an offset patch a fill");
++    for (uint64_t pos : {0ull, 1ull, 2ull, 7ull, 1023ull, 1024ull, 1025ull, 1500ull, 4095ull}) {
++        std::vector<uint32_t> iw = w;
++        stream_patch::attn_apply(iw.data(), t, pos, g);
++        uint64_t start, nf;
++        stream_patch::attn_window(pos, g.window, &start, &nf);
++        const uint64_t rows = rb * ((nf + rb - 1) / rb);
++        bool ok = true;
++        for (size_t f = 0; f < k.bases.size(); ++f) {
++            const size_t bd = 4 + f * 24;
++            ok = ok && iw[bd + 4] == rows * 2 * slice / 4 && iw[bd + 12 + 10] == k.bases[f] + start * k.kv_row;
++        }
++        const size_t row = 4 + k.bases.size() * 24, rec = row + 24;
++        ok = ok && iw[row + 12 + 10] == pos * k.kv_row && iw[rec + 12 + 10] == (0x80000000u | pos * k.ptab_row);
++        ok = ok && start + rows <= std::max<uint64_t>(pos, 1) + rb - 1;   // within kvslice - 1 rows of slack
++        check(ok, std::string(name) + " rb " + std::to_string(rb) + " at position " + std::to_string(pos) + ": " + std::to_string(rows) +
++                      " rows from row " + std::to_string(start));
++    }
++}
++}  // namespace
++
++int main() {
++    for (uint64_t rb : {2ull, 4ull}) {
++        run("dx_local", {8192, 4096, 1024, 2, 256, {0, 1024, 2048, 3072}}, rb);
++        run("dx", {4096, 2048, 0, 1, 512, {0, 1024}}, rb);
++    }
++    std::printf(failures ? "KVSLICE-PATCH FAIL\n" : "KVSLICE-PATCH OK\n");
++    return failures ? 1 : 0;
++}
+diff --git a/src/open_qwen36/manifest.cpp b/src/open_qwen36/manifest.cpp
+index 0f4354e..7f3390e 100644
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -221,6 +221,11 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
+             fail(where, "kernel " + k + ": rb " + std::to_string(d.rb) + " is not 1, 2 or 4");
+         if (d.rb > 1 && d.patch != "attnpos")
+             fail(where, "kernel " + k + ": rb " + std::to_string(d.rb) + " needs the attnpos patch table");
++        d.kvslice = v.value("kvslice", 0ull);
++        // attn_stepw.cc takes blocks of 2 or 4 rows, and the padding is its own (attn_kvslice_rows), not rb's
++        if (d.kvslice && ((d.kvslice != 2 && d.kvslice != 4) || d.patch != "attnpos" || d.rb != 1))
++            fail(where, "kernel " + k + ": kvslice " + std::to_string(d.kvslice) +
++                            " needs 2 or 4 rows, the attnpos patch table and rb 1");
+         if (!m.contexts.count(d.context)) fail(where, "kernel " + k + " names unknown context " + d.context);
+         if (!d.patch.empty() && d.patch != "moeroute2" && d.patch != "attnpos" && d.patch != "moebatch" &&
+             d.patch != "attnrows")
+diff --git a/src/open_qwen36/manifest.hpp b/src/open_qwen36/manifest.hpp
+index 87cc3e5..3e5b2a8 100644
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -217,6 +217,9 @@ struct KernelDesc {
+     /// layer types have different attention geometry (Gemma 4: head dim 256 and 512) builds a
+     /// kernel per type, each patched with its own; absent in the manifest = the layout's.
+     uint64_t kv_row = 0, ptab_row = 0;
++    /// attnpos: rows of one per-core window element (OPEN-ATTN-KVSLICE: each attention core reads its own
++    /// kv heads of the window on a fill of its own); 0 = the one window fill of every other kernel.
++    uint64_t kvslice = 0;
+ };
+ 
+ // OPEN-DECODE-ROWS: `kernel` reuses each layer's pool / consts / state / ptab; l == 0 means no rows pass.

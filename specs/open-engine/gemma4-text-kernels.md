@@ -100,8 +100,14 @@ logit, took fast to 9.4-9.7 s. That evening the GGUF view's pools moved to a
 4608-byte Q4_0-native chunk, which drops the min plane because the cores form
 `m = -8 d` themselves. Every logit stayed the same and decode took 6-7% less
 time, 238-240 against 255-256 ms per token. Decode is bound by the weight
-stream, not by the GEMV arithmetic. The measured results and the decode
-profile are in `OPEN-FAMILY-GEMMA4`.
+stream, not by the GEMV arithmetic. Later that night the decode layer's
+attention moved to 8 cores of 2 heads, 4 cached rows a call, each core
+reading only its own kv heads of the window. On a quiet machine, decode
+after the 1450-token prompt took 199-200 instead of 237 ms per token, and
+1-2% more at the start of a context. The head split and the windows leave
+every logit as it was; the row blocks keep the greedy tokens and the
+distance to the reference. The measured results and the decode profile are
+in `OPEN-FAMILY-GEMMA4`.
 
 The two implementations agree on 12B's layer types, global geometry, K=V
 before separate norms, unit score scale, V norm, proportional RoPE pairing and

@@ -96,6 +96,8 @@ class DenseGeometry:
     SCALE: float = 0.0                                              # attn.h ATTN_SCALE; 0 = 1/sqrt(HD)
     ROPE_PAIR: int = 0                                              # attn.h ATTN_ROPE_PAIR; 0 = ROT/2
     QLOCAL: int = 0                                                 # attn.h ATTN_QLOCAL: a core keeps only its q heads
+    AWIDE: int = 0                                                  # dx.py: attention cores on row 4, og joined in memtiles
+    KVSLICE: int = 0                                                # dx.py: rows a per-core window element holds; 0 = attnknobs.kvslice
 
 
 @dataclass(frozen=True)

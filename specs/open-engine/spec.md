@@ -509,7 +509,9 @@ of one kv head share every K and V row they load, and give logits byte-identical
   below one row is a window fill, its BD length patched to the padded rows times its own per-row words, its offset to its base
   plus `start * kv_row`; the KV buffer keeps `kvslice - 1` rows of slack.
 - `dx.py` counts its own shim MM2S producers and refuses, naming the free columns, a design with more window streams than
-  free channels (Granite: columns 3..7); a q / k / v bias or a sliding window keeps the broadcast.
+  free channels (Granite: columns 3..7); a q / k / v bias or a sliding window keeps the broadcast. A recipe may set
+  the windows itself (`DenseGeometry.KVSLICE`): Gemma 4's decode layers take them on both layer types, the
+  local one's 1024-row window included, with 8 kv heads in 4 shared streams of 2 (OPEN-FAMILY-GEMMA4).
 - **`dxl`** (the L-row pass) takes the same per-core windows when its family is in `DXL_KVSLICE_MEASURED`: core c of every row
   group reads one slice stream shared by the groups, each group walking its own blocks and tail element and skipping the rest
   (`dxl_attn_skipw`), so `dxl` stays bit-identical to `dx`.
@@ -2148,6 +2150,81 @@ kernels `gemma4-12b-shl` and `gemma4-12b-q40`, 8 host threads
   kernels themselves by 1.6-2.1x. Inferred, not measured inside a quiet
   prefill: much of the in-prefill slowdown reported above is that load.
 
+**Decode attention at depth (2026-10-30, night).** A quiet profile came first
+(`target/npu-dev/gemma4-12b-depth-probe.sh`, `--bench-decode 7` minima,
+binary `q40b`; `dibs run --measure` CLEAN before and NOISY after, when a
+dotnet build started; load average 0.2-5.7 at the runs). On the compact set a
+global layer took 3.96 / 4.95 / 6.35 / 8.98 ms at positions 26 / 1024 / 2048
+/ 4000, 1.26 us a cached row, and a local layer 3.32 ms at 26 and 4.42-4.48
+at the full 1024-row window. With the attention arithmetic compiled out
+(`ATTN_NULL=1`), the broadcast stream alone cost 0.29 us a global row and
+0.58 ms a local window. At 1024 the local layers were most of the walk: 40
+times 1.1 ms. The step took 189 / 240 / 255 / 278 ms.
+
+The decode layer's attention (`recipes/gemma4.py` `dx_attention` and
+`dx_geometry`, picked for the dx builds by `G4_DX=1`) now runs on 8 cores of
+2 heads on row 4, their og joined in memtiles. Each core takes 4 cached rows
+a call and reads only its own kv heads of the window on a shim channel of
+its own (OPEN-ATTN-KVSLICE). The local layer's 8 kv heads go in 4 shared
+streams of 2, its sliding window included; the global layer's two copies of
+its one kv head go in 2. A local core takes its half of a 4-head q element
+(`attn.h` ATTN_QLOCAL). The block kernel beside the single-row one overflowed
+program memory by up to 448 B at 2 rows a call. attn.h's integer scalar
+routines (ATTN_INTFP) and one 32-lane exponential (ATTN_EXP32) fix that;
+both leave every bit as it was. At 4 rows 656 B remain. The block prefill's
+attention dispatch (`dx_attn.py`) keeps 4 cores and one row. The manifest's
+`dx_local` and `dx` carry `kvslice 4`; the runtime side is
+`upstream-patches/gemma4-kvslice-runtime.patch`, checked by
+`kvslice_patch_test`. `G4_ACORES=4 G4_RB=1 G4_KVSLICE=0` gives the old walk.
+
+Gates, declared before the runs: every prefill logit byte-identical (the
+prefill does not run dx). The head split and the windows must leave every
+decode logit as it was. Rows a call change the online softmax's rounding, so
+there the decode logits must be no further from the independent reference
+than the old kernel's, with the same greedy tokens. Prompts: short (25
+tokens + 32), the long one (1450 + 32) and its first 1000 tokens + 40, which
+decodes across the window boundary. All on binary `kvs1` (c0ec6b37).
+
+**Result (measured in Phlegm, 2026-10-30 22:50 to 2026-10-31 00:30):**
+- Prompt dumps byte-identical in every run (26, 1000 and 1450 of each).
+- Byte for byte, decode included: 8 cores at one row with the broadcast
+  window equal the old kernel (39 of 39 at 1000+). Per-core windows equal
+  the broadcast at 2 rows. 16 cores equal 8, at 2 rows and at 4. The
+  default-configuration export (`kernels/gemma4-12b-dec`: the same 26 core
+  programs and `insts.bin` as the probe set) matches on short and long.
+- Against the reference (`gemma4-12b-ref/compare_g4.py`), decode positions,
+  min / median cosine at 1 / 2 / 4 rows a call. Short: 0.999479 at all three;
+  medians 0.9999538 / 0.9999478 / 0.9999437. Long: 0.997748 / 0.997786 /
+  0.997782; medians 0.9998607 / 0.9998726 / 0.9998643. 1000 + 40: 0.935690 /
+  0.964017 / 0.963989; medians 0.9998785 / 0.9998843 / 0.9998839. Greedy
+  tokens were identical everywhere: 32, 40 and 32. On 1000 + 40, at 1006 the
+  NPU at every setting picks token 100 over the reference's 101 (margin
+  0.165). Every setting strays at 1007 (cosine 0.964). At 1008-1009 the old
+  kernel strays most: 0.936 / 0.972, against 0.991 / 0.988 at 2 rows and
+  0.965 / 0.982 at 4. Reference: `ref-b1000-forced`, numpy over the prompt
+  and the 39 shared greedy tokens.
+- Timing, two `dibs run --measure` units, CLEAN before and after, load
+  average 0.7-3.1 (`gemma4-12b-run/wide-time/`, `w8r4-time/`). Plain decode
+  in ms a token, two runs each:
+
+| kernel | 64 after the short prompt | 32 after the 1450-token prompt |
+|---|---|---|
+| old (4 cores, 1 row, broadcast) | 179, 179; 182, 182 | 240, 237; 237, 237 |
+| 8 cores, 2 rows, windows | 183, 182; 184, 183 | 205, 205; 204, 206 |
+| 16 cores, 4 rows, windows | 193, 192 | 201, 201 |
+| **8 cores, 4 rows, windows (default)** | 184, 185 | 199, 200 |
+
+- `--bench-decode` step, old against the default (second unit): 189.0 /
+  180.8 ms at 26, 238.0 / 205.9 at 1024, 251.7 / 210.3 at 2048 and 264.4 /
+  206.9 at 4000. At 4000 that is 3.8 against 4.8 tok/s. One layer at 4000: a
+  global layer 8.99 against 5.32 ms (0.38 us a cached row); a local one 4.24
+  against 3.40.
+- 16 cores were as fast at depth and slower at the start. Each switch into a
+  layer's context reloads every attention core's program. In the walk a
+  global layer, the one after each switch into its context, took 1.5-1.8 ms
+  more than alone at 16 cores, 0.7-1.0 at 8 and 0.4-0.7 at 4. At the start
+  of a context the default costs 1-2% (3-5 ms a token).
+
 **Open:** the `model.q4nx` route has not run. FLM's 12B package stores 16-row
 signed-q4 tiles (2304 B), a 16-row q8 head (4352 B) and a BF16 embedding
 table; both packers (`pack.q4_chunks_of`, `pools.cpp`) read 5120, 8704 and
@@ -2164,11 +2241,9 @@ set `OMP_NUM_THREADS`. The best count is not settled: 8 measured best under
 other load, and the quiet-machine run used 8 without a sweep. In Phlegm, `oflm serve`'s two-turn chat has not
 run. The source of the NPU's 1.5-2x per-stage error over BF16 rounding is
 unknown. The procedure's logit form of the boundary check cannot detect a
-one-row window error. Decode at depth: the global layers' attention runs
-on 4 cores at one cached row a call, and the local window is one broadcast
-stream; more attention cores on the global layers, and per-core KV windows
-(OPEN-ATTN-KVSLICE, which needs `ATTN_RB` above 1 and this runtime's
-patcher has no `kvslice`), are unbuilt. The head did not speed up with
+one-row window error. Decode at depth: a global layer after a switch into
+its context takes 0.7-1.0 ms more than alone, 8 times a token, and it still
+grows 0.38 us a cached row. The head did not speed up with
 fewer bytes on the quiet machine; why is not measured. Lean prefill on the
 Q4_0-native view was 3.5% slower in the one quiet pair.
 

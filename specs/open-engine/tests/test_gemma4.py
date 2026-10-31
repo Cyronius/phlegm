@@ -403,3 +403,41 @@ def test_bfp16_route_is_the_default_and_the_q4_route_is_lean(unvalidated, monkey
     assert b["gemm_bfp16_n4096_k15360"] == {"design": "gemm_bfp16/gemm_bfp16.py", "build_dir": "gemm_bfp16/build_n4096_k15360_m256",
                                             "env": {"GB_M": "256", "GB_K": "15360", "GB_N": "4096"}}
     assert all(n in b for n in g["builds"] if n.startswith("gemm_"))
+
+
+def test_decode_attention_is_wide_with_per_core_windows(unvalidated, monkeypatch):
+    """dx's decode attention (gemma4.dx_geometry): 8 cores of 2 heads on row 4, 4 rows a call and a
+    per-core window (manifest kvslice 4) for both layer types, on every dx build; the block prefill's
+    attention dispatch (dx_attn.py) keeps geometry()'s 4 cores of 4 heads and 1 row. G4_ACORES=4
+    G4_RB=1 G4_KVSLICE=0 gives back the walk the layer always had."""
+    s = spec()
+    for kind in ("local", "global"):
+        g, d = G4.geometry(s, kind), G4.dx_geometry(s, kind)
+        assert (g.ACORES, g.NHL, g.RB, g.AWIDE, g.KVSLICE) == (4, 4, 1, 0, 0)
+        assert (d.ACORES, d.NHL, d.RB, d.AWIDE, d.KVSLICE) == (8, 2, 4, 1, 4)
+        assert d == G4.replace(g, ACORES=8, NHL=2, RB=4, AWIDE=1, KVSLICE=4)
+    for sec in (manifest(s), manifest(s)["gguf"]):
+        assert sec["kernels"]["dx_local"]["kvslice"] == 4 and sec["kernels"]["dx"]["kvslice"] == 4
+        assert all("kvslice" not in sec["kernels"][k] for k in ("dxB", "dxB_local") if k in sec["kernels"])
+    b = G4.builds(s)
+    for n, v in b.items():
+        assert (v["env"].get(G4.DX_ENV) == "1") == (v["design"] == "dense/dx.py"), n
+    monkeypatch.setenv(G4.KIND_ENV, "global")
+    assert G4.recipe(s).geo == G4.geometry(s, "global")             # dx_attn.py's
+    monkeypatch.setenv(G4.DX_ENV, "1")
+    assert G4.recipe(s).geo == G4.dx_geometry(s, "global")          # dx.py's
+    monkeypatch.setenv("G4_ACORES", "4")
+    monkeypatch.setenv("G4_RB", "1")
+    monkeypatch.setenv("G4_KVSLICE", "0")
+    assert G4.recipe(s).geo == G4.geometry(s, "global")
+    assert G4.probe_env()["G4_ACORES"] == "4"                        # a set value joins the build key
+    m = manifest(s)["gguf"]
+    assert "kvslice" not in m["kernels"]["dx_local"] and "kvslice" not in m["kernels"]["dx"]
+    monkeypatch.setenv("G4_ACORES", "8")
+    assert G4.dx_geometry(s, "local").AWIDE == 1 and G4.dx_geometry(s, "local").KVSLICE == 0
+    monkeypatch.setenv("G4_RB", "2")
+    monkeypatch.setenv("G4_KVSLICE", "1")
+    assert (G4.dx_geometry(s, "global").RB, G4.dx_geometry(s, "global").KVSLICE) == (2, 2)
+    monkeypatch.setenv("G4_ACORES", "6")
+    with pytest.raises(OpRangeError):
+        G4.dx_geometry(s, "local")

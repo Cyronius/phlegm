@@ -605,13 +605,25 @@ static inline void attn_q_impl(const float *__restrict qe ATTN_BIAS_PARM, const 
 #else
   const float *__restrict qsrc = qe;
 #endif
+#if ATTN_QLOCAL && ATTN_NHL < ATTN_KVH / 2
+  // A core owns fewer heads than one q element carries (Gemma 4's local layers on 8 cores: 2 of
+  // 4): e is the first of them inside the element, and they land at local heads 0 .. kNHL.
+  static_assert(kHPE % kNHL == 0, "attn.h ATTN_QLOCAL: a core's heads must tile a q element");
+#define ATTN_QN kNHL
+#define ATTN_QSRC(i) ((unsigned)e + (i))
+#define ATTN_QDST(i) (i)
+#else
+#define ATTN_QN kHPE
+#define ATTN_QSRC(i) (i)
+#define ATTN_QDST(i) ((unsigned)e * kHPE + (i))
+#endif
 #if !ATTN_VEXP
-  for (unsigned i = 0; i < kHPE; ++i) norm_rope(qsrc + i * kHD, qn, cs, qs + ((unsigned)e * kHPE + i) * kHD);
+  for (unsigned i = 0; i < ATTN_QN; ++i) norm_rope(qsrc + ATTN_QSRC(i) * kHD, qn, cs, qs + ATTN_QDST(i) * kHD);
 #else
   alignas(128) float t[kHD];
-  for (unsigned i = 0; i < kHPE; ++i) {
-    norm_rope(qsrc + i * kHD, qn, cs, t);
-    bfloat16 *qh = qs + ((unsigned)e * kHPE + i) * kHD;
+  for (unsigned i = 0; i < ATTN_QN; ++i) {
+    norm_rope(qsrc + ATTN_QSRC(i) * kHD, qn, cs, t);
+    bfloat16 *qh = qs + ATTN_QDST(i) * kHD;
     for (unsigned j = 0; j < kHD; j += kV) {
       vbN<kV> h, l;
       splitN<kV>(aie::load_v<kV>(t + j), h, l);
@@ -630,6 +642,9 @@ static inline void attn_q_impl(const float *__restrict qe ATTN_BIAS_PARM, const 
     }
   }
 #endif
+#undef ATTN_QN
+#undef ATTN_QSRC
+#undef ATTN_QDST
 }
 // k element e -> bf16 kout (the cache row half); v element e -> bf16 vout
 static inline void attn_k_impl(const float *__restrict ke ATTN_BIAS_PARM, const bfloat16 *__restrict kn,
@@ -1289,6 +1304,9 @@ __attribute__((noinline)) inline void attn_rowb_impl(const bfloat16 *const *__re
   const vfN<kPV> pv = ATTN_EXPN<kPV>(aie::select(fsubN<kPV>(aie::load_v<kPV>(sv), aie::load_v<kPV>(mnv)), eup,
                                              aie::mask<kPV>::from_uint32(((1u << kNHL) - 1u) << kNHL)));
   const vfN<kNL> e = aie::shuffle_down(pv, kNHL).template extract<kNL>(0);
+#elif ATTN_EXP32
+  // a block narrower than the one routine (Gemma 4 at 2 heads a core, RB 2: 16 lanes) rides on it too
+  const vfN<kPV> pv = attn_vexp<kPV>(fsubN<kPV>(aie::load_v<kPV>(sv), aie::load_v<kPV>(mnv)));
 #else
   const vfN<kPV> pv = ATTN_EXPN<kPV>(fsubN<kPV>(aie::load_v<kPV>(sv), aie::load_v<kPV>(mnv)));
 #endif

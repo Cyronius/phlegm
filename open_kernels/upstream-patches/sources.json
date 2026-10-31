@@ -336,5 +336,29 @@
     "note": "std_perm_gguf's third chunk law: a 4608-B pool chunk (the Q4_0-native GGUF view, recipes/gemma4.py G4_Q40) holds the bf16 d plane and the codes, the cores taking m = -8 d (gemv_q4.h GEMV_Q4_0_NATIVE, gemm_q4_dequant.h GQD_Q4_0); only Q4_0 tensors pack into it, anything else is refused. gguf_pack_test checks it against the q4_1 law's d plane and codes, that law's m against -8 d, and that a Q4_1 tensor is refused. A diff over base plus the seven earlier Gemma 4 patches",
     "patch": "gemma4-q40-gguf-runtime.patch",
     "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "gemma4_kvslice_20261030": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030"
+    ],
+    "files": [
+      "open_kernels/harness/stream_patch.hpp",
+      "src/open_qwen36/CMakeLists.txt",
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/kvslice_patch_test.cpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp"
+    ],
+    "note": "per-core KV windows (OPEN-ATTN-KVSLICE) in this runtime: the manifest's kernel `kvslice` (2 or 4 rows an element, attnpos only, rb 1), attnpos tables over several window fills (each fill's length patched to the window padded to whole elements times its own words a row, its offset to its compiled in-row base plus the window's first row), and kvslice - 1 rows of KV slack. stream_patch.hpp's kvslice parts are phlegm's own header's (open_kernels/harness), without its rb_win, slot and attnposv additions. kvslice_patch_test checks Gemma 4's local (four fills, 1024-row window) and global (two fills) streams at positions 0..4095. Gemma 4's dx_local / dx kernels carry kvslice 4 (recipes/gemma4.py dx_attention); the test covers 2 and 4. A diff over base plus the eight earlier Gemma 4 patches",
+    "patch": "gemma4-kvslice-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
   }
 }
