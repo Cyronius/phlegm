@@ -2121,6 +2121,33 @@ build `q40b` differs only in an error message), kernels
   arithmetic adds 0.2-0.9 ms. The full set's step is 230 ms at position 26,
   327 at 1450 and 360 at 3000; the null set's 254, 282 and 274.
 
+**Result (measured in Phlegm, 2026-10-30 20:42-20:48, quiet machine):** `dibs
+run --measure` CLEAN before and after, load average 8.3 falling to 1.5,
+nothing else on the NPU. Ryzen AI MAX+ 395 (Strix Halo), Linux
+7.2.11-200.fc44 with the in-tree `amdxdna` (no version string); `xrt-smi`
+failed, so the NPU power mode is unrecorded. Binaries `pipe4` and `q40b`,
+kernels `gemma4-12b-shl` and `gemma4-12b-q40`, 8 host threads
+(`target/npu-dev/gemma4-12b-idle-run.sh`, results in
+`gemma4-12b-run/idle/`).
+- Fast prefill, 1450 tokens, three runs after a warm-up: 3.91 / 3.87 / 3.83
+  s (about 375 tokens/s), against 9.4-9.7 s at load 33-37. Weights resident
+  in 11.2-11.5 s, against 17-18.
+- Lean prefill, one run each: 17.5 s compact, 18.2 s Q4_0-native.
+- Decode, 64 tokens after the short prompt, alternating: compact 193 / 191 /
+  191 ms/token (5.2 tok/s), Q4_0-native 181 / 179 / 182 (5.5 tok/s, -6%).
+  Traced: 191.8 against 177.1 ms a step at position 26 and 246.2 against
+  231.6 at 1024 (4.0 and 4.3 tok/s). After the 1450-token prompt, compact
+  decode takes 250-253 ms/token.
+- Per dispatch, compact against Q4_0-native (blocked time, position 26): a
+  local layer 3.48 against 3.18 ms (about 38 GB/s either way), a global
+  layer 4.57 against 4.35. The head's minimum is 12.6-13.0 ms in both,
+  whatever its bytes.
+- Kernels alone (`--bench-kernel`, mean): `ag_shl1280_local` 0.33 ms,
+  `gemm_bfp16_n15360_k3840` 1.65 ms (about 18 TFLOPS) and `n4096_k4096` 0.53
+  ms, against 0.69, 2.61 and 0.89 ms at load 33-40: the load slowed the
+  kernels themselves by 1.6-2.1x. Inferred, not measured inside a quiet
+  prefill: much of the in-prefill slowdown reported above is that load.
+
 **Open:** the `model.q4nx` route has not run. FLM's 12B package stores 16-row
 signed-q4 tiles (2304 B), a 16-row q8 head (4352 B) and a BF16 embedding
 table; both packers (`pack.q4_chunks_of`, `pools.cpp`) read 5120, 8704 and
@@ -2133,16 +2160,17 @@ dispatches for 1450 tokens, at about a tenth of the GEMMs' rate) and every
 kernel's slowdown inside the prefill against alone. The step-major schedule
 has run only on Gemma 4: the other dense families reach it only through
 `OFLM_OPEN_DENSE_LAYER_MAJOR=1`, ungated. Runs that source `env.sh` must
-set `OMP_NUM_THREADS`. The best count under other load is not settled: 8
-measured best here, and an idle machine has not been measured. In Phlegm, `oflm serve`'s two-turn chat has not
+set `OMP_NUM_THREADS`. The best count is not settled: 8 measured best under
+other load, and the quiet-machine run used 8 without a sweep. In Phlegm, `oflm serve`'s two-turn chat has not
 run. The source of the NPU's 1.5-2x per-stage error over BF16 rounding is
 unknown. The procedure's logit form of the boundary check cannot detect a
 one-row window error. Decode at depth: the global layers' attention runs
 on 4 cores at one cached row a call, and the local window is one broadcast
 stream; more attention cores on the global layers, and per-core KV windows
 (OPEN-ATTN-KVSLICE, which needs `ATTN_RB` above 1 and this runtime's
-patcher has no `kvslice`), are unbuilt. No decode figure here is from a
-quiet machine.
+patcher has no `kvslice`), are unbuilt. The head did not speed up with
+fewer bytes on the quiet machine; why is not measured. Lean prefill on the
+Q4_0-native view was 3.5% slower in the one quiet pair.
 
 ### OPEN-FAMILY-HUNYUAN: HunYuan dense on the dense recipe
 **Applies to:** openflowlm-next (`open_kernels/recipes/dense.py`, `spec.py`, `designs/attn/attn.h`, `designs/dense/dx.py`, `utilities/q4nx-build`)
