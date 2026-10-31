@@ -93,9 +93,11 @@ def run(driver: Path, bundle: Path, source: Gemma4TextSource, layer_index: int,
     if plan.variant != "12B" or not isinstance(layer_index, int) or not 0 <= layer_index < len(plan.layers):
         raise ValueError("expected a Gemma 4 12B layer")
     layer = plan.layers[layer_index]
-    if (not isinstance(position, int) or position < 0 or position >= plan.max_context or
-            hidden.shape != (plan.hidden,) or hidden.dtype != bfloat16 or
-            previous_k.shape != (position, layer.kv_heads, layer.head_dim) or
+    if not isinstance(position, int) or position < 0 or position >= plan.max_context:
+        raise ValueError("Gemma 4 decode position out of range")
+    previous_rows = min(position, layer.sliding_window - 1) if layer.sliding_window else position
+    if (hidden.shape != (plan.hidden,) or hidden.dtype != bfloat16 or
+            previous_k.shape != (previous_rows, layer.kv_heads, layer.head_dim) or
             previous_v.shape != previous_k.shape or previous_k.dtype != bfloat16 or
             previous_v.dtype != bfloat16):
         raise ValueError("Gemma 4 decode state differs from layer geometry")
