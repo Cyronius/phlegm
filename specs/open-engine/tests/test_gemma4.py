@@ -193,7 +193,8 @@ def test_block_prefill_has_each_kinds_geometry(unvalidated, monkeypatch):
     """Per layer type: its own qkv3 / o GEMM shapes, attention kernel, context, window and rows.
     The global qkv3 weight is q plus the four k_proj copies of the K and V slots, consecutive."""
     monkeypatch.setenv("DENSE_GGUF_GEMM", "1")
-    monkeypatch.setenv("DENSE_GGUF_COMPACT", "0")      # the f32-scale twin's names
+    monkeypatch.setenv("G4_Q40", "0")                  # not the Q4_0-native view ...
+    monkeypatch.setenv("DENSE_GGUF_COMPACT", "0")      # ... nor the compact one: the f32-scale twin's names
     monkeypatch.setenv("G4_BFP16", "0")                # the q4 route as gemm_block
     m = manifest(spec())["gguf"]
     loc, glo = m["layer_types"][DENSE_LOCAL]["gemm_block"], m["layer_types"][DENSE]["gemm_block"]
@@ -225,10 +226,11 @@ def test_block_prefill_has_each_kinds_geometry(unvalidated, monkeypatch):
 
 @pytest.mark.parametrize("gemm", ["0", "1"])
 def test_compact_gguf_view_is_the_q4_1_sections_pool_and_kernels(unvalidated, monkeypatch, gemm):
-    """By default (DENSE_GGUF_COMPACT unset, or 1) the GGUF view keeps its reader (std_perm_gguf,
-    the scaled embedding, the folded consts) on the q4_1 section's chunk law, offsets, buffers,
-    decode kernels and head, and the block route's GEMMs are the q4_1-law builds. =0 gives the
-    f32-scale twin. The q4nx section does not change."""
+    """Without the Q4_0-native view (G4_Q40=0) and with DENSE_GGUF_COMPACT unset, or 1, the GGUF
+    view keeps its reader (std_perm_gguf, the scaled embedding, the folded consts) on the q4_1
+    section's chunk law, offsets, buffers, decode kernels and head, and the block route's GEMMs
+    are the q4_1-law builds. =0 gives the f32-scale twin. The q4nx section does not change."""
+    monkeypatch.setenv("G4_Q40", "0")
     monkeypatch.setenv("DENSE_GGUF_GEMM", gemm)
     monkeypatch.setenv("DENSE_GGUF_COMPACT", "0")
     twin = manifest(spec())
@@ -272,6 +274,44 @@ def test_compact_gguf_view_is_the_q4_1_sections_pool_and_kernels(unvalidated, mo
     assert all(n in b for n in g["builds"] if n.startswith("gemm_"))
     monkeypatch.setenv("DENSE_GGUF_COMPACT", "0")
     assert "DENSE_GGUF_COMPACT" in G4.probe_env()     # a set value joins the build key
+
+
+def test_q40_gguf_view_is_its_own_pool_law_and_kernels(unvalidated, monkeypatch):
+    """By default (G4_Q40 unset, or 1) the GGUF view is built at the Q4_0-native law (4608-B
+    chunks, no min plane): its own offsets, a tenth smaller pools and head, the _q40 decode, head
+    and lean GEMM builds, and the same reader, consts, buffers and bfp16 route as the compact view
+    (G4_Q40=0). The q4nx section does not move."""
+    m = manifest(spec())
+    monkeypatch.setenv("G4_Q40", "1")
+    assert {k: v for k, v in manifest(spec())["gguf"].items() if k != "build_key"} == \
+        {k: v for k, v in m["gguf"].items() if k != "build_key"}
+    monkeypatch.setenv("G4_Q40", "0")
+    assert G4.probe_env()["G4_Q40"] == "0"              # a set value joins the build key
+    compact = manifest(spec())
+    assert not any("q40" in n for n in G4.builds(spec()))
+    monkeypatch.delenv("G4_Q40")
+    g, c = m["gguf"], compact["gguf"]
+    assert {k: v for k, v in m.items() if k not in ("gguf", "builds", "build_key")} == \
+        {k: v for k, v in compact.items() if k not in ("gguf", "builds", "build_key")}
+    assert (g["spec"]["quant"], g["layout"]["chunk_bytes"], g["pack"]["chunk_bytes"]) == ("q4_0", 4608, 4608)
+    assert g["pack"]["pool_bytes"] < c["pack"]["pool_bytes"] and g["globals"]["lmpool"] < c["globals"]["lmpool"]
+    assert g["pack"]["embed"] == c["pack"]["embed"] and [o["op"] for o in g["pack"]["lm_head"]["ops"]] == ["std_perm_gguf"]
+    for name, lt in g["layer_types"].items():
+        cl = c["layer_types"][name]
+        assert lt["pack"]["consts"] == cl["pack"]["consts"] and lt["buffers"] == cl["buffers"]
+        assert {o["op"] for o in lt["pack"]["pool"]} == {"std_perm_gguf"}
+        assert [(o["tensor"], o["nch"]) for o in lt["pack"]["pool"]] == [(o["tensor"], o["nch"]) for o in cl["pack"]["pool"]]
+        assert lt["pack"]["pool"][-1]["dst"] < cl["pack"]["pool"][-1]["dst"]
+        assert lt["gemm_block"] == cl["gemm_block"]               # bfp16, packed from the GGUF itself
+        lean = lt["gemm_block_variants"]["lean"]
+        assert all(st["kernel"].endswith("_q40") for st in lean["program"] if st["kernel"].startswith("gemm_n"))
+    assert (g["kernels"]["dx_local"]["build"], g["kernels"]["dx"]["build"], g["kernels"]["lm"]["build"]) == \
+        ("dx_q40", "dxg_q40", "lm_head_q4_q40")
+    b = G4.builds(spec())
+    assert b["dx_q40"]["env"]["GEMV_Q4_0"] == "1" and b["lm_head_q4_q40"]["env"]["LMHEAD_Q4_0"] == "1"
+    gemms = [n for n in b if n.startswith("gemm_n")]
+    assert len(gemms) == 6 and all(n.endswith("_q40") and b[n]["env"]["GQP_FMT"] == "q4_0" for n in gemms)
+    assert all(st in b for st in g["builds"])
 
 
 def test_attn_block_is_on_by_default_and_carries_each_kinds_attention(unvalidated, monkeypatch):

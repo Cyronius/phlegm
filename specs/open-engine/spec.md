@@ -2074,6 +2074,53 @@ wait on the NPU.
 - The attention products run at 1.1-1.4 TFLOPS alone (`ag_shl1280_local`
   0.67 GFLOP in 0.49 ms minimum), against 8.8-12.1 for the bfp16 GEMMs.
 
+**Decode: the Q4_0-native view (2026-10-30, evening).** The GGUF view's pools
+now default to a third chunk law: 4608 bytes, holding the codes and the bf16
+`d` plane with no min plane. The cores form `m = -8 d` themselves, which is
+exact in bf16, so every product equals the compact view's. Only Q4_0
+tensors fit; the QAT GGUF is all Q4_0, and the packer refuses anything else.
+`G4_Q40=0` at export gives the compact view. The kernels are `dx_q40`,
+`dxg_q40`, `lm_head_q4_q40` (`GEMV_Q4_0_NATIVE`) and the lean route's six
+GEMMs (`GQP_FMT=q4_0`, `GQD_Q4_0`). The runtime side is
+`upstream-patches/gemma4-q40-gguf-runtime.patch`. A layer's pool is 127-139
+MB instead of 141-155, and the head 566 MB instead of 629.
+
+Gates, declared before the runs: every prefill and decode logit byte-identical
+to the compact view's (fast short and long, lean long), and the compact set
+unchanged on the new binary.
+
+**Result (measured in Phlegm, 2026-10-30, development runs, load average
+17-29 from other sessions' CPU jobs):** binary `q40` (207b6315; the shipped
+build `q40b` differs only in an error message), kernels
+`kernels/gemma4-12b-q40`, against `pipe4` on `kernels/gemma4-12b-shl`.
+- Profile first (`--bench-decode`, compact view): a step is all dispatch
+  time (host residue 0.6 ms). A local layer streams 134 MB in 3.7-4.6 ms,
+  29-36 GB/s; the head 601 MB in 14.9-16.8 ms, 36-40 GB/s. Context switches
+  do not show: the real walk is no slower than each layer alone.
+- The layers are stream-bound: with the GEMV arithmetic compiled out
+  (`DX_NULL=1`, `kernels/gemma4-12b-null`), a local layer alone took 4.56-4.61
+  ms against 4.23-4.41, and the step 233.5 against 233.9-240.9 ms.
+- The memtile weight ring with early weight issue (`DX_WRING=16
+  DX_WORDER=1`, `kernels/gemma4-12b-wo`) gave the same bits (25 short and 17
+  long dumps) and no gain: 64-token decode 251 / 242 against 225 / 241
+  ms/token. It stays off.
+- Q4_0-native: fast short 0 of 58, fast long 0 of 1482, lean long 0 of 1482
+  dumps differ; the compact set on the new binary 0 of 58.
+- Timing, alternating: 64-token decode 240 / 238 against 256 / 255 ms/token
+  (4.2 against 3.9 tok/s, -6.5%). Decode after the 1450-token prompt 313 /
+  318 against 335 / 334 ms. `--bench-decode` step at position 26: 240 against
+  256 ms; at 1024: 309 against 330. Lean prefill 28.0 / 27.9 against 27.2 /
+  27.5 s, within this load's spread or slightly slower. The bytes fell 10%;
+  the time 6-7%.
+- The KV walk at depth, with the attention arithmetic compiled out
+  (`ATTN_NULL=1`, `kernels/gemma4-12b-anull`), one layer alone: a global
+  layer takes 6.96 against 5.59 ms at position 1450 and 10.69 against 6.23
+  at 3000. Its attention arithmetic, about 1.5 us a cached row, is the
+  larger cost: about 36 ms a token at 3000 over the 8 global layers. A local
+  layer's 1024-row window streams 8 MB at about 10 GB/s, about 0.8 ms; its
+  arithmetic adds 0.2-0.9 ms. The full set's step is 230 ms at position 26,
+  327 at 1450 and 360 at 3000; the null set's 254, 282 and 274.
+
 **Open:** the `model.q4nx` route has not run. FLM's 12B package stores 16-row
 signed-q4 tiles (2304 B), a 16-row q8 head (4352 B) and a BF16 embedding
 table; both packers (`pack.q4_chunks_of`, `pools.cpp`) read 5120, 8704 and
@@ -2090,7 +2137,12 @@ set `OMP_NUM_THREADS`. The best count under other load is not settled: 8
 measured best here, and an idle machine has not been measured. In Phlegm, `oflm serve`'s two-turn chat has not
 run. The source of the NPU's 1.5-2x per-stage error over BF16 rounding is
 unknown. The procedure's logit form of the boundary check cannot detect a
-one-row window error.
+one-row window error. Decode at depth: the global layers' attention runs
+on 4 cores at one cached row a call, and the local window is one broadcast
+stream; more attention cores on the global layers, and per-core KV windows
+(OPEN-ATTN-KVSLICE, which needs `ATTN_RB` above 1 and this runtime's
+patcher has no `kvslice`), are unbuilt. No decode figure here is from a
+quiet machine.
 
 ### OPEN-FAMILY-HUNYUAN: HunYuan dense on the dense recipe
 **Applies to:** openflowlm-next (`open_kernels/recipes/dense.py`, `spec.py`, `designs/attn/attn.h`, `designs/dense/dx.py`, `utilities/q4nx-build`)

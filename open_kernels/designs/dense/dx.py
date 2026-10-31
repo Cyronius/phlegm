@@ -66,6 +66,10 @@ if int(os.environ.get("GEMV_SCALES_F32", 0)) and SPEC.quant != "q4_1_f32":
     # the export builds this design twice: q4nx chunks and GGUF-direct f32-scale chunks
     from dataclasses import replace
     SPEC = replace(SPEC, quant="q4_1_f32")
+if int(os.environ.get("GEMV_Q4_0", 0)) and SPEC.quant != "q4_0":
+    # and, for a Q4_0-native GGUF view (gemma4 G4_Q40), 4608-B chunks without a min plane
+    from dataclasses import replace
+    SPEC = replace(SPEC, quant="q4_0")
 QR = for_spec(SPEC)      # dense, or lfm2 for its attention layers
 R = QR.recipe(SPEC)
 L, G = R.layout, R.geo
@@ -79,11 +83,19 @@ assert not G.GATE, "dx.py: the Qwen3 dense recipe has no attention gate"
 
 # GGUF-direct pools (spec.quant == "q4_1_f32"): f32-scale chunks, the gemv
 # wrappers compiled with the f32-scale define and the gemv_q4s32 symbol prefix.
+# A Q4_0-native view (spec.quant == "q4_0"): the bf16 d plane alone, m = -8 d on the
+# core, under the gemv_q40 prefix.
 F32 = SPEC.quant == "q4_1_f32"
+Q40 = SPEC.quant == "q4_0"
 CH = QR.chunk_bytes(SPEC.quant)
-GEMV_DEF = ["-DGEMV_Q4_SCALES_F32=1", "-DGEMV_Q4_PREFIX=gemv_q4s32"] if F32 else []
-GYSYM = "gemv_q4s32_gy" if F32 else "gemv_q4_gy"
-GMSYM = "gemv_q4s32_gms" if F32 else "gemv_q4_gms"
+GEMV_DEF = (["-DGEMV_Q4_SCALES_F32=1", "-DGEMV_Q4_PREFIX=gemv_q4s32"] if F32 else
+            ["-DGEMV_Q4_0_NATIVE=1", "-DGEMV_Q4_PREFIX=gemv_q40"] if Q40 else [])
+# debug: DX_NULL=1 compiles the q4_1 GEMV arithmetic out and keeps every DMA (gemv_q4.h GEMV_NULL), for
+# timing a layer's stream floor; the output is garbage. Not in the build key: give it its own --build-root.
+if int(os.environ.get("DX_NULL", 0)):
+    GEMV_DEF = GEMV_DEF + ["-DGEMV_NULL"]
+GYSYM = "gemv_q4s32_gy" if F32 else "gemv_q40_gy" if Q40 else "gemv_q4_gy"
+GMSYM = "gemv_q4s32_gms" if F32 else "gemv_q40_gms" if Q40 else "gemv_q4_gms"
 
 
 Q8 = SPEC.q8_roles              # the roles the container stores at q8 (OPEN-QUANT-Q8); usually empty

@@ -79,6 +79,7 @@ BAND_BYTES = 10240 # 64 rows x 256 K x 5/8 B/elem
 FORMATS = {
     "q4_1": (BAND_BYTES, BAND_K, 4, 5, 8),
     "q4_1_f32": (12288, BAND_K, 4, 3, 4),  # two GGUF-direct 6144 B chunks
+    "q4_0": (9216, BAND_K, 4, 9, 16),      # two Q4_0-native 4608 B chunks (no min plane)
     "bf16": (8192, 64, 1, 2, 1),          # recipes/pack.py pack_bf16_gemm, the A operand as stored
 }
 FMT = "q4_1_f32" if os.environ.get("GQP_SCALES_F32") == "1" else os.environ.get("GQP_FMT", "q4_1")
@@ -263,7 +264,7 @@ def gemm_q4_prefill(
     # touches it and needs the L1, so it keeps a token 64 B; q4_1 builds keep theirs as they were.
     # Fused GGUF dequant never touches the two-pass nibble scratch. Its larger
     # weight FIFO needs that space; retain a 64 B placeholder for the entry ABI.
-    nib_ty = np.ndarray[(64 if wfmt_t2 or fmt == "q4_1_f32" else m * k_tile,), np.dtype[np.uint8]]
+    nib_ty = np.ndarray[(64 if wfmt_t2 or fmt in ("q4_1_f32", "q4_0") else m * k_tile,), np.dtype[np.uint8]]
     # the A operand: bf16, or (GQP_XBFP) 9 B per 8 values of bfp16ebs8
     scratch_ty = (np.ndarray[(m * k_tile * 9 // 8,), np.dtype[np.uint8]] if xbfp
                   else np.ndarray[(m * k_tile,), np.dtype[dtype_in]])
@@ -291,9 +292,11 @@ def gemm_q4_prefill(
             _dequant_flags.append("-DGQD_IDQ")
     # GQP_NULL_MM=1: timing-only ablation, the matmul call skipped (B still acquired/released)
     null_mm = os.environ.get("GQP_NULL_MM") == "1"
-    if fmt in ("q4_1", "q4_1_f32"):
+    if fmt in ("q4_1", "q4_1_f32", "q4_0"):
         if fmt == "q4_1_f32":
             _dequant_flags.append("-DGQD_SCALES_F32=1")
+        if fmt == "q4_0":
+            _dequant_flags.append("-DGQD_Q4_0=1")
         dequant_srcs = ensure_dequant_entries(bfp=xbfp)
         dequant_kernels = [
             ExternalFunction(f"gqd_entry_k{ky}", source_file=str(dequant_srcs[ky]),
@@ -413,7 +416,7 @@ def gemm_q4_prefill(
 
             def one_band(band):
                 for ky in range(KPB):  # compile-time (Python) unroll: distinct entry symbols
-                    if fmt in ("q4_1", "q4_1_f32"):
+                    if fmt in ("q4_1", "q4_1_f32", "q4_0"):
                         dequants[ky](band, local[0], local[1])
                     elem_in_b = in_b.acquire(1)
                     if not null_mm:

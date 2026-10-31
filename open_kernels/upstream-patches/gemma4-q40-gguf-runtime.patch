@@ -1,0 +1,90 @@
+diff --git a/src/open_qwen36/gguf_pack_test.cpp b/src/open_qwen36/gguf_pack_test.cpp
+index 01ddff2..40568df 100644
+--- a/src/open_qwen36/gguf_pack_test.cpp
++++ b/src/open_qwen36/gguf_pack_test.cpp
+@@ -21,6 +21,7 @@
+ 
+ #include "open_qwen36/gguf_file.hpp"
+ #include "open_qwen36/pools.hpp"
++#include "open_qwen36/q4nx_file.hpp"
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -408,6 +409,35 @@ int main() {
+         }
+         std::printf("%s std_perm_gguf Q4_0 into the q4_1 law (%zu mismatches)\n", badc ? "FAIL" : "ok", badc);
+         if (badc) return 1;
++
++        // The Q4_0-native law (4608 B): the q4_1 law's d plane and codes with no m plane, and
++        // that m plane is exactly -8 d (the value the cores form), so both views compute alike.
++        std::vector<uint8_t> pq(static_cast<size_t>(op.nch) * 4608, 0);
++        pools::apply(op, g0, 0, pq.data(), pq.size(), 4608);
++        size_t badq = 0;
++        for (size_t c = 0; c < op.nch; ++c) {
++            const uint8_t* n = pc.data() + c * 5120;
++            const uint8_t* q = pq.data() + c * 4608;
++            badq += std::memcmp(n, q, 512) != 0;                 // d
++            badq += std::memcmp(n + 1024, q + 512, 4096) != 0;   // codes
++            for (size_t j = 0; j < 256; ++j) {                   // m == -8 d, in bf16
++                uint16_t d16, m16;
++                std::memcpy(&d16, n + 2 * j, 2);
++                std::memcpy(&m16, n + 512 + 2 * j, 2);
++                const float df = bf16_to_f32(d16), mf = bf16_to_f32(m16);
++                badq += mf != -8.0f * df;
++            }
++        }
++        std::printf("%s std_perm_gguf Q4_0 into the Q4_0-native law (%zu mismatches)\n", badq ? "FAIL" : "ok", badq);
++        if (badq) return 1;
++        bool q41_refused = false;                                // a Q4_1 block's min is not -8 d
++        try {
++            pools::apply(op, g, 0, pq.data(), pq.size(), 4608);
++        } catch (const std::exception&) {
++            q41_refused = true;
++        }
++        std::printf("%s std_perm_gguf refuses a Q4_1 tensor in the Q4_0-native law\n", q41_refused ? "ok   " : "FAIL");
++        if (!q41_refused) return 1;
+         std::vector<uint8_t> odd(static_cast<size_t>(op.nch) * 4736, 0);
+         bool refused = false;
+         try {
+diff --git a/src/open_qwen36/pools.cpp b/src/open_qwen36/pools.cpp
+index fecf666..821e0fe 100644
+--- a/src/open_qwen36/pools.cpp
++++ b/src/open_qwen36/pools.cpp
+@@ -102,6 +102,7 @@ const uint8_t* raw(const WeightFile& m, const std::string& name, size_t need, si
+ constexpr size_t Q8_CHUNK = 8704;    // 256 bf16 scales then 8192 int8 codes
+ constexpr size_t Q4_CHUNK = 5120;    // 256 bf16 d, 256 bf16 m, then 4096 B of nibbles
+ constexpr size_t GGUF_CHUNK = 6144;  // the GGUF-direct twin's f32-scale law: 1024 B d, 1024 B m, codes
++constexpr size_t Q40_CHUNK = 4608;   // the Q4_0-native view's law: 256 bf16 d, then the codes (m = -8 d on the core)
+ constexpr size_t Q4_HALF = 2560;     // GPT-OSS's chunk: the same layout over 32 rows x 128 columns
+ constexpr size_t Q4K_CHUNK = 4736;   // 256 uint8 scales, 256 uint8 mins, 4096 B of nibbles, 32 bf16 S, 32 bf16 M
+ constexpr size_t Q8H_SCALES = 256;   // a half-tile's 128 bf16 scales
+@@ -609,16 +610,26 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+                  "requantizes Q8_0/Q4_K/Q6_K (convert K-quants with q4nx-build otherwise)");
+         const bool has_min = t.type == GgufFile::Type::Q4_1 || kq;
+         const size_t blk = has_min ? 20 : 18;
+-        if (ch != Q4_CHUNK && ch != GGUF_CHUNK)
++        if (ch != Q4_CHUNK && ch != GGUF_CHUNK && ch != Q40_CHUNK)
+             fail("std_perm_gguf " + name + ": pool chunk " + std::to_string(ch) +
+-                 " is neither the q4_1 law nor the GGUF-direct twin's f32 one");
++                 " is not the q4_1 law, the GGUF-direct twin's f32 one or the Q4_0-native one");
++        // The Q4_0-native law stores d alone and the cores take m = -8 d: only a Q4_0 block
++        // has that min, so anything else (Q4_1, or a tensor requantized with its own min) is refused.
++        const bool q40_law = ch == Q40_CHUNK;
++        if (q40_law && t.type != GgufFile::Type::Q4_0)
++            fail("std_perm_gguf " + name + " is " + GgufFile::type_name(t.type) +
++                 "; the Q4_0-native pool (4608-B chunks) holds Q4_0 tensors only (export the kernels with G4_Q40=0)");
+         const bool f32_law = ch == GGUF_CHUNK;
+-        const size_t M_OFF = f32_law ? 1024 : 512, CODES = f32_law ? 2048 : 1024;
++        const size_t M_OFF = f32_law ? 1024 : 512, CODES = f32_law ? 2048 : q40_law ? 512 : 1024;
+         // one block scale pair (plane index j = kb*32 + r) in the pool's law
+         auto put_scales = [&](uint8_t* d, size_t j, float df, float mf) {
+             if (f32_law) {
+                 std::memcpy(d + 4 * j, &df, 4);
+                 std::memcpy(d + M_OFF + 4 * j, &mf, 4);
++            } else if (q40_law) {
++                (void)mf;                                        // -8 d, formed on the core
++                const uint16_t db = bf16_rne(df);
++                std::memcpy(d + 2 * j, &db, 2);
+             } else {
+                 const uint16_t db = bf16_rne(df), mb = bf16_rne(mf);
+                 std::memcpy(d + 2 * j, &db, 2);

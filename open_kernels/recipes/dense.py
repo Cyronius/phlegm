@@ -45,8 +45,8 @@ from . import gguf as GGUF
 from .catalogue import LIMITS, OpRangeError, check_buffer_args, require
 from .qwen36moe import ATTN_LMAX  # Path A: the widest attention GEMM stream (window chunk)
 from .qwen36moe import (BAND_ROWS, CHUNK, ELEM, GEMM_T, MB, _op_index, band_bytes, chunk_bytes, core_l1,
-                        down_split, norm_split, q4_bytes, proj_op, q4_chunks, mixed_check, quant_check,
-                        require_gemv, role_bytes, roundup, tab_bytes)
+                        down_split, gguf_direct, norm_split, q4_bytes, proj_op, q4_chunks, mixed_check,
+                        quant_check, require_gemv, role_bytes, roundup, tab_bytes)
 from .spec import DENSE, DENSE_LOCAL, ModelSpec
 
 
@@ -200,7 +200,7 @@ def cores_for(spec: ModelSpec) -> int:
 
 def pool_quant(spec: ModelSpec) -> str:
     """The pool's q4 chunk layout; mixed q8 specs retain the ordinary q4 base layout."""
-    return "q4_1_f32" if spec.quant == "q4_1_f32" else "q4_1"
+    return spec.quant if gguf_direct(spec.quant) else "q4_1"
 
 
 def gguf_q8_head(spec: ModelSpec) -> bool:
@@ -223,7 +223,7 @@ def _check(spec: ModelSpec) -> None:
         raise OpRangeError(f"dense: activation {spec.activation!r} (silu | gelu_tanh)")
     if spec.has_local and spec.sliding_window <= 0:
         raise OpRangeError("dense: dense_local layers need a positive sliding_window")
-    if spec.quant == "q4_1_f32":
+    if gguf_direct(spec.quant):
         pass
     else:
         quant_check(spec, "dense")
@@ -320,7 +320,9 @@ def stream_knobs(spec: ModelSpec) -> tuple[int, bool]:
     ring = int(os.environ.get("DX_WRING", WRING_DEPTH if on else 0))
     # A sandwich family (Gemma 3 / 4) gets the early issue only when DX_WORDER=1 forces it, for
     # an A/B build: its two extra norm round trips sit between o and up | gate, where no weight
-    # await depends on them (o needs xn, up | gate band 0 needs xm), but it has not been measured.
+    # await depends on them (o needs xn, up | gate band 0 needs xm). Measured on Gemma 4 12B's
+    # compact pools with DX_WRING=16 (2026-10-30, OPEN-FAMILY-GEMMA4): the same bits and no gain,
+    # since its layers stream at the rate a GEMV_NULL build does.
     order = os.environ.get("DX_WORDER", "1" if on else "0") == "1"
     return ring, order
 
@@ -529,11 +531,11 @@ def pack_plan(spec: ModelSpec) -> dict:
         "lm_head": {"pool_bytes": head_pool_bytes(spec, L),
                     "ops": ([{"op": "lmhead_q8", "tensor": "lm_head.weight", "dst": 0,
                               "chunk_bytes": 8704, "in_dim": hid}] if gguf_q8_head(spec) else
-                            [{"op": "std_perm_gguf" if spec.quant == "q4_1_f32" else "std_perm",
+                            [{"op": "std_perm_gguf" if gguf_direct(spec.quant) else "std_perm",
                              "tensor": "lm_head.weight", "dst": 0,
                               "nch": q4_chunks(lm_rows(spec), hid, pool_quant(spec)), "in_dim": hid}])},
         "embed": {"tensor": "model.embed_tokens.weight", "dim": hid,
-                  **({"scale": hid ** 0.5} if spec.quant == "q4_1_f32" and spec.family == "gemma3" else {})},
+                  **({"scale": hid ** 0.5} if gguf_direct(spec.quant) and spec.family == "gemma3" else {})},
         "norm": {"tensor": "model.norm.weight", "bytes": hid * 2},
     }
 

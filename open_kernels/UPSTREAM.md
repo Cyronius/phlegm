@@ -256,6 +256,14 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   clone and still takes `fast|lean|bfp16`. Kernel sets need nothing new: without
   `kernels_shl` the scores take two dispatches. The diff applies over `beccd46` plus the six
   patches above.
+- `upstream-patches/gemma4-q40-gguf-runtime.patch` (2026-10-30) gives `std_perm_gguf` a
+  third chunk law. A 4608-byte pool chunk holds the bf16 `d` plane and the codes, with no
+  min plane: the cores form `m = -8 d` themselves, which is exact in bf16 and so the value
+  the 5120-byte law stores. Only Q4_0 tensors pack into it; anything else is refused at
+  load. This is the pool law of the Q4_0-native GGUF view (`recipes/gemma4.py`, `G4_Q40=1`;
+  `gemv_q4.h` `GEMV_Q4_0_NATIVE`, `gemm_q4_dequant.h` `GQD_Q4_0`). `gguf_pack_test` checks
+  it against the 5120-byte law's `d` plane and codes. The diff applies over `beccd46` plus
+  the seven patches above.
 
 `designs/dense/dx_attn.py` now takes its recipe module from `for_spec` and its flags from the
 recipe's `attn_flags`, and gained `dx.py`'s ATTN_QLOCAL q loop. It emits byte-identical MLIR

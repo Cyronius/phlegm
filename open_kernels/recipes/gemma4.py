@@ -36,7 +36,7 @@ from dataclasses import dataclass, replace
 
 from . import dense as D
 from .catalogue import OpRangeError, check_buffer_args
-from .qwen36moe import ATTN_LMAX, MB, proj_op, q4_chunks, role_bytes, roundup
+from .qwen36moe import ATTN_LMAX, MB, gguf_direct, proj_op, q4_chunks, role_bytes, roundup
 from .spec import DENSE, DENSE_LOCAL, ModelSpec
 
 band_bytes = D.band_bytes    # noqa: F401  (dx.py: band_bytes(K, quant))
@@ -44,7 +44,7 @@ chunk_bytes = D.chunk_bytes  # noqa: F401  (dx.py: chunk_bytes(quant))
 attn_flags = D.attn_flags    # noqa: F401  (phlegm's dx.py: attn_flags(G, probe_env))
 # The build key's probe variables (cache.py reads it off the family module): the attention ones
 # and dense's, DENSE_GGUF_GEMM among them -- it adds the block prefill route's builds.
-G4_PROBE_VARS = ("G4_ATTN_BLOCK", "G4_BFP16")
+G4_PROBE_VARS = ("G4_ATTN_BLOCK", "G4_BFP16", "G4_Q40")
 
 
 def probe_env() -> dict[str, str]:
@@ -54,6 +54,24 @@ def probe_env() -> dict[str, str]:
     return env
 
 KIND_ENV = "G4_KIND"          # which layer type a dx.py build is for: "local" | "global"
+# A pool law's build-name suffix: the q4nx section's, the f32-scale twin's, the Q4_0-native view's.
+SFX = {"q4_1": "", "q4_1_f32": "_f32", "q4_0": "_q40"}
+
+
+def q40_on() -> bool:
+    """The GGUF view on Q4_0-native pools: 4608-B chunks holding the codes and the bf16 d plane,
+    the cores taking m = -8 d (gemv_q4.h GEMV_Q4_0_NATIVE, gemm_q4_dequant.h GQD_Q4_0), so the
+    products are the compact view's with a tenth fewer weight bytes. On unless G4_Q40=0, which
+    gives the compact view: every prefill and decode logit matched it, and decode took 6-7%
+    less time (OPEN-FAMILY-GEMMA4). Every tensor the pools hold must be Q4_0, as in the QAT
+    Q4_0 GGUF; the packer refuses anything else, and such a GGUF needs G4_Q40=0."""
+    return os.environ.get("G4_Q40") != "0"
+
+
+def gguf_quant(spec: ModelSpec) -> str:
+    """The pool law recipes/manifest.py builds the GGUF section at: Q4_0-native (q40_on, the
+    default), else the f32-scale twin, which finalize_gguf_manifest turns into the compact view."""
+    return "q4_0" if q40_on() else "q4_1_f32"
 KINDS = {"local": DENSE_LOCAL, "global": DENSE}
 LAYER_SCALE = "model.layers.{j}.layer_output_scale.weight"   # GGUF blk.{j}.layer_output_scale.weight
 
@@ -175,22 +193,22 @@ def pack_plan(spec: ModelSpec) -> dict:
     s = sub_spec(spec, "local")
     L = D.layout(s)
     hid = spec.hidden
-    f32 = spec.quant == "q4_1_f32"
+    gd = gguf_direct(spec.quant)
     return {
         "pool_bytes": pool_bytes(spec), "chunk_bytes": D.chunk_bytes(D.pool_quant(spec)),
         "layer_types": {KINDS[k]: _layer_plan(spec, k) for k in KINDS},
         "lm_head": {"pool_bytes": L.LMHEAD_POOL_BYTES,
-                    "ops": [{"op": "std_perm_gguf" if f32 else "std_perm", "tensor": "lm_head.weight", "dst": 0,
+                    "ops": [{"op": "std_perm_gguf" if gd else "std_perm", "tensor": "lm_head.weight", "dst": 0,
                              "nch": q4_chunks(D.lm_rows(spec), hid, D.pool_quant(spec)), "in_dim": hid}]},
         # GGUF stores the raw table; HF multiplies by sqrt(hidden) at lookup (as Gemma 3)
-        "embed": {"tensor": "model.embed_tokens.weight", "dim": hid, **({"scale": hid ** 0.5} if f32 else {})},
+        "embed": {"tensor": "model.embed_tokens.weight", "dim": hid, **({"scale": hid ** 0.5} if gd else {})},
         "norm": {"tensor": "model.norm.weight", "bytes": hid * 2},
     }
 
 
 def _kernel_sets(spec: ModelSpec) -> dict[str, str]:
-    f32 = spec.quant == "q4_1_f32"
-    return {"local": "dx_f32" if f32 else "dx", "global": "dxg_f32" if f32 else "dxg"}
+    sfx = SFX[D.pool_quant(spec)]
+    return {"local": "dx" + sfx, "global": "dxg" + sfx}
 
 
 def gemm_on() -> bool:
@@ -293,7 +311,7 @@ def compact_on() -> bool:
     return os.environ.get("DENSE_GGUF_COMPACT") != "0"
 
 
-def gemm_route(spec: ModelSpec, max_ctx: int = 4096, pool_quant: str = "q4_1_f32") -> dict | None:
+def gemm_route(spec: ModelSpec, max_ctx: int = 4096, pool_quant: str | None = None) -> dict | None:
     """The block prefill route (OPEN-PREFILL-BATCH, kind "dense"), per layer type: dense's
     five-GEMM chain (qkv3, o, gate, up, down) with T single-token attention dispatches between
     the first two, which the engine's host chain runs with Gemma 3's GeGLU-tanh and sandwich
@@ -309,13 +327,14 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096, pool_quant: str = "q4_1_f32
     dense's opt-in GGUF route: it gave the sequential route's greedy tokens on both prompts
     and the 1024-row window at 1023 / 1024 / 1025 (OPEN-FAMILY-GEMMA4). DENSE_GGUF_GEMM=0
     leaves it out: None means the sequential path, byte for byte what it was. `pool_quant`
-    is the chunk law the GEMMs read: the f32-scale twin's, or q4_1's for the compact view
-    (finalize_gguf_manifest)."""
-    if spec.quant != "q4_1_f32" or not gemm_on():
+    is the chunk law the GEMMs read: the spec's own (the f32-scale twin's or the Q4_0-native
+    view's), or q4_1's for the compact view (finalize_gguf_manifest)."""
+    if not gguf_direct(spec.quant) or not gemm_on():
         return None
-    if pool_quant not in ("q4_1", "q4_1_f32"):
+    pool_quant = pool_quant or D.pool_quant(spec)
+    if pool_quant not in SFX:
         raise OpRangeError(f"gemma4 gemm route: no GEMM build reads {pool_quant!r} pools")
-    sfx = "_f32" if pool_quant == "q4_1_f32" else ""
+    sfx = SFX[pool_quant]
     T = D.GEMM_T
     hid, ff = spec.hidden, spec.intermediate
     plans = pack_plan(spec)["layer_types"]
@@ -410,7 +429,8 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096, pool_quant: str = "q4_1_f32
         out["builds"][name] = {"design": "gemm_q4_prefill/gemm_q4_prefill.py",
                                "build_dir": f"gemm_q4_prefill/build_n{N}_k{K}_t{T}{sfx}",
                                "env": {"GQP_N": str(N), "GQP_K": str(K), "GQP_T": str(T),
-                                       **({"GQP_SCALES_F32": "1"} if sfx else {})}}
+                                       **({"GQP_SCALES_F32": "1"} if pool_quant == "q4_1_f32" else
+                                          {"GQP_FMT": "q4_0"} if pool_quant == "q4_0" else {})}}
     out["variants"] = {}
     if bfp16_on():
         # bfp16 is gemm_block (fast, the default); the q4 route above becomes `lean`
@@ -427,9 +447,8 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     """dx_local on the local design's context, dx on the global one's. Each attnpos kernel
     names its own KV and position-record row (the engine's per-kernel geometry); each layer
     type its own consts / act / state sizes and position table."""
-    f32 = spec.quant == "q4_1_f32"
     sets = _kernel_sets(spec)
-    lm_set = "lm_head_q4_f32" if f32 else "lm_head_q4"
+    lm_set = "lm_head_q4" + SFX[D.pool_quant(spec)]
     Ll = layout(spec, max_ctx, "local")
     out = {
         "contexts": {"dx": f"{sets['local']}/final.xclbin", "dxg": f"{sets['global']}/final.xclbin",
@@ -468,7 +487,7 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             if r["variants"].get(lt):
                 out["layer_types"][lt]["gemm_block_variants"] = r["variants"][lt]
     if spec.quant == "q4_1":
-        g = programs(replace(spec, quant="q4_1_f32"), max_ctx)
+        g = programs(replace(spec, quant=gguf_quant(spec)), max_ctx)
         out["gguf"] = {k: g[k] for k in ("contexts", "kernels", "layer_types", "tail", "globals")}
     return out
 
@@ -483,13 +502,24 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
          "lm_head_q4_f32": {"design": "lm_head_q4/lm_head_q4.py", "build_dir": f"lm_head_q4/build_{rows}_f32",
                             "env": {"LMHEAD_N": str(rows), "LMHEAD_K": str(spec.hidden),
                                     "LMHEAD_CORES": str(n), "LMHEAD_SCALES_F32": "1"}}}
+    if q40_on():
+        b["lm_head_q4_q40"] = {"design": "lm_head_q4/lm_head_q4.py", "build_dir": f"lm_head_q4/build_{rows}_q40",
+                               "env": {"LMHEAD_N": str(rows), "LMHEAD_K": str(spec.hidden),
+                                       "LMHEAD_CORES": str(n), "LMHEAD_Q4_0": "1"}}
     for kind, name in (("local", "dx"), ("global", "dxg")):
         bd = f"dense/build_gemma4_{kind}_h{spec.hidden}"
         b[name] = {"design": "dense/dx.py", "build_dir": bd, "env": {KIND_ENV: kind}}
         b[name + "_f32"] = {"design": "dense/dx.py", "build_dir": bd + "_f32",
                             "env": {KIND_ENV: kind, "GEMV_SCALES_F32": "1"}}
-    # the GEMMs the GGUF view runs: the compact view's read q4_1-law pools, the twin's f32 ones
-    r = gemm_route(replace(spec, quant="q4_1_f32"), pool_quant="q4_1" if compact_on() else "q4_1_f32")
+        if q40_on():
+            b[name + "_q40"] = {"design": "dense/dx.py", "build_dir": bd + "_q40",
+                                "env": {KIND_ENV: kind, "GEMV_Q4_0": "1"}}
+    # the GEMMs the GGUF view runs: Q4_0-native pools, else the compact view's q4_1-law ones or
+    # the twin's f32 ones
+    if q40_on():
+        r = gemm_route(replace(spec, quant="q4_0"))
+    else:
+        r = gemm_route(replace(spec, quant="q4_1_f32"), pool_quant="q4_1" if compact_on() else "q4_1_f32")
     if r:
         b.update(r["builds"])
     return b
@@ -514,7 +544,7 @@ def finalize_gguf_manifest(spec: ModelSpec, manifest: dict) -> None:
     GGUF section keeps its reader (std_perm_gguf, the scaled embedding, the f32 norms and
     their folded layer scale) and takes the q4_1 section's pool geometry, buffers, decode
     kernels and head. The block prefill route's GEMMs become the q4_1-law builds."""
-    if spec.quant != "q4_1" or "gguf" not in manifest or not compact_on():
+    if spec.quant != "q4_1" or "gguf" not in manifest or not compact_on() or q40_on():
         return
     g, b = manifest["gguf"], manifest
     g["spec"] = copy.deepcopy(b["spec"])      # the pool law the view's kernels compile for

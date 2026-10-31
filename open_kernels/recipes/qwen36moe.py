@@ -59,6 +59,11 @@ def probe_env() -> dict[str, str]:
 CHUNK = 5120                 # q4_1: 32 rows x 256 K (8192 values) + bf16 d, m per 32-block
 CHUNK_F32 = 6144             # GGUF-direct (spec.quant "q4_1_f32"): the same tile, the fp16
                              # block scales/mins widened EXACTLY to f32 (open_kernels/gguf_pool.py)
+CHUNK_Q40 = 4608             # GGUF-direct Q4_0 (spec.quant "q4_0"): the same codes and the bf16 d
+                             # plane alone; the cores take m = -8 d (gemv_q4.h GEMV_Q4_0_NATIVE)
+# The quants a GGUF-direct view (the manifest's "gguf" section) is built at: its pools are
+# packed from the GGUF by std_perm_gguf, whatever the chunk law.
+GGUF_QUANTS = ("q4_1_f32", "q4_0")
 CHUNK_VALUES = 8192
 CHUNK_ROWS = 32
 CHUNK_COLS = CHUNK_VALUES // CHUNK_ROWS   # 256: the k-tile the band law and std_perm both count in
@@ -90,14 +95,22 @@ AB_LANES = 32                # dn_glue.h's kV: the lanes of one alpha/beta W row
                              # W element stays 64 rows x 32 bf16 = 4 KB (see glue_ab_tile).
 
 
+def gguf_direct(quant: str) -> bool:
+    """A GGUF-direct pool law (packed from the GGUF by std_perm_gguf)."""
+    return quant in GGUF_QUANTS
+
+
 def chunk_bytes(quant: str) -> int:
-    """The q4 pool chunk bytes for a scale layout: q4nx bf16 (5120) or GGUF-direct f32 (6144)."""
+    """The q4 pool chunk bytes for a scale layout: q4nx bf16 (5120), GGUF-direct f32 (6144) or
+    GGUF-direct Q4_0 (4608, no min plane)."""
     if quant == "q4_1":
         return CHUNK
     if quant == "q4_1_f32":
         return CHUNK_F32
+    if quant == "q4_0":
+        return CHUNK_Q40
     raise OpRangeError(f"quant={quant!r}: no open q4 pool chunk layout "
-                       f"(have q4_1, q4_1_f32)")
+                       f"(have q4_1, q4_1_f32, q4_0)")
 
 
 def q8_chunk_bytes(quant: str) -> int:
@@ -243,7 +256,7 @@ def proj_op(spec: ModelSpec, role: str, tensor: str, dst: int, rows: int, cols: 
     q8 (twice the pool elements, 16-row half-tiles). `chunk0` is a SOURCE file-chunk offset
     in either format, so the fused [q | gate] split reads the same way."""
     q = spec.quant_of(role)
-    if q == "q4_1_f32":
+    if gguf_direct(q):
         pop = "std_perm_gguf"
     elif q == "q8":
         pop = "q8_perm"

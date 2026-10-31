@@ -118,7 +118,9 @@ def manifest(spec: ModelSpec, max_ctx: int = 4096, key: str | None = None) -> di
         # engine parses it with the same code and swaps the whole view at load. The
         # quant guard keeps the nested manifest from carrying its own gguf section.
         from dataclasses import replace
-        m["gguf"] = manifest(replace(spec, quant="q4_1_f32"), max_ctx, key)
+        # the family names the view's pool law (gemma4: Q4_0-native when asked); else the f32 twin's
+        quant = getattr(F, "gguf_quant", lambda s: "q4_1_f32")(spec)
+        m["gguf"] = manifest(replace(spec, quant=quant), max_ctx, key)
     if has_split_step(m["layer_types"]):
         m["manifest_version"] = SPLIT_MANIFEST_VERSION
     if has_gemm_pool_op(m["layer_types"]):

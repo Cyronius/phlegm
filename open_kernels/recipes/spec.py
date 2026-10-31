@@ -31,7 +31,8 @@ LAYER_TYPES = (LINEAR, FULL, DENSE, DENSE_LOCAL, SHORT_CONV)   # dense_local: a 
 # MoE / qwen35 recipes pack it with `lmhead_q8`, the dense recipes with `std_perm`), so
 # putting it in the map would move every shipped model's spec_hash for no kernel change.
 QUANT_ROLES = ("attn", "linear", "linear_out", "shared", "ffn", "experts")
-QUANT_FORMATS = ("q4_1", "q4_1_f32", "q8", "mxfp4", "t2")   # t2: 2-bit ternary chunks (OPEN-QUANT-T2), repacked from exact q4_1
+QUANT_FORMATS = ("q4_1", "q4_1_f32", "q4_0", "q8", "mxfp4", "t2")   # t2: 2-bit ternary chunks (OPEN-QUANT-T2), repacked from exact q4_1;
+# q4_0: a GGUF-direct Q4_0 view's 4608-B chunks (recipes/qwen36moe.py CHUNK_Q40)
 DEFAULT_QUANT = "q4_1"
 NORM_GROUPS = (1, 2, 4)   # the GroupRMSNorm counts the `ln` kernels build (ln.h LN_GROUPS)
 CHUNK_FORMAT = {5120: "q4_1", 8704: "q8"}

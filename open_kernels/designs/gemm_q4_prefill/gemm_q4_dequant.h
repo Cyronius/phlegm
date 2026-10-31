@@ -62,6 +62,15 @@
 #if GQD_SCALES_F32 && defined(GQD_TWO_PASS)
 #error "the GGUF f32-scale format supports the fused dequant path only"
 #endif
+// GQD_Q4_0=1: Q4_0-native chunks (4608 B: the bf16 d plane at [0:512), the codes at
+// [512:4608)); the min is -8 d, formed on the core, which is exact in bf16 and so the value a
+// q4_1-law chunk of the same tensor stores (gemv_q4.h GEMV_Q4_0_NATIVE).
+#ifndef GQD_Q4_0
+#define GQD_Q4_0 0
+#endif
+#if GQD_Q4_0 && (GQD_SCALES_F32 || defined(GQD_TWO_PASS))
+#error "the Q4_0-native format is bf16-scale and supports the fused dequant path only"
+#endif
 
 #if defined(GQD_TWO_PASS) && defined(GQD_R8)
 #error "GQD_TWO_PASS writes the (4 x 8) A-block layout only; the bfp16 mmul (GQD_R8) needs the fused pass"
@@ -77,6 +86,11 @@ static constexpr unsigned GQD_CHUNK_BYTES = 6144;
 static constexpr unsigned GQD_META_BYTES = 2048;
 static constexpr unsigned GQD_M_OFF = 1024;
 using gqd_scale_t = float;
+#elif GQD_Q4_0
+static constexpr unsigned GQD_CHUNK_BYTES = 4608;
+static constexpr unsigned GQD_META_BYTES = 512;
+static constexpr unsigned GQD_M_OFF = 0;        // no min plane: m = -8 d
+using gqd_scale_t = bfloat16;
 #else
 static constexpr unsigned GQD_CHUNK_BYTES = 5120;
 static constexpr unsigned GQD_META_BYTES = 1024;
@@ -360,8 +374,15 @@ __attribute__((noinline)) inline void gqd_fused_ky(const uint8_t *__restrict ban
         const unsigned kb = k0 / 32;                   // d / m are constant over a 32-k block
         const aie::vector<bfloat16, 64> d_e = gqd_scale<false, false>(dp, kb);
         const aie::vector<bfloat16, 64> d_o = gqd_scale<true, true>(dp, kb);
+#if GQD_Q4_0
+        (void)mp;
+        const aie::vector<bfloat16, 64> m_e = aie::mul(d_e, (bfloat16)-8.0f).template to_vector<bfloat16>();   // exact
+        const aie::vector<bfloat16, 64> m_o =
+            aie::mul(gqd_scale<true, false>(dp, kb), (bfloat16)-8.0f).template to_vector<bfloat16>();
+#else
         const aie::vector<bfloat16, 64> m_e = gqd_scale<false, false>(mp, kb);
         const aie::vector<bfloat16, 64> m_o = gqd_scale<true, false>(mp, kb);
+#endif
         // 64 contiguous bytes = 8 k x 8 row-pairs, lane (k - k0) * 8 + rp
         const aie::vector<uint8_t, 64> q = aie::load_v<64>(nibp + k0 * 8);
         const aie::vector<bfloat16, 64> ne = aie::to_float<bfloat16>(aie::bit_and((uint8_t)0x0F, q), 0);

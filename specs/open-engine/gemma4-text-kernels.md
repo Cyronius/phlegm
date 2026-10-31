@@ -96,8 +96,12 @@ product. The schedule and the stacked scores left every logit unchanged.
 Fast took 9.2-10.0 s for the 1450-token prompt (6-7 ms per token) against
 16.1-16.3 s on the old stages, and lean 28.4 against 37.5 s. Both gates still
 pass with the fp32 GELU. Cutting four host copies, again without changing a
-logit, took fast to 9.4-9.7 s. The measured results and the decode profile are in
-`OPEN-FAMILY-GEMMA4`.
+logit, took fast to 9.4-9.7 s. That evening the GGUF view's pools moved to a
+4608-byte Q4_0-native chunk, which drops the min plane because the cores form
+`m = -8 d` themselves. Every logit stayed the same and decode took 6-7% less
+time, 238-240 against 255-256 ms per token. Decode is bound by the weight
+stream, not by the GEMV arithmetic. The measured results and the decode
+profile are in `OPEN-FAMILY-GEMMA4`.
 
 The two implementations agree on 12B's layer types, global geometry, K=V
 before separate norms, unit score scale, V norm, proportional RoPE pairing and
