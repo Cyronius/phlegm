@@ -1,0 +1,150 @@
+diff --git a/src/open_qwen36/core.cpp b/src/open_qwen36/core.cpp
+index 10da6bf..eaa8054 100644
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -445,6 +445,7 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
+     if (const char* env = std::getenv("OFLM_OPEN_ROUTE_SENTINEL")) route_sentinel_ = std::atoi(env) != 0;
+     if (const char* env = std::getenv("OFLM_OPEN_READ_FENCE")) g_read_fence = std::atoi(env) != 0;
+     if (const char* env = std::getenv("OFLM_OPEN_STEP_TRACE")) step_trace_ = std::atoi(env);
++    g4split_on_ = std::getenv("OFLM_G4_SPLIT") != nullptr;
+     if (const char* env = std::getenv("OFLM_OPEN_SPIN_US")) spin_us_ = std::atoi(env);
+     // OPEN-DECODE-PIPELINE. Level 1 keeps the next layer's first dispatch in flight behind
+     // this layer's last one only when the two share a hardware context; level 2 crosses
+@@ -1957,6 +1958,7 @@ void Core::gemma4_route(const Step& s, int layer) {
+     G4Moe& g = g4moe(s, layer);
+     xrt::bo& act = act_[layer];
+     read_back(act, hid * 4, s.a_res);
++    const double t_rb = ms_since(t0);
+     uint8_t* a = act.map<uint8_t*>();
+     const float* res = reinterpret_cast<const float*>(a + s.a_res);
+     std::vector<double> r(hid), xm(hid);
+@@ -1964,11 +1966,19 @@ void Core::gemma4_route(const Step& s, int layer) {
+     const double sc = 1.0 / std::sqrt(static_cast<double>(hid));
+     for (size_t i = 0; i < hid; ++i) r[i] *= g.router_scale[i] * sc;
+     std::vector<double> logit(E);
++    // over the host threads: one thread's DRAM stream of the 1.44 MB router is the cost, not its
++    // arithmetic (2026-11-01: 7-9 ms a token serial; each logit is still one thread's own sum)
++#pragma omp parallel for schedule(static)
+     for (size_t e = 0; e < E; ++e) {
++        // eight independent double partial sums (lanes i mod 8), so the matvec is not one serial
++        // add chain per expert: that chain was 7-9 ms of a 115 ms step (OFLM_G4_SPLIT, 2026-11-01)
+         const float* wr = g.router.data() + e * hid;
+-        double acc = 0.0;
+-        for (size_t i = 0; i < hid; ++i) acc += static_cast<double>(wr[i]) * r[i];
+-        logit[e] = acc;
++        double a8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++        size_t i = 0;
++        for (; i + 8 <= hid; i += 8)
++            for (size_t j = 0; j < 8; ++j) a8[j] += static_cast<double>(wr[i + j]) * r[i + j];
++        for (size_t j = 0; i < hid; ++i, ++j) a8[j] += static_cast<double>(wr[i]) * r[i];
++        logit[e] = ((a8[0] + a8[1]) + (a8[2] + a8[3])) + ((a8[4] + a8[5]) + (a8[6] + a8[7]));
+     }
+     std::vector<uint32_t> order(E);
+     for (size_t e = 0; e < E; ++e) order[e] = static_cast<uint32_t>(e);
+@@ -1986,6 +1996,7 @@ void Core::gemma4_route(const Step& s, int layer) {
+     uint16_t* xb = reinterpret_cast<uint16_t*>(a + s.a_xm);
+     for (size_t i = 0; i < hid; ++i) xb[i] = f32_to_bf16(static_cast<float>(xm[i]));
+     std::memcpy(a + s.a_w, wv, sizeof wv);
++    const double t_math = ms_since(t0);
+     act.sync(XCL_BO_SYNC_BO_TO_DEVICE, s.a_w + sizeof wv - s.a_xm, s.a_xm);
+     if (route_log_on_) {
+         std::vector<uint8_t> rec(sizeof idx + sizeof wv);
+@@ -1993,9 +2004,12 @@ void Core::gemma4_route(const Step& s, int layer) {
+         std::memcpy(rec.data() + sizeof idx, wv, sizeof wv);
+         route_log_.push_back({layer, rec});
+     }
++    const double t_sync = ms_since(t0);
+     stream_patch::moe2_apply(k.iw(), k.moe2, idx, w_->moe);
+     k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+-    timing_.route_ms += ms_since(t0);
++    const double t_all = ms_since(t0);
++    timing_.route_ms += t_all;
++    g4split_[0] += t_rb; g4split_[1] += t_math - t_rb; g4split_[2] += t_sync - t_math; g4split_[3] += t_all - t_sync;
+ }
+ 
+ void Core::gemma4_combine(const Step& s, int layer) {
+@@ -2008,11 +2022,20 @@ void Core::gemma4_combine(const Step& s, int layer) {
+     xrt::bo& act = act_[layer];
+     read_back(act, hid * 4, s.a_res);
+     read_back(act, hid * 4, s.a_t1);
+-    read_back(act, hid * 4, s.a_moe);
++    read_back(act, s.moe_parts * hid * 4, s.a_moe);
++    const double t_rb = ms_since(t0);
+     const uint8_t* a = act.map<uint8_t*>();
+     const float* res = reinterpret_cast<const float*>(a + s.a_res);
+     const float* t1 = reinterpret_cast<const float*>(a + s.a_t1);
+     const float* m = reinterpret_cast<const float*>(a + s.a_moe);
++    std::vector<float> msum;
++    if (s.moe_parts > 1) {
++        // gm8: one partial a routed slot; their sum in slot order, in f32 as the 4-core kernel's accumulator
++        msum.assign(m, m + hid);
++        for (size_t j = 1; j < s.moe_parts; ++j)
++            for (size_t i = 0; i < hid; ++i) msum[i] += m[j * hid + i];
++        m = msum.data();
++    }
+     std::vector<double> t2(hid), y(hid);
+     g4_rms(m, hid, s.eps, g.post_norm2.data(), t2.data());
+     std::vector<float> sum(hid);
+@@ -2021,8 +2044,11 @@ void Core::gemma4_combine(const Step& s, int layer) {
+     xrt::bo& xres = buffer("xres", 0);
+     float* x = xres.map<float*>();
+     for (size_t i = 0; i < hid; ++i) x[i] = static_cast<float>(res[i] + y[i]);
++    const double t_math = ms_since(t0);
+     xres.sync(XCL_BO_SYNC_BO_TO_DEVICE, hid * 4, 0);
+-    timing_.route_ms += ms_since(t0);
++    const double t_all = ms_since(t0);
++    timing_.route_ms += t_all;
++    g4split_[4] += t_rb; g4split_[5] += t_math - t_rb; g4split_[6] += t_all - t_math;
+ }
+ 
+ void Core::arm_route_records() {
+@@ -2295,6 +2321,11 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
+         softcap_logits();
+         timing_.lmhead_ms = ms_since(t1);
+     }
++    if (g4split_on_ && g4split_[0] + g4split_[4] > 0) {
++        std::fprintf(stderr, "  g4 host @%d: route rb %.2f math %.2f act-sync %.2f patch %.2f | combine rb %.2f math %.2f sync %.2f ms\n",
++                     pos_, g4split_[0], g4split_[1], g4split_[2], g4split_[3], g4split_[4], g4split_[5], g4split_[6]);
++    }
++    for (double& v : g4split_) v = 0;
+     ++pos_;
+     if (!mpos && mrope_on_) ++mrope_pos_;      // a text token after an image: (c, c, c), then c + 1
+     timing_.total_ms = ms_since(t0);
+diff --git a/src/open_qwen36/core.hpp b/src/open_qwen36/core.hpp
+index e84ae12..10208b9 100644
+--- a/src/open_qwen36/core.hpp
++++ b/src/open_qwen36/core.hpp
+@@ -576,6 +576,8 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
+         std::vector<float> post_norm2, post_norm;                          ///< [hidden]; post_norm divided by the fold
+     };
+     std::map<int, G4Moe> g4moe_;
++    double g4split_[7] = {0, 0, 0, 0, 0, 0, 0};   ///< OFLM_G4_SPLIT: route rb / math / act sync / patch; combine rb / math / sync
++    bool g4split_on_ = false;
+     G4Moe& g4moe(const Step& s, int layer);
+     void log(const std::string& s) const;
+ 
+diff --git a/src/open_qwen36/manifest.cpp b/src/open_qwen36/manifest.cpp
+index 66dfbc1..85deca1 100644
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -133,6 +133,8 @@ std::vector<Step> parse_program(const json& j, const std::string& where) {
+             } else {
+                 st.a_t1 = get<uint64_t>(s, "a_t1", where);
+                 st.a_moe = get<uint64_t>(s, "a_moe", where);
++                if (s.contains("moe_parts")) st.moe_parts = get<uint64_t>(s, "moe_parts", where);
++                if (st.moe_parts < 1 || st.moe_parts > 8) fail(where, "gemma4_combine: moe_parts must be 1..8");
+                 st.post_norm2 = get<std::string>(s, "post_norm2", where);
+                 st.post_norm = get<std::string>(s, "post_norm", where);
+                 st.div_running = get<std::string>(s, "div_running", where);
+diff --git a/src/open_qwen36/manifest.hpp b/src/open_qwen36/manifest.hpp
+index 1c4c08a..4964da9 100644
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -67,6 +67,7 @@ struct Step {
+     /// fills at the chosen experts. combine writes xres = res + post_norm'(t1 + post_norm2(m)), t1 at
+     /// a_t1, m at a_moe, post_norm' divided by the product of div_running over the earlier layers.
+     uint64_t a_res = 0, a_xm = 0, a_w = 0, a_t1 = 0, a_moe = 0;
++    uint64_t moe_parts = 1;                  ///< combine: m is the sum of this many f32 [hidden] partials from a_moe (gm8: one a slot)
+     double eps = 1e-6;
+     std::string router, router_scale, expert_scale, pre_norm, post_norm2, post_norm, div_running;
+     std::vector<std::string> args;           ///< run: buffer names (per-layer: pool consts act state; else globals)
