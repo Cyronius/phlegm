@@ -405,15 +405,15 @@ Sources: [speculative decoding](specs/open-engine/plans/spec-decode.md),
 
 ### trit-embed-3l sentence embedder
 
-- [ ] Keep the weights resident or replicated: today all 2.09 MB stream from DDR on every
-  dispatch, and data movement is 54% of the 0.83 ms dispatch.
-- [ ] Fill the 4096-byte weight packets, which are 56-81% full.
+- [ ] Cut core compute, which now bounds the dispatch (0.48 ms, against 0.26 ms with every kernel
+  stubbed): the projection epilogue, and attention's repeated bfp16 operand conversions.
+- [ ] Hide the remaining host work per dispatch (0.53 ms an abstract, against 0.48 ms back to back).
 - [ ] Add an embeddings route to `phlegm serve`, and run the encoder on Windows.
 
 `open_kernels/designs/trit_embed/` runs all three ternary layers (2-bit weights, int8
-activations) in one dispatch per 128-token slot. On a quiet machine it encodes 1,199 SciFact
-abstracts/s and 9,928 packed STSB sentences/s; its vectors score with the CPU reference
-(four-task nDCG@10 33.80 against 33.85).
+activations) in one dispatch per 128-token slot. On a quiet machine (2026-11-01) it encodes 1,888
+SciFact abstracts/s and 14,926 packed STSB sentences/s, 1.6x the 2026-10-31 build; its vectors
+score with the CPU reference (four-task nDCG@10 33.81 against 33.85).
 
 Source: [design README](open_kernels/designs/trit_embed/README.md).
 

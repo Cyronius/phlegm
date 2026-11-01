@@ -5,4 +5,8 @@ extern "C" void f2_out(const float *x,uint8 *e) {
   return;
 #endif
   for(int i=0;i<1536;i+=32) aie::store_v((float*)e+i,aie::load_v<32>(x+i));
+#ifdef F2_PROF_CYCLES
+  f2_prof[15]=F2_CYC()-f2_prof[14];
+  for(int i=0;i<16;++i) ((uint32*)(e+6144))[i]=f2_prof[i];
+#endif
 }

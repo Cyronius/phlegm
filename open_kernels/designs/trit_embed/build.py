@@ -26,7 +26,7 @@ def main():
     p.add_argument('--cap', type=int, choices=(8, 32, 128), default=128)
     p.add_argument('--layers', type=int, choices=(2, 3), default=3)
     p.add_argument('--stub', default='', help="'all', or comma-separated kernels (attend,linear,...) that return immediately")
-    p.add_argument('--bdepth', type=int, choices=(1, 2), default=2, help='Broadcast FIFO depth')
+    p.add_argument('--bdepth', type=int, choices=(1, 2, 3), default=2, help='Broadcast FIFO depth (8192-byte elements)')
     p.add_argument('--defs', default='', help='Comma-separated kernel macros, e.g. F2_PROF_NOEPI')
     p.add_argument('--opt', default='', choices=('', '0', '1', '2', '3'), help='aiecc -O level for core code')
     a = p.parse_args()
@@ -39,12 +39,12 @@ def main():
     import aie.iron as iron
     from aie.iron.device import from_name
     iron.set_current_device(from_name('npu2', n_cols=8))
-    from trit_design import DESIGN, SPECIALIZE, SOURCES, PACKETS
+    from trit_design import DESIGN, SPECIALIZE, SOURCES, PACKETS, ESZ
     # Keep failed compiler products for diagnosing the 16 KiB core budget.
     import aie.utils.compile.jit.compilabledesign as compiler_module
     compiler_module._cleanup_failed_compilation = lambda path: None
     tag = (f'L{a.layers}_cap{a.cap}_d{a.bdepth}' + (f'_O{a.opt}' if a.opt else '')
-           + ''.join('_' + m.replace('F2_PROF_', '').lower() for m in a.defs.split(',') if m)
+           + ''.join('_' + m.replace('F2_PROF_', '').replace('=', '').lower() for m in a.defs.split(',') if m)
            + (f"_stub-{a.stub.replace(',', '+')}" if a.stub else ''))
     out = ROOT / ('build' if tag == 'L3_cap128_d2' else f'build_{tag}')
     out.mkdir(exist_ok=True)
@@ -56,7 +56,7 @@ def main():
     size_tool = Path(os.environ['PEANO_INSTALL_DIR']) / ('bin/llvm-size.exe' if os.name == 'nt' else 'bin/llvm-size')
     sections = subprocess.check_output([str(size_tool), '-A', str(work / 'elfs_main_core_0_2/elfs_main_core_0_2.elf')], text=True)
     text_bytes = int(re.search(r'^\.text\s+(\d+)', sections, re.MULTILINE)[1])
-    report = {'tag': tag, 'stub': a.stub, 'broadcast_depth': a.bdepth, 'packets': PACKETS, 'aiecc_opt': a.opt,
+    report = {'tag': tag, 'stub': a.stub, 'broadcast_depth': a.bdepth, 'defs': [m for m in a.defs.split(',') if m], 'packets': PACKETS, 'element_bytes': ESZ, 'packet_format': 2, 'aiecc_opt': a.opt,
               'cap': a.cap, 'texts_per_dispatch': 128 // a.cap, 'cores': 32, 'layers': a.layers,
               'scope': f'One dispatch, {a.layers} full encoder layers; host embedding lookup/input norm/output projection/pooling',
               'program_text_bytes': text_bytes, 'stack_bytes_per_core': 0x1400,
