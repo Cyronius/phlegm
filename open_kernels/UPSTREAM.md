@@ -276,6 +276,70 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   stream (two fills) at positions 0 to 4095. The diff applies over `beccd46` plus the eight
   patches above.
 
+- `upstream-patches/gptoss-runtime.patch` (2026-10-31) runs GPT-OSS from its GGUF
+  (OPEN-FAMILY-GPTOSS). It adds the MXFP4 GGUF type, zero-extends a GGUF embedding row and an
+  F32 norm into a padded width, and adds four pack ops: `gx_q8` (Q8_0 to q8 half-tiles with
+  the bias in the pad), `gx_ug` and `gx_down` (MXFP4 experts to half-tiles, up and gate per
+  band) and `gx_lmhead` (Q8_0 to `lm_head_q8`'s f32-scale chunks). They write the bytes
+  `recipes/gptoss_pack.py` writes. The `gptoss_route` program step runs the router on the
+  host between `gx_att` and `gx_moe` and patches `gx_moe`'s fills through `moeroute2`'s
+  table. The diff applies over `beccd46` plus the nine patches above; a round trip over the
+  Gemma 4 runtime reproduces the seven files exactly.
+
+- `upstream-patches/gptoss-prefill-runtime.patch` (2026-10-31) gives GPT-OSS its native MXFP4
+  experts and its block prefill (OPEN-FAMILY-GPTOSS, OPEN-PREFILL-GPTOSS). Pack ops `gx_ug_mx4`
+  and `gx_down_mx4` write the experts as mx4 half-tiles (`designs/gemv_q4/gemv_mx4.h`: the
+  GGUF's own nibbles, re-signed for the core's decode); `gp_bfp16` writes a GGUF tensor's rows
+  into a `gemm_bfp16` B operand at any K that is a multiple of 64, optionally as the hi or lo
+  half of a stacked operand; `gp_mx4` writes the experts as `gemm_bfp16` GB_B=mx4 tiles. The
+  manifest's `gptoss_prefill` section names the four GEMMs (and a 128-row expert variant), their
+  weights and the small tensors; the `gxexpert` patch re-points an expert GEMM's buffer-0 fills
+  per dispatch, alternating two copies of the stream so the next run's expert is patched while
+  the last one runs. `Core::step_gptoss_prompt` is the layer-major route `step_gemm_prompt` takes
+  when the set carries it; `block_prefill_min` lets a set state its own crossover, which the
+  engine uses. The diff applies over `beccd46`, the nine Gemma 4 patches and
+  `gptoss-runtime.patch` (sha256 `8a5f808e`, unchanged); `target/npu-dev/gptoss-prefill-patch.sh`
+  regenerates it and checks the chain reproduces the clone.
+
+- `upstream-patches/gemma4-moe-runtime.patch` (2026-10-31) runs Gemma 4 26B-A4B from its QAT
+  Q4_0 GGUF (OPEN-FAMILY-GEMMA4-MOE). Two pack ops: `g4_q40` (a Q4_0 tensor, 2-D or the
+  experts' 3-D, into Q4_0-native chunks in `std_perm`'s band law, with rows and columns padded
+  by zeros, an expert stride and a band stride for the interleaved gate | up bands) and
+  `g4_lmhead_q8` (the Q6_K tied embedding requantised to `lm_head_q8`'s bf16-scale chunks).
+  Two program steps around the `gm_moe` dispatch: `gemma4_route` (the router on the host over
+  the attention residual, top 8 renormalised times `per_expert_scale`, `pre_ffw_norm_2` into
+  the expert input, `moeroute2`'s table patched) and `gemma4_combine` (`post_ffw_norm` of the
+  dense MLP's and the experts' normed outputs, with the folded layer scalar, into `xres`).
+  `host_step` dispatches them beside `moeroute2`; `arm_route_records` now arms `moeroute2`
+  steps only. `gguf_pack_test` checks `g4_q40` against `std_perm_gguf` and with padding,
+  expert and band strides, and `g4_lmhead_q8` within half a step. The diff applies over
+  `beccd46` plus the nine Gemma 4 patches above (not over `gptoss-runtime.patch`, which is
+  a separate clone); applying the ten in order reproduces the runtime tree exactly.
+
+- `upstream-patches/gemma4-moe-decode-runtime.patch` (2026-11-01, sha256 `e1cd6b79...`) is Gemma 4
+  26B-A4B's decode work over `gemma4-moe-runtime.patch` (OPEN-FAMILY-GEMMA4-MOE). `gemma4_route`'s
+  router runs over the host threads with eight partial sums per logit (it was one serial double
+  chain per expert: 7-9 ms of a 115 ms step; now about 1 ms; the logits of a full gate run are
+  byte-identical). `gemma4_combine` takes `moe_parts` (default 1): m is the sum of that many
+  f32 [hidden] partials from `a_moe`, for the 8-core `gm8` probe. `OFLM_G4_SPLIT=1` prints the
+  route / combine host split per step. No pack-op or kernel ABI change; the merged layer image
+  (`designs/gemma4_moe/dxm.py`) needs nothing new from the runtime (two kernels on one context,
+  as `lx` / `ax` already are). Applies over `beccd46`, the nine Gemma 4 patches and
+  `gemma4-moe-runtime.patch` (`target/npu-dev/gemma4-moe-runtime`).
+
+- `upstream-patches/qwen35moe-gguf-runtime.patch` (2026-10-31) runs Qwen3.5 / 3.6 MoE text
+  models (Ornith 1.5 35B-A3B, Nex N2.5 mini, KAT Coder V2.5 Dev) from a llama.cpp `qwen35moe`
+  GGUF (OPEN-FAMILY-QWEN36MOE-GGUF). Seven pack ops write the q4nx ops' bytes in the q4_1 law:
+  `q35_mat`, `q35_stripes`, `q35_down`, `q35_lmhead`, `q35_t`, `q35_vec` and `q35_conv`. Q4_0,
+  Q4_1 and Q4_K blocks keep their codes, with the scale pair rounded to bf16 (RNE). Q8_0, Q5_0
+  and Q6_K blocks are requantized. The ops undo the converter's per-head `[q | gate]`
+  interleave and its tiled linear-attention value heads. On a GGUF, the MoE block route's
+  host stages read their small weights from the packed consts. `q35_pack_dump` writes packed
+  bytes for `open_kernels/model/qwen35moe_gguf_check.py`. The diff applies over `beccd46`
+  plus the nine Gemma 4 patches and the recorded `gptoss-runtime.patch` (sha256 `8a5f808e`);
+  the clone is `target/npu-dev/qwen35moe-runtime`, and a round trip reproduces its tree.
+  Kernel sets that carry the new `gguf` section need this runtime to parse their manifest.
+
 `designs/dense/dx_attn.py` now takes its recipe module from `for_spec` and its flags from the
 recipe's `attn_flags`, and gained `dx.py`'s ATTN_QLOCAL q loop. It emits byte-identical MLIR
 for the 15 shipped dense specs with a block route that emit at all; `qwen3-14b` refuses at

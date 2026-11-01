@@ -11,6 +11,7 @@ r"""dit_ew: the row-wise and elementwise ops of a diffusion transformer step, on
     swiglu       Y = silu(A) * B
     euler        Y = A + dt * B                                  params: dt
     silu         Y = silu(A)
+    gelu_tanh    Y = gelu_tanh(A)                                (its own core program)
 
 Every op is an instruction stream over ONE static configuration: the core program runs
 each op's loop a runtime number of times (zero for the ops not asked for), so a whole
@@ -63,7 +64,9 @@ from aie.iron.device import Tile
 HERE = Path(__file__).resolve().parent
 KERNEL_SRC = str(HERE / "ew.cc")
 
-EL = 3072
+EL = int(os.environ.get("DE_EL", "3072"))
+if EL not in (3072, 4096):
+    raise ValueError("dit_ew supports 3072- or 4096-wide row elements")
 CHUNK = 1024                      # innermost DMA dimension (a shim BD's d0 is <= 1023 words)
 N_COLS, PER_COL = 8, 2
 N_PAR_MAX = 3
@@ -71,11 +74,12 @@ STACK = 0x800
 
 (R_NPAR, R_CNT_LN, R_CNT_RES, R_CNT_QK, R_CNT_BIN, R_CNT_UN, R_W, R_IDX_GATE, R_IDX_SHIFT,
  R_IDX_SCALE, R_BINOP, R_ROW0, R_ROW_STEP, R_N_TXT, R_GRID_W, R_HEADS, R_NORM, R_UNIT_GATE,
- R_ROPE, R_B_QH, R_B_KH) = range(21)
-RTP_LEN = 24
+ R_ROPE, R_B_QH, R_B_KH, R_GRID_H, R_AFFINE_RMS, R_BIAS_PERIOD,
+ R_TANH_GATE, R_REF_ROW) = range(26)
+RTP_LEN = 26
 BINOPS = {"swiglu": 1, "euler": 2}
-OPS_2IN = {"res_ln_mod", "qk", "swiglu", "euler"}
-OPS_2OUT = {"res_ln_mod", "qk"}
+OPS_2IN = {"res_ln_mod", "qk", "qk_moss", "qk_flux3", "qk_qwen21", "swiglu", "euler", "situ"}
+OPS_2OUT = {"res_ln_mod", "qk", "qk_moss", "qk_flux3", "qk_qwen21"}
 
 
 def view_elems(v: dict) -> int:
@@ -93,6 +97,34 @@ def check_spec(s: dict) -> str | None:
         v = s.get(k)
         if v and v.get("kind") != "tile24" and (v["T"] % N_COLS or (v["T"] // N_COLS * v["E"]) % PER_COL):
             return f"view {k}: T must split evenly over {N_COLS} columns x {PER_COL} cores"
+    if s["op"] == "qk_moss":
+        h, w, text = s.get("grid_h", 0), s.get("grid_w", 0), s.get("n_txt", 0)
+        if not (1 <= h <= 64 and 1 <= w <= 64 and 1 <= text <= 4096):
+            return "qk_moss needs grid height/width 1..64 and text length 1..4096"
+        if s.get("tok0", -1) < 0:
+            return "qk_moss needs a nonnegative token start"
+    if s.get("lean") and s["op"] not in ("ln_mod", "res_ln_mod", "euler", "swiglu"):
+        return "a lean dit_ew stream carries only ln_mod, res_ln_mod and binary row ops"
+    if s["op"] == "qk_flux3":
+        h, w, text = s.get("grid_h", -1), s.get("grid_w", 0), s.get("n_txt", -1)
+        if not (0 <= h <= 64 and 1 <= w <= 64 and 0 <= text <= 512):
+            return "FLUX 3 q/k needs grid height 0..64, width 1..64, text length 0..512"
+        if h * w + text > s["a"]["T"] or s.get("tok0", -1) < 0:
+            return "FLUX 3 q/k real tokens exceed its padded stream"
+        if not 0 <= s.get("ref_row", 64) <= 64:
+            return "FLUX 3 q/k reference start row must be 0..64"
+    if s["op"] == "qk_qwen21":
+        h, w, text = s.get("grid_h", 0), s.get("grid_w", 0), s.get("n_txt", -1)
+        if EL != 4096 or not (1 <= h <= 64 and 1 <= w <= 64 and 0 <= text <= 1023):
+            return "Qwen Image 2.1 q/k needs EL=4096, grid 1..64 and text length 0..1023"
+        cond = s.get("cond_row", 0)
+        if not 0 <= cond < max(text, 1) or h * w * (2 if cond else 1) + text > s["a"]["T"] \
+                or s.get("tok0", -1) < 0:
+            return "Qwen Image 2.1 q/k real tokens (or condition row) exceed its padded stream"
+    if s["op"] == "bias" and (s["a"].get("E", 1) not in (1, 2, 3) or
+                                  s.get("n_par") != s["a"].get("E", 1) or
+                                  s.get("bias_period") != s["a"].get("E", 1)):
+        return "bias needs 1..3 row elements and one parameter element per row element"
     return None
 
 
@@ -127,15 +159,32 @@ def dit_ew(X: In, B: In, P: In, Y: Out, Z: Out, *, spec: CompileTime[str]):
     k_ln = Kernel("ln_mod_row", obj, [el_ty, el_ty, par_ty, rtp_ty])
     k_res = Kernel("res_ln_mod_row", obj, [el_ty, el_ty, el_ty, el_ty, par_ty, rtp_ty])
     k_qk = Kernel("qk_row", obj, [el_ty, el_ty, el_ty, el_ty, par_ty, rtp_ty, np.int32])
+    k_moss = Kernel("qk_moss_row", obj, [el_ty, el_ty, el_ty, el_ty, par_ty, rtp_ty, np.int32])
+    k_flux3 = Kernel("qk_flux3_row", obj, [el_ty, el_ty, el_ty, el_ty, par_ty, rtp_ty, np.int32])
+    k_qwen21 = Kernel("qk_qwen21_row", obj, [el_ty, el_ty, el_ty, el_ty, par_ty, rtp_ty, np.int32])
     k_bin = Kernel("bin_row", obj, [el_ty, el_ty, el_ty, par_ty, rtp_ty])
     k_un = Kernel("un_row", obj, [el_ty, el_ty, rtp_ty])
-    kernels = [k_param, k_ln, k_res, k_qk, k_bin, k_un]
+    k_situ = Kernel("situ_row", obj, [el_ty, el_ty, el_ty])
+    k_gelu = Kernel("gelu_row", obj, [el_ty, el_ty])
+    k_bias = Kernel("bias_row", obj, [el_ty, el_ty, par_ty, rtp_ty, np.int32])
+    kernels = ([k_situ] if op == "situ" else
+               [k_gelu] if op == "gelu_tanh" else
+               [k_param, k_moss] if op == "qk_moss" else
+               [k_param, k_flux3] if op == "qk_flux3" else
+               [k_param, k_qwen21] if op == "qk_qwen21" else
+               [k_param, k_bias] if op == "bias" else
+               # "lean": a set of ln_mod/res_ln_mod/euler streams that omits the
+               # FLUX.2 q/k and SiLU paths (a smaller core program). Every stream of
+               # such a set must be lean. The generic program fits again since
+               # GELU-tanh moved to its own entry point (gelu_row).
+               [k_param, k_ln, k_res, k_bin] if s.get("lean") else
+               [k_param, k_ln, k_res, k_qk, k_bin, k_un])
 
     offs = [i * EL for i in range(PER_COL)]
     A3, B3, Y3, Z3 = [], [], [], []
     A1, B1, Y1, Z1 = {}, {}, {}, {}
     for c in range(N_COLS):
-        for name, lst, l1, depth in (("A", A3, A1, 2), ("B", B3, B1, 1)):
+        for name, lst, l1, depth in (("A", A3, A1, 1 if EL == 4096 else 2), ("B", B3, B1, 1)):
             f = ObjectFifo(l2_ty, name=f"{name}_L3L2_{c}", depth=2)
             lst.append(f)
             parts = f.cons().split(offs, tile=Tile(c, 1), obj_types=[el_ty] * PER_COL,
@@ -143,7 +192,7 @@ def dit_ew(X: In, B: In, P: In, Y: Out, Z: Out, *, spec: CompileTime[str]):
                                    depths=[depth] * PER_COL)
             for r in range(PER_COL):
                 l1[(c, r)] = parts[r].cons()
-        for name, lst, l1, depth in (("Y", Y3, Y1, 2), ("Z", Z3, Z1, 1)):
+        for name, lst, l1, depth in (("Y", Y3, Y1, 1 if EL == 4096 else 2), ("Z", Z3, Z1, 1)):
             f = ObjectFifo(l2_ty, name=f"{name}_L2L3_{c}", depth=2)
             lst.append(f)
             parts = f.prod().join(offs, tile=Tile(c, 1), obj_types=[el_ty] * PER_COL,
@@ -157,8 +206,79 @@ def dit_ew(X: In, B: In, P: In, Y: Out, Z: Out, *, spec: CompileTime[str]):
     def make_core_fn(r):
         return lambda *args: core_fn(r, *args)
 
+    def situ_core_fn(r, a_in, b_in, y_out, z_out, kern, par, my_rtp, barrier):
+        barrier.wait_for_value(1)
+        for _ in range_(my_rtp[R_CNT_BIN]):
+            a = a_in.acquire(1)
+            b = b_in.acquire(1)
+            y = y_out.acquire(1)
+            kern[0](a, b, y)
+            a_in.release(1)
+            b_in.release(1)
+            y_out.release(1)
+        barrier.release_with_value(1)
+
+    def make_situ_core_fn(r):
+        return lambda *args: situ_core_fn(r, *args)
+
+    def gelu_core_fn(r, a_in, b_in, y_out, z_out, kern, par, my_rtp, barrier):
+        barrier.wait_for_value(1)
+        for _ in range_(my_rtp[R_CNT_UN]):
+            a = a_in.acquire(1)
+            y = y_out.acquire(1)
+            kern[0](a, y)
+            a_in.release(1)
+            y_out.release(1)
+        barrier.release_with_value(1)
+
+    def make_gelu_core_fn(r):
+        return lambda *args: gelu_core_fn(r, *args)
+
+    def moss_core_fn(r, a_in, b_in, y_out, z_out, kern, par, my_rtp, barrier):
+        barrier.wait_for_value(1)
+        for i in range_(my_rtp[R_NPAR]):
+            e = a_in.acquire(1)
+            kern[0](e, par, i, r - 1, my_rtp)
+            a_in.release(1)
+        for t in range_(my_rtp[R_CNT_QK]):
+            q = a_in.acquire(1)
+            k = b_in.acquire(1)
+            qo = y_out.acquire(1)
+            ko = z_out.acquire(1)
+            kern[1](q, k, qo, ko, par, my_rtp, t)
+            a_in.release(1)
+            b_in.release(1)
+            y_out.release(1)
+            z_out.release(1)
+        barrier.release_with_value(1)
+
+    def make_moss_core_fn(r):
+        return lambda *args: moss_core_fn(r, *args)
+
+    def bias_core_fn(r, a_in, b_in, y_out, z_out, kern, par, my_rtp, barrier):
+        barrier.wait_for_value(1)
+        for i in range_(my_rtp[R_NPAR]):
+            e = a_in.acquire(1)
+            kern[0](e, par, i, r - 1, my_rtp)
+            a_in.release(1)
+        for t in range_(my_rtp[R_CNT_UN]):
+            a = a_in.acquire(1)
+            y = y_out.acquire(1)
+            kern[1](a, y, par, my_rtp, t)
+            a_in.release(1)
+            y_out.release(1)
+        barrier.release_with_value(1)
+
+    def make_bias_core_fn(r):
+        return lambda *args: bias_core_fn(r, *args)
+
     def core_fn(r, a_in, b_in, y_out, z_out, kern, par, my_rtp, barrier):
-        k_param, k_ln, k_res, k_qk, k_bin, k_un = kern
+        lean = len(kern) == 4
+        if lean:
+            k_param, k_ln, k_res, k_bin = kern
+            k_qk = k_un = None
+        else:
+            k_param, k_ln, k_res, k_qk, k_bin, k_un = kern
         barrier.wait_for_value(1)
         for i in range_(my_rtp[R_NPAR]):
             e = a_in.acquire(1)
@@ -180,16 +300,17 @@ def dit_ew(X: In, B: In, P: In, Y: Out, Z: Out, *, spec: CompileTime[str]):
             b_in.release(1)
             y_out.release(1)
             z_out.release(1)
-        for t in range_(my_rtp[R_CNT_QK]):
-            q = a_in.acquire(1)
-            k = b_in.acquire(1)
-            qo = y_out.acquire(1)
-            ko = z_out.acquire(1)
-            k_qk(q, k, qo, ko, par, my_rtp, t)
-            a_in.release(1)
-            b_in.release(1)
-            y_out.release(1)
-            z_out.release(1)
+        if not lean:
+            for t in range_(my_rtp[R_CNT_QK]):
+                q = a_in.acquire(1)
+                k = b_in.acquire(1)
+                qo = y_out.acquire(1)
+                ko = z_out.acquire(1)
+                k_qk(q, k, qo, ko, par, my_rtp, t)
+                a_in.release(1)
+                b_in.release(1)
+                y_out.release(1)
+                z_out.release(1)
         for _ in range_(my_rtp[R_CNT_BIN]):
             a = a_in.acquire(1)
             b = b_in.acquire(1)
@@ -198,12 +319,13 @@ def dit_ew(X: In, B: In, P: In, Y: Out, Z: Out, *, spec: CompileTime[str]):
             a_in.release(1)
             b_in.release(1)
             y_out.release(1)
-        for _ in range_(my_rtp[R_CNT_UN]):
-            a = a_in.acquire(1)
-            y = y_out.acquire(1)
-            k_un(a, y, my_rtp)
-            a_in.release(1)
-            y_out.release(1)
+        if not lean:
+            for _ in range_(my_rtp[R_CNT_UN]):
+                a = a_in.acquire(1)
+                y = y_out.acquire(1)
+                k_un(a, y, my_rtp)
+                a_in.release(1)
+                y_out.release(1)
         barrier.release_with_value(1)
 
     workers = []
@@ -213,7 +335,11 @@ def dit_ew(X: In, B: In, P: In, Y: Out, Z: Out, *, spec: CompileTime[str]):
                                  initial_value=np.zeros(RTP_LEN, dtype=np.int32),
                                  use_write_rtp=True)
             barriers[(c, r)] = WorkerRuntimeBarrier()
-            workers.append(Worker(make_core_fn(r), [
+            worker_fn = (make_situ_core_fn(r) if op == "situ" else
+                         make_gelu_core_fn(r) if op == "gelu_tanh" else
+                         make_moss_core_fn(r) if op in ("qk_moss", "qk_flux3", "qk_qwen21") else
+                         make_bias_core_fn(r) if op == "bias" else make_core_fn(r))
+            workers.append(Worker(worker_fn, [
                 A1[(c, r)], B1[(c, r)], Y1[(c, r)], Z1[(c, r)], kernels,
                 Buffer(par_ty, name=f"par_{c}_{r}"), rtp[(c, r)], barriers[(c, r)]],
                 tile=Tile(c, 2 + r), stack_size=STACK))
@@ -223,7 +349,11 @@ def dit_ew(X: In, B: In, P: In, Y: Out, Z: Out, *, spec: CompileTime[str]):
     n_par = s.get("n_par", 0)
     idx = s.get("idx", {})
     cnt_slot = {"ln_mod": R_CNT_LN, "res_ln_mod": R_CNT_RES, "qk": R_CNT_QK,
-                "swiglu": R_CNT_BIN, "euler": R_CNT_BIN, "silu": R_CNT_UN}[op]
+                "qk_moss": R_CNT_QK, "qk_flux3": R_CNT_QK,
+                "qk_qwen21": R_CNT_QK,
+                "swiglu": R_CNT_BIN, "euler": R_CNT_BIN, "situ": R_CNT_BIN,
+                "silu": R_CNT_UN, "gelu_tanh": R_CNT_UN,
+                "bias": R_CNT_UN}[op]
     sizes = s["sizes"]
     tys = [np.ndarray[(sizes[k],), np.dtype[bfloat16]] for k in ("X", "B", "P", "Y", "Z")]
 
@@ -234,12 +364,23 @@ def dit_ew(X: In, B: In, P: In, Y: Out, Z: Out, *, spec: CompileTime[str]):
                     R_IDX_SCALE: idx.get("scale", 0), R_BINOP: BINOPS.get(op, 0),
                     R_HEADS: s.get("heads", EL // 128),
                     R_NORM: int(s.get("norm") == "rms"), R_UNIT_GATE: int(s.get("unit_gate", 0)),
-                    R_ROPE: int(s.get("rope") == "qwen"), R_B_QH: s.get("b_q_heads", 0),
+                    R_GRID_H: s.get("grid_h", 1),
+                    R_AFFINE_RMS: int(s.get("affine_rms", 0)),
+                    R_BIAS_PERIOD: s.get("bias_period", 0),
+                    R_TANH_GATE: int(s.get("tanh_gate", 0)),
+                    R_REF_ROW: s.get("ref_row", 64),
+                    R_ROPE: int(s.get("rope") == "qwen"),
+                    R_B_QH: s.get("b_q_heads", 0),
                     R_B_KH: s.get("b_k_heads", EL // 128)}
-            if op == "qk":
+            if op == "qk_qwen21":                 # an edit's condition-image start row
+                vals[R_REF_ROW] = s.get("cond_row", 0)
+            if op in ("qk", "qk_moss", "qk_flux3", "qk_qwen21"):
                 vals |= {R_ROW0: s.get("tok0", 0) + c * (s["a"]["T"] // N_COLS) + r,
                          R_ROW_STEP: PER_COL, R_N_TXT: s.get("n_txt", 0),
                          R_GRID_W: s.get("grid_w", 1)}
+            if op == "bias":
+                vals |= {R_ROW0: c * (s["a"]["T"] // N_COLS) * s["a"].get("E", 1) + r,
+                         R_ROW_STEP: PER_COL}
             for k in range(RTP_LEN):
                 buf[k] = vals.get(k, 0)
         for bar in barriers.values():

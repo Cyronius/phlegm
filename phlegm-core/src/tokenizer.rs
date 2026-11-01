@@ -18,6 +18,194 @@ pub const OBJECT_REF_END: u32 = 248048;
 /// Any of these ends generation (tokenizer_config.json: eos_token_id).
 pub const EOS_TOKEN_IDS: [u32; 3] = [ENDOFTEXT, IM_END, OBJECT_REF_END];
 
+/// `strftime` over a UTC time for the chat templates (`strftime_now`): %Y %m %d %H %M %S %b %B
+/// %a %A %y %j %e %%; anything else is copied through as written.
+pub(crate) fn strftime_utc(fmt: &str, unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400);
+    let tod = unix_secs.rem_euclid(86_400);
+    // civil_from_days (Howard Hinnant): proleptic Gregorian date of a day count
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July",
+                                "August", "September", "October", "November", "December"];
+    const DAYS: [&str; 7] = ["Thursday", "Friday", "Saturday", "Sunday", "Monday", "Tuesday", "Wednesday"];
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let first_of_month = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334][(m - 1) as usize];
+    let yday = first_of_month + d + i64::from(leap && m > 2);
+    let wd = DAYS[days.rem_euclid(7) as usize];
+    let mn = MONTHS[(m - 1) as usize];
+    let mut out = String::new();
+    let mut chars = fmt.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out += &y.to_string(),
+            Some('y') => out += &format!("{:02}", y.rem_euclid(100)),
+            Some('m') => out += &format!("{m:02}"),
+            Some('d') => out += &format!("{d:02}"),
+            Some('e') => out += &format!("{d:2}"),
+            Some('j') => out += &format!("{yday:03}"),
+            Some('H') => out += &format!("{:02}", tod / 3600),
+            Some('M') => out += &format!("{:02}", tod / 60 % 60),
+            Some('S') => out += &format!("{:02}", tod % 60),
+            Some('b') => out += &mn[..3],
+            Some('B') => out += mn,
+            Some('a') => out += &wd[..3],
+            Some('A') => out += wd,
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+/// GPT-OSS's harmony output, `<|channel|>analysis<|message|>...<|end|><|start|>assistant<|channel|>final
+/// <|message|>...<|return|>`, split into (analysis, final). None when the text carries no final
+/// channel marker (another family, or a harmony turn cut short before its answer).
+pub fn harmony_split(text: &str) -> Option<(String, String)> {
+    const FINAL: &str = "<|channel|>final<|message|>";
+    const ANALYSIS: &str = "<|channel|>analysis<|message|>";
+    let at = text.rfind(FINAL)?;
+    let strip = |t: &str| {
+        let mut t = t;
+        for end in ["<|return|>", "<|end|>", "<|call|>", "<|endoftext|>"] {
+            if let Some(i) = t.find(end) {
+                t = &t[..i];
+            }
+        }
+        t.trim().to_owned()
+    };
+    let analysis = text[..at].find(ANALYSIS).map(|i| strip(&text[i + ANALYSIS.len()..at])).unwrap_or_default();
+    Some((analysis, strip(&text[at + FINAL.len()..])))
+}
+
+/// A harmony reply so far as (reasoning, answer): the analysis message's text and the final
+/// message's, each without its markers and cut at its end marker. The streaming server re-derives
+/// both after every token and sends each one's new suffix (`reasoning_content` / `content`).
+pub fn harmony_progress(text: &str) -> (String, String) {
+    const FINAL: &str = "<|channel|>final<|message|>";
+    const ANALYSIS: &str = "<|channel|>analysis<|message|>";
+    let cut = |t: &str| {
+        let mut t = t;
+        for end in ["<|end|>", "<|return|>", "<|call|>", "<|start|>", "<|endoftext|>"] {
+            if let Some(i) = t.find(end) {
+                t = &t[..i];
+            }
+        }
+        t.to_owned()
+    };
+    let fin = text.rfind(FINAL);
+    let reasoning = text
+        .find(ANALYSIS)
+        .filter(|i| fin.map_or(true, |f| *i < f))
+        .map(|i| cut(&text[i + ANALYSIS.len()..fin.unwrap_or(text.len())]))
+        .unwrap_or_default();
+    let answer = fin.map(|f| cut(&text[f + FINAL.len()..])).unwrap_or_default();
+    (reasoning, answer)
+}
+
+/// How a model's chat template marks reasoning apart from the answer, read from the model's own
+/// files at load (`Tokenizer::load`), never from its name.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReasoningFormat {
+    /// GPT-OSS's harmony channels (`harmony_progress` / `harmony_split`).
+    Harmony,
+    /// A reasoning block between two markers ahead of the answer: Gemma 4's
+    /// `<|channel>thought\n ... <channel|>` (its tokenizer_config `response_template`), Qwen3.5's
+    /// `<think> ... </think>` (its chat template).
+    Tagged { open: String, close: String },
+}
+
+/// One reply's reasoning/answer splitter: the format, plus whether the rendered prompt already
+/// opened the reasoning block (Qwen's generation prompt ends in `<think>\n`, so its reply starts
+/// inside the block and never repeats the opener).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reasoning {
+    pub format: ReasoningFormat,
+    pub opened_by_prompt: bool,
+}
+
+impl Reasoning {
+    pub fn for_prompt(format: ReasoningFormat, prompt: &str) -> Reasoning {
+        let opened_by_prompt = match &format {
+            ReasoningFormat::Tagged { open, .. } => prompt.trim_end().ends_with(open.trim_end()),
+            ReasoningFormat::Harmony => false,
+        };
+        Reasoning { format, opened_by_prompt }
+    }
+
+    /// The reply so far as (reasoning, answer), for streaming: each side only grows as text is
+    /// appended, and a partly decoded marker is held back until it resolves.
+    pub fn progress(&self, text: &str) -> (String, String) {
+        self.derive(text, true)
+    }
+
+    /// `progress` once the reply is complete: nothing more is held back.
+    pub fn progress_done(&self, text: &str) -> (String, String) {
+        self.derive(text, false)
+    }
+
+    /// A finished reply as (reasoning, answer), trimmed. A reply cut short inside its reasoning
+    /// has an empty answer.
+    pub fn split(&self, text: &str) -> (String, String) {
+        if self.format == ReasoningFormat::Harmony {
+            if let Some(parts) = harmony_split(text) {
+                return parts;
+            }
+        }
+        let (r, a) = self.derive(text, false);
+        (r.trim().to_owned(), a.trim().to_owned())
+    }
+
+    fn derive(&self, text: &str, partial: bool) -> (String, String) {
+        let (open, close) = match &self.format {
+            ReasoningFormat::Harmony => return harmony_progress(text),
+            ReasoningFormat::Tagged { open, close } => (open.trim_end(), close.as_str()),
+        };
+        // Drop a trailing piece of text that may be the start of `marker`.
+        let hold = |t: &'_ str, marker: &str| -> usize {
+            if !partial {
+                return t.len();
+            }
+            (1..marker.len().min(t.len() + 1))
+                .rev()
+                .find(|&n| t.is_char_boundary(t.len() - n) && marker.starts_with(&t[t.len() - n..]))
+                .map_or(t.len(), |n| t.len() - n)
+        };
+        let lead = text.trim_start();
+        let inside = if self.opened_by_prompt {
+            text
+        } else if let Some(rest) = lead.strip_prefix(open) {
+            rest
+        } else if partial && open.starts_with(lead) {
+            return (String::new(), String::new());
+        } else {
+            return (String::new(), lead.to_owned());
+        };
+        match inside.find(close) {
+            Some(i) => (
+                inside[..i].trim_start().to_owned(),
+                inside[i + close.len()..].trim_start().to_owned(),
+            ),
+            None => (inside[..hold(inside, close)].trim_start().to_owned(), String::new()),
+        }
+    }
+}
+
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -118,6 +306,85 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn harmony_split_takes_the_final_channel() {
+        let t = "<|channel|>analysis<|message|>Think.<|end|><|start|>assistant<|channel|>final<|message|>Paris.<|return|>";
+        assert_eq!(harmony_split(t), Some(("Think.".into(), "Paris.".into())));
+        assert_eq!(harmony_split("<|channel|>final<|message|> Hi "), Some((String::new(), "Hi".into())));
+        assert_eq!(harmony_split("<|channel|>analysis<|message|>cut short"), None);
+        assert_eq!(harmony_split("plain text"), None);
+    }
+
+    #[test]
+    fn harmony_progress_grows_reasoning_then_answer() {
+        let steps = ["<|channel|>analysis<|message|>Th", "<|channel|>analysis<|message|>Think.<|end|>",
+                     "<|channel|>analysis<|message|>Think.<|end|><|start|>assistant<|channel|>final<|message|>Pa",
+                     "<|channel|>analysis<|message|>Think.<|end|><|start|>assistant<|channel|>final<|message|>Paris."];
+        let got: Vec<_> = steps.iter().map(|t| harmony_progress(t)).collect();
+        assert_eq!(got[0], ("Th".into(), String::new()));
+        assert_eq!(got[1], ("Think.".into(), String::new()));
+        assert_eq!(got[2], ("Think.".into(), "Pa".into()));
+        assert_eq!(got[3], ("Think.".into(), "Paris.".into()));
+    }
+
+    #[test]
+    fn tagged_reasoning_streams_monotonically_and_splits() {
+        let gemma = Reasoning::for_prompt(
+            ReasoningFormat::Tagged { open: "<|channel>thought\n".into(), close: "<channel|>".into() },
+            "<|turn>user\nHi<turn|>\n<|turn>model\n",
+        );
+        assert!(!gemma.opened_by_prompt);
+        let reply = "<|channel>thought\nThe user greets.<channel|>Hello!";
+        let mut last = (String::new(), String::new());
+        for end in (0..=reply.len()).filter(|&i| reply.is_char_boundary(i)) {
+            let now = gemma.progress(&reply[..end]);
+            assert!(now.0.starts_with(&last.0) && now.1.starts_with(&last.1), "{end}: {last:?} -> {now:?}");
+            last = now;
+        }
+        assert_eq!(last, ("The user greets.".into(), "Hello!".into()));
+        assert_eq!(gemma.progress("<|channel>thought\nHm <chan"), ("Hm ".into(), String::new()));
+        assert_eq!(gemma.split("Hello!"), (String::new(), "Hello!".into()));
+        assert_eq!(gemma.split("<|channel>thought\ncut"), ("cut".into(), String::new()));
+
+        let qwen = Reasoning::for_prompt(
+            ReasoningFormat::Tagged { open: "<think>".into(), close: "</think>".into() },
+            "<|im_start|>assistant\n<think>\n",
+        );
+        assert!(qwen.opened_by_prompt);
+        assert_eq!(qwen.split("Plan.\n</think>\n\nParis."), ("Plan.".into(), "Paris.".into()));
+        assert_eq!(qwen.progress("Plan.\n</thi"), ("Plan.\n".into(), String::new()));
+        let closed = Reasoning::for_prompt(qwen.format.clone(), "<think>\n\n</think>\n\n");
+        assert_eq!(closed.split("Paris."), (String::new(), "Paris.".into()));
+        let harmony = Reasoning::for_prompt(ReasoningFormat::Harmony, "");
+        assert_eq!(harmony.split("<|channel|>analysis<|message|>cut short"), ("cut short".into(), String::new()));
+    }
+
+    #[test]
+    fn strftime_utc_matches_known_dates() {
+        assert_eq!(strftime_utc("%Y-%m-%d", 0), "1970-01-01");
+        assert_eq!(strftime_utc("%Y-%m-%d %H:%M:%S", 1_793_404_800 + 3723), "2026-10-31 01:02:03");
+        assert_eq!(strftime_utc("%d %b %Y, %A (%j)", 1_709_164_800), "29 Feb 2024, Thursday (060)");
+        assert_eq!(strftime_utc("100%% %Q", 0), "100% %Q");
+    }
+
+    #[test]
+    fn generation_config_eos_replaces_the_fallback_names() {
+        // GPT-OSS: <|end|> closes the analysis message mid-turn; only generation_config's ids stop
+        let (dir, _) = fixture(false, false);
+        let mut tk = HfTokenizer::from_file(dir.join("tokenizer.json")).unwrap();
+        tk.add_special_tokens([AddedToken::from("<|end|>", true), AddedToken::from("<|return|>", true)])
+            .unwrap();
+        tk.save(dir.join("tokenizer.json"), false).unwrap();
+        let end = tk.token_to_id("<|end|>").unwrap();
+        let ret = tk.token_to_id("<|return|>").unwrap();
+        let before = Tokenizer::load(&dir).unwrap();
+        assert!(before.is_eos(end), "without generation_config.json the fallback names apply");
+        std::fs::write(dir.join("generation_config.json"), json!({"eos_token_id": [ret]}).to_string()).unwrap();
+        let after = Tokenizer::load(&dir).unwrap();
+        assert!(after.is_eos(ret) && after.is_eos(1) && !after.is_eos(end));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn native_stream_buffers_split_utf8_and_keeps_exact_complete_decode() {
         let (dir, tokenizer) = fixture(false, true);
         let mut stream = tokenizer.decode_stream();
@@ -151,6 +418,7 @@ pub(crate) mod tests {
 }
 
 pub struct Tokenizer {
+    reasoning: Option<ReasoningFormat>,
     tk: HfTokenizer,
     env: Environment<'static>,
     add_bos_token: bool,
@@ -227,9 +495,48 @@ impl Tokenizer {
         // methods (str.startswith/.endswith/...) that minijinja doesn't define
         // natively; minijinja-contrib's pycompat shim adds them.
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        // transformers passes `strftime_now` into the template's globals; GPT-OSS's harmony
+        // template stamps "Current date:" with it. UTC: the server has no timezone of its own.
+        env.add_function("strftime_now", |fmt: String| -> String {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            strftime_utc(&fmt, secs)
+        });
+        // Where the reply's reasoning ends, from the model's own files: harmony channels in the
+        // template; else the tokenizer_config `response_template` thinking field (Gemma 4); else
+        // `<think>`/`</think>` in the template (Qwen3.5).
+        let tagged = |open: &str, close: &str| ReasoningFormat::Tagged { open: open.into(), close: close.into() };
+        let thinking = config.pointer("/response_template/fields/thinking");
+        let reasoning = if template_src.contains("<|channel|>") {
+            Some(ReasoningFormat::Harmony)
+        } else if let (Some(open), Some(close)) = (
+            thinking.and_then(|t| t.get("open")).and_then(Value::as_str),
+            thinking.and_then(|t| t.get("close")).and_then(Value::as_str),
+        ) {
+            Some(tagged(open, close))
+        } else if template_src.contains("<think>") && template_src.contains("</think>") {
+            Some(tagged("<think>", "</think>"))
+        } else {
+            None
+        };
         env.add_template_owned("chat", template_src)
             .map_err(|e| format!("compiling chat_template.jinja: {e}"))?;
 
+        // generation_config.json's eos_token_id is what transformers stops on. Where a model ships
+        // one it is the whole list: the fallback names below include `<|end|>`, which GPT-OSS's
+        // harmony format writes after its analysis message and BEFORE the final answer.
+        let generation_eos: Option<Vec<u32>> =
+            std::fs::read_to_string(model_dir.join("generation_config.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|g| match g.get("eos_token_id") {
+                    Some(Value::Number(n)) => n.as_u64().map(|id| vec![id]),
+                    Some(Value::Array(ids)) => Some(ids.iter().filter_map(Value::as_u64).collect()),
+                    _ => None,
+                })
+                .map(|ids| ids.into_iter().filter_map(|id| u32::try_from(id).ok()).collect());
         let mut eos_ids: std::collections::HashSet<u32> = match config.get("eos_token_id") {
             Some(Value::Number(n)) => n
                 .as_u64()
@@ -248,7 +555,10 @@ impl Tokenizer {
                 eos_ids.insert(id);
             }
         }
-        for name in [
+        if let Some(ids) = &generation_eos {
+            eos_ids.extend(ids.iter().copied());
+        }
+        for name in if generation_eos.is_some() { &[][..] } else { &[
             "<|im_end|>",
             "<|eot_id|>",
             "<end_of_turn>",
@@ -256,7 +566,7 @@ impl Tokenizer {
             "<|endoftext|>",
             "<|end_of_text|>",
             "<｜end▁of▁sentence｜>",
-        ] {
+        ][..] } {
             if let Some(id) = tk.token_to_id(name) {
                 eos_ids.insert(id);
             }
@@ -267,6 +577,7 @@ impl Tokenizer {
         Ok(Tokenizer {
             tk,
             env,
+            reasoning,
             add_bos_token,
             bos_token,
             eos_ids,
@@ -319,6 +630,18 @@ impl Tokenizer {
 
     pub fn stop_ids(&self) -> std::collections::HashSet<u32> {
         self.eos_ids.clone()
+    }
+
+    /// The chat template speaks OpenAI's harmony format (GPT-OSS): replies arrive as an analysis
+    /// channel then a final one, which the CLI and server separate (`harmony_split`).
+    pub fn is_harmony(&self) -> bool {
+        self.reasoning == Some(ReasoningFormat::Harmony)
+    }
+
+    /// The splitter for a reply to `prompt` (the rendered chat template), or None when the model's
+    /// files mark no reasoning block.
+    pub fn reasoning_for(&self, prompt: &str) -> Option<Reasoning> {
+        self.reasoning.clone().map(|f| Reasoning::for_prompt(f, prompt))
     }
 
     // ---- chat template ----------------------------------------------------

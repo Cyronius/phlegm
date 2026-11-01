@@ -64,9 +64,14 @@ from aie.iron.device import Tile
 HERE = Path(__file__).resolve().parent
 KERNEL_SRC = str(HERE / "fa_dit.cc")
 
-TQ, LKP, DC, DFULL = 32, 64, 64, 128
+VAE_HEAD = os.environ.get("DF_VAE_HEAD") == "1"
+# DF_VAE_DIM: the single head's width, 1152 (decoder mid block) or 768 (encoder).
+VAE_DIM = int(os.environ.get("DF_VAE_DIM", 1152))
+if VAE_HEAD and VAE_DIM not in (768, 1152):
+    raise ValueError("DF_VAE_DIM must be 768 or 1152")
+TQ, LKP, DC, DFULL = (8, 16, 64, VAE_DIM) if VAE_HEAD else (32, 64, 64, 128)
 NDCH = DFULL // DC
-N_GROUPS, GROUP_COLS, N_ROWS = 2, 4, 4
+N_GROUPS, GROUP_COLS, N_ROWS = (1 if VAE_HEAD else 2), 4, 4
 CORES = GROUP_COLS * N_ROWS            # per group
 QROWS_PASS = CORES * TQ                # 512
 Q_ON_A = CORES // 2                    # Q tiles on fifo A; the rest ride B
@@ -112,6 +117,8 @@ def dit_fa(
     k_ld = k_ld or kv_heads * DFULL
     v_ld = v_ld or kv_heads * DFULL
     valid_len = valid_len or lk
+    if VAE_HEAD and (causal or valid_len != lk):
+        raise ValueError("Qwen VAE attention is bidirectional over all spatial tokens")
     why = check_shape(L, heads, kv_heads, lk)
     assert why is None, why
 
@@ -127,7 +134,7 @@ def dit_fa(
 
     flags = [f"-DFA_TQ={TQ}", f"-DFA_LKP={LKP}", f"-DFA_DC={DC}", f"-DFA_DFULL={DFULL}",
              f"-DFA_QROWS_PASS={QROWS_PASS}", f"-DFA_EXP_FIX={EXP_FIX}", f"-DFA_TAU={TAU}",
-             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+             f"-DFA_VAE_HEAD={int(VAE_HEAD)}", "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
              "-Wno-deprecated-declarations"]
     # One ExternalFunction compiles the file; every call goes through a plain Kernel
     # sibling (whisper_fa's note: ExternalFunction's arg check rejects acquired bf16
@@ -196,7 +203,7 @@ def dit_fa(
                     # Q: a block is 2 cores' rows; its chunks arrive d-chunk by d-chunk.
                     for pair in range(CORES // 2):
                         fifo = a_in if pair < Q_ON_A // 2 else b_in
-                        for d in range(NDCH):
+                        for d in (range_(NDCH) if VAE_HEAD else range(NDCH)):
                             e = fifo.acquire(1)
                             if pair == i // 2:
                                 capture(e, q_saved, d, i % 2)
@@ -204,7 +211,7 @@ def dit_fa(
                     init(o, up, sp)
                     for c in range_(n_chunks):
                         zero_g(g_buf)
-                        for d in range(NDCH):
+                        for d in (range_(NDCH) if VAE_HEAD else range(NDCH)):
                             k = a_in.acquire(1)
                             if "noqk" not in _EXPT:
                                 qk(q_saved, k, g_buf, d)
@@ -212,7 +219,7 @@ def dit_fa(
                         mask(g_buf, my_rtp, p, c)
                         if "nosm" not in _EXPT:
                             step(g_buf, up, sp, o)
-                        for d in range(NDCH):
+                        for d in (range_(NDCH) if VAE_HEAD else range(NDCH)):
                             v = b_in.acquire(1)
                             if "nopv" not in _EXPT:
                                 pv(g_buf, v, o, d)
@@ -314,8 +321,9 @@ def dit_fa(
 # build_design.py convention
 DESIGN = dit_fa
 SPECIALIZE = dict(
-    L=int(os.environ.get("DF_L", 4608)),
-    heads=int(os.environ.get("DF_HEADS", 24)),
+    L=int(os.environ.get("DF_L", 1024 if VAE_HEAD else 4608)),
+    lk=int(os.environ.get("DF_LK", 0)),
+    heads=int(os.environ.get("DF_HEADS", 1 if VAE_HEAD else 24)),
     kv_heads=int(os.environ.get("DF_KV_HEADS", 0)),
     causal=int(os.environ.get("DF_CAUSAL", 0)),
     valid_len=int(os.environ.get("DF_VALID_LEN", 0)),

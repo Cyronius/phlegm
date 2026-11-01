@@ -109,6 +109,8 @@ def manifest(spec: ModelSpec, max_ctx: int = 4096, key: str | None = None) -> di
         m["rows"] = prog["rows"]
     if "verify" in prog:          # speculative decode's verify image (OPEN-DECODE-SPECULATIVE-VERIFY)
         m["verify"] = prog["verify"]
+    if "gptoss_prefill" in prog:  # GPT-OSS's block prefill (OPEN-PREFILL-GPTOSS): its GEMMs, weights and tensors
+        m["gptoss_prefill"] = prog["gptoss_prefill"]
     plan = F.pack_plan(spec)
     for lt, d in plan.pop("layer_types").items():
         m["layer_types"][lt]["pack"] = d

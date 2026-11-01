@@ -8,8 +8,11 @@
 //   res_ln_mod_row x' = x + gate * y (R_UNIT_GATE: x + y);  z = the norm of x', as above
 //   qk_row         per-head RMSNorm (weights wq / wk), then RoPE: FLUX.2's 4-axis interleaved
 //                  pairs, or (R_ROPE = 1) Qwen3's 1-D rotate-half, theta 1e6
+//   qk_moss_row    MOSS image-first four-axis, centered, half-split RoPE
 //   bin_row        swiglu: silu(a) * b     euler: a + dt * b
+//   situ_row       MOSS SiTU hidden/gate activation
 //   un_row         silu
+//   gelu_row       GELU(approximate="tanh") (Qwen Image 2.1 text projection; own program)
 //
 // Arithmetic: bf16 x bf16 products into fp32 accumulators, 32 lanes. aie2p has no
 // native fp32 vector multiply (it is emulated, and a first fp32 version of these
@@ -51,7 +54,8 @@ constexpr float EPS = 1e-6f;
 enum {
   R_NPAR, R_CNT_LN, R_CNT_RES, R_CNT_QK, R_CNT_BIN, R_CNT_UN, R_W, R_IDX_GATE,
   R_IDX_SHIFT, R_IDX_SCALE, R_BINOP, R_ROW0, R_ROW_STEP, R_N_TXT, R_GRID_W, R_HEADS,
-  R_NORM, R_UNIT_GATE, R_ROPE, R_B_QH, R_B_KH
+  R_NORM, R_UNIT_GATE, R_ROPE, R_B_QH, R_B_KH, R_GRID_H, R_AFFINE_RMS,
+  R_BIAS_PERIOD, R_TANH_GATE, R_REF_ROW
 };
 enum { BIN_SWIGLU = 1, BIN_EULER = 2 };
 
@@ -133,6 +137,61 @@ static inline VB silu32(VB x) {
   return aie::mac(ha, h, th).to_vector<bfloat16>();
 }
 
+// Qwen Image 2.1 text projection uses GELU(approximate="tanh"). Keep the
+// polynomial and tanh argument in fp32; the result is rounded to bf16 once.
+static inline VB gelu_tanh32(VB x) {
+  VB th;
+  const VF16 cubic = aie::broadcast<float, 16>(0.044715f);
+  const VF16 gain = aie::broadcast<float, 16>(0.7978845608028654f);
+  auto xf = acc_of(x).to_vector<float>();
+  for (int half = 0; half < 2; ++half) {
+    VF16 a = xf.extract<16>(half);
+    VF16 square = aie::mul(a, a).to_vector<float>();
+    VF16 cube = aie::mul(square, a).to_vector<float>();
+    VF16 inner = aie::add(a, aie::mul(cube, cubic).to_vector<float>());
+    th.insert(half, aie::tanh<bfloat16>(aie::mul(inner, gain).to_vector<float>()));
+  }
+  VB h = aie::mul(x, (bfloat16)0.5f).to_vector<bfloat16>();
+  return aie::mac(acc_of(h), h, th).to_vector<bfloat16>();
+}
+
+static inline VB tanh_bf16(VB x) {
+  aie::vector<float, 32> xf = acc_of(x).to_vector<float>();
+  VB y;
+  y.insert(0, aie::tanh<bfloat16>(xf.extract<16>(0)));
+  y.insert(1, aie::tanh<bfloat16>(xf.extract<16>(1)));
+  return y;
+}
+
+// MOSS Image's SiTU(up, gate), with its two 8192-wide halves padded to three
+// 3072-wide EW elements by the MOSS weight packer. This never applies SwiGLU.
+static inline VB tanh32(VB x) {
+  // XDNA2's tanh LUT has about 5% relative error near |x|=0.5. Use the
+  // [5/4] Pade form, clamped to 4 where its absolute error is below 0.003.
+  const VB z = aie::min(aie::max(x, (bfloat16)-4.0f), (bfloat16)4.0f);
+  const VB z2 = aie::mul(z, z).to_vector<bfloat16>();
+  const VB z4 = aie::mul(z2, z2).to_vector<bfloat16>();
+  AC num = aie::mac(acc_bcast(1.0f), z2, (bfloat16)(1.0f / 9.0f));
+  num = aie::mac(num, z4, (bfloat16)(1.0f / 945.0f));
+  AC den = aie::mac(acc_bcast(1.0f), z2, (bfloat16)(4.0f / 9.0f));
+  den = aie::mac(den, z4, (bfloat16)(1.0f / 63.0f));
+  const VB scaled = aie::mul(z, num.to_vector<bfloat16>()).to_vector<bfloat16>();
+  return aie::mul(scaled, aie::inv(den.to_vector<bfloat16>())).to_vector<bfloat16>();
+}
+
+static inline VB situ32(VB hidden, VB gate) {
+  const VB one = aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
+  const VB gh = aie::mul(gate, (bfloat16)0.5f).to_vector<bfloat16>();
+  const VB gq = aie::mul(gate, (bfloat16)0.25f).to_vector<bfloat16>();
+  const VB hu = aie::mul(hidden, (bfloat16)0.04f).to_vector<bfloat16>();
+  const VB sigmoid = aie::mul(aie::add(one, tanh32(gh)),
+                              (bfloat16)0.5f).to_vector<bfloat16>();
+  const VB gated = aie::mul(tanh32(gq), sigmoid).to_vector<bfloat16>();
+  const VB bounded = aie::mul(tanh32(hu), (bfloat16)25.0f).to_vector<bfloat16>();
+  return aie::mul(aie::mul(gated, (bfloat16)4.0f).to_vector<bfloat16>(),
+                  bounded).to_vector<bfloat16>();
+}
+
 // Interleaved-pair swap: [x0, x1, x2, x3, ...] -> [x1, x0, x3, x2, ...].
 static inline VB pair_swap(VB v) {
   auto u = aie::interleave_unzip(v, v, 1);
@@ -201,6 +260,117 @@ static __attribute__((noinline)) void rope_token(const float *__restrict tab, in
   }
 }
 
+// FLUX 3's published reference uses the same four 32-wide adjacent-pair axes
+// as the FLUX.2 q/k kernel, but scales generated-image h/w coordinates by 0.5.
+// The fine and coarse tables retain full-frequency text positions; one extra
+// 32-float entry at [2304:2336] represents a half image step. This mode covers
+// Image rows at or past ref_row belong to one reference image: its h restarts
+// at zero and its l coordinate is -1 (the published reference-image id), the
+// conjugate of the position-1 fine entry. ref_row=64 disables references.
+static __attribute__((noinline)) void flux3_rope_token(
+    const float *__restrict tab, int g, int n_txt, int grid_w, int ref_row) {
+  const VF16 one = aie::broadcast<float, 16>(1.0f), zero = aie::zeros<float, 16>();
+  for (int a = 0; a < 4; a++)
+    rope_axis(a, one, zero);
+  if (g < n_txt) {
+    const int hi = g >> 6, lo = g & 63;
+    const float *ph = tab + ROPE_COARSE + hi * 32, *pl = tab + ROPE_FINE + lo * 32;
+    VF16 ca = aie::load_v<16>(ph), sa = aie::load_v<16>(ph + 16);
+    VF16 cb = aie::load_v<16>(pl), sb = aie::load_v<16>(pl + 16);
+    rope_axis(3, aie::sub(mulf(ca, cb), mulf(sa, sb)), aie::add(mulf(sa, cb), mulf(ca, sb)));
+  } else {
+    const int k = g - n_txt;
+    int h = k / grid_w;
+    const int w = k - h * grid_w;
+    if (h >= ref_row) {
+      h -= ref_row;
+      const float *pl = tab + ROPE_FINE + 32;
+      rope_axis(3, aie::load_v<16>(pl), aie::neg(aie::load_v<16>(pl + 16)));
+    }
+    const float *half = tab + ROPE_COARSE + 8 * 32;
+    VF16 ch = aie::load_v<16>(half), sh = aie::load_v<16>(half + 16);
+    for (int axis = 0; axis < 2; ++axis) {
+      const int coord = axis ? w : h;
+      const float *base = tab + ROPE_FINE + (coord >> 1) * 32;
+      VF16 ca = aie::load_v<16>(base), sa = aie::load_v<16>(base + 16);
+      if (coord & 1)
+        rope_axis(1 + axis, aie::sub(mulf(ca, ch), mulf(sa, sh)),
+                  aie::add(mulf(sa, ch), mulf(ca, sh)));
+      else
+        rope_axis(1 + axis, ca, sa);
+    }
+  }
+  for (int i = 0; i < HD; i += 16) {
+    aie::accum<accfloat, 16> c, sn;
+    c.from_vector(aie::load_v<16>(s_c + i));
+    sn.from_vector(aie::load_v<16>(s_s + i));
+    aie::store_v(s_chi + i, c.template to_vector<bfloat16>());
+    aie::store_v(s_shi + i, sn.template to_vector<bfloat16>());
+  }
+  for (int i = 0; i < HD; i++) {
+    s_clo[i] = (bfloat16)(s_c[i] - float(s_chi[i]));
+    s_slo[i] = (bfloat16)(s_s[i] - float(s_shi[i]));
+  }
+}
+
+// Qwen Image 2.1: complex-pair RoPE with 16 frame, 56 height and 56 width
+// channels. Each table has 32 positions × 64 complex pairs × (cos,sin),
+// stored as BF16 in one EL=4096 parameter element. Factor p = 32a + b;
+// negative centered image coordinates negate sin after factorization.
+// cond > 0: an edit's published order [text 0..cond) [condition image] [text] [target
+// image], both images grid_h x grid_w and n_txt text rows in all. Each image block
+// freezes the frame axis at the text position before it, and the text after a block
+// resumes max(grid_h, grid_w) further on (diffusers QwenImage21Rope).
+static __attribute__((noinline)) void qwen21_rope_token(
+    const bfloat16 *__restrict tab, int g, int n_txt, int grid_h, int grid_w, int cond) {
+  const bfloat16 *__restrict fine = tab;
+  const bfloat16 *__restrict coarse = tab + EL;
+  int frame = g, height = g, width = g, k = -1;
+  if (cond > 0) {
+    const int hw = grid_h * grid_w, gap = grid_h > grid_w ? grid_h : grid_w;
+    if (g >= n_txt + hw) {
+      k = g - n_txt - hw;
+      frame = n_txt + gap;
+    } else if (g >= cond + hw) {
+      frame = height = width = g - hw + gap;
+    } else if (g >= cond) {
+      k = g - cond;
+      frame = cond;
+    }
+  } else if (g >= n_txt) {
+    k = g - n_txt;
+    frame = n_txt;
+  }
+  if (k >= 0) {
+    height = k / grid_w - (grid_h - grid_h / 2);
+    width = k % grid_w - (grid_w - grid_w / 2);
+  }
+  for (int pair = 0; pair < HD / 2; ++pair) {
+    const int pos = pair < 8 ? frame : pair < 36 ? height : width;
+    const int mag = pos < 0 ? -pos : pos;
+    const int fi = (mag & 31) * HD + 2 * pair;
+    const int co = (mag >> 5) * HD + 2 * pair;
+    const float cf = float(fine[fi]), sf = float(fine[fi + 1]);
+    const float cc = float(coarse[co]), sc = float(coarse[co + 1]);
+    const float c = cf * cc - sf * sc;
+    const float s = (pos < 0 ? -1.0f : 1.0f) * (sf * cc + cf * sc);
+    s_c[2 * pair] = s_c[2 * pair + 1] = c;
+    s_s[2 * pair] = -s;
+    s_s[2 * pair + 1] = s;
+  }
+  for (int i = 0; i < HD; i += 16) {
+    aie::accum<accfloat, 16> c, sn;
+    c.from_vector(aie::load_v<16>(s_c + i));
+    sn.from_vector(aie::load_v<16>(s_s + i));
+    aie::store_v(s_chi + i, c.template to_vector<bfloat16>());
+    aie::store_v(s_shi + i, sn.template to_vector<bfloat16>());
+  }
+  for (int i = 0; i < HD; ++i) {
+    s_clo[i] = (bfloat16)(s_c[i] - float(s_chi[i]));
+    s_slo[i] = (bfloat16)(s_s[i] - float(s_shi[i]));
+  }
+}
+
 // (The qk helpers are noinline: qk_row calls each up to three times, and inlined copies
 // overflow the core's 16 KB program memory.)
 // Qwen3 rotate-half RoPE factors for position g: cos/sin of g*f_j, j < 64, into
@@ -225,6 +395,63 @@ static __attribute__((noinline)) void qwen_rope_token(const float *__restrict ta
     aie::store_v(s_shi + i, sn.template to_vector<bfloat16>());
   }
   for (int i = 0; i < 64; i++) {
+    s_clo[i] = (bfloat16)(s_c[i] - float(s_chi[i]));
+    s_slo[i] = (bfloat16)(s_s[i] - float(s_shi[i]));
+  }
+}
+
+// MOSS uses four 16-wide axes in the first half of each 128-wide head, and
+// rotates against the corresponding dimensions in the second half. The r axis
+// is zero for text-to-image. A compact bf16 table stores 65 coarse positions,
+// 64 fine positions and the two centered image-coordinate offsets. It fits in
+// the existing two 3072-wide parameter elements after the q/k norm weights.
+constexpr int M_COARSE = 0, M_FINE = 65 * 32, M_HOFF = M_FINE + 64 * 32,
+              M_WOFF = M_HOFF + 32;
+static inline VF16 moss_float16(const bfloat16 *__restrict p) {
+  aie::accum<accfloat, 16> a;
+  a.from_vector(aie::load_v<16>(p));
+  return a.to_vector<float>();
+}
+static inline void moss_angle(VF16 ca, VF16 sa, VF16 cb, VF16 sb, VF16 &c, VF16 &s) {
+  c = aie::sub(mulf(ca, cb), mulf(sa, sb));
+  s = aie::add(mulf(sa, cb), mulf(ca, sb));
+}
+static __attribute__((noinline)) void moss_rope_token(
+    const bfloat16 *__restrict tab, int g, int n_txt, int grid_h, int grid_w) {
+  const VF16 one = aie::broadcast<float, 16>(1.0f), zero = aie::zeros<float, 16>();
+  for (int i = 0; i < 64; i += 16) {
+    aie::store_v(s_c + i, one);
+    aie::store_v(s_s + i, zero);
+  }
+  const int image_tokens = grid_h * grid_w;
+  const bool image = g < image_tokens;
+  const int f = image ? n_txt : g - image_tokens;
+  const bfloat16 *coarse = tab + M_COARSE + (f >> 6) * 32;
+  const bfloat16 *fine = tab + M_FINE + (f & 63) * 32;
+  VF16 c, s;
+  moss_angle(moss_float16(coarse), moss_float16(coarse + 16),
+             moss_float16(fine), moss_float16(fine + 16), c, s);
+  aie::store_v(s_c + 16, c);
+  aie::store_v(s_s + 16, s);
+  if (image) {
+    const int h = g / grid_w, w = g - h * grid_w;
+    for (int axis = 0; axis < 2; ++axis) {
+      const bfloat16 *coord = tab + M_FINE + (axis ? w : h) * 32;
+      const bfloat16 *shift = tab + (axis ? M_WOFF : M_HOFF);
+      moss_angle(moss_float16(coord), moss_float16(coord + 16),
+                 moss_float16(shift), moss_float16(shift + 16), c, s);
+      aie::store_v(s_c + 32 + axis * 16, c);
+      aie::store_v(s_s + 32 + axis * 16, s);
+    }
+  }
+  for (int i = 0; i < 64; i += 16) {
+    aie::accum<accfloat, 16> ca, sa;
+    ca.from_vector(aie::load_v<16>(s_c + i));
+    sa.from_vector(aie::load_v<16>(s_s + i));
+    aie::store_v(s_chi + i, ca.to_vector<bfloat16>());
+    aie::store_v(s_shi + i, sa.to_vector<bfloat16>());
+  }
+  for (int i = 0; i < 64; ++i) {
     s_clo[i] = (bfloat16)(s_c[i] - float(s_chi[i]));
     s_slo[i] = (bfloat16)(s_s[i] - float(s_shi[i]));
   }
@@ -333,7 +560,8 @@ void ln_mod_row(bfloat16 *__restrict x, bfloat16 *__restrict y, bfloat16 *__rest
   const bool rms = rtp[R_NORM];
   float mean, rstd;
   ln_stats(x, W, mean, rstd, rms);
-  ln_apply(x, y, par + rtp[R_IDX_SCALE] * EL, rms ? nullptr : par + rtp[R_IDX_SHIFT] * EL, W,
+  ln_apply(x, y, par + rtp[R_IDX_SCALE] * EL,
+           rms && !rtp[R_AFFINE_RMS] ? nullptr : par + rtp[R_IDX_SHIFT] * EL, W,
            mean, rstd);
 }
 
@@ -349,7 +577,9 @@ void res_ln_mod_row(bfloat16 *__restrict x, bfloat16 *__restrict yb, bfloat16 *_
   const bool unit = rtp[R_UNIT_GATE];
   AC s = aie::zeros<accfloat, 32>(), q = aie::zeros<accfloat, 32>();
   for (int i = 0; i < W; i += 32) {
-    VB r = aie::mac(acc_of(aie::load_v<32>(x + i)), unit ? one : aie::load_v<32>(g + i),
+    VB gate = unit ? one : aie::load_v<32>(g + i);
+    if (rtp[R_TANH_GATE]) gate = tanh_bf16(gate);
+    VB r = aie::mac(acc_of(aie::load_v<32>(x + i)), gate,
                     aie::load_v<32>(yb + i)).to_vector<bfloat16>();
     aie::store_v(xo + i, r);
     s = aie::add(s, r);
@@ -362,7 +592,8 @@ void res_ln_mod_row(bfloat16 *__restrict x, bfloat16 *__restrict yb, bfloat16 *_
   const float mean = rms ? 0.0f : aie::reduce_add(s.to_vector<float>()) * inv_w;
   const float var = aie::reduce_add(q.to_vector<float>()) * inv_w - mean * mean;
   const float rstd = aie::invsqrt((var > 0.0f ? var : 0.0f) + EPS);
-  ln_apply(xo, z, par + rtp[R_IDX_SCALE] * EL, rms ? nullptr : par + rtp[R_IDX_SHIFT] * EL, W,
+  ln_apply(xo, z, par + rtp[R_IDX_SCALE] * EL,
+           rms && !rtp[R_AFFINE_RMS] ? nullptr : par + rtp[R_IDX_SHIFT] * EL, W,
            mean, rstd);
 }
 
@@ -392,6 +623,64 @@ void qk_row(bfloat16 *__restrict a, bfloat16 *__restrict b, bfloat16 *__restrict
   copy_heads(b + (bq + bk) * HD, bo + (bq + bk) * HD, EL / HD - bq - bk);
 }
 
+void qk_moss_row(bfloat16 *__restrict q, bfloat16 *__restrict k,
+                 bfloat16 *__restrict qo, bfloat16 *__restrict ko,
+                 bfloat16 *__restrict par, int32_t *__restrict rtp, int32_t t) {
+  SET_ROUNDING();
+  const int g = rtp[R_ROW0] + t * rtp[R_ROW_STEP];
+  if (g >= rtp[R_GRID_H] * rtp[R_GRID_W] + rtp[R_N_TXT]) {
+    const VB zero = aie::zeros<bfloat16, 32>();
+    for (int i = 0; i < EL; i += 32) {
+      aie::store_v(qo + i, zero);
+      aie::store_v(ko + i, zero);
+    }
+    return;
+  }
+  moss_rope_token(par + EL, g, rtp[R_N_TXT], rtp[R_GRID_H], rtp[R_GRID_W]);
+  qk_heads_half(q, qo, par, rtp[R_HEADS]);
+  qk_heads_half(k, ko, par + HD, rtp[R_HEADS]);
+}
+
+// Kept separate from qk_row so the FLUX 3 specialization fits in AIE program
+// memory without linking the FLUX.2 and Qwen RoPE paths into each core.
+void qk_flux3_row(bfloat16 *__restrict q, bfloat16 *__restrict k,
+                  bfloat16 *__restrict qo, bfloat16 *__restrict ko,
+                  bfloat16 *__restrict par, int32_t *__restrict rtp, int32_t t) {
+  SET_ROUNDING();
+  const int g = rtp[R_ROW0] + t * rtp[R_ROW_STEP];
+  if (g >= rtp[R_N_TXT] + rtp[R_GRID_H] * rtp[R_GRID_W]) {
+    const VB zero = aie::zeros<bfloat16, 32>();
+    for (int i = 0; i < EL; i += 32) {
+      aie::store_v(qo + i, zero);
+      aie::store_v(ko + i, zero);
+    }
+    return;
+  }
+  flux3_rope_token((const float *)(par + EL), g, rtp[R_N_TXT], rtp[R_GRID_W], rtp[R_REF_ROW]);
+  qk_heads(q, qo, par, rtp[R_HEADS]);
+  qk_heads(k, ko, par + HD, rtp[R_HEADS]);
+}
+
+// Kept separate from the other q/k paths to stay within core program memory.
+void qk_qwen21_row(bfloat16 *__restrict q, bfloat16 *__restrict k,
+                   bfloat16 *__restrict qo, bfloat16 *__restrict ko,
+                   bfloat16 *__restrict par, int32_t *__restrict rtp, int32_t t) {
+  SET_ROUNDING();
+  const int g = rtp[R_ROW0] + t * rtp[R_ROW_STEP];
+  const int cond = rtp[R_REF_ROW];                 // first condition-image row; 0: none
+  if (g >= rtp[R_N_TXT] + rtp[R_GRID_H] * rtp[R_GRID_W] * (cond > 0 ? 2 : 1)) {
+    const VB zero = aie::zeros<bfloat16, 32>();
+    for (int i = 0; i < EL; i += 32) {
+      aie::store_v(qo + i, zero);
+      aie::store_v(ko + i, zero);
+    }
+    return;
+  }
+  qwen21_rope_token(par + EL, g, rtp[R_N_TXT], rtp[R_GRID_H], rtp[R_GRID_W], cond);
+  qk_heads(q, qo, par, rtp[R_HEADS]);
+  qk_heads(k, ko, par + HD, rtp[R_HEADS]);
+}
+
 void bin_row(bfloat16 *__restrict a, bfloat16 *__restrict b, bfloat16 *__restrict y,
              bfloat16 *__restrict par, int32_t *__restrict rtp) {
   SET_ROUNDING();
@@ -407,10 +696,40 @@ void bin_row(bfloat16 *__restrict a, bfloat16 *__restrict b, bfloat16 *__restric
   }
 }
 
+// Keep MOSS's activation in a separate entry point so a SiTU specialization
+// does not link the unrelated q/k, norm, SwiGLU and Euler row programs.
+void situ_row(bfloat16 *__restrict a, bfloat16 *__restrict b, bfloat16 *__restrict y) {
+  SET_ROUNDING();
+  for (int i = 0; i < EL; i += 32)
+    aie::store_v(y + i, situ32(aie::load_v<32>(a + i), aie::load_v<32>(b + i)));
+}
+
 void un_row(bfloat16 *__restrict a, bfloat16 *__restrict y, int32_t *__restrict rtp) {
   SET_ROUNDING();
   for (int i = 0; i < EL; i += 32)
     aie::store_v(y + i, silu32(aie::load_v<32>(a + i)));
+}
+
+// GELU-tanh is its own entry point, linked only by "gelu_tanh" streams. Inlined
+// into un_row it added ~0.9 KB to every generic stream's core program, which then
+// overflowed the 16 KB program memory (15,856 -> 16,880 bytes for a FLUX 3 norm).
+void gelu_row(bfloat16 *__restrict a, bfloat16 *__restrict y) {
+  SET_ROUNDING();
+  for (int i = 0; i < EL; i += 32)
+    aie::store_v(y + i, gelu_tanh32(aie::load_v<32>(a + i)));
+}
+
+// Add one of up to three per-element bias vectors to each row element. The
+// stream may have a larger physical row stride (for a half of an FFN output).
+void bias_row(bfloat16 *__restrict a, bfloat16 *__restrict y,
+              bfloat16 *__restrict par, int32_t *__restrict rtp, int32_t t) {
+  SET_ROUNDING();
+  const int period = rtp[R_BIAS_PERIOD];
+  const int element = (rtp[R_ROW0] + t * rtp[R_ROW_STEP]) % period;
+  const bfloat16 *__restrict bias = par + element * EL;
+  for (int i = 0; i < EL; i += 32)
+    aie::store_v(y + i, aie::add(aie::load_v<32>(a + i),
+                                 aie::load_v<32>(bias + i)));
 }
 
 } // extern "C"

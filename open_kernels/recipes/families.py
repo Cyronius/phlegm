@@ -25,6 +25,9 @@ def family_module(name: str) -> ModuleType:
     if name == "gemma4":
         from . import gemma4
         return gemma4
+    if name == "gptoss":
+        from . import gptoss
+        return gptoss
     if name in ("qwen3", "llama3", "gemma3", "hunyuan", "granite", "phi3", "qwen2", "k2"):
         from . import dense
         return dense
@@ -39,32 +42,9 @@ def for_spec(spec: ModelSpec) -> ModuleType:
 
 
 FAMILIES = ("qwen36moe", "qwen35", "qwen3", "llama3", "gemma3", "hunyuan", "granite", "phi3", "qwen2",
-            "lfm2", "k2", "dflash2", "gemma4")
+            "lfm2", "k2", "dflash2", "gemma4", "gptoss")
 
 # Families whose ModelSpec derives but whose kernels do not exist. Naming the gap here is
 # the point: routing such a model to the nearest recipe would emit kernels that drop a whole
 # stage of the layer and then report parity against a replica making the same mistake.
-NOT_IMPLEMENTED = {
-    "gptoss": "the arithmetic is settled and tested (model/replica_gptoss.py); standalone "
-              "gptoss_gate, gptoss_mxfp4, gptoss_router, gptoss_expert_gemv, gptoss_mix and "
-              "gptoss_residual, gptoss_attention, gptoss_attention_state, gptoss_rope and "
-              "gptoss_qkv_gemv, gptoss_o_gemv and gptoss_norm "
-              "kernels cover clamped activation, MXFP4 expert projection with bias, biased "
-              "top-four routing, mixing, output bias/residual and sink attention arithmetic; "
-              "one synthetic one-token layer including both norms, full/sliding sink attention, "
-              "YaRN, QKV/output projections, output bias/residual and top-four MoE is "
-              "NPU-checked across separate images, but no deployable layer recipe composes them. "
-              "o_proj bias still has no slot in the existing layer design; the MoE FFN has to "
-              "compose with sliding-window layers, which no recipe does today; the attention "
-              "sublayer and MoE are NPU-checked as separate images but lack packing, persistent "
-              "KV state and runtime integration; "
-              "and the expert "
-              "intermediate equals hidden, which "
-              "qwen36moe's core layout does not survive -- the stripe assignment, the core "
-              "scratch and the expert hidden's element count each refuse it by name "
-              "(OPEN-MOE-WIDE-FF). The packer reads the container's attention projections "
-              "and head (std_fuse, OPEN-PACK-CHUNK-FUSE) and knows where each expert's "
-              "gate, up and down live (OPEN-PACK-EXPERT-ORDER), but has no op that PLACES "
-              "them, because where they go waits on that layout. ATTN_SINK landed at "
-              "e0511bd7 and is no longer a gap. See .plans/flm-kernel-coverage.md",
-}
+NOT_IMPLEMENTED: dict[str, str] = {}

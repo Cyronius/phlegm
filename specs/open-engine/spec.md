@@ -1503,6 +1503,123 @@ correlation -- three orders of magnitude more than the kernels' own 1e-5 -- and 
 change generated text. That is the evidence for a main-core q8 GEMV. Log:
 `.claude/plans/q-hw-results.md`.
 
+### OPEN-FAMILY-QWEN36MOE-GGUF: the 35B-A3B geometry runs straight from a llama.cpp GGUF
+**Applies to:** `open_kernels/recipes/qwen36moe.py` (`gguf_view`), the runtime companion
+`open_kernels/upstream-patches/qwen35moe-gguf-runtime.patch`
+**Test category:** unit (`specs/open-engine/tests/test_qwen36moe_gguf.py`) + manual (NPU and model)
+
+A `qwen35moe` GGUF (Ornith 1.5 35B-A3B, Nex N2.5 mini, KAT Coder V2.5 Dev: the reference 35B's
+`spec_hash sha256:32e980528551`) shall load through the manifest's `gguf` section. That section
+is the q4_1 manifest, with the same kernels, programs, layouts and block prefill route. Every
+pack op is translated in place to a `q35_*` op that writes the q4nx op's bytes in the q4_1
+chunk law. Q4_0 / Q4_1 / Q4_K blocks keep their codes, with the scale pair rounded to bf16 by
+RNE, which is the value the f32-scale kernels use on the core. Q8_0 / Q5_0 / Q6_K blocks are
+requantized: to q4_1 for projections, to `lm_head_q8` for the head. The ops undo the
+converter's per-head `[q | gate]` interleave and its tiled linear-attention value heads
+(OPEN-CONVERT-QWEN35-VHEADS's rule). They also transpose alpha, beta, the router and conv1d.
+No q4nx file is written and no weight is held in f32 on the device. A spec with a q8 or t2
+role, or a rotated one, gets no view.
+
+**Acceptance criteria:**
+- The view's op order, `dst`, `nch` and `in_dim` equal the q4_1 plan's. The block route's
+  weight indices name `q35_mat` ops. The untile map inverts llama.cpp's `_reorder_v_heads`.
+- `q35_pack_dump` plus `open_kernels/model/qwen35moe_gguf_check.py` (gguf-py dequantization,
+  inverse band laws): exact types within 4e-3 relative L2 (Q4_1 within 1e-2, from the bf16
+  min); norms, A, dt, conv, alpha, beta and router bit-equal to their bf16 / f32 values.
+- Full model on the NPU, against llama.cpp on the same GGUF and on the NPU-weights control
+  (`open_kernels/model/qwen35moe_gguf_npulike.py`, requantized tensors replaced by the values
+  the pool holds).
+
+**Result 2026-10-31 (KAT-Coder-V2.5-Dev Q4_0, bartowski, sha256 `aa7d33c9...`; Strix Halo):**
+The pack check on layers 0, 3, 5 and 7 and the head reports ALL OK. Exact tensors are within
+1.6-1.7e-3 relative L2 (Q4_1 down 5-7e-3). Requantized tensors are 8.1-8.6e-2 (Q8_0 / Q5_0 /
+Q6_K to q4_1) and 5.6e-3 (Q6_K head to q8). A 32-token chat prompt with 64 greedy tokens
+matches llama.cpp (CPU) for the first 40 tokens and the NPU-weights control for all 64, on
+both the sequential and the block route. A 491-token prompt crosses the 256-row block; its
+partial KL is over llama.cpp's top 20:
+
+| pair | argmax agree | KL median | KL mean | KL p95 |
+| --- | --- | --- | --- | --- |
+| NPU block route vs llama.cpp | 430/491 | 1.9e-2 | 4.3e-2 | 1.4e-1 |
+| control vs llama.cpp (requantization alone) | 431/491 | 1.7e-2 | 3.9e-2 | 1.4e-1 |
+| NPU block route vs control (NPU arithmetic) | 469/491 | 2.1e-3 | 9.8e-3 | 4.2e-2 |
+| NPU sequential vs control | 470/491 | 2.2e-3 | 8.8e-3 | 4.6e-2 |
+
+Positions 240-271 have median 1.8e-3 and 32/32 argmax against the control. The second
+block's median equals the first block's. Requantizing the GGUF's Q8_0 / Q5_0 / Q6_K tensors
+accounts for nearly all of the gap to llama.cpp. A per-role q8 view would keep them, and
+remains open. `phlegm run` and `phlegm serve` answer correctly, including a streamed
+response. Qwen's `<think>` text goes to `reasoning_content` (SERVER-REASONING in
+`specs/server/spec.md`; checked live on KAT Q4K 2026-11-01). The development
+timing is 4.6 s for the 491-token block prefill, 30.7 s sequential, and 84-86 ms per decode
+token (npu and cpu held; `dibs --measure` was blocked by a GPU lease; not a benchmark).
+Evidence: `.plans/qwen35moe-gguf.md`.
+
+**Result 2026-10-31 (KAT-Coder-V2.5-Dev, our own all-Q4_0 GGUF, sha256 `c1dfbb9a...`):** We built it
+from the BF16 safetensors with llama.cpp build 12015, using `llama quantize --pure
+--output-tensor-type q8_0 --tensor-type ssm_alpha=bf16 --tensor-type ssm_beta=bf16 ... Q4_0`
+and no imatrix. Nothing is requantized at pack time. Every Q4_0 tensor packs bit-exactly
+(relative L2 0): from a BF16 source, Q4_0's scale (block max / -8) is already a bf16 value. The
+Q8_0 head is within 1.7e-3. A pure Q4_1 build packs at about 4e-3, from the bf16 rounding of the
+scale and min. On the 491-token prompt the NPU agrees with llama.cpp on this same file at
+461/491 argmax (block route; median KL 2.1e-3) and 462/491 (sequential; 2.7e-3). On the
+32-token prompt the 64 greedy tokens all match. The window over positions 240-271 is 30/32
+and 31/32. Against BF16, llama.cpp on this file agrees 404/491 (median KL 5.5e-2). Bartowski's
+imatrix Q4_0 mix agrees 427/491 (2.2e-2), so the exact fit costs quantization quality.
+The same recipe with our own imatrix (`--imatrix`, 802 chunks of calibration_datav5, sha256
+`3ea5ab3f...`) packs at 1.6-1.7e-3. llama.cpp on that file agrees with BF16 at 411/491
+(4.3e-2), and the NPU agrees with llama.cpp on it at 456/491 and 457/491. Imatrix Q4_K keeps
+its codes too, but packs at 5-7e-3, so it falls outside the 4e-3 exact bound. The NPU on it
+agrees with BF16 at 428/491, with median KL 1.8e-2. Evidence: `.plans/qwen35moe-gguf.md`.
+
+**Packing bound (2026-10-31, user-approved; `qwen35moe_gguf_check.py` `EXACT_LIMIT`):** the
+bound is relative L2 per source type.
+- Q4_0 and a Q8_0 head: 2.5e-3 (measured 1.6-1.7e-3).
+- Q4_1: 1e-2.
+- Q4_K: 7e-3. The q35 ops keep Q4_K's codes and only round its d·sc and dmin·mn scale pairs to
+  bf16 (measured 5.0-6.7e-3). Its measured cost on KAT is 452/491 (block) and 458/491
+  (sequential) argmax against llama.cpp on the same file, against 456/457 for imatrix Q4_0.
+
+A requantized tensor (a Q8_0 / Q5_0 / Q6_K pool, or a head other than Q8_0) fails the check
+unless `--allow-requant` is given. Imatrix Q4_K `--pure` with a Q8_0 head is the standard
+recipe for this family.
+
+**Result 2026-10-31 (Ornith 1.5 35B-A3B and Nex N2.5 mini, own all-Q4_0 GGUFs):** No published
+Ornith GGUF packs exactly. ornith-ai's Q4_K_M and bartowski's Q4_0 both mix Q6_K / Q8_0 / Q5_0
+types. So both models were built like KAT's: from the BF16 safetensors (ornith-ai/Ornith-1.5-35B-A3B
+@ `10fbf86f`, nex-agi/Nex-N2.5-mini @ `87420286`), with the same convert and `quantize --pure`
+commands. The sha256 values are `bf9255db...` (Ornith) and `8439836e...` (Nex).
+- Ornith's GGUF keeps its MTP layer as blk.40. llama.cpp ignores it ("unused tensor"), and the view
+  never names it: config.json gives 40 layers.
+- Nex has no MTP weights, so it converts with `--no-mtp`. Its transformers-5
+  `tokenizer_class` was mapped to `Qwen2Tokenizer` for the converter only.
+- Ornith derives KAT's spec. Nex differs only in `real_vocab` (248077), which is
+  kernel-independent. Both run on KAT's kernel files unchanged; Nex has a regenerated manifest.
+- The pack check on layers 0, 3, 5, 7, 38 and 39 is rel L2 0 for every Q4_0 tensor, and the head
+  is 1.65e-3.
+
+The 491-token prompt, against llama.cpp CPU on the same file:
+
+| pair | argmax agree | KL median | KL mean | KL p95 |
+| --- | --- | --- | --- | --- |
+| Ornith NPU block route | 413/491 | 1.3e-3 | 1.8e-2 | 9.4e-2 |
+| Ornith NPU sequential | 407/491 | 1.4e-3 | 2.0e-2 | 1.0e-1 |
+| Ornith llama.cpp CPU vs Vulkan (control) | 411/491 | 1.3e-3 | 1.0e-2 | 8.4e-2 |
+| Nex NPU block route | 451/491 | 5.7e-3 | 2.6e-2 | 8.2e-2 |
+| Nex NPU sequential | 444/491 | 4.3e-3 | 1.9e-2 | 6.8e-2 |
+| Nex llama.cpp CPU vs Vulkan (control) | 450/491 | 4.5e-3 | 2.0e-2 | 6.5e-2 |
+| KAT llama.cpp CPU vs Vulkan (control) | 469/491 | 1.2e-3 | 9.7e-3 | 4.6e-2 |
+
+- The NPU sits at the level of two llama.cpp backends on each model. Ornith's argmax agreement is
+  low for any pair, because it has many near ties on this prompt.
+- Ornith's NPU tail is heavier than its control's (mean 1.8e-2 against 1.0e-2, max 1.56 against
+  0.62). That is open.
+- On the 32-token prompt Nex matches llama.cpp for all 64 greedy tokens on both routes. Ornith
+  differs at token 0, a near tie (−0.65 / −0.74) that llama.cpp Vulkan resolves the NPU's way.
+- `phlegm run` and `serve` (streamed and not) answer correctly for both.
+- Development timing equals KAT's paired control in the same window. No BF16 comparison was made
+  for these two. Evidence: `.plans/qwen35moe-gguf.md`.
+
 ### OPEN-FAMILY-QWEN3: Qwen3 dense on the open kernels
 **Applies to:** openflowlm-next (`open_kernels/recipes/qwen3.py`, `designs/dense/dx.py`, `designs/lm_head_q4`, `src/open_qwen36/`)
 **Test category:** manual (needs the NPU and `OpenFlowLM/Qwen3-4B-NPU2`); the recipe's arithmetic is unit-tested in `tests/test_qwen3_dense.py`
@@ -2246,6 +2363,179 @@ its context takes 0.7-1.0 ms more than alone, 8 times a token, and it still
 grows 0.38 us a cached row. The head did not speed up with
 fewer bytes on the quiet machine; why is not measured. Lean prefill on the
 Q4_0-native view was 3.5% slower in the one quiet pair.
+
+### OPEN-FAMILY-GEMMA4-MOE: Gemma 4 26B-A4B's text decoder: the 12B's attention and a routed-expert block
+**Applies to:** Phlegm (`open_kernels/recipes/gemma4.py`, `spec.py`, `designs/gemma4_moe/` (`dxm.py`, `gm.py`, the `gm8.py` probe), `designs/dense/dx.py`; the runtime clone's `gemma4-moe-runtime.patch` and `gemma4-moe-decode-runtime.patch`)
+**Test category:** manual (needs the NPU and the GGUF); the derivation, the padding, the pool plan and the program are unit-tested in `tests/test_gemma4.py`
+
+Gemma 4 26B-A4B (`gemma4` / `gemma4_text`, `enable_moe_block`) shall run on the open
+runtime from Google's QAT Q4_0 GGUF. Its attention is the 12B's (OPEN-FAMILY-GEMMA4),
+built once per layer type on `dx.py` with the decode attention at depth (8 cores, 4 rows a
+call, per-core KV windows). Every layer adds a routed-expert block beside the dense MLP.
+
+How 26B-A4B differs from 12B. Sources: Google's `config.json` (base and `-it`
+identical in `text_config`), the GGUF's metadata and tensor table, transformers
+`modeling_gemma4.py` (`Gemma4TextDecoderLayer`, `Gemma4TextRouter`,
+`Gemma4TextExperts`) and llama.cpp's `src/models/gemma4.cpp`, which agree on every
+point below.
+
+| | 12B (`gemma4_unified`) | 26B-A4B (`gemma4`) |
+|---|---|---|
+| hidden | 3840 | 2816 (11 k-tiles; 4 cores of 64-row bands, as the 12B) |
+| layers | 48: 40 sliding, 8 global | 30: 25 sliding, 5 global (layers 5, 11, 17, 23, 29) |
+| q heads | 16 | 16 |
+| sliding layers | 8 kv heads, head dim 256, window 1024, theta 1e4, full rotation | the same |
+| global layers | 1 kv head, head dim 512, K = V | **2 kv heads**, head dim 512, K = V (`attention_k_eq_v`; no `attn_v`) |
+| global RoPE | proportional, 0.25 of 512 (64 pairs), theta 1e6 | the same |
+| dense MLP | GeGLU-tanh, 15360 | GeGLU-tanh, **2112**, in every layer |
+| routed experts | none | **128 experts, top 8, width 704**, GeGLU-tanh, no biases |
+| shared expert | none | none besides the dense MLP, which has its own norms (below) |
+| vocab / head | 262144, tied, cap 30 | the same; the GGUF's `token_embd` is **Q6_K** |
+| GGUF tensors | Q4_0 projections | Q4_0 projections and experts; F32 norms, router, scales |
+
+The block, per layer, with `res = x + post_attention_norm(attn(input_norm(x)))`:
+
+- dense MLP: `t1 = post_ffw_norm_1(mlp(pre_feedforward_layernorm(res)))`.
+- router (`ffn_gate_inp`, F32 [128, 2816]): its input is `res` itself, RMS-normed
+  without weight, times `router.scale` (GGUF `ffn_gate_inp.scale`, F32 [2816], stored
+  raw) and `2816^-0.5`. Softmax over all 128 logits, the top 8, renormalised to sum 1,
+  then each times `per_expert_scale[e]` (GGUF `ffn_down_exps.scale`, F32 [128]).
+- experts: input `pre_ffw_norm_2(res)`. `ffn_gate_up_exps` is Q4_0 [128, 1408, 2816], gate
+  rows first; `ffn_down_exps` is Q4_0 [128, 2816, 704]. `m = sum_e w_e down_e(gelu_tanh(gate_e) * up_e)`.
+- output: `y = (res + post_feedforward_layernorm(t1 + post_ffw_norm_2(m))) * layer_scalar`.
+
+`layer_scalar` folds into the post-attention and post-FFN norms by `div_running`, as on
+the 12B. The router's norm, `pre_ffw_norm_2`, `post_ffw_norm_1` and `post_ffw_norm_2`
+all read normalised values or a residual carried at one scale, so none of them takes the
+fold.
+
+Shapes the kernels need. 2112 and 704 are not whole k-tiles, so the dense MLP pads to
+2304 (36 bands over 4 cores) and the experts to 768 (12 bands, 3 k-tiles) with zero
+rows and columns. A zero gate row gives `gelu(0) * up = 0`, and a zero down column reads
+it, so the padding adds nothing to the products. With 768 rows, an expert's gate (or up)
+and its down hold the same number of chunks, as `moeroute2`'s geometry requires.
+
+**Acceptance criteria (unit):**
+- the 26B config derives a `gemma4` spec with 128 experts, top 8, expert width 704 and 2 global kv heads; E2B / E4B (per-layer inputs or KV sharing) are still refused.
+- the dense MLP pads to 2304 and the experts to 768; the 12B's recipe, pool plan and builds do not move.
+- the pool holds the experts from byte 0 (gate | up per expert, then the down slices), the attention and dense MLP after them, and every offset fits a 32-bit fill word.
+
+**Procedure (manual):** greedy tokens against llama.cpp on the same GGUF; every prefill
+position's log-KL against an independent fp32 reference and against a BF16-rounding
+control; a prompt past the 1024-row window; `phlegm run` and `phlegm serve`.
+
+The route, per layer and one token a step (`recipes/gemma4.py`, the `MOE_*` block):
+
+1. `dx_local` / `dx`: the 12B's `dx.py` at 8 attention cores, 4 rows a call and per-core
+   KV windows. Its consts put `post_ffw_norm_1` (unfolded) where the 12B has
+   `post_feedforward_layernorm`. The dispatch leaves `res` at `AD_RES` and
+   `t1 = post_ffw_norm_1(mlp)` at `AD_T2`. Its own `xres = res + t1` is overwritten.
+2. `gemma4_route` (host): the router and `pre_ffw_norm_2`. It writes bf16 `xm2` and the
+   eight weights into `act` and patches `gm_moe`'s expert fills (`moeroute2`).
+3. `gm_l` / `gm_g` (`designs/gemma4_moe/gm.py`'s 4 cores): each takes 3 gate | up bands of
+   each expert, one fill per expert, then 11 down bands summed over the experts. Since
+   2026-11-01 these cores sit inside each layer type's dx image on its free Tile(4..7, 2)
+   and shim columns 4-7 (`designs/gemma4_moe/dxm.py`, `MOE_DESIGN = "dxm"`), as the image's
+   second instruction stream, so a layer runs in one hardware context (R-0003). The stream
+   takes dx's six buffer arguments and reads `pool` and `act`. The two streams of an image
+   are built together, and their xclbins must agree apart from build stamps.
+4. `gemma4_combine` (host): `xres = res + post_feedforward_layernorm'(t1 +
+   post_ffw_norm_2(m))`, with the folded layer scalar. `moe_parts` > 1 sums that many
+   partials of m first (the `gm8` probe's layout).
+
+The pool holds the experts from byte 0 (467 MB a layer, 508 MB in all). The head is the
+Q6_K embedding requantised at load to `lm_head_q8`'s bf16-scale chunks. The runtime change
+is `upstream-patches/gemma4-moe-runtime.patch`. Budgets: `gm_moe` uses 8976 of 16384 B of
+program memory and ends its L1, stack included, at 47,328 of 65,536 B. `dx_q40` and
+`dxg_q40` keep 656 B and 720 B of program memory free, as the 12B's do, and end their L1 at
+59,680 and 56,320 B.
+
+**Result (measured in Phlegm, 2026-10-31, development runs):** Strix Halo, NPU firmware
+1.1.2.65, Linux 7.2.11, the runtime clone `target/npu-dev/gemma4-moe-runtime` (binary
+sha256 `972329ff...`, manifest `f849ee19...`), Google's QAT Q4_0 GGUF (sha256
+`3eca3b8f...`). The reference is the 12B's numpy forward over the dequantised GGUF,
+extended with this block and a Q6_K reader (fp32 GEMMs, fp64 RoPE and softmax). The
+control is the same forward with bf16 GEMM inputs and K/V rows. llama.cpp is build 12015
+on the CPU. Positions past the prompt are teacher-forced on llama.cpp's tokens.
+
+- 26-token prompt: the 32 greedy tokens equal llama.cpp's and the reference's. Decode
+  logit cosine is at least 0.99835, median 0.99999. Prompt KL median 6.8e-4 against the
+  control's 7.7e-4; decode 6.1e-8 against 7.8e-8. Neither has an argmax flip.
+- 1450-token prompt: the 32 greedy tokens equal llama.cpp's and the reference's. Decode
+  cosine is at least 0.99916.
+- Prompt KL over the 1450 tokens, NPU against the control:
+
+| | NPU | control |
+|---|---|---|
+| KL median | 9.8e-3 | 1.26e-2 |
+| KL mean | 6.1e-2 | 6.5e-2 |
+| positions above KL 0.1 | 228 | 230 |
+| argmax flips | 133 | 136 |
+
+  Log-KL correlation is 0.86. Both grow with position, from about 5e-4 over the first 26
+  tokens to 1-2e-2 past 100. This model amplifies BF16 rounding about 80 times more than
+  the 12B, whose control reached 1.6e-4. The amplification is inferred to come from top-8
+  routing on near ties. The NPU adds nothing measurable beyond the rounding.
+- Window: over positions 1024-1449, the NPU is closer by KL to the 1024-row reference than
+  to the no-window one at 387 of 426 positions; the control is at 390. The NPU's median KL
+  to the windowed reference is 1.6e-2; the two references differ by 0.23.
+- Timing (load average 8-29 from other sessions; NPU runs serialised by `dibs`): resident
+  after 12 s. Sequential prefill took 249 s for 1450 tokens (172 ms a token) and 4.4 s for 26.
+  Decode runs at 170 ms a token after the short prompt and 179 ms after the long one. A
+  step is about 80 ms of `dx` (30 dispatches), 45 ms of `gm_moe`, 10-13 ms of host route and
+  combine, and 23 ms of head.
+- `phlegm run` and `phlegm serve`: the bridge built against the clone answers both. `serve`
+  answered one plain, one streamed and one two-turn request. The two-turn request recalled
+  the name given in its first turn. HTTP wall time was 11.8 s for 24 + 64 tokens, 15.2 s
+  streamed, and 15.8 s for 44 + 32.
+
+Phlegm renders the template with `enable_thinking=true`; the `<|channel>thought` block goes to
+`reasoning_content` and `run`'s stderr (SERVER-REASONING in `specs/server/spec.md`; checked live
+2026-11-01, `target/npu-dev/reasoning-split/gemma4-26b`).
+
+**Result (measured in Phlegm, 2026-11-01, development runs): decode on one context a layer
+type.** The stack and GGUF are unchanged. The runtime is `gemma4-moe-decode-runtime.patch`
+over the 10-31 patch (binary sha256 `7ac77f9b...`). The kernel set is
+`target/npu-dev/kernels/gemma4-26b-dxm` (manifest sha256 `495772bb...`). Evidence is in
+`target/npu-dev/gemma4-26b-perf/` and `gemma4-26b-run/dxm1/`.
+
+- Profile first, at load average 1-3: a step took 113-119 ms, not the 170 ms of the loaded
+  10-31 runs. `dx` took 58 ms, `gm_moe` 33 ms and the head 15.5 ms (the `lm` dispatch is
+  14.5 ms for 749 MB, 50 GB/s). Host work took 5.5-9 ms. Of that, 7-9 ms was the router's
+  matvec, one serial double-precision add chain per expert. The combine took 0.4 ms and
+  the syncs under 0.1 ms. The serial residue (wall time minus the parts) was 0.14 ms, and
+  submit-ahead gained nothing. Pipelining the layer close alone would save under 1 ms.
+- Context changes were the real cost. Alone in its context, `dx_local` takes 1.08-1.32 ms.
+  In the walk, with the experts on their own context, it takes 1.89-1.92 ms. The 8-core
+  `gm8` probe (one routed slot a core; 7760 B of program memory, L1 end 48,608 B) took
+  0.73-0.90 ms alone but 1.17 ms in the walk: an 8-program image costs more to enter. With
+  the experts inside dx's image, `dx_local` takes 0.88 ms and the experts 0.74 ms. A step's
+  dispatches fell from 106.8 to 77.8 ms. What remains is ~1.3 ms at each of the 10
+  local / global boundaries a token, plus the head's two contexts.
+- The router now runs over the host threads, with eight partial sums a logit: 7-9 ms down
+  to 1.0 ms a token.
+- Budgets of the merged images: dx's cores are unchanged (15,728 / 15,664 B of program
+  memory; the attention core's L1 ends at 59,680 B). The expert cores' L1 ends at 47,328 B.
+  `dx_q40` uses all 16 MM2S channels; `dxg_q40` keeps 2 free. insts.bin is 24,616 / 24,288 B
+  (dx) and 13,300 B (gm).
+- Gate: all 1,540 logit dumps of the short and long gate runs are byte-identical to the 10-31
+  run's, so every result above holds unchanged. Greedy is 32 / 32 equal to llama.cpp on both
+  prompts. The 1450-token prompt's KL median is 9.8e-3 against the control's 1.26e-2, with
+  133 argmax flips against 136. The window result is unchanged.
+- Timing: 6 alternating paired rounds against the 10-31 build, on the 26-token prompt with
+  48 greedy tokens, at load average 8-20 from other sessions. The per-round median step
+  ratio, new over old, is 0.796. The step median went from 131.7 to 106.0 ms (276 steps
+  each). Decode summaries were 127-138 ms a token before and 99-116 after; sequential
+  prefill 116-125 and 87-99 ms a token. Tokens were identical in all 12 runs. Single runs on
+  a quieter machine: 119 ms a token before (load 3), 82 after (gate run, load 9). The
+  1450-token prefill took 127 s (88 ms a token).
+- The head was measured and left alone. It streams at the highest rate seen on this array in
+  these runs, so only fewer bytes would help: a Q6_K-native head would save ~3 ms, and a
+  Q4_0 head ~7 ms, but Q4_0 is lossy.
+
+**Open:** block prefill (sequential only, 88 ms a token), the ten local / global context
+changes a token, a smaller head, contexts past 4096 tokens and a clean benchmark. The host
+close stays on the host: it is 0.4 ms a token.
 
 ### OPEN-FAMILY-HUNYUAN: HunYuan dense on the dense recipe
 **Applies to:** openflowlm-next (`open_kernels/recipes/dense.py`, `spec.py`, `designs/attn/attn.h`, `designs/dense/dx.py`, `utilities/q4nx-build`)
@@ -3872,9 +4162,12 @@ than ignored.
 - The branch is keyed on `rope_type`, so linear, longrope, Llama 3 and unscaled families
   derive exactly what they derived before.
 
-### OPEN-FAMILY-GPTOSS: GPT-OSS derives a spec and has no recipe yet
-**Applies to:** openflowlm-next (`open_kernels/recipes/spec.py`, `families.py`)
-**Test category:** unit (`tests/test_gptoss.py`)
+### OPEN-FAMILY-GPTOSS: GPT-OSS derives a spec and runs on its own recipe from the GGUF
+**Applies to:** openflowlm-next (`open_kernels/recipes/spec.py`, `families.py`, `gptoss.py`,
+`gptoss_pack.py`, `designs/gptoss/`, `designs/gemv_q4/gemv_mx4.h`, `mx4_codes.h`; runtime
+`upstream-patches/gptoss-runtime.patch`, `gptoss-prefill-runtime.patch`)
+**Test category:** unit (`tests/test_gptoss.py`, `tests/test_gptoss_pack.py`); manual (the
+recipe's procedure below, which needs the NPU and the GGUF)
 
 A config whose `model_type` is `gpt_oss` shall derive a `ModelSpec` with `family` `gptoss`:
 GQA attention with no q/k norm and no gate, a sliding window on the layers HF marks
@@ -3897,11 +4190,10 @@ alternation and has nothing to do with this family.
 The sink, the biases and the activation's constants are family properties for the same
 reason Qwen2's bias is: every GPT-OSS has them and `spec_hash()` covers every field.
 
-`recipes.families.family_module("gptoss")` shall raise `NotImplementedError` naming what is
-missing, and `gptoss` shall stay out of `FAMILIES` and `DENSE_FAMILIES`. Routing it to the
-dense or the MoE recipe would emit kernels that drop the sink and compute the wrong FFN, and
-then report parity against a reference carrying the same gaps -- which is exactly how
-OPEN-PACK-Q4-0 went unnoticed.
+`recipes.families.family_module("gptoss")` shall return `recipes/gptoss.py`, and `gptoss`
+shall stay out of `DENSE_FAMILIES`: routing it to the dense or the MoE recipe would emit
+kernels that drop the sink and compute the wrong FFN, and then report parity against a
+reference carrying the same gaps -- which is exactly how OPEN-PACK-Q4-0 went unnoticed.
 
 **Acceptance criteria:**
 - gpt-oss-20b's fields derive `family == "gptoss"`, `(num_heads, num_kv_heads, head_dim) ==
@@ -3917,9 +4209,8 @@ OPEN-PACK-Q4-0 went unnoticed.
 - The older `rope_theta` + `rope_scaling` pair and transformers 5's single `rope_parameters`
   object give the same `spec_hash()`. A missing `hidden_size`, `num_hidden_layers`,
   `num_local_experts`, `num_experts_per_tok`, `vocab_size` or `rope_theta` is named.
-- `family_module("gptoss")` raises `NotImplementedError` whose message names the sink, the
-  clamped SwiGLU and the extra biases; `"gptoss"` is in neither `FAMILIES` nor
-  `DENSE_FAMILIES`.
+- `family_module("gptoss")` is `recipes.gptoss`; `"gptoss"` is in `FAMILIES` and not in
+  `DENSE_FAMILIES`, and `dense._check` refuses a GPT-OSS spec.
 - **The adapter selects the open engine (manual).** `GPT_OSS::load_model` calls
   `_shared_select_open_engine("OFLM_GPTOSS_ENGINE", "GPT-OSS")` like its twelve siblings,
   and `checkpoint()` / `restore()` go through the `causal_lm` base pointer. Until this
@@ -3974,13 +4265,171 @@ order is settled by OPEN-PACK-EXPERT-ORDER; what the experts still have no pack 
 the destination, which waits on the MoE block's layout (OPEN-MOE-WIDE-FF). `.claude/plans/gptoss-bringup.md` has the decoded layouts and the
 ordered work.
 
-**What a recipe would still need** (not requirements yet; each earns its own when it is
-built): the padded widths above, the sink in the attention core (OPEN-ATTN-SINK), a
-clamped-SwiGLU expert kernel and room for the three expert biases and the router's, a bias on
-`o_proj` -- which OPEN-ATTN-QKV-BIAS explicitly excludes -- an MoE FFN on sliding-window
-layers, which no recipe composes today, and YaRN position tables in the engine. The
-arithmetic for all of it is settled and tested (OPEN-GPTOSS-FFN-REF); what is left is
-kernels. `.claude/plans/gptoss-moe-and-biases.md` has the element and stream accounting.
+**The recipe (2026-10-31), from the GGUF.** The source is ggml-org's `gpt-oss-20b-MXFP4.gguf`
+(Q8_0 attention / embedding / head, MXFP4 experts, every norm, bias, sink and router weight
+F32 and bf16-exact); the q4nx container is not read. A layer is two dispatches with the
+router on the host between them:
+
+- `gx_att` (`designs/gptoss/gx.py`, `GX_PART=att`; `attnpos`): the entry norm, q | k | v,
+  YaRN RoPE, attention with the learned sink over 4 cores of 16 heads (`ATTN_SINK`, `RB` 4:
+  Peano crashes on `attn_row_impl` at 16 heads a core under `ATTN_VEXP` at `RB` 1), o, then
+  `res = x + o` and `xm = post_attention_norm(res)`. Both layer types take the YaRN table:
+  the sliding layers share the full layers' rotation (`rope_inv_freq(local=True)` is
+  Gemma's unscaled local table, and using it moved the attention output by 4%).
+- `gptoss_route` (runtime `Core::gptoss_route`): the router over the bf16 xm, the top four,
+  softmax over those four; the weights go beside xm in the x element gx_moe's cores take,
+  the weighted down biases to `bsum`, the experts into gx_moe's fills (`moeroute2`).
+- `gx_moe` (`GX_PART=moe`; `moeroute2`): per expert, up | gate, the clamped SwiGLU scaled by
+  the routing weight; down sums the four experts in each core's accumulator
+  (`gemv_q8_pool_group_acc`); `xres = res + down + bsum` (`ln_add3`).
+- the tail: `ln` (`LN_DIV` 2880) and `lm_head_q8` with f32 scales.
+
+The attention streams `gemv_q8.h`'s half-tiles: Q8_0 only narrows its fp16 scale to bf16, as
+the GGUF q4 path's f32 planes do in the kernel. The experts stream `gemv_mx4.h`'s mx4
+half-tiles, the GGUF's own MXFP4 (GX_MX4=0 at export keeps the q8 half-tiles the route
+first shipped): the q8 half-tile's 16 rows x 256 K and band law in 2368 B instead of 5120, the
+e2m1 nibbles re-signed by the pack so that the core decodes them with straight lines
+(`mx4_codes.h`: t = v + max(v - 4, 0) - max(-4 - v, 0), code = t + max(t - 8, 0), six vector
+ops for 64 weights; -12 sits on int4's spare -8) into exactly the integer codes, in [-12, 12],
+the q8 tile held, under the same exact bf16 scale 2^(e-128). So the products are the q8
+route's to the bit. A q/k/v/o/gate/up bias is f32[16] in each k-tile-0 half-tile's pad
+(`GEMV_Q8_PAD_BIAS`), where the accumulator starts. Hidden and the expert width pad to 3072
+with zero weights, and the residual's padding stays exactly zero; the norms take their mean
+over 2880 (`LN_DIV`). The layer pool is 534 MiB (1114 at q8), 12.5 GiB for 24 layers. A prompt
+prefills on the family's own block route, OPEN-PREFILL-GPTOSS.
+
+**Acceptance (manual):** with the kernel set exported (`export_qwen36_kernels.py
+--model-dir <gguf dir>`), (1) `designs/gptoss/check_layer.py` runs layer 0 through both
+dispatches at the compiled position against `model/gptoss_gguf_reference.py`; (2)
+`open_qwen36_cli --prefill-logits --dump-logits` over a harmony chat prompt agrees with
+llama.cpp's greedy tokens and with the reference's logits; (3) a prompt past the 128-row
+window compares every prefill position against the reference and against its `--npu-like`
+rounding control; (4) `phlegm run` and `phlegm serve` answer through the bridge.
+
+**Result 2026-10-31 (Strix Halo, XRT 2.27.0, development runs, not a clean benchmark):**
+(1) layer 0, position 1: K 2.0e-3, og 3.8e-3, res 4.4e-4, xm 2.1e-3 rel L2; the reference's
+experts [9, 7, 16, 19]; h_e against the reference fed the NPU's xm 1e-5; layer output 7.4e-4
+(cos 0.9999997) against the fp32 reference. (2) the 79-token chat prompt's 32 greedy tokens
+equal llama.cpp's; KL(reference || NPU) median 4.1e-7, max 1.4e-3 over those positions, where
+llama.cpp's own partial KL from the reference is median 8.4e-7, max 1.2e-2. (3) a 663-token
+prompt: 624/663 argmax agree, KL median 1.0e-3, mean 3.6e-2, max 9.3 at position 599; the
+rounding control alone gives 632/663, median 6.1e-4, mean 2.5e-2, max 4.45 at the same
+position, and the two log-KLs correlate at 0.77; no change across the window crossings. (4)
+`phlegm run` and `serve` answer coherently (harmony analysis apart from the answer).
+Sequential prefill 141 ms a token, decode 140-146 ms a token (6.8-7.1 tok/s).
+
+**Result 2026-10-31, the experts at MXFP4 (`gemv_mx4.h`; Strix Halo, loaded machine):** (1)
+layer 0 at the compiled position: `act` and `xres` after both dispatches byte-identical to the
+q8 run's; `gx_moe` alone (run_kernel, 30 runs, the same machine minutes apart) 4.06 ms median
+at q8, 2.59 ms with the first mx4 decode (seven ops), 2.49 ms with the six-op one: 65.5 MB a
+dispatch at 26 GB/s against q8's 141.6 MB at 35 GB/s, so the decode is core-bound, ~86.5
+bundles a 32-K block against q8's 57 (Peano; the per-block epilogue is most of the rest). (2)
+the 79-token chat prompt: every one of its 79 prefill positions' logits byte-identical to the
+q8 run's, the 32 greedy tokens equal. In the full model `gx_moe` went 79.5 to ~64 ms a token
+while the unchanged attention dispatch rose 43 to ~51 under other sessions' load, so the
+decode rate did not move measurably (140 ms a token); a clean paired measurement is open.
+
+Not established: the Safeguard variant, contexts past 4096 rows, the q4nx container, a clean
+paired decode benchmark, and a faster mx4 epilogue (`gx_moe`'s 2.49 ms against a ~1.9 ms
+stream floor).
+
+### OPEN-PREFILL-GPTOSS: GPT-OSS's block prefill, the experts' GEMMs reading MXFP4 natively
+**Applies to:** openflowlm-next (`open_kernels/recipes/gptoss.py` `prefill_route`,
+`designs/gemm_bfp16/{gemm_bfp16.py,mx4_b.cc,pack.py}`, `designs/gemv_q4/mx4_codes.h`; runtime
+`upstream-patches/gptoss-prefill-runtime.patch`: `Core::step_gptoss_prompt`, the `gp_*` pack ops,
+the `gxexpert` patch, the manifest's `gptoss_prefill`)
+**Test category:** unit (`tests/test_gptoss.py`, `tests/test_gptoss_pack.py`); manual (the
+procedure below, which needs the NPU and the GGUF)
+
+A GPT-OSS kernel set carries a block prefill route (`gptoss_prefill`, unless GX_PREFILL=0 at
+export) that runs the whole prompt through each layer before the next, behind the engine's
+`step_gemm_prompt` / `layer_major_ok` (so `phlegm run` / `serve` and `open_qwen36_cli
+--gemm-block` take it). The four projections run as whole-array `gemm_bfp16` dispatches of
+256 rows:
+
+- q | k | v (N 10240, K 2880) and o (N 6144, K 4096) on `gemm_bfp16`'s context, their Q8_0
+  weights packed at load as a stacked [bfp16(W) ; bfp16(W - bfp16(W))] (`gp_bfp16`, split hi /
+  lo; GX_PREFILL_HILO=0 drops the lo half), the host summing column c with column c + N / 2.
+- each routed expert's gate | up (N 6144: the gate's rows at 0, the up's at 3072; K 2880) and
+  down (N 3072, K 2880) on `gemm_bfp16`'s MXFP4 variant (GB_B=mx4): the weights stay MXFP4 in
+  DDR, 4352 B a 128 x 64 tile against bfp16's 9216, and each core turns its tile into the
+  bfp16 one in L1 (`mx4_b.cc`, the decode of `mx4_codes.h`, q = code and x = e + 5: exact)
+  before the unchanged multiply. One dispatch per (expert, chunk of its tokens), the stream
+  compiled for expert 0 and re-pointed at the expert by the `gxexpert` patch (every buffer-0
+  fill's offset + e x the expert's bytes; two copies of the stream alternate, so the next
+  run's expert is patched in while the last one runs). A chunk that fills half of 128 rows or
+  less runs on a second build of the same GEMM at 32-row tiles (`t_small`, its own context;
+  every small chunk first, so one change of context a layer).
+- everything else on the host in fp32, as `model/gptoss_gguf_reference.py` computes it: the
+  norms, the half-split rotation at YaRN's frequencies with cos / sin times its attention
+  factor, attention with the learned sink over the cache rows (the sliding window on its
+  layers; one task per kv head and query, its eight heads register-blocked together), the
+  router (dot products in double), the clamped SwiGLU with the gate / up biases, and each
+  expert's output added into the residual with its routing weight and down bias. K / V land in
+  the cache as bf16 rows, as the decode kernels keep them, so decode continues from the end
+  of the prompt.
+
+Every GEMM activation goes in as [hi ; lo] rows (OFLM_OPEN_GPTOSS_HILO, on by default; the
+experts alone follow OFLM_OPEN_GPTOSS_HILO_EXPERTS): the row, and what bfp16 rounds away from
+it, so a dispatch takes 128 tokens and the host sums row r with row r + 128. bfp16 keeps eight bits a block of eight, and both roundings measured
+large: alone against the fp32 reference (663-token prompt, KL median), the attention weights
+3.3e-3, q | k | v's input 2.2e-3, o's 1.1e-3, down's 1.1e-3, gate | up's 0.83e-3, all of them
+5.5e-3 -- against the sequential route's rounding control's 6.1e-4.
+
+The host overlaps the NPU: q | k | v of block b runs, then o of block b - 1, with block b's
+rotation, cache rows and attention (its queries read only rows up to their own) in q | k | v
+b's post; the experts run gate | up of chunk i, then down of chunk i - 1, so the SwiGLU into
+down's operand runs while the NPU computes. Each job's buffers are its own twin of a pair.
+The engine takes the route from the set's own `min_prompt` (12 tokens), where a 16-token
+prompt measured 1.0 s on it against ~2.0 s one token a step; OFLM_OPEN_GEMM_BLOCK_MIN
+overrides it, OFLM_OPEN_GPTOSS_PREFILL=0 turns the route off.
+
+**Acceptance criteria:**
+- Unit: the emission (four GEMMs, the stacked hi / lo weights at row0 and row0 + N / 2, the
+  expert variants on their contexts with the `gxexpert` patch, the globals' sizes,
+  GX_PREFILL=0 and GX_PREFILL_HILO=0 removing what they name); the mx4 decode's straight lines
+  against its table over every int4 value; the mx4 half-tile equal to the q8 one and its byte
+  law; the GEMM's MXFP4 B equal to the MXFP4 values in `pack_b`'s tile order.
+- Kernel: `make_test.py make --mx4` at 256 x 2880 x 6144 matches the product of the decoded
+  operands (rel_fro <= 1e-4).
+- Model: every prefill position of a prompt past the window within the sequential route's
+  distance from the fp32 reference (argmax and KL median), and the greedy continuation of the
+  79-token chat prompt equal to llama.cpp's.
+
+**Procedure:** `designs/gemm_bfp16/make_test.py make --mx4` / `run_kernel` / `compare`;
+`open_qwen36_cli --gemm-block --prefill-logits --dump-logits` over `long.ids` (663 tokens) and a
+2000-token prompt, compared position by position with `gptoss_gguf_reference.py` (and its
+`--bfp16-like` control); `--gemm-block --max-tokens 32` over the chat prompt.
+
+**Result 2026-10-31 (Strix Halo, XRT 2.27.0; development runs on a machine other sessions
+kept at load average 30-55, not a clean benchmark):**
+- Kernel: the MXFP4 GEMM at 256 x 2880 x 6144 matches the decoded product to rel_fro 1.2e-7
+  (fp32 sum order), 1.15 ms against plain bfp16's 0.84 (the decode is 27 %, the weight bytes
+  less than half); at 128 rows (32-row tiles) 0.79 ms.
+- Accuracy against the fp32 reference: 663 tokens, argmax 636/663, KL median 6.8e-4, mean
+  1.4e-2, max 1.25 (the sequential route: 624/663, 1.0e-3, 3.6e-2, 9.3); without the hi / lo
+  activations 621/663, 3.0e-3; with neither hi / lo half 610/663, 4.6e-3; with the experts'
+  activations plain bfp16 (OFLM_OPEN_GPTOSS_HILO_EXPERTS=0, the attention's still hi / lo)
+  631/663, 1.1e-3, mean 1.7e-2 -- the sequential route's level, at half the experts' GEMM rows;
+  its speed was not separable from the machine's load (68) when first measured; alternated
+  later at load 32-37 (8 threads, the route NPU-bound: the NPU ~92 % busy, the experts' GEMMs
+  ~2.5 of its ~3.5 s) it was 3.36 / 3.52 s against 4.26 / 4.03 s with hi / lo (763 expert
+  dispatches of each kind instead of 943). The default stays hi / lo. 2000 tokens (56
+  positions, every 37th and the last): 56/56, KL median 4.3e-4, max 2.6e-2. The chat prompt's
+  32 greedy tokens equal llama.cpp's. Every host restructuring after the hi / lo change was
+  checked byte for byte against the run before it.
+- Speed, prefill only (`open_qwen36_cli`, OMP threads as given): 663 tokens 2.9 s at 16
+  threads, 3.3 s at 4 (sequential 94 s); 2000 tokens 9.4 s at 8, 10.3 s at 4; 16 / 32 / 64
+  tokens 1.0 / 1.1 / 1.16 s. Through the bridge (the `phlegm serve` path) 663 tokens 2.8-3.0
+  s; `phlegm` spawns its bridge with `--threads` (default 4), which matters: the route's host
+  stages were 6.6 s at 4 threads before they were vectorised and fused.
+- Load: 17-21 s (10 s without the route's ~11.4 GiB of weights: the experts' GEMM tiles 10.8
+  GiB, the stacked attention weights 1.4 GiB).
+
+Not established: a clean benchmark, contexts past 4096 rows, attention products on the NPU
+(the host's attention is 2.3 s of the 2000-token prefill at 4 threads), one shared copy of
+the experts for decode and prefill (the GEMM reads its own 10.8 GiB of tiles), and an
+expert GEMM that fills its rows across experts (a chunk still pads to 128 or 256 rows).
 
 ### OPEN-GPTOSS-FFN-REF: the fp64 reference for GPT-OSS's experts, router and sink attention
 **Applies to:** openflowlm-next (`open_kernels/model/replica_gptoss.py`)

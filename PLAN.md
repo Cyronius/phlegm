@@ -129,16 +129,218 @@ timing as separate follow-ups.
 Sources: [monorepo plan, P5](.claude/plans/phlegm-monorepo.md),
 [visualization plan](specs/viz/plans/flow-viz.md).
 
+## GPT-OSS 20B
+
+Runs on the NPU from ggml-org's `gpt-oss-20b-MXFP4.gguf` through `recipes/gptoss.py` and the
+open runtime (`upstream-patches/gptoss-runtime.patch` + `gptoss-prefill-runtime.patch`):
+`phlegm run` and `phlegm serve` answer through the bridge, with the harmony analysis apart
+from the answer. Decode streams the experts as the GGUF's own MXFP4 (`gemv_mx4.h`, decoded on
+the core into the q8 route's exact codes: byte-identical logits, `gx_moe` 4.06 -> 2.49 ms a
+layer, 12.5 GiB of pools instead of ~26). Prompts prefill on a block route (OPEN-PREFILL-GPTOSS):
+q | k | v and o as bfp16 GEMMs, each expert's GEMMs reading MXFP4 natively (decoded to bfp16 in
+L1), every operand hi + lo to ~16 bits, the rest on the host in fp32. 663 tokens in 2.9-3.3 s
+(94 s one token a step), 2000 tokens in ~10 s, 16 tokens in 1.0 s; accuracy against an fp32
+reference at least the sequential route's; the chat prompt's greedy tokens equal llama.cpp's.
+Development timing on a loaded machine. Open: a clean benchmark, NPU attention products for
+long prompts, one shared copy of the experts (the prefill GEMM keeps its own 10.8 GiB), the
+Safeguard variant. Plan: [.plans/gptoss-native.md](.plans/gptoss-native.md); spec:
+OPEN-FAMILY-GPTOSS, OPEN-PREFILL-GPTOSS.
+
+## Gemma 4 26B-A4B (MoE)
+
+Runs on the NPU from Google's QAT Q4_0 GGUF through `recipes/gemma4.py` (the 12B's dx.py
+attention and dense MLP, with `designs/gemma4_moe/gm.py`'s expert cores in the same image as a
+second stream, `dxm.py`; the router and FFN close on the host) and the open runtime
+(`upstream-patches/gemma4-moe-runtime.patch` + `gemma4-moe-decode-runtime.patch`). On a
+26- and a 1450-token prompt, the 32 greedy tokens equal llama.cpp's on the same GGUF. Every
+logit's KL against an fp32 reference matches a bf16-rounding control. `phlegm run` and
+`serve` answer through the bridge. Development timing (2026-11-01, paired against the 10-31
+build): decode step 0.80x (106 against 132 ms median at load 8-20; 82 ms a token on a quieter
+run), sequential prefill 88 ms a token, logits byte-identical. Phlegm returns Gemma's thought
+channel as `reasoning_content` (SERVER-REASONING). Open: block prefill; the ten local / global
+context changes a token; a clean benchmark. Plan:
+[.plans/gemma4-moe.md](.plans/gemma4-moe.md); spec `OPEN-FAMILY-GEMMA4-MOE`.
+
+## Qwen3.5 MoE 35B-A3B (Ornith 1.5, Nex N2.5 mini, KAT Coder V2.5 Dev)
+
+KAT Coder V2.5 Dev runs on the NPU from bartowski's unmodified Q4_0 GGUF. It uses the qwen36moe
+q4_1 kernels and block prefill route through the manifest's new `gguf` view, with `q35_*` pack
+ops from `upstream-patches/qwen35moe-gguf-runtime.patch`. `phlegm run` and `serve` answer
+correctly. Against llama.cpp on the same GGUF, the 491-token prompt has partial KL median
+1.9e-2; against a control holding the NPU's weights, 2.1e-3. Requantizing the GGUF's Q8_0 /
+Q5_0 / Q6_K tensors to q4_1 is the gap. Development timing: 4.6 s for the 491-token prefill
+and 84-86 ms per decode token. Ornith 1.5 and Nex N2.5 mini now run the same way, from their own
+pure Q4_0 GGUFs built from BF16 (`/home/cyrus/models/{Ornith-1.5-35B-A3B,Nex-N2.5-mini}-Q4pure-NPU2`),
+on KAT's kernels. Each agrees with llama.cpp at the level of llama.cpp CPU against Vulkan: Ornith
+413/491, Nex 451/491. `phlegm run` and `serve` work for both. Open: a BF16 comparison for those two,
+Ornith's heavier KL tail, a clean benchmark. The `<think>` block goes to `reasoning_content`
+(SERVER-REASONING; checked on KAT). Plan: [.plans/qwen35moe-gguf.md](.plans/qwen35moe-gguf.md);
+spec: OPEN-FAMILY-QWEN36MOE-GGUF.
+
 ## Native image model support
 
 Qwen Image 2.1 and FLUX 3 Image Klein are requested for text-to-image and
-editing through the CLI and image API, with native NPU inference. They are
+editing through the CLI and image API, with native NPU inference. MOSS Image
+SFT is also requested for its published text-to-image path. They are
 new model families: the existing FLUX.2 Klein NPU schedule and C++ image
 engine cannot load them by alias. The FLUX 3 port also needs its separate
 prompt upsampler and the published reference inference behavior. Acquisition,
 architecture differences, validation gates and current blockers are tracked
 in [the native image model plan](.plans/native-image-models.md). Do not register
-either model as supported until actual NPU generation and editing pass.
+Qwen Image 2.1 or FLUX 3 as supported until actual NPU generation and editing
+pass. MOSS's pinned checkpoint, DiT weight packer, SiTU and q/k RoPE kernel
+checks are recorded in [the MOSS plan](.plans/moss-image-native.md). Its
+headless Qwen3.5 text package, matching 40-set NPU kernel export, and
+all-token encoder path are implemented. A 17-token native NPU run agrees with
+the exact packed-weight CPU reference within 0.52% relative L2 and 0.999986
+cosine across all 32 layers. Its 18.5% difference from the BF16 Transformers
+reference is therefore attributable to the Q4/Q8 text package. A 290-token
+prompt crosses the 256-token block boundary but has 57.9% final relative error
+against BF16; the published CPU chunk and recurrent references also differ
+substantially there, so long-context quality still needs a pinned optimized
+reference. The MOSS VAE decoder's 96/192/384-channel native schedule and
+weight packing are implemented. A 96-channel GroupNorm ran on the NPU within
+1.04% of its CPU reference; the real 47.1 MB decoder pack covers 37 weights
+and 30 norm blocks, and a decoded convolution matches its checkpoint within
+0.66%. The full 102-operation 512-pixel VAE decoder ran on the NPU and matched
+the FP32 reference at 0.77 mean absolute RGB levels and 47.7 dB PSNR from
+identical random latents. The real-weight MOSS joint-block path now runs
+RMSNorm/modulation, four GEMMs, q/k RoPE, 24-head attention, SiTU, and both
+gated residuals on the NPU. One 512-pixel block matched its BF16 checkpoint
+reference within 2.53% relative L2. All 42 main blocks completed 420 NPU
+operations on a 512-pixel random embedded fixture, with 8.99% final relative
+L2 and 0.995943 cosine against the published BF16 block stack. The native
+text projection and two refinement blocks completed 32 operations from actual
+Qwen3.5 NPU hidden rows and matched the BF16 checkpoint reference within
+1.34% relative L2. Native latent embedding and timestep conditioning also
+passed checkpoint comparisons. A conditioned 42-block forward from those
+native stages completed 420 NPU operations at 512 pixels; its final velocity
+was 2.97% relative L2 and 0.999755 cosine from the full one-step BF16
+reference. `moss_native_sample.py` now stages the native text, DiT and VAE
+passes with FP32 Euler/CFG updates and the negative branch's block-22 skip.
+A default 50-step, guidance-3 run completed all positive and negative NPU
+forwards plus VAE decoding and produced a coherent 512-pixel red block image
+for `a red cube on a white table`. Its latent state remained finite. The
+`phlegm image` CLI and `/v1/images/generations` endpoint each completed a
+separate real NPU request; the API returned an encoded 512-pixel PNG. A
+13-token prompt ran with verified RTP-derived kernel variants, whose changed
+instruction streams exactly matched an independent direct export. Supported
+asset configurations can now serve ordinary text-to-image prompts in the
+validated 512-pixel bucket. The 1024-pixel and long-prompt quality gates
+remain open; the API rejects resolutions absent from its configured kernels.
+For FLUX 3, a native 1536-row half-scale RoPE fixture passed a 0.26% relative
+L2 gate, and one real-weight per-mode image block completed nine NPU operations
+at 512 pixels. Its output was 2.30% relative L2 and 0.99970 cosine from the
+pinned BF16 block reference. The prompt upsampler and editing path still
+need integration.
+Five consecutive checkpoint-weighted image-mode blocks now complete 45 NPU
+operations at 512 pixels. Their output differs by 4.61% relative L2 from the
+published BF16 five-block reference, with 0.99890 cosine. The FLUX 3 FP32
+autoencoder decoder weights are packed for the native VAE schedule. All 102
+decoder operations completed on the NPU at 512 pixels; the resulting RGB
+image differed from the published FP32 decoder by 0.604 mean pixel values
+and 49.08 dB PSNR on identical random latents. Sampling and editing
+integration remain open.
+The five early text-mode blocks also execute on the NPU for an 80-token
+fixture. All 45 operations completed; their final state differs by 4.22%
+relative L2 from the published BF16 reference, with 0.99912 cosine.
+The full 28-block shared text/image stack runs 308 NPU operations for 80 text
+tokens plus a 32x32 image grid. Its final state differs by 6.25% relative L2
+from the published BF16 shared-stack reference, with 0.99802 cosine.
+Native image entry, 80-token text entry, and final image projection now run
+with the checkpoint's packed weights. Their relative L2 errors versus the
+published BF16 projections are 0.93%, 2.52%, and 1.41%, respectively.
+Flow-map timestep, reference-time, early/single mode modulation, and final
+modulation complete 13 NPU operations. A connected one-pass DiT validation
+now runs all of those stages with 5+5 early blocks and 28 shared blocks.
+Its early image/text states differ by 2.89%/3.56%, and its final shared state
+by 4.15%, from the published BF16 full-model pass. The final velocity differs
+by 19.92% relative L2 because the output head amplifies those state changes.
+This remains a synthetic 80-token conditioning fixture, not prompt inference.
+The FLUX 3 VAE encoder weights now cover all 28 native weight slices and 22
+normalization blocks. Its 50 compiled streams execute the full 89-operation
+512-pixel encoder on the NPU. On a local generated image, native reference
+tokens differ by 10.51% relative L2 from the published FP32 encoder, but
+decoding both token sets through the published VAE yields only 0.494 mean
+RGB pixel difference and 50.02 dB PSNR. A synthetic checkerboard has 21.04%
+token drift; traced stages locate its growth mainly in the first two down
+blocks. Reference-image DiT conditioning and the prompt upsampler still need
+native integration. A diagnostic 16-step flow-map sampler now runs every
+FLUX 3 DiT stage and the VAE decoder on the NPU and produces a coherent
+512-pixel red cube for a published CPU text-embedding fixture. Its final
+latent remains finite. This validates the DiT sampler loop but does not
+establish native prompt support. The checkpoint's Qwen3-VL language tower
+has been packed as a headless 2.9 GB Q4NX encoder with all 398 tensors
+mapped. The native text engine captures the eight FLUX 3 layer taps in one
+pass and applies the published 80-token pad mask and position ID. Its 40-set
+matching NPU kernel export completed. On a 15-token red-cube prompt, native
+real-token taps are 5.56% relative L2 and 0.9988 cosine from the published
+BF16 text reference; all native pad rows are identical as required, and the
+overall 80-row error is 5.91% with 0.9986 cosine. A full native 16-step run
+through this text encoder, all DiT blocks, and the VAE decoder produced a
+coherent 512-pixel red cube on a white table with finite latents. The prompt
+was passed directly; the published upsampler, editing path, and 1024-pixel
+validation remain open before FLUX 3 CLI/API registration.
+
+2026-10-27 FLUX 3 text-to-image update: the published prompt upsampler's 760
+BF16 tensors were packed into a 475-tensor native Q4NX language/LM package.
+The local NPU generated a complete 138-token red-cube caption with the
+reference's T2I system prompt, 1.5 presence penalty and stop IDs. That caption
+needs 145 Qwen3-VL text tokens; the native text encoder pads to the published
+160-token bucket. Matching NPU text-entry, text-block and shared-block kernel
+sets were exported. A full 16-step native upsampler → text encoder → DiT → VAE
+run produced a coherent 512-pixel red cube on a white table with finite
+latents. `phlegm image` completed a separate full native route with one
+denoising step. `/v1/images/generations` completed another one-step request
+and returned a valid 512×512 PNG, while `/v1/models` listed the configured
+FLUX 3 model. The local configuration currently supplies 80- and 160-token
+DiT buckets; longer upsampled captions require matching kernel exports.
+
+2026-10-31 FLUX 3 editing update: one-reference editing runs natively. The
+reference is prepared as published, encoded by the native VAE encoder, and
+conditions the DiT through the `image_cond` per-mode and shared blocks
+(reference RoPE `l=-1` in `qk_flux3`). A 16-step native edit matched the
+unchanged published CPU pipeline at MAE 2.33/255 and PSNR 35.86 dB; `phlegm
+image --image` and `POST /v1/images/edits` each completed a real NPU edit.
+Edits pass the prompt as typed (the published `pup=False` path) because the
+upsampler's vision tower has no NPU route yet. A 240-token text bucket also
+passed on hardware; longer buckets wait on text-encoder pad masking across
+prefill blocks. Qwen Image 2.1 editing needs a native Qwen3-VL vision tower,
+LM image-embedding input and the Qwen VAE encoder; the server rejects it.
+Neither model is registered as supported. Details:
+[`specs/open-engine/flux3-image-native.md`](specs/open-engine/flux3-image-native.md).
+Reference-image editing still needs the upsampler's vision tower and native
+conditioning path; 1024-pixel kernels and validation remain open.
+
+Qwen Image 2.1 update: Q4 lost a large text-tower activation and was rejected.
+An all-Q8 package now runs the 36-layer text tower on the NPU; its 15 × 4096
+red-cube embeddings differ by 7.589% relative L2 from BF16 CPU with 0.99712
+cosine. The full 32-block image transformer, checkpoint entry and final head
+run on the NPU. Layer 31 differed by 4.259% relative L2 from the independent
+BF16 block stack, and the final head differed by 0.867%. A four-step native
+FlowMatch Euler diagnostic produced finite latents. Native VAE probes have
+passed the first real 64→1152 convolution and padded 144-channel RMSNorm.
+All 82 active first-frame decoder parameter groups are now packed, and its 20
+unique convolution streams compile. Four real-weight native convolution
+probes, including fused upsampling and a 512-pixel width change, pass within
+1.12% relative L2 of decoded packed-weight CPU arithmetic. The 144/288/576
+RMSNorms also pass in convolution-padded physical widths 256/384/640.
+The native 1152-wide single-head VAE attention kernel passed a checkpoint-QKV
+probe at 3.624% relative L2 and cosine 0.999379; the shared 128-wide
+attention regression also passed after that kernel change. The connected
+150-operation VAE decoder executes 105 NPU kernels and decoded those four-step
+latents into a coherent 512-pixel image. Against the official FP32 decoder
+on the same latents it differs by 0.671% relative L2, cosine 0.999985.
+`backend=qwen21` is wired into `phlegm image` and the image API, and prompt
+length 1..64 is handled by checked RTP instruction patches. The published
+40-step native route with raw Qwen3-VL text completed and decoded to a clean
+red cube on a light table. A 21-token prompt passed the CLI end to end, and a
+separate 16-token API request returned HTTP 200 with a valid PNG. One-step
+requests are rejected because the published terminal stretch yields NaN there.
+Native editing, 1024-pixel output, and longer prompts remain open.
+See [the Qwen Image 2.1 native spec](specs/open-engine/qwen-image21-native.md)
+for the checkpoint contract, validation artifacts and remaining gates; the
+working implementation log is `.plans/native-image-models.md`.
 
 ## 5. Kernel correctness and performance backlog
 

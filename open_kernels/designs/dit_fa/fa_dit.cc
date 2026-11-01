@@ -60,7 +60,11 @@ constexpr int QROWS_PASS = FA_QROWS_PASS;
 
 constexpr int NDCH = DFULL / DC;
 static_assert(DFULL % DC == 0, "head dim must be whole chunks");
-static_assert(TQ % 32 == 0, "row loops load 32 rows at a time");
+#ifndef FA_VAE_HEAD
+#define FA_VAE_HEAD 0 // Qwen VAE single-head attention (768 encoder or 1152 decoder wide)
+#endif
+static_assert(TQ % 32 == 0 || (TQ == 8 && FA_VAE_HEAD),
+              "supported query tiles are 32 rows or the 8-row VAE tile");
 static_assert(LKP % 16 == 0 && DC % 16 == 0, "mmul 2x2 blocking");
 // A Q block (two cores' rows) is the size of a K block -- they share a fifo.
 static_assert(2 * TQ == LKP, "Q block must be the size of a K block");
@@ -74,6 +78,8 @@ constexpr double sqrt_d = (DFULL == 64)    ? 8.0
                           : (DFULL == 128) ? 11.313708498984761
                           : (DFULL == 256) ? 16.0
                           : (DFULL == 512) ? 22.627416997969522
+                          : (DFULL == 768) ? 27.712812921102035
+                          : (DFULL == 1152) ? 33.94112549695428
                                            : 0.0;
 static_assert(sqrt_d != 0.0, "add sqrt(DFULL) for this head dim");
 // exp_fix's quadratic (see there)
@@ -91,7 +97,8 @@ static inline bfloat16 bf16_neg_inf() {
   return *(bfloat16 *)&u;
 }
 
-// attn_npu2.cc's matmul_vectorized_2x2_mmul, unchanged. A and C are 8x8-block
+// attn_npu2.cc's matmul_vectorized_2x2_mmul, plus a one-row-block path for
+// the Qwen VAE's 8-query-row tile. A and C are 8x8-block
 // column-major ([col block][row block][8][8]); B is K (transpose_b, blocks
 // [k block][n block]) or V (blocks [n block][k block]).
 template <typename T_in, typename T_out, unsigned rowA, unsigned colA,
@@ -99,6 +106,36 @@ template <typename T_in, typename T_out, unsigned rowA, unsigned colA,
 static inline void matmul_2x2(const T_in *__restrict pA,
                               const T_in *__restrict pB, T_out *__restrict pC) {
   using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
+  if constexpr (rowA == 1) {
+    for (unsigned j = 0; j < colB; j += 2) {
+      const T_in *__restrict pA1 = pA;
+      const T_in *__restrict pB1 = pB + j * colA * MMUL::size_B;
+      const T_in *__restrict pB2 = pB + (j + 1) * colA * MMUL::size_B;
+      T_out *__restrict pC1 = pC + j * MMUL::size_C;
+      MMUL C00(aie::load_v<MMUL::size_C>(pC1));
+      MMUL C01(aie::load_v<MMUL::size_C>(pC1 + MMUL::size_C));
+      for (unsigned i = 0; i < colA; ++i) {
+        aie::vector<T_in, MMUL::size_A> A0 = aie::load_v<MMUL::size_A>(pA1);
+        pA1 += MMUL::size_A;
+        aie::vector<T_in, MMUL::size_B> B0, B1;
+        if constexpr (transpose_b) {
+          B0 = aie::transpose(aie::load_v<MMUL::size_B>(
+                                  pB + (i * colB + j) * MMUL::size_B), t, s);
+          B1 = aie::transpose(aie::load_v<MMUL::size_B>(
+                                  pB + (i * colB + j + 1) * MMUL::size_B), t, s);
+        } else {
+          B0 = aie::load_v<MMUL::size_B>(pB1);
+          B1 = aie::load_v<MMUL::size_B>(pB2);
+        }
+        pB1 += MMUL::size_B;
+        pB2 += MMUL::size_B;
+        C00.mac(A0, B0);
+        C01.mac(A0, B1);
+      }
+      aie::store_v(pC1, C00.template to_vector<T_out>());
+      aie::store_v(pC1 + MMUL::size_C, C01.template to_vector<T_out>());
+    }
+  } else {
   for (unsigned z = 0; z < rowA; z += 2)
     chess_prepare_for_pipelining chess_loop_range(2, ) {
       T_out *__restrict pC1 = pC + (z)*MMUL::size_C;
@@ -150,6 +187,7 @@ static inline void matmul_2x2(const T_in *__restrict pA,
         pC2 += MMUL::size_C * rowA;
       }
     }
+  }
 }
 
 // attn_npu2.cc's exp2f_poly16 (from mlir-aie aie_kernels/aie2p/exp2f_vec.cc,
@@ -288,13 +326,19 @@ exp_cols(bfloat16 *__restrict p, const float *__restrict nuc,
 
 // Multiply 32 rows of a block-column-major tile with TQ rows and ncols columns
 // by rep's per-row factors (replicate_rows32).
+#if FA_TQ == 8
+#define FA_SCALE_ATTR __attribute__((noinline))
+#else
+#define FA_SCALE_ATTR inline
+#endif
 template <int ncols>
-static inline void scale_rows(bfloat16 *__restrict x, const bfloat16 *__restrict rep) {
+static FA_SCALE_ATTR void scale_rows(bfloat16 *__restrict x,
+                                    const bfloat16 *__restrict rep) {
   using V = aie::vector<bfloat16, 32>;
   constexpr int col_blocks = ncols / 8;
   constexpr int chunk = col_blocks < 8 ? col_blocks : 8;
   static_assert(col_blocks % chunk == 0);
-  for (int gi = 0; gi < 8; gi++) {
+  for (int gi = 0; gi < TQ / 4; gi++) {
     V rv = aie::load_v<32>(rep + gi * 32);
     bfloat16 *__restrict p = x + gi * 32;
 #pragma clang loop unroll(disable)
@@ -389,8 +433,13 @@ void pass_init(bfloat16 *__restrict gp, bfloat16 *__restrict up, float *__restri
   for (int i = 0; i < GP_ELEMS; i += 32)
     aie::store_v(gp + i, z);
   aie::vector<bfloat16, 32> lo = aie::broadcast<bfloat16, 32>(bf16_lowest());
-  for (int i = 0; i < TQ; i += 32)
-    aie::store_v(up + i, lo);
+  if constexpr (TQ == 8) {
+    for (int i = 0; i < TQ; i++)
+      up[i] = bf16_lowest();
+  } else {
+    for (int i = 0; i < TQ; i += 32)
+      aie::store_v(up + i, lo);
+  }
   aie::vector<float, 16> zf = aie::zeros<float, 16>();
   for (int i = 0; i < TQ * 8; i += 16)
     aie::store_v(sp + i, zf);
@@ -424,6 +473,8 @@ void pv(bfloat16 *g, bfloat16 *v, bfloat16 *gp, int32_t c) {
 void apply_mask(bfloat16 *__restrict g, int32_t *__restrict rtp, int32_t pass,
                 int32_t chunk) {
   SET_ROUNDING();
+  if constexpr (FA_VAE_HEAD)
+    return; // Qwen VAE still-image attention is full and bidirectional.
   const int32_t valid_len = rtp[3];
   const int32_t causal = rtp[4];
   const int32_t row0 = pass * QROWS_PASS + rtp[5];
@@ -470,6 +521,32 @@ void softmax_step(bfloat16 *__restrict g, bfloat16 *__restrict up,
   using V = aie::vector<bfloat16, 32>;
   const float c = float(log2e);
   row_max(g, s_newmax);
+  if constexpr (TQ == 8) {
+    bool resc = false;
+    for (int row = 0; row < TQ; row++)
+      resc |= float(s_newmax[row]) > float(up[row]) + TAU / c;
+    if (resc) {
+      alignas(64) float delta[16] = {};
+      alignas(64) bfloat16 factors[16];
+      for (int row = 0; row < TQ; row++) {
+        const float old = float(up[row]);
+        const float next = old > float(s_newmax[row]) ? old : float(s_newmax[row]);
+        delta[row] = (old - next) * c;
+        up[row] = (bfloat16)next;
+      }
+      auto d = aie::max(aie::load_v<16>(delta), aie::broadcast<float, 16>(-111.0f));
+      aie::store_v(factors, aie::exp2<bfloat16>(d));
+      for (int row = 0; row < TQ; row++) {
+        s_resc[row] = factors[row];
+        for (int lane = 0; lane < 8; lane++) {
+          s_rep[row * 8 + lane] = s_resc[row];
+          sp[row * 8 + lane] *= float(s_resc[row]);
+          s_nuc[row * 8 + lane] = -float(up[row]) * c;
+        }
+      }
+      scale_rows<DFULL>(gp, s_rep);
+    }
+  } else {
   bool resc = false;
   const V tau = aie::broadcast<bfloat16, 32>((bfloat16)(TAU / c));
   for (int i = 0; i < TQ; i += 32)
@@ -506,6 +583,7 @@ void softmax_step(bfloat16 *__restrict g, bfloat16 *__restrict up,
       widen_scale(s_rep, s_nuc + rh * 256, -c, 256);
     }
   }
+  }
   const bfloat16 sc_hi_s = (bfloat16)log2e;
   const bfloat16 sc_lo_s = (bfloat16)(float(log2e) - float(sc_hi_s));
   const aie::vector<bfloat16, 16> sc_hi = aie::broadcast<bfloat16, 16>(sc_hi_s);
@@ -518,6 +596,14 @@ void softmax_step(bfloat16 *__restrict g, bfloat16 *__restrict up,
 // End of a pass: O /= l (l replicated, so its bf16 inverse is scale_rows' table).
 void finalize(float *__restrict sp, bfloat16 *__restrict gp) {
   SET_ROUNDING();
+  if constexpr (TQ == 8) {
+    for (int j = 0; j < TQ * 8; j += 16) {
+      aie::accum<accfloat, 16> a;
+      a.from_vector(aie::load_v<16>(sp + j));
+      aie::store_v(s_rep + j, aie::inv(a.template to_vector<bfloat16>()));
+    }
+    scale_rows<DFULL>(gp, s_rep);
+  } else {
   for (int rh = 0; rh < TQ / 32; rh++) {
     for (int j = 0; j < 256; j += 16) {
       aie::accum<accfloat, 16> a;
@@ -525,6 +611,7 @@ void finalize(float *__restrict sp, bfloat16 *__restrict gp) {
       aie::store_v(s_rep + j, aie::inv(a.template to_vector<bfloat16>()));
     }
     scale_rows<DFULL>(gp + rh * 256, s_rep);
+  }
   }
 }
 

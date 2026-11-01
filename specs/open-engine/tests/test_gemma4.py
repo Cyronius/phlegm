@@ -441,3 +441,114 @@ def test_decode_attention_is_wide_with_per_core_windows(unvalidated, monkeypatch
     monkeypatch.setenv("G4_ACORES", "6")
     with pytest.raises(OpRangeError):
         G4.dx_geometry(s, "local")
+
+
+# ---- Gemma 4 26B-A4B (OPEN-FAMILY-GEMMA4-MOE): google/gemma-4-26B-A4B(-it) config.json's text tower
+TC_26B = dict(TC, model_type="gemma4_text", hidden_size=2816, intermediate_size=2112, num_hidden_layers=30,
+              num_global_key_value_heads=2, enable_moe_block=True, num_experts=128, top_k_experts=8,
+              moe_intermediate_size=704,
+              layer_types=["full_attention" if (l + 1) % 6 == 0 else "sliding_attention" for l in range(30)])
+HF_26B = {"model_type": "gemma4", "text_config": TC_26B}
+
+
+def spec_26b():
+    return ModelSpec.from_hf_config(HF_26B)
+
+
+def test_26b_derives_its_experts_and_the_e_models_stay_refused():
+    s = spec_26b()
+    assert s.family == "gemma4" and s.layer_types.count(DENSE) == 5 and s.layer_types[5] == DENSE
+    assert (s.hidden, s.intermediate, s.num_experts, s.experts_per_tok, s.moe_intermediate) == (2816, 2112, 128, 8, 704)
+    assert (s.global_head_dim, s.global_kv_heads, s.global_rotary_dim, s.num_kv_heads) == (512, 2, 128, 8)
+    assert G4.is_moe(s) and not G4.is_moe(spec())
+    with pytest.raises(SpecError, match="E2B / E4B"):           # per-layer inputs: still refused
+        ModelSpec.from_hf_config({"model_type": "gemma4",
+                                  "text_config": dict(TC_26B, hidden_size_per_layer_input=256)})
+    with pytest.raises(SpecError, match="E2B / E4B"):           # a dense gemma4_text: still refused
+        ModelSpec.from_hf_config({"model_type": "gemma4", "text_config": dict(TC_26B, enable_moe_block=False)})
+
+
+def test_26b_pads_the_dense_mlp_and_the_experts(unvalidated):
+    s = spec_26b()
+    assert (G4.moe_ff(s), G4.expert_ff(s)) == (2304, 768)
+    for kind in ("local", "global"):
+        sub = G4.sub_spec(s, kind)
+        assert (sub.intermediate, sub.num_experts, sub.quant) == (2304, 0, "q4_0")
+        assert G4.geometry(s, kind).N_CORES == 4
+    M = G4.moe_layout(s)
+    assert (M.N_CORES, M.UP_PC, M.DOWN_PC, M.CH) == (4, 3, 11, 4608)
+    # an expert's gate (or up) and its down hold the same chunks: moeroute2's up_bytes
+    assert M.UP_BYTES == 768 // 64 * M.BB_H == 2816 // 64 * M.BB_F == 1216512
+
+
+def test_26b_pool_holds_the_experts_first(unvalidated):
+    s = spec_26b()
+    M = G4.moe_layout(s)
+    assert (M.POOL_DOWN, M.POOL_END) == (128 * 2 * M.UP_BYTES, 128 * 3 * M.UP_BYTES)
+    for kind in ("local", "global"):
+        L = G4.layout(s, kind=kind)
+        assert L.POOL_Q == M.POOL_DENSE >= M.POOL_END and L.POOL_BYTES < 1 << 32
+        assert M.AD_XM >= L.AD_BYTES and M.AD_W >= M.AD_XM + 2816 * 2 and M.AD_BYTES >= M.AD_MOE + 2816 * 4
+        plan = G4.pack_plan(s)["layer_types"][G4.KINDS[kind]]
+        gate, up, down = plan["pool"][:3]
+        assert (gate["dst"], up["dst"], down["dst"]) == (0, M.BB_H, M.POOL_DOWN)
+        assert (gate["row0"], up["row0"], gate["rows"], gate["n_total"]) == (0, 704, 704, 1408)
+        assert (down["in_dim"], down["src_dim"], down["rows"], down["expert_bytes"]) == (768, 704, 2816, M.UP_BYTES)
+        assert gate["stripe_bytes"] == 2 * M.BB_H and gate["expert_bytes"] == M.EXPERT_UG
+        mlp_down = [op for op in plan["pool"] if op["tensor"] == "blk.{l}.ffn_down.weight"][0]
+        assert (mlp_down["in_dim"], mlp_down["src_dim"], mlp_down["dst"]) == (2304, 2112, L.POOL_DOWN)
+        post = [op for op in plan["consts"] if op["dst"] == L.CD_POSTFFN][0]
+        assert post["tensor"] == "blk.{l}.post_ffw_norm_1.weight" and "div_running" not in post
+    g = manifest(s)["layout"]["moe"]
+    assert (g["pool_down"], g["share_up"], g["up_bytes"], g["topk"]) == (M.POOL_DOWN, M.POOL_END, M.UP_BYTES, 8)
+
+
+def test_26b_program_routes_and_combines_on_the_host(unvalidated):
+    """dxm (the default): the experts are each layer type's image's second stream, so a layer runs
+    in one context; its program still routes and combines on the host around the two dispatches"""
+    s = spec_26b()
+    m = manifest(s)
+    for sec in (m, m["gguf"]):
+        assert sec["spec"]["quant"] in ("q4_1", "q4_0") and "gemm_block" not in sec["layer_types"]["dense"]
+        for lt, kn, gk, ctx in (("dense_local", "dx_local", "gm_l", "dx"), ("dense", "dx", "gm_g", "dxg")):
+            prog = sec["layer_types"][lt]["program"]
+            assert [st["op"] for st in prog] == ["run", "gemma4_route", "run", "gemma4_combine"]
+            assert prog[0]["kernel"] == kn and prog[2] == {"op": "run", "kernel": gk, "args": prog[0]["args"]}
+            assert prog[1]["kernel"] == prog[3]["kernel"] == gk and prog[3]["moe_parts"] == 1
+            assert prog[1]["a_res"] == prog[3]["a_res"] == G4.layout(s, kind="local" if lt == "dense_local" else "global").AD_RES
+            assert sec["kernels"][gk]["context"] == sec["kernels"][kn]["context"] == ctx
+            assert sec["kernels"][gk]["patch"] == "moeroute2" and sec["kernels"][kn]["patch"] == "attnpos"
+        assert "gm" not in sec["contexts"] and "gm_moe" not in sec["kernels"]
+        assert sec["pack"]["lm_head"]["ops"][0]["op"] == "g4_lmhead_q8"
+    b = G4.builds(s)
+    assert set(b) == {"ln", "lm_head_q8", "dx_q40", "dx_q40_gm", "dxg_q40", "dxg_q40_gm"}
+    for name in ("dx_q40", "dxg_q40"):
+        a, g = b[name], b[name + "_gm"]
+        assert a["design"] == g["design"] == "gemma4_moe/dxm.py" and a["build_dir"] != g["build_dir"]
+        assert (a["env"].pop("G4_DXM_STREAM"), g["env"].pop("G4_DXM_STREAM")) == ("dx", "gm") and a["env"] == g["env"]
+    assert m["hf_config_check"]["num_experts"] == 128 and m["hf_config_check"]["intermediate_size"] == 2112
+
+
+@pytest.mark.parametrize("design,parts", [("gm", 1), ("gm8", 8)])
+def test_26b_expert_image_of_its_own(unvalidated, monkeypatch, design, parts):
+    """G4_MOE_DESIGN=gm | gm8: the experts on a context of their own (the 2026-10-31 route, and the
+    8-core image a routed slot a core); gm8 leaves one partial a slot for the combine to add"""
+    monkeypatch.setattr(G4, "MOE_DESIGN", design)
+    s = spec_26b()
+    m = manifest(s)
+    for lt in ("dense_local", "dense"):
+        prog = m["layer_types"][lt]["program"]
+        assert prog[2] == {"op": "run", "kernel": "gm_moe", "args": ["pool", "act"]} and prog[3]["moe_parts"] == parts
+    assert m["kernels"]["gm_moe"] == {"context": "gm", "insts": "gm_moe/insts.bin", "patch": "moeroute2", "build": "gm_moe"}
+    b = G4.builds(s)
+    assert set(b) == {"ln", "lm_head_q8", "gm_moe", "dx_q40", "dxg_q40"}
+    assert b["gm_moe"]["design"] == f"gemma4_moe/{design}.py" and b["dx_q40"]["design"] == "dense/dx.py"
+    M = G4.moe_layout(s)
+    assert M.AD_BYTES >= M.AD_MOE + parts * 2816 * 4
+
+
+def test_26b_leaves_the_12b_alone(unvalidated):
+    s = spec()
+    assert G4.sub_spec(s, "local") == G4.replace(s, layer_types=(DENSE_LOCAL,) * 48)
+    assert G4.layout(s, kind="local").POOL_Q == 0
+    assert "gm_moe" not in G4.builds(s) and "moe" not in manifest(s)["layout"]

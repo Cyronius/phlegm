@@ -1,0 +1,777 @@
+diff --git a/src/open_qwen36/CMakeLists.txt b/src/open_qwen36/CMakeLists.txt
+index 7c2e7d4..16a280e 100644
+--- a/src/open_qwen36/CMakeLists.txt
++++ b/src/open_qwen36/CMakeLists.txt
+@@ -41,7 +41,9 @@ target_link_libraries(open_qwen36_cli PRIVATE xrt_coreutil)
+ 
+ add_executable(manifest_test manifest_test.cpp manifest.cpp gguf_file.cpp q4nx_file.cpp)
+ add_executable(gguf_pack_test gguf_pack_test.cpp gguf_file.cpp pools.cpp manifest.cpp q4nx_file.cpp)
+-foreach(t gguf_pack_test)
++# q35_pack_dump (no XRT): the Qwen3.5 / 3.6 MoE GGUF view's packed bytes for open_kernels/model/qwen35moe_gguf_check.py
++add_executable(q35_pack_dump q35_pack_dump.cpp gguf_file.cpp pools.cpp manifest.cpp q4nx_file.cpp)
++foreach(t gguf_pack_test q35_pack_dump)
+     target_include_directories(${t} PRIVATE ${_inc})
+ endforeach()
+ target_include_directories(manifest_test PRIVATE ${_inc})
+@@ -53,6 +55,7 @@ find_package(OpenMP REQUIRED)
+ if(OpenMP_CXX_FOUND)
+     target_link_libraries(vit_test PRIVATE OpenMP::OpenMP_CXX)
+ endif()
++target_link_libraries(q35_pack_dump PRIVATE OpenMP::OpenMP_CXX)
+ 
+ # block_host_test (no XRT): the block prefill's host stages against replica_block.py's fixture
+ add_executable(block_host_test block_host_test.cpp block_host.cpp)
+diff --git a/src/open_qwen36/core.cpp b/src/open_qwen36/core.cpp
+index 379c2aa..7892010 100644
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -728,14 +728,72 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
+                 const GemmBlockProgram& gb = lt.gemm_block;
+                 HostConsts& h = hc_[l];
+                 auto* qf = dynamic_cast<Q4nxFile*>(file_.get());
+-                if (!qf)
+-                    throw std::runtime_error("open_qwen36: GGUF-direct block prefill is not implemented for MoE models");
+-                auto bf = [&](const char* suffix) { return qf->bf16(const_tensor(lt, suffix, l)); };
+                 auto want = [&](const std::vector<float>& v, size_t n, const char* what) {
+                     if (v.size() != n)
+                         throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": " + what + " has " +
+                                                  std::to_string(v.size()) + " values, the route wants " + std::to_string(n));
+                 };
++                if (!qf) {
++                    // A GGUF (recipes/qwen36moe.py gguf_view): the host stages read the consts bytes the
++                    // q35_* ops just packed -- the same bf16 / f32 values, in the container's layout, the
++                    // decode kernels read -- so the two routes cannot disagree on a weight.
++                    auto cop = [&](const std::string& suffix) -> const PackOp& {
++                        for (const PackOp& op : lt.consts) {
++                            const std::string& t = op.tensor;
++                            if (t.size() >= suffix.size() && t.compare(t.size() - suffix.size(), suffix.size(), suffix) == 0)
++                                return op;
++                        }
++                        throw std::runtime_error("open_qwen36: layer type " + lt.name + " has no consts tensor ending in " + suffix);
++                    };
++                    auto cvals = [&](const std::string& suffix, size_t n, size_t elem) {
++                        const PackOp& op = cop(suffix);
++                        if (op.dst + n * elem > lt.consts_bytes)
++                            throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": " + suffix + " runs past the consts");
++                        std::vector<float> v(n);
++                        for (size_t i = 0; i < n; ++i) {
++                            if (elem == 4) {
++                                std::memcpy(&v[i], c_host + op.dst + 4 * i, 4);
++                            } else {
++                                uint16_t b;
++                                std::memcpy(&b, c_host + op.dst + 2 * i, 2);
++                                const uint32_t u = static_cast<uint32_t>(b) << 16;
++                                std::memcpy(&v[i], &u, 4);
++                            }
++                        }
++                        return v;
++                    };
++                    const size_t hid = w_->hidden;
++                    h.ln = cvals("attn_norm.weight", hid, 2);
++                    h.postln = cvals("post_attention_norm.weight", hid, 2);
++                    if (!gb.has_dense_ffn()) {
++                        h.router = cvals("ffn_gate_inp.weight", hid * w_->moe.experts, 2);
++                        h.sgw = cvals("ffn_gate_inp_shexp.weight", hid, 2);
++                    }
++                    if (gb.kind == "linear") {
++                        const PackOp& a = cop("ssm_alpha.weight");
++                        h.lanes = a.dst_rows ? a.dst_rows : a.rows;
++                        h.Wa = cvals("ssm_alpha.weight", hid * h.lanes, 2);
++                        h.Wb = cvals("ssm_beta.weight", hid * h.lanes, 2);
++                        h.A = cvals("ssm_a", gb.value_heads, 4);
++                        h.dtb = cvals("ssm_dt.bias", gb.value_heads, 4);
++                        h.nw = cvals("ssm_norm.weight", gb.head_dim, 2);
++                        // q35_conv stores conv_transpose's banks ([group][tap][width]); the host wants [tap][channel]
++                        const PackOp& cv = cop("ssm_conv1d.weight");
++                        const std::vector<float> banked = cvals("ssm_conv1d.weight", cv.taps * cv.groups * cv.width, 2);
++                        if (cv.groups * cv.width != gb.qkv_dim || cv.taps != gb.conv_kernel)
++                            throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": the conv consts are not [" +
++                                                     std::to_string(gb.conv_kernel) + ", " + std::to_string(gb.qkv_dim) + "]");
++                        h.convw.assign(cv.taps * gb.qkv_dim, 0.f);
++                        for (size_t g = 0; g < cv.groups; ++g)
++                            for (size_t k = 0; k < cv.taps; ++k)
++                                for (size_t i = 0; i < cv.width; ++i)
++                                    h.convw[k * gb.qkv_dim + g * cv.width + i] = banked[(g * cv.taps + k) * cv.width + i];
++                    } else {
++                        h.qn = cvals("attn_q_norm.weight", gb.hd, 2);
++                        h.kn = cvals("attn_k_norm.weight", gb.hd, 2);
++                    }
++                } else {
++                auto bf = [&](const char* suffix) { return qf->bf16(const_tensor(lt, suffix, l)); };
+                 h.ln = bf("input_layernorm.weight");
+                 h.postln = bf("post_attention_layernorm.weight");
+                 want(h.ln, w_->hidden, "input_layernorm");
+@@ -789,6 +847,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
+                     want(h.qn, gb.hd, "q_norm");
+                     want(h.kn, gb.hd, "k_norm");
+                 }
++                }
+             }
+         }
+         c.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+@@ -2362,7 +2421,7 @@ std::pair<size_t, size_t> Core::op_region(const LayerType& lt, const std::string
+     const PackOp& op = ops[idx];
+     // the GEMM dequantises the q4_1 band law, which is what std_perm writes; a q8_perm
+     // projection has no route (the recipe does not emit one) and is refused here too
+-    if (op.op != "std_perm" && op.op != "std_perm_gguf")
++    if (op.op != "std_perm" && op.op != "std_perm_gguf" && op.op != "q35_mat")
+         throw std::runtime_error("open_qwen36: op_region: " + from + " op " + std::to_string(idx) + " is a " + op.op +
+                                  ", not a band-law projection the GEMM reads");
+     return {static_cast<size_t>(op.dst), static_cast<size_t>(op.nch) * w_->chunk_bytes};
+diff --git a/src/open_qwen36/gguf_file.cpp b/src/open_qwen36/gguf_file.cpp
+index a1b8aea..4310edf 100644
+--- a/src/open_qwen36/gguf_file.cpp
++++ b/src/open_qwen36/gguf_file.cpp
+@@ -84,6 +84,7 @@ uint64_t gguf_type_bytes(uint32_t t, uint64_t values) {
+         case 1: case 30: return values * 2;               // f16 / bf16
+         case 2: return values / 32 * 18;                  // q4_0
+         case 3: return values / 32 * 20;                  // q4_1
++        case 6: return values / 32 * 22;                  // q5_0 (the qwen35moe GGUF view's shared experts)
+         case 8: return values / 32 * 34;                  // q8_0
+         case 12: return values / 256 * 144;               // q4_k
+         case 14: return values / 256 * 210;               // q6_k
+diff --git a/src/open_qwen36/manifest.cpp b/src/open_qwen36/manifest.cpp
+index 4caa88c..398aff3 100644
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -66,6 +66,18 @@ PackOp parse_op(const json& j, const std::string& where) {
+     p.row0 = j.value("row0", 0ull);
+     p.n_total = j.value("n_total", 0ull);
+     p.div_running = j.value("div_running", "");
++    p.period = j.value("period", 0ull);
++    p.take = j.value("take", 0ull);
++    p.offset = j.value("offset", 0ull);
++    p.kheads = j.value("kheads", 0ull);
++    p.vperk = j.value("vperk", 0ull);
++    p.vdim = j.value("vdim", 0ull);
++    p.v0 = j.value("v0", 0ull);
++    p.vaxis = j.value("vaxis", 0ull);
++    if (p.take && (p.period < p.take || p.offset + p.take > p.period))
++        fail(where, p.op + " " + p.tensor + ": take / offset do not fit the period");
++    if (p.kheads && (!p.vperk || !p.vdim || p.vaxis > 1))
++        fail(where, p.op + " " + p.tensor + ": a value-head untile needs vperk, vdim and vaxis 0 / 1");
+     if (!p.div_running.empty() && (p.op != "put" || p.div_running.find("{j}") == std::string::npos))
+         fail(where, p.op + " " + p.tensor + ": div_running names a per-layer {j} tensor, on a put");
+     if (!p.via.empty() && (p.op != "bf16_gemm" || p.via != "q4_1"))
+@@ -81,9 +93,10 @@ PackOp parse_op(const json& j, const std::string& where) {
+     if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm" || p.op == "bfp16_gemm" ||
+         p.op == "put" || p.op == "expert_down" || p.op == "conv_transpose" || p.op == "lmhead_q8" ||
+         p.op == "transpose" || p.op == "transpose_banked" || p.op == "gx_q8" || p.op == "gx_down" ||
+-        p.op == "gx_lmhead") {
++        p.op == "gx_lmhead" || p.op == "q35_mat" || p.op == "q35_down" || p.op == "q35_lmhead" || p.op == "q35_t" ||
++        p.op == "q35_vec" || p.op == "q35_conv") {
+         if (p.tensor.empty()) fail(where, p.op + " without a tensor");
+-    } else if (p.op == "expert_stripes" || p.op == "gx_ug") {
++    } else if (p.op == "expert_stripes" || p.op == "gx_ug" || p.op == "q35_stripes") {
+         if (p.up.empty() || p.gate.empty()) fail(where, p.op + " without up / gate");
+     } else {
+         fail(where, "unknown pack op '" + p.op + "'");
+@@ -100,6 +113,13 @@ PackOp parse_op(const json& j, const std::string& where) {
+     else if (p.op == "lmhead_q8") need_all({{"chunk_bytes", p.chunk_bytes}, {"in_dim", p.in_dim}});
+     else if (p.op == "conv_transpose") need_all({{"taps", p.taps}, {"groups", p.groups}, {"width", p.width}});
+     else if (p.op == "gx_q8" || p.op == "gx_lmhead") need_all({{"rows", p.rows}, {"in_dim", p.in_dim}});
++    else if (p.op == "q35_mat") need_all({{"nch", p.nch}, {"in_dim", p.in_dim}});
++    else if (p.op == "q35_stripes") need_all({{"stripe_bytes", p.stripe_bytes}, {"stripes", p.stripes}, {"experts", p.experts}});
++    else if (p.op == "q35_down") need_all({{"expert_bytes", p.expert_bytes}, {"experts", p.experts}});
++    else if (p.op == "q35_lmhead") need_all({{"in_dim", p.in_dim}});
++    else if (p.op == "q35_t") need_all({{"rows", p.rows}, {"cols", p.cols}});
++    else if (p.op == "q35_vec") need_all({{"cap", p.cap}, {"elem", p.elem}});
++    else if (p.op == "q35_conv") need_all({{"taps", p.taps}, {"groups", p.groups}, {"width", p.width}});
+     else if (p.op == "gx_ug" || p.op == "gx_down")
+         need_all({{"experts", p.experts}, {"rows", p.rows}, {"in_dim", p.in_dim}, {"expert_bytes", p.expert_bytes}});
+     return p;
+diff --git a/src/open_qwen36/manifest.hpp b/src/open_qwen36/manifest.hpp
+index 6bbd0d8..6bb5750 100644
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -25,7 +25,7 @@ namespace open_qwen36 {
+ /// One packing-plan op: which tensor lands at which byte offset in which
+ /// chunk order (open_kernels/recipes/pack.py is the same interpreter in NumPy).
+ struct PackOp {
+-    std::string op;                          ///< std_perm | std_perm_gguf | std_fuse | q8_perm | expert_stripes | expert_down | put | conv_transpose | lmhead_q8 | transpose | transpose_banked | gx_q8 | gx_ug | gx_down | gx_lmhead
++    std::string op;                          ///< std_perm | std_perm_gguf | std_fuse | q8_perm | expert_stripes | expert_down | put | conv_transpose | lmhead_q8 | transpose | transpose_banked | gx_q8 | gx_ug | gx_down | gx_lmhead | q35_mat | q35_stripes | q35_down | q35_lmhead | q35_t | q35_vec | q35_conv
+     std::string tensor, up, gate;            ///< tensor names; "{l}" stands for the layer index
+     /// gx_q8 / gx_ug (GPT-OSS, OPEN-FAMILY-GPTOSS): the per-row f32 bias that rides in each
+     /// k-tile-0 half-tile's pad (gemv_q8.h GEMV_Q8_PAD_BIAS); "" = none
+@@ -53,6 +53,11 @@ struct PackOp {
+                                                                         ///< over the layers BEFORE this one, of this
+                                                                         ///< one-value tensor ("{j}" = that layer) --
+                                                                         ///< Gemma 4's layer_output_scale, folded
++    /// q35_* (Qwen3.5 / 3.6 MoE from a llama.cpp GGUF, pools.cpp): pool row r reads source row
++    /// (r / take) * period + offset + r % take (take 0 = r), then value heads untiled from
++    /// element v0 on axis vaxis (0 rows, 1 columns): kheads x vperk heads of vdim, GGUF head
++    /// j * kheads + k is the kernels' k * vperk + j (kheads 0 = no untile)
++    uint64_t period = 0, take = 0, offset = 0, kheads = 0, vperk = 0, vdim = 0, v0 = 0, vaxis = 0;
+     uint64_t dst_rows = 0;                                              ///< transpose: pad the
+                                                                         ///< destination row to this
+                                                                         ///< many values, tail zeroed
+diff --git a/src/open_qwen36/pools.cpp b/src/open_qwen36/pools.cpp
+index 53e67a2..b46b91d 100644
+--- a/src/open_qwen36/pools.cpp
++++ b/src/open_qwen36/pools.cpp
+@@ -493,6 +493,352 @@ std::vector<float> gx_bias(const WeightFile& m, const std::string& name, size_t
+ }
+ }  // namespace
+ 
++// ---- Qwen3.5 / 3.6 MoE straight from a llama.cpp GGUF (OPEN-FAMILY-QWEN36MOE, recipes/qwen36moe.py
++// gguf_view): the q35_* pack ops write the SAME pool / consts bytes the q4nx container's ops write,
++// in the q4_1 chunk law (5120 B: bf16 d[256], bf16 m[256], codes), from the GGUF's own blocks.
++//
++//   exact  Q4_0 (d, m = -8 d), Q4_1 (d, m), Q4_K (d * sc, -dmin * mn per 32-block): the codes are
++//          the GGUF's, the scale pair RNE-rounded to bf16 -- the value the f32-scale kernels narrow
++//          it to on the core (gemv_q4.h load_scale), so nothing here is a new rounding of the model
++//   requant Q8_0 / Q5_0 / Q6_K / F32 / F16 / BF16 blocks: dequantized, then the q4_1 law with the
++//          directed bf16 roundings requant_q4_1_chunks uses (the range covers the block)
++//
++// llama.cpp's conversion (conversion/qwen.py) differs from the HF / q4nx order in two ways the
++// maps below undo: the full-attention q_proj rows stay interleaved per head ([q_h | gate_h], the
++// container holds [all q | all gate]), and the linear-attention value heads are TILED
++// (head j * kheads + k) where HF / the kernels group them (head k * vperk + j): the qkv V rows,
++// z rows, alpha / beta rows, A / dt elements, conv V channels and ssm_out columns. Norm weights
++// carry the +1 in both; A is -exp(A_log) in both; conv1d is [channels, taps] here, [taps,
++// channels] in the container.
++namespace {
++struct Q35Map {
++    // rows: source row of pool row r. period / take / offset: r -> (r / take) * period + offset + r % take
++    uint64_t period = 0, take = 0, offset = 0;
++    // value-head untile on the op's axis, from element v0: kheads x vperk heads of vdim
++    uint64_t kheads = 0, vperk = 0, vdim = 0, v0 = 0;
++    size_t operator()(size_t i) const {
++        size_t s = i;
++        if (take) s = (i / take) * period + offset + i % take;
++        if (kheads && s >= v0) {
++            const size_t rel = s - v0, h = rel / vdim, k = h / vperk, j = h % vperk;
++            s = v0 + (j * kheads + k) * vdim + rel % vdim;
++        }
++        return s;
++    }
++};
++
++Q35Map q35_map(const PackOp& op, bool rows_axis) {
++    Q35Map m;
++    if (rows_axis) {
++        m.period = op.period;
++        m.take = op.take;
++        m.offset = op.offset;
++    }
++    if (op.kheads && (op.vaxis == 1) != rows_axis) {
++        m.kheads = op.kheads;
++        m.vperk = op.vperk;
++        m.vdim = op.vdim;
++        m.v0 = op.v0;
++    }
++    return m;
++}
++
++void q35_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
++    if (j < 4) {
++        *d = q[j] & 63;
++        *m = q[j + 4] & 63;
++    } else {
++        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
++        *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
++    }
++}
++
++/// Bytes per block and values per block of the GGUF types the q35 ops read.
++void q35_type(GgufFile::Type t, size_t* bb, size_t* bv, const std::string& name) {
++    switch (t) {
++        case GgufFile::Type::Q4_0: *bb = 18; *bv = 32; return;
++        case GgufFile::Type::Q4_1: *bb = 20; *bv = 32; return;
++        case GgufFile::Type::Q5_0: *bb = 22; *bv = 32; return;
++        case GgufFile::Type::Q8_0: *bb = 34; *bv = 32; return;
++        case GgufFile::Type::Q4_K: *bb = 144; *bv = 256; return;
++        case GgufFile::Type::Q6_K: *bb = 210; *bv = 256; return;
++        case GgufFile::Type::F32: *bb = 4; *bv = 1; return;
++        case GgufFile::Type::F16: *bb = 2; *bv = 1; return;
++        case GgufFile::Type::BF16: *bb = 2; *bv = 1; return;
++        default:
++            fail(name + " is " + GgufFile::type_name(t) + "; the q35 ops read Q4_0/Q4_1/Q4_K exactly and "
++                 "requantize Q5_0/Q8_0/Q6_K/F32/F16/BF16");
++    }
++}
++
++/// One 32-value block (block `kb` of a row starting at `row`) as the q4_1 law: `exact` when the
++/// GGUF block is itself d * q + m with 4-bit q, else its f32 values in `v`.
++struct Q35Block {
++    bool exact = false;
++    float d = 0.f, m = 0.f;
++    uint8_t q[32];
++    float v[32];
++};
++
++void q35_block(GgufFile::Type t, const uint8_t* row, size_t kb, Q35Block& o) {
++    switch (t) {
++        case GgufFile::Type::Q4_0: {
++            const uint8_t* b = row + kb * 18;
++            uint16_t h;
++            std::memcpy(&h, b, 2);
++            o.exact = true;
++            o.d = fp16_to_f32(h);
++            o.m = -8.f * o.d;
++            for (int i = 0; i < 16; ++i) {
++                o.q[i] = b[2 + i] & 15;
++                o.q[i + 16] = b[2 + i] >> 4;
++            }
++            return;
++        }
++        case GgufFile::Type::Q4_1: {
++            const uint8_t* b = row + kb * 20;
++            uint16_t h, mh;
++            std::memcpy(&h, b, 2);
++            std::memcpy(&mh, b + 2, 2);
++            o.exact = true;
++            o.d = fp16_to_f32(h);
++            o.m = fp16_to_f32(mh);
++            for (int i = 0; i < 16; ++i) {
++                o.q[i] = b[4 + i] & 15;
++                o.q[i + 16] = b[4 + i] >> 4;
++            }
++            return;
++        }
++        case GgufFile::Type::Q4_K: {
++            // 256-value super-block: fp16 d, fp16 dmin, 12 B of 6-bit (scale, min) pairs, 128 B of
++            // nibbles -- sub-block j's value l is nibble (j % 2) of qs[(j / 2) * 32 + l]
++            const uint8_t* b = row + (kb / 8) * 144;
++            const int j = static_cast<int>(kb % 8);
++            uint16_t h, mh;
++            std::memcpy(&h, b, 2);
++            std::memcpy(&mh, b + 2, 2);
++            uint8_t sc, mn;
++            q35_scale_min_k4(j, b + 4, &sc, &mn);
++            o.exact = true;
++            o.d = fp16_to_f32(h) * sc;            // exact in f32: an fp16 times a 6-bit integer
++            o.m = -fp16_to_f32(mh) * mn;
++            const uint8_t* qs = b + 16 + (j / 2) * 32;
++            for (int l = 0; l < 32; ++l) o.q[l] = (qs[l] >> (4 * (j % 2))) & 15;
++            return;
++        }
++        case GgufFile::Type::Q5_0: {
++            const uint8_t* b = row + kb * 22;
++            uint16_t h;
++            uint32_t qh;
++            std::memcpy(&h, b, 2);
++            std::memcpy(&qh, b + 2, 4);
++            const float d = fp16_to_f32(h);
++            o.exact = false;
++            for (int i = 0; i < 16; ++i) {
++                const int x0 = ((b[6 + i] & 15) | (((qh >> i) << 4) & 0x10)) - 16;
++                const int x1 = ((b[6 + i] >> 4) | ((qh >> (i + 12)) & 0x10)) - 16;
++                o.v[i] = d * x0;
++                o.v[i + 16] = d * x1;
++            }
++            return;
++        }
++        case GgufFile::Type::Q8_0: {
++            const uint8_t* b = row + kb * 34;
++            uint16_t h;
++            std::memcpy(&h, b, 2);
++            const float d = fp16_to_f32(h);
++            o.exact = false;
++            for (int i = 0; i < 32; ++i) o.v[i] = d * static_cast<int8_t>(b[2 + i]);
++            return;
++        }
++        case GgufFile::Type::Q6_K: {
++            // llama.cpp dequantize_row_q6_K, only the 32 values of sub-block kb % 8
++            const uint8_t* b = row + (kb / 8) * 210;
++            uint16_t h;
++            std::memcpy(&h, b + 208, 2);
++            const float d = fp16_to_f32(h);
++            const int j = static_cast<int>(kb % 8), n = j / 4, quarter = j % 4;   // 128-value half, 32-value part
++            const uint8_t* ql = b + 64 * n;
++            const uint8_t* qh = b + 128 + 32 * n;
++            const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192) + 8 * n;
++            o.exact = false;
++            for (int l = 0; l < 32; ++l) {
++                const int is = l / 16;
++                int q;
++                switch (quarter) {
++                    case 0: q = (ql[l] & 15) | (((qh[l] >> 0) & 3) << 4); break;
++                    case 1: q = (ql[l + 32] & 15) | (((qh[l] >> 2) & 3) << 4); break;
++                    case 2: q = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4); break;
++                    default: q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4); break;
++                }
++                o.v[l] = d * sc[is + 2 * quarter] * (q - 32);
++            }
++            return;
++        }
++        case GgufFile::Type::F32: {
++            o.exact = false;
++            std::memcpy(o.v, row + kb * 128, 128);
++            return;
++        }
++        case GgufFile::Type::F16:
++        case GgufFile::Type::BF16: {
++            o.exact = false;
++            for (int i = 0; i < 32; ++i) {
++                uint16_t u;
++                std::memcpy(&u, row + (kb * 32 + i) * 2, 2);
++                o.v[i] = t == GgufFile::Type::F16 ? fp16_to_f32(u) : bf16_to_f32(u);
++            }
++            return;
++        }
++        default:
++            fail(std::string("q35_block: ") + GgufFile::type_name(t));
++    }
++}
++
++/// One value (row-relative column `c`) of a GGUF row, any q35 type, as f32.
++float q35_value(GgufFile::Type t, const uint8_t* row, size_t c) {
++    if (t == GgufFile::Type::F32) {
++        float f;
++        std::memcpy(&f, row + 4 * c, 4);
++        return f;
++    }
++    if (t == GgufFile::Type::F16 || t == GgufFile::Type::BF16) {
++        uint16_t u;
++        std::memcpy(&u, row + 2 * c, 2);
++        return t == GgufFile::Type::F16 ? fp16_to_f32(u) : bf16_to_f32(u);
++    }
++    Q35Block b;
++    q35_block(t, row, c / 32, b);
++    return b.exact ? b.d * b.q[c % 32] + b.m : b.v[c % 32];
++}
++
++/// Write one block into a q4_1-law chunk at (row r of 32, block kb of 8).
++void q35_put(const Q35Block& b, unsigned r, unsigned kb, uint8_t* chunk) {
++    const unsigned meta = kb * 32 + r;
++    uint16_t du, mu;
++    uint8_t q[32];
++    if (b.exact) {
++        du = bf16_rne(b.d);
++        mu = bf16_rne(b.m);
++        std::memcpy(q, b.q, 32);
++    } else {
++        float mn = b.v[0], mx = b.v[0];
++        for (int i = 1; i < 32; ++i) {
++            mn = std::min(mn, b.v[i]);
++            mx = std::max(mx, b.v[i]);
++        }
++        mu = bf16_floor(mn);
++        const float mf = bf16_to_f32(mu);
++        du = bf16_ceil((mx - mf) / 15.0f);
++        const float d = bf16_to_f32(du), inv = d > 0.f ? 1.f / d : 0.f;
++        for (int i = 0; i < 32; ++i) {
++            int v = static_cast<int>((b.v[i] - mf) * inv + 0.5f);
++            q[i] = static_cast<uint8_t>(v < 0 ? 0 : v > 15 ? 15 : v);
++        }
++    }
++    std::memcpy(chunk + 2 * meta, &du, 2);
++    std::memcpy(chunk + 512 + 2 * meta, &mu, 2);
++    for (unsigned i = 0; i < 32; ++i) {
++        const unsigned p = code_index(r, kb, i);
++        chunk[1024 + (p >> 1)] |= static_cast<uint8_t>(q[i] << (4 * (p & 1)));
++    }
++}
++
++/// A GGUF tensor the q35 ops read: its type, block geometry, [experts,] rows, cols.
++struct Q35Tensor {
++    const uint8_t* base = nullptr;
++    GgufFile::Type type = GgufFile::Type::F32;
++    size_t rows = 0, cols = 0, experts = 1, row_bytes = 0;
++    const uint8_t* row(size_t e, size_t r) const { return base + (e * rows + r) * row_bytes; }
++};
++
++Q35Tensor q35_tensor(const WeightFile& m, const std::string& name, size_t experts) {
++    const auto* g = dynamic_cast<const GgufFile*>(&m);
++    if (!g) fail(name + ": the q35 ops read a GGUF");
++    const auto& t = g->tensor(name);
++    Q35Tensor q;
++    q.type = t.type;
++    q.cols = t.dims.at(0);
++    q.rows = t.dims.size() >= 2 ? t.dims[1] : 1;
++    q.experts = t.dims.size() >= 3 ? t.dims[2] : 1;
++    if (experts && (t.dims.size() != 3 || q.experts != experts))
++        fail(name + ": not an [" + std::to_string(experts) + ", rows, cols] expert tensor");
++    size_t bb, bv;
++    q35_type(t.type, &bb, &bv, name);
++    if (q.cols % bv || (bv > 1 && q.cols % 32)) fail(name + ": " + std::to_string(q.cols) + " columns is not whole blocks");
++    q.row_bytes = q.cols / bv * bb;
++    q.base = raw(m, name, q.row_bytes * q.rows * q.experts);
++    return q;
++}
++
++/// Chunk (rows row0.. +32 of the pool's matrix, columns 256 * kt..) of tensor `t` (expert e)
++/// through the row / column maps; rows / columns past `rows_lim` / `cols_lim` stay zero.
++void q35_chunk(const Q35Tensor& t, size_t e, const Q35Map& rmap, const Q35Map& cmap, size_t row0, size_t kt,
++               size_t rows_lim, size_t cols_lim, uint8_t* chunk) {
++    std::memset(chunk, 0, Q4_CHUNK);
++    Q35Block b;
++    for (unsigned r = 0; r < 32; ++r) {
++        if (row0 + r >= rows_lim) break;
++        const size_t sr = rmap(row0 + r);
++        if (sr >= t.rows) fail("q35 chunk: source row " + std::to_string(sr) + " past " + std::to_string(t.rows));
++        const uint8_t* row = t.row(e, sr);
++        for (unsigned kb = 0; kb < 8; ++kb) {
++            const size_t col = 256 * kt + 32 * kb;
++            if (col >= cols_lim) break;
++            const size_t sc = cmap(col);
++            if (sc % 32 || sc >= t.cols) fail("q35 chunk: source column block " + std::to_string(sc));
++            q35_block(t.type, row, sc / 32, b);
++            q35_put(b, r, kb, chunk);
++        }
++    }
++}
++
++/// Every value a q35 small-tensor op writes, in the container's layout (q35_t: [cols][dst_rows];
++/// q35_vec: [cap / elem]; q35_conv: [taps][channels]), before the bf16 / f32 store.
++std::vector<float> q35_values(const PackOp& op, const WeightFile& m, int layer) {
++    const std::string name = with_layer(op.tensor, layer);
++    const Q35Tensor t = q35_tensor(m, name, 0);
++    const Q35Map rmap = q35_map(op, true);
++    std::vector<float> out;
++    if (op.op == "q35_t") {
++        // a [rows, cols] GGUF matrix stored [cols][dst_rows]: the alpha / beta projections, the router
++        if (t.rows != op.rows || t.cols != op.cols)
++            fail("q35_t " + name + " is [" + std::to_string(t.rows) + ", " + std::to_string(t.cols) + "], the plan says [" +
++                 std::to_string(op.rows) + ", " + std::to_string(op.cols) + "]");
++        const size_t dr = op.dst_rows ? op.dst_rows : op.rows;
++        out.assign(op.cols * dr, 0.f);
++#pragma omp parallel for
++        for (long long rr = 0; rr < static_cast<long long>(op.rows); ++rr) {
++            const size_t r = static_cast<size_t>(rr);
++            const uint8_t* row = t.row(0, rmap(r));
++            for (size_t c = 0; c < op.cols; ++c) out[c * dr + r] = q35_value(t.type, row, c);
++        }
++    } else if (op.op == "q35_vec") {
++        const size_t n = t.cols * t.rows, slots = op.cap / op.elem;
++        if (n > slots) fail("q35_vec " + name + " has " + std::to_string(n) + " values, its slot " + std::to_string(slots));
++        out.assign(n, 0.f);
++        for (size_t i = 0; i < n; ++i) {
++            const size_t s = rmap(i);
++            out[i] = q35_value(t.type, t.row(0, s / t.cols), s % t.cols);
++        }
++    } else if (op.op == "q35_conv") {
++        // GGUF [channels, taps] -> [taps][channels], the V channels untiled
++        const size_t ch = op.groups * op.width;
++        if (t.rows != ch || t.cols != op.taps)
++            fail("q35_conv " + name + " is [" + std::to_string(t.rows) + ", " + std::to_string(t.cols) + "], the plan says [" +
++                 std::to_string(ch) + ", " + std::to_string(op.taps) + "]");
++        out.assign(op.taps * ch, 0.f);
++        for (size_t c = 0; c < ch; ++c) {
++            const uint8_t* row = t.row(0, rmap(c));
++            for (size_t k = 0; k < op.taps; ++k) out[k * ch + c] = q35_value(t.type, row, k);
++        }
++    } else {
++        fail("q35_values: " + op.op);
++    }
++    return out;
++}
++}  // namespace
++
+ uint64_t op_bytes(const PackOp& op, size_t chunk_bytes) {
+     if (op.op == "bfp16_gemm") return op.n_total * op.in_dim / 8 * BFP16_BLOCK_BYTES;
+     return op.op == "bf16_gemm" ? op.nch * 2 * 8192 : op.nch * chunk_bytes;
+@@ -1111,6 +1457,142 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+                     }
+                 }
+         }
++    } else if (op.op == "q35_mat") {
++        // a GGUF [out, in] matrix into std_perm's band order, through the q / gate and value-head maps
++        const std::string name = with_layer(op.tensor, layer);
++        if (ch != Q4_CHUNK) fail("q35_mat " + name + ": the q35 ops write the q4_1 law (5120-B chunks), the pool's is " +
++                                 std::to_string(ch));
++        if (op.nch == 0 || op.in_dim == 0) fail("q35_mat " + name + " without nch / in_dim");
++        const Q35Tensor t = q35_tensor(m, name, 0);
++        const size_t ncol = op.in_dim / 256, out_dim = op.nch / ncol * 32;
++        const Q35Map rmap = q35_map(op, true), cmap = q35_map(op, false);
++        if (t.cols != op.in_dim) fail("q35_mat " + name + " has " + std::to_string(t.cols) + " columns, the plan " +
++                                      std::to_string(op.in_dim));
++        bounds(op, op.nch * ch, dst_bytes);
++        const auto perm = std_perm(op.nch, op.in_dim);
++#pragma omp parallel for schedule(dynamic)
++        for (long long cc = 0; cc < static_cast<long long>(op.nch); ++cc) {
++            const size_t c = static_cast<size_t>(cc);
++            q35_chunk(t, 0, rmap, cmap, 32 * (perm[c] / ncol), perm[c] % ncol, out_dim, op.in_dim,
++                      dst + op.dst + c * ch);
++        }
++    } else if (op.op == "q35_stripes" || op.op == "q35_down") {
++        // the routed experts, GGUF [E, rows, cols], in expert_stripes' / expert_down's chunk orders:
++        // stripes  per expert 2 * stripes stripes of [up_k | gate_k], stripe chunk c = rows
++        //          128 k + 32 (c % 4), k-tile c / 4
++        // down     per expert, chunk c = rows 128 (c / (4 ncol)) + 32 (c % 4), k-tile (c / 4) % ncol
++        const bool ug = op.op == "q35_stripes";
++        const std::string un = with_layer(ug ? op.up : op.tensor, layer);
++        if (ch != Q4_CHUNK) fail(op.op + " " + un + ": the q35 ops write the q4_1 law (5120-B chunks)");
++        const uint64_t E = op.experts;
++        const Q35Tensor u = q35_tensor(m, un, E);
++        Q35Tensor g;
++        if (ug) {
++            g = q35_tensor(m, with_layer(op.gate, layer), E);
++            if (g.rows != u.rows || g.cols != u.cols) fail(op.op + ": " + un + " and its gate differ in shape");
++        }
++        const size_t ncol = u.cols / 256;
++        if (u.cols % 256 || u.rows % 128) fail(op.op + " " + un + ": [" + std::to_string(u.rows) + ", " +
++                                                std::to_string(u.cols) + "] is not whole 128-row x 256-column tiles");
++        const uint64_t ns = ug ? op.stripes : 0, S = op.stripe_bytes;
++        const size_t per = ug ? 2 * ns * S : op.expert_bytes;
++        if (ug && (!ns || ns * 128 != u.rows || S != 4 * ncol * ch))
++            fail(op.op + " " + un + ": " + std::to_string(ns) + " stripes of " + std::to_string(S) + " B do not tile [" +
++                 std::to_string(u.rows) + ", " + std::to_string(u.cols) + "]");
++        if (!ug && per != u.rows * u.cols / 8192 * ch)
++            fail(op.op + " " + un + ": expert_bytes " + std::to_string(per) + " is not the expert's chunks");
++        bounds(op, E * per, dst_bytes);
++        const Q35Map id;
++        const size_t nchs = per / ch;
++#pragma omp parallel for schedule(dynamic)
++        for (long long ee = 0; ee < static_cast<long long>(E); ++ee) {
++            const size_t e = static_cast<size_t>(ee);
++            uint8_t* d = dst + op.dst + e * per;
++            for (size_t c = 0; c < nchs; ++c) {
++                if (ug) {
++                    const size_t sc = c % (2 * 4 * ncol), k = c / (2 * 4 * ncol), half = sc / (4 * ncol), cin = sc % (4 * ncol);
++                    q35_chunk(half ? g : u, e, id, id, 128 * k + 32 * (cin % 4), cin / 4, u.rows, u.cols, d + c * ch);
++                } else {
++                    q35_chunk(u, e, id, id, 128 * (c / (4 * ncol)) + 32 * (c % 4), (c / 4) % ncol, u.rows, u.cols,
++                              d + c * ch);
++                }
++            }
++        }
++    } else if (op.op == "q35_lmhead") {
++        // the head, [vocab, hidden] -> lm_head_q8's 8704-B chunks (bf16 scale[kb*32 + r], then int8
++        // code_index(r, kb, i)) in the 128-row supertile order lmhead_q8 writes. A Q8_0 block keeps its
++        // codes (scale RNE to bf16); anything else is requantized per 32-block, scale = bf16_ceil(amax/127)
++        const std::string name = with_layer(op.tensor, layer);
++        const Q35Tensor t = q35_tensor(m, name, 0);
++        if (t.cols != op.in_dim || op.in_dim % 256 || t.rows % 128)
++            fail("q35_lmhead " + name + ": [" + std::to_string(t.rows) + ", " + std::to_string(t.cols) + "] vs in_dim " +
++                 std::to_string(op.in_dim));
++        const size_t nk = op.in_dim / 256, per_band = 4 * nk, nch = t.rows / 32 * nk;
++        bounds(op, nch * Q8_CHUNK, dst_bytes);
++#pragma omp parallel for schedule(dynamic)
++        for (long long kk = 0; kk < static_cast<long long>(nch); ++kk) {
++            const size_t k = static_cast<size_t>(kk), s = k / per_band, rr = k % per_band;
++            const size_t rb = 4 * s + rr % 4, kt = rr / 4;
++            uint8_t* c = dst + op.dst + k * Q8_CHUNK;
++            Q35Block b;
++            for (unsigned r = 0; r < 32; ++r) {
++                const uint8_t* row = t.row(0, 32 * rb + r);
++                for (unsigned kb = 0; kb < 8; ++kb) {
++                    const size_t blk = kt * 8 + kb;
++                    uint16_t su;
++                    int8_t q[32];
++                    if (t.type == GgufFile::Type::Q8_0) {
++                        const uint8_t* B = row + blk * 34;
++                        uint16_t h;
++                        std::memcpy(&h, B, 2);
++                        su = bf16_rne(fp16_to_f32(h));
++                        std::memcpy(q, B + 2, 32);
++                    } else {
++                        q35_block(t.type, row, blk, b);
++                        float v[32], amax = 0.f;
++                        for (int i = 0; i < 32; ++i) {
++                            v[i] = b.exact ? b.d * b.q[i] + b.m : b.v[i];
++                            amax = std::max(amax, std::fabs(v[i]));
++                        }
++                        su = bf16_ceil(amax / 127.f);
++                        const float sf = bf16_to_f32(su), inv = sf > 0.f ? 1.f / sf : 0.f;
++                        for (int i = 0; i < 32; ++i) {
++                            const long qi = std::lround(v[i] * inv);
++                            q[i] = static_cast<int8_t>(qi < -127 ? -127 : qi > 127 ? 127 : qi);
++                        }
++                    }
++                    std::memcpy(c + 2 * (kb * 32 + r), &su, 2);
++                    for (unsigned i = 0; i < 32; ++i) c[512 + code_index(r, kb, i)] = static_cast<uint8_t>(q[i]);
++                }
++            }
++        }
++    } else if (op.op == "q35_t" || op.op == "q35_vec" || op.op == "q35_conv") {
++        // the small consts: bf16 (q35_t, q35_conv, q35_vec elem 2) or f32 (q35_vec elem 4)
++        const std::vector<float> v = q35_values(op, m, layer);
++        const size_t elem = op.op == "q35_vec" ? op.elem : 2;
++        if (elem != 2 && elem != 4) fail(op.op + " " + op.tensor + ": elem " + std::to_string(elem));
++        size_t n = v.size();
++        if (op.op == "q35_conv") {
++            // conv_transpose's banked layout: per group g of `width` channels, `taps` rows
++            bounds(op, n * 2, dst_bytes);
++            const size_t ch = op.groups * op.width;
++            for (uint64_t gg = 0; gg < op.groups; ++gg)
++                for (uint64_t k = 0; k < op.taps; ++k)
++                    for (uint64_t i = 0; i < op.width; ++i) {
++                        const uint16_t b = f32_to_bf16(v[k * ch + gg * op.width + i]);
++                        std::memcpy(dst + op.dst + ((gg * op.taps + k) * op.width + i) * 2, &b, 2);
++                    }
++        } else {
++            bounds(op, n * elem, dst_bytes);
++            for (size_t i = 0; i < n; ++i) {
++                if (elem == 4) {
++                    std::memcpy(dst + op.dst + 4 * i, &v[i], 4);
++                } else {
++                    const uint16_t b = f32_to_bf16(v[i]);
++                    std::memcpy(dst + op.dst + 2 * i, &b, 2);
++                }
++            }
++        }
+     } else {
+         fail("unknown pack op " + op.op);
+     }
+diff --git a/src/open_qwen36/q35_pack_dump.cpp b/src/open_qwen36/q35_pack_dump.cpp
+new file mode 100644
+index 0000000..281d8a7
+--- /dev/null
++++ b/src/open_qwen36/q35_pack_dump.cpp
+@@ -0,0 +1,64 @@
++/// \file q35_pack_dump.cpp
++/// \brief No-XRT tool for the Qwen3.5 / 3.6 MoE GGUF view (OPEN-FAMILY-QWEN36MOE-GGUF): packs the
++///        named layers' pool and consts (and optionally the head) from model.gguf through the
++///        manifest's gguf section, exactly as Core does, and writes the bytes for an independent
++///        decode (open_kernels/model/qwen35moe_gguf_check.py).
++///
++///     q35_pack_dump <manifest.json> <model.gguf> <out_dir> <layer,layer,...|-> [head]
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <sstream>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++#include "open_qwen36/gguf_file.hpp"
++#include "open_qwen36/manifest.hpp"
++#include "open_qwen36/pools.hpp"
++
++using namespace open_qwen36;
++
++static void write(const std::string& path, const std::vector<uint8_t>& b) {
++    std::ofstream f(path, std::ios::binary);
++    f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
++    if (!f) throw std::runtime_error("cannot write " + path);
++}
++
++int main(int argc, char** argv) {
++    if (argc < 5) {
++        std::fprintf(stderr, "usage: %s manifest.json model.gguf out_dir layers|- [head]\n", argv[0]);
++        return 2;
++    }
++    try {
++        Manifest top = Manifest::load(argv[1]);
++        if (!top.gguf) throw std::runtime_error("the manifest has no gguf section");
++        const Manifest& m = *top.gguf;
++        GgufFile g(argv[2]);
++        const std::string out = argv[3];
++        if (std::string(argv[4]) != "-") {
++            std::stringstream ss(argv[4]);
++            std::string tok;
++            while (std::getline(ss, tok, ',')) {
++                const int l = std::atoi(tok.c_str());
++                const LayerType& lt = m.layer_type(static_cast<size_t>(l));
++                std::vector<uint8_t> pool(m.pool_bytes), consts(lt.consts_bytes);
++                pools::pack_pool(m, lt, g, l, pool.data());
++                pools::pack_consts(m, lt, g, l, consts.data());
++                write(out + "/pool" + tok + ".bin", pool);
++                write(out + "/consts" + tok + ".bin", consts);
++                std::printf("layer %d (%s): pool %zu B, consts %zu B\n", l, lt.name.c_str(), pool.size(), consts.size());
++            }
++        }
++        if (argc > 5 && std::string(argv[5]) == "head") {
++            std::vector<uint8_t> head(m.lmhead_pool_bytes);
++            pools::pack_lmhead(m, g, head.data());
++            write(out + "/lmhead.bin", head);
++            std::printf("head: %zu B\n", head.size());
++        }
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "q35_pack_dump: %s\n", e.what());
++        return 1;
++    }
++    return 0;
++}

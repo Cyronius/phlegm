@@ -70,10 +70,294 @@ def q40_on() -> bool:
 
 def gguf_quant(spec: ModelSpec) -> str:
     """The pool law recipes/manifest.py builds the GGUF section at: Q4_0-native (q40_on, the
-    default), else the f32-scale twin, which finalize_gguf_manifest turns into the compact view."""
-    return "q4_0" if q40_on() else "q4_1_f32"
+    default), else the f32-scale twin, which finalize_gguf_manifest turns into the compact view.
+    26B-A4B has only the Q4_0-native view."""
+    return "q4_0" if q40_on() or is_moe(spec) else "q4_1_f32"
 KINDS = {"local": DENSE_LOCAL, "global": DENSE}
 LAYER_SCALE = "model.layers.{j}.layer_output_scale.weight"   # GGUF blk.{j}.layer_output_scale.weight
+
+
+# ---- Gemma 4 26B-A4B (OPEN-FAMILY-GEMMA4-MOE): the 12B's attention and dense MLP on dx.py, and a
+# routed-expert block beside them in every layer:
+#
+#   dx_local / dx  (dx.py, unchanged): ... res = x + post_attention_norm(attn); t1 = post_ffw_norm_1(
+#                  mlp(pre_feedforward_layernorm(res))) at AD_T2 (CD_POSTFFN holds post_ffw_norm_1)
+#   gemma4_route   (host): the router over res, top 8, renormalised, times per_expert_scale; xm2 =
+#                  pre_ffw_norm_2(res) as bf16 with the eight weights in its last x element; gm_moe's
+#                  expert fills pointed at the chosen experts (moeroute2)
+#   gm_moe         (designs/gemma4_moe/gm8.py): eight cores, core c = routed slot c: gate | up -> w_c
+#                  gelu_tanh(g) u in L1 -> down -> partial m_c f32 at AD_MOE + c * hidden * 4
+#                  (gm.py, the 4-core split with h through DDR, is the 2026-10-31 design it replaced)
+#   gemma4_combine (host): m = the partials' sum in slot order; xres = res + post_feedforward_layernorm'(
+#                  t1 + post_ffw_norm_2(m)), the last norm carrying the folded layer scalar (div_running)
+#
+# The GGUF view is the only view, at the QAT file's own Q4_0 blocks (4608-B chunks).
+MOE_QUANT = "q4_0"
+MOE_TOPK_MAX = 8                      # the weights f32[8] beside xm2; moeroute2's slots
+# Where the routed experts run (2026-11-01, gemma4-moe.md):
+#   dxm -- gm.py's 4 cores inside each layer type's dx image, as its second stream: one context a layer
+#          type, so a layer changes context only at a local <-> global boundary (designs/gemma4_moe/dxm.py)
+#   gm8 -- an 8-core image of its own, a routed slot a core (designs/gemma4_moe/gm8.py)
+#   gm  -- the 4-core image of its own (designs/gemma4_moe/gm.py, the 2026-10-31 route)
+MOE_DESIGN = os.environ.get("G4_MOE_DESIGN", "dxm")
+MOE_DESIGNS = ("dxm", "gm8", "gm")
+
+
+def moe_design() -> str:
+    if MOE_DESIGN not in MOE_DESIGNS:
+        raise OpRangeError(f"gemma4: G4_MOE_DESIGN={MOE_DESIGN!r} ({' | '.join(MOE_DESIGNS)})")
+    return MOE_DESIGN
+
+
+def moe_parts(spec: ModelSpec) -> int:
+    """the partial sums the expert kernel leaves at AD_MOE: one a routed slot (gm8), or their sum"""
+    return spec.experts_per_tok if moe_design() == "gm8" else 1
+
+
+def moe_kernel(kind: str) -> str:
+    """the expert kernel a layer type runs: its own image's second stream (dxm), or gm_moe"""
+    return ("gm_l" if kind == "local" else "gm_g") if moe_design() == "dxm" else "gm_moe"
+
+
+def is_moe(spec: ModelSpec) -> bool:
+    return bool(spec.num_experts)
+
+
+def moe_ff(spec: ModelSpec) -> int:
+    """The dense MLP's width padded to whole 64-row bands over 4 cores and whole k-tiles: 2112 -> 2304."""
+    return roundup(spec.intermediate, 256)
+
+
+def expert_ff(spec: ModelSpec) -> int:
+    """An expert's width padded the same way: 704 -> 768 (12 bands, 3 k-tiles)."""
+    return roundup(spec.moe_intermediate, 256)
+
+
+@dataclass(frozen=True)
+class MoeLayout:
+    HID: int; FF: int; FR: int; TOPK: int; EXPERTS: int; N_CORES: int
+    UP_PC: int; DOWN_PC: int; PER_CALL: int; CH: int; CALL_BYTES: int
+    BB_H: int; BB_F: int                       # one 64-row band at K = HID / K = FF
+    UP_BYTES: int; EXPERT_UG: int; POOL_DOWN: int; POOL_END: int; POOL_DENSE: int
+    AD_XM: int; AD_W: int; AD_H: int; H_STRIDE: int; AD_MOE: int; AD_BYTES: int
+    XM_ELEMS: int; TAB_BYTES: int; MS_U: int; MS_G: int; MS_T: int; MS_FLOATS: int
+
+
+def moe_layout(spec: ModelSpec) -> MoeLayout:
+    """gm_moe's geometry and the pool / act regions it shares with dx.py. One expert's gate (or up)
+    is 768 x 2816 and its down 2816 x 768: the same chunks, as moeroute2 needs (`up_bytes`). Per
+    expert the gate and up bands interleave ([gate band b | up band b], b = 0..11), so a core's three
+    bands are one fill; the down slices follow every expert's gate | up. The act regions sit past the
+    larger layer type's dense act, so one gm_moe build serves both."""
+    from .qwen36moe import ELEM, band_bytes as q4_band, chunk_bytes as q4_chunk, tab_bytes
+    if not is_moe(spec):
+        raise OpRangeError("gemma4: moe_layout on a spec without experts")
+    loc = sub_spec(spec, "local")
+    n = D.cores_for(loc)
+    hid, ff, E, K = spec.hidden, expert_ff(spec), spec.num_experts, spec.experts_per_tok
+    if ff % (64 * n) or hid % (64 * n):
+        raise OpRangeError(f"gemma4 moe: hidden {hid} / expert width {ff} are not whole bands over {n} cores")
+    ch = q4_chunk(MOE_QUANT)
+    bb_h, bb_f = q4_band(hid, MOE_QUANT), q4_band(ff, MOE_QUANT)
+    up = ff // 64 * bb_h
+    if up != hid // 64 * bb_f:
+        raise OpRangeError("gemma4 moe: an expert's gate and down must be the same size for moeroute2")
+    pool_down = E * 2 * up
+    pool_end = pool_down + E * up
+    dense = roundup(pool_end, MB)
+    if dense + max(D.layout(sub_spec(spec, k)).POOL_BYTES for k in KINDS) >= 1 << 32:
+        raise OpRangeError("gemma4 moe: a layer pool past 4 GiB does not fit a 32-bit fill offset")
+    base = roundup(max(D.layout(sub_spec(spec, k)).AD_BYTES for k in KINDS), ELEM)
+    xm_elems = roundup(hid * 2 + 4 * MOE_TOPK_MAX, ELEM) // ELEM
+    ad_xm = base
+    ad_w = ad_xm + (xm_elems - 1) * ELEM + 2048          # the weights: byte 2048 of xm2's last element
+    if ad_w < ad_xm + hid * 2:
+        raise OpRangeError("gemma4 moe: the routing weights would overlap xm2")
+    h_stride = roundup(ff * 4, ELEM)                     # one x element per expert's h
+    ad_h = ad_xm + xm_elems * ELEM
+    ad_moe = ad_h + K * h_stride
+    return MoeLayout(
+        HID=hid, FF=ff, FR=spec.moe_intermediate, TOPK=K, EXPERTS=E, N_CORES=n,
+        UP_PC=ff // 64 // n, DOWN_PC=hid // 64 // n, PER_CALL=2, CH=ch, CALL_BYTES=2 * ch,
+        BB_H=bb_h, BB_F=bb_f, UP_BYTES=up, EXPERT_UG=2 * up, POOL_DOWN=pool_down, POOL_END=pool_end,
+        POOL_DENSE=dense, AD_XM=ad_xm, AD_W=ad_w, AD_H=ad_h, H_STRIDE=h_stride, AD_MOE=ad_moe,
+        AD_BYTES=roundup(ad_moe + K * hid * 4, ELEM), XM_ELEMS=xm_elems, TAB_BYTES=tab_bytes(max(hid, ff)),
+        MS_U=0, MS_G=64, MS_T=128, MS_FLOATS=192)
+
+
+def _q40_op(tensor: str, dst: int, rows_pad: int, in_dim: int, src_dim: int, rows: int, row0: int = 0,
+            experts: int = 1, expert_rows: int = 0, expert_bytes: int = 0, band_stride: int = 0) -> dict:
+    """runtime pack op g4_q40 (gemma4-moe-runtime.patch): `rows` file rows from `row0` (+ e * expert_rows
+    for expert e) of a Q4_0 GGUF tensor of row length src_dim, as rows_pad x in_dim Q4_0-native chunks in
+    the std_perm band law, zero past the file's rows and columns; band b at dst + b * band_stride (0:
+    contiguous) + e * expert_bytes."""
+    if in_dim % 256 or rows_pad % 64 or src_dim > in_dim or rows > rows_pad:
+        raise OpRangeError(f"gemma4 moe: {tensor}: {rows} x {src_dim} into {rows_pad} x {in_dim}")
+    return {"op": "g4_q40", "tensor": tensor, "dst": dst, "nch": q4_chunks(rows_pad, in_dim, MOE_QUANT),
+            "in_dim": in_dim, "src_dim": src_dim, "rows": rows, "row0": row0, "experts": experts,
+            "n_total": expert_rows or rows, "expert_bytes": expert_bytes, "stripe_bytes": band_stride}
+
+
+def _moe_layer_plan(spec: ModelSpec, kind: str) -> dict:
+    s = sub_spec(spec, kind)
+    L, G, M = layout(spec, kind=kind), geometry(spec, kind), moe_layout(spec)
+    hid, ff, fr = spec.hidden, s.intermediate, spec.intermediate
+    b = "blk.{l}."
+    pre = "model.layers.{l}."
+    kv1 = (spec.global_kv_heads if kind == "global" else spec.num_kv_heads) * s.head_dim
+    if kv1 != G.KVW:
+        raise OpRangeError(f"gemma4 moe: {kind} kv width {kv1} vs the attention element's {G.KVW}")
+    E, er, ef = spec.num_experts, spec.moe_intermediate, M.FF
+    pool = [
+        # the experts: gate rows [0, 704) and up rows [704, 1408) of the fused tensor, band-interleaved
+        _q40_op(b + "ffn_gate_up_exps.weight", 0, ef, hid, hid, er, 0, E, 2 * er, M.EXPERT_UG, 2 * M.BB_H),
+        _q40_op(b + "ffn_gate_up_exps.weight", M.BB_H, ef, hid, hid, er, er, E, 2 * er, M.EXPERT_UG, 2 * M.BB_H),
+        _q40_op(b + "ffn_down_exps.weight", M.POOL_DOWN, hid, ef, er, hid, 0, E, hid, M.UP_BYTES),
+        proj_op(s, "attn", pre + "self_attn.q_proj.weight", L.POOL_Q, G.QW, hid, hid),
+        proj_op(s, "attn", pre + "self_attn.k_proj.weight", L.POOL_K, G.KVW, hid, hid),
+        # the global layers have no v_proj: K = V, the raw k projection in the V slot (as the 12B)
+        proj_op(s, "attn", pre + ("self_attn.k_proj.weight" if kind == "global" else "self_attn.v_proj.weight"),
+                L.POOL_V, G.KVW, hid, hid),
+        proj_op(s, "attn", pre + "self_attn.o_proj.weight", L.POOL_O, hid, G.QW, G.QW),
+        _q40_op(b + "ffn_up.weight", L.POOL_UP, ff, hid, hid, fr),
+        _q40_op(b + "ffn_gate.weight", L.POOL_GATE, ff, hid, hid, fr),
+        _q40_op(b + "ffn_down.weight", L.POOL_DOWN, hid, ff, fr, hid),
+    ]
+    run = {"div_running": LAYER_SCALE}
+    consts = [
+        {"op": "put", "tensor": pre + "input_layernorm.weight", "dst": L.CD_LNW, "cap": L.ELN},
+        {"op": "put", "tensor": pre + "post_attention_layernorm.weight", "dst": L.CD_POSTLN, "cap": L.ELN, **run},
+        {"op": "put", "tensor": pre + "self_attn.q_norm.weight", "dst": L.CD_META, "cap": G.HD * 2},
+        {"op": "put", "tensor": pre + "self_attn.k_norm.weight", "dst": L.CD_META + G.HD * 2, "cap": G.HD * 2},
+        {"op": "put", "tensor": pre + "pre_feedforward_layernorm.weight", "dst": L.CD_PREFFN, "cap": L.ELN},
+        # t1 = post_ffw_norm_1(mlp): normalised again by the combine, so no fold here
+        {"op": "put", "tensor": b + "post_ffw_norm_1.weight", "dst": L.CD_POSTFFN, "cap": L.ELN},
+    ]
+    return {"pool": pool, "consts": consts}
+
+
+def lm_q8_rows(spec: ModelSpec) -> int:
+    return roundup(spec.vocab, 128)
+
+
+def lm_q8_bytes(spec: ModelSpec) -> int:
+    """The head as lm_head_q8's bf16-scale chunks (8704 B, 32 rows x 256 K), requantised from the GGUF's
+    Q6_K token_embd at load (g4_lmhead_q8): 8-bit codes keep the Q6_K values to <= 1/254 of a block's max."""
+    return roundup(lm_q8_rows(spec) // 32 * (spec.hidden // 256) * 8704, MB)
+
+
+def _moe_pack_plan(spec: ModelSpec) -> dict:
+    return {
+        "pool_bytes": pool_bytes(spec), "chunk_bytes": D.chunk_bytes(MOE_QUANT),
+        "layer_types": {KINDS[k]: _moe_layer_plan(spec, k) for k in KINDS},
+        "lm_head": {"pool_bytes": lm_q8_bytes(spec),
+                    "ops": [{"op": "g4_lmhead_q8", "tensor": "lm_head.weight", "dst": 0, "rows": lm_q8_rows(spec),
+                             "in_dim": spec.hidden}]},
+        "embed": {"tensor": "model.embed_tokens.weight", "dim": spec.hidden, "scale": spec.hidden ** 0.5},
+        "norm": {"tensor": "model.norm.weight", "bytes": spec.hidden * 2},
+    }
+
+
+def moe_route_step(spec: ModelSpec, kind: str) -> dict:
+    L, M = layout(spec, kind=kind), moe_layout(spec)
+    b = "blk.{l}."
+    return {"op": "gemma4_route", "kernel": moe_kernel(kind), "a_res": L.AD_RES, "a_xm": M.AD_XM, "a_w": M.AD_W,
+            "router": b + "ffn_gate_inp.weight", "router_scale": b + "ffn_gate_inp.scale",
+            "expert_scale": b + "ffn_down_exps.scale", "pre_norm": b + "pre_ffw_norm_2.weight",
+            "eps": spec.norm_eps}
+
+
+def moe_combine_step(spec: ModelSpec, kind: str) -> dict:
+    L, M = layout(spec, kind=kind), moe_layout(spec)
+    b = "blk.{l}."
+    return {"op": "gemma4_combine", "kernel": moe_kernel(kind), "a_res": L.AD_RES, "a_t1": L.AD_T2, "a_moe": M.AD_MOE,
+            "moe_parts": moe_parts(spec),
+            "post_norm2": b + "post_ffw_norm_2.weight", "post_norm": b + "post_ffw_norm.weight",
+            "div_running": "blk.{j}.layer_output_scale.weight", "eps": spec.norm_eps}
+
+
+def _moe_programs(spec: ModelSpec, max_ctx: int) -> dict:
+    sets = _kernel_sets(replace(spec, quant=MOE_QUANT))
+    M = moe_layout(spec)
+    merged = moe_design() == "dxm"
+    out = {
+        "contexts": {"dx": f"{sets['local']}/final.xclbin", "dxg": f"{sets['global']}/final.xclbin",
+                     "ln": "ln/final.xclbin", "lm": "lm_head_q8/final.xclbin"},
+        "kernels": {"ln": {"context": "ln", "insts": "ln/insts.bin", "build": "ln"},
+                    "lm": {"context": "lm", "insts": "lm_head_q8/insts.bin", "build": "lm_head_q8"}},
+        "layer_types": {},
+        "tail": [{"op": "run", "kernel": "ln", "args": ["xres", "zero", "normw", "xresf", "hn"]},
+                 {"op": "run", "kernel": "lm", "args": ["lmpool", "hn", "logits"]}],
+        "globals": {"xres": spec.hidden * 4, "zero": spec.hidden * 4, "normw": spec.hidden * 2,
+                    "xresf": spec.hidden * 4, "hn": spec.hidden * 2, "logits": lm_q8_rows(spec) * 4,
+                    "lmpool": lm_q8_bytes(spec)},
+    }
+    if not merged:
+        out["contexts"]["gm"] = "gm_moe/final.xclbin"
+        out["kernels"]["gm_moe"] = {"context": "gm", "insts": "gm_moe/insts.bin", "patch": "moeroute2", "build": "gm_moe"}
+    for kind, lt in KINDS.items():
+        L = layout(spec, max_ctx, kind)
+        local = kind == "local"
+        kn, tab, ctx = ("dx_local", "ptab_local", "dx") if local else ("dx", "ptab", "dxg")
+        window = spec.sliding_window if local else 0
+        args = ["pool", "xres", "consts", "state", "act", tab]
+        check_buffer_args(kn, args)
+        out["kernels"][kn] = {"context": ctx, "insts": f"{sets[kind]}/insts.bin", "patch": "attnpos",
+                              "build": sets[kind], "window": window, "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW}
+        if dx_geometry(spec, kind).KVSLICE:
+            out["kernels"][kn]["kvslice"] = dx_geometry(spec, kind).KVSLICE
+        out["globals"][tab] = {"per_row": L.PTAB_ROW, "inv_freq": spec.rope_inv_freq(local=local), "window": window,
+                               "rotary_dim": sub_spec(spec, kind).rotary_dim}
+        gk = moe_kernel(kind)
+        if merged:
+            # the image's second stream: dx's six buffer arguments (one image, one kernel signature);
+            # it reads pool and act only
+            out["kernels"][gk] = {"context": ctx, "insts": f"{sets[kind]}_gm/insts.bin", "patch": "moeroute2",
+                                  "build": f"{sets[kind]}_gm"}
+        out["layer_types"][lt] = {
+            "buffers": {"consts": L.CD_BYTES, "act": M.AD_BYTES, "state": {"kind": "kv", "row": L.KV_ROW}},
+            "program": [{"op": "run", "kernel": kn, "args": args}, moe_route_step(spec, kind),
+                        {"op": "run", "kernel": gk, "args": args if merged else ["pool", "act"]},
+                        moe_combine_step(spec, kind)],
+        }
+    if spec.quant != MOE_QUANT:
+        out["gguf"] = True            # the same program at the view's own law (manifest.py nests it)
+    return out
+
+
+def _moe_builds(spec: ModelSpec) -> dict[str, dict]:
+    M = moe_layout(spec)
+    rows = lm_q8_rows(spec)
+    b = {"ln": {"design": "ln/ln.py", "build_dir": f"ln/build_{spec.hidden}_{spec.norm_eps:g}",
+                "env": {"LN_N": str(spec.hidden), "LN_EPS": f"{spec.norm_eps:g}"}},
+         "lm_head_q8": {"design": "lm_head_q8/lm_head_q8.py", "build_dir": f"lm_head_q8/build_g4_n{rows}_k{spec.hidden}",
+                        "env": {"LMHEAD_N": str(rows), "LMHEAD_K": str(spec.hidden), "LMHEAD_CORES": "8"}},
+         }
+    d = moe_design()
+    if d != "dxm":
+        b["gm_moe"] = {"design": f"gemma4_moe/{d}.py",
+                       "build_dir": f"gemma4_moe/build{'8' if d == 'gm8' else ''}_h{spec.hidden}_f{M.FF}_k{M.TOPK}", "env": {}}
+    for kind, name in (("local", "dx"), ("global", "dxg")):
+        env = {KIND_ENV: kind, DX_ENV: "1", "GEMV_Q4_0": "1"}
+        if d != "dxm":
+            b[name + "_q40"] = {"design": "dense/dx.py", "build_dir": f"dense/build_gemma4moe_{kind}_h{spec.hidden}_q40",
+                                "env": env}
+            continue
+        # one image, two streams, rebuilt together; only the dx stream's xclbin is loaded, so the two
+        # builds' xclbins must agree (export_qwen36_kernels.xclbin_equivalent; gemma4-26b-build.sh checks)
+        for stream, sfx in (("dx", ""), ("gm", "_gm")):
+            b[name + "_q40" + sfx] = {"design": "gemma4_moe/dxm.py",
+                                      "build_dir": f"gemma4_moe/build_dxm_{kind}_h{spec.hidden}_{stream}",
+                                      "env": {**env, "G4_DXM_STREAM": stream}}
+    return b
+
+
+def moe_geometry(spec: ModelSpec) -> dict:
+    """stream_patch::MoeGeometry for moeroute2 over gm_moe's fills: slot j is compiled as expert j."""
+    M = moe_layout(spec)
+    return {"stripe": M.UP_BYTES, "up_bytes": M.UP_BYTES, "down_core": M.UP_BYTES, "pool_down": M.POOL_DOWN,
+            "share_up": M.POOL_END, "share_gate": M.POOL_END, "share_down": M.POOL_END,
+            "experts": spec.num_experts, "topk": spec.experts_per_tok}
 
 
 def _kind(kind: str | None) -> str:
@@ -88,6 +372,11 @@ def sub_spec(spec: ModelSpec, kind: str) -> ModelSpec:
     layer sliding. Global: head dim 512, the kv head doubled (see the module docstring),
     the proportional rotation's 128 dims, no window."""
     n = spec.num_layers
+    if is_moe(spec):
+        # 26B-A4B: dx.py builds the attention and the dense MLP at its padded width; the routed
+        # experts are gm_moe's (moe_layout), so the dense recipe sees a dense spec
+        spec = replace(spec, intermediate=moe_ff(spec), num_experts=0, experts_per_tok=0, moe_intermediate=0,
+                       quant=MOE_QUANT)
     if kind == "local":
         return replace(spec, layer_types=(DENSE_LOCAL,) * n)
     return replace(spec, layer_types=(DENSE,) * n, head_dim=spec.global_head_dim or spec.head_dim,
@@ -107,6 +396,9 @@ def _check(spec: ModelSpec) -> None:
         raise OpRangeError(f"gemma4: {spec.global_kv_heads} global kv heads (the duplication covers 1)")
     if not spec.attn_k_eq_v:
         raise OpRangeError("gemma4: global layers with their own v_proj are not packed here")
+    if is_moe(spec) and not (0 < spec.experts_per_tok <= MOE_TOPK_MAX and spec.moe_intermediate):
+        raise OpRangeError(f"gemma4 moe: top-{spec.experts_per_tok} of {spec.num_experts} experts "
+                           f"(gm_moe and the route step carry at most {MOE_TOPK_MAX})")
     for kind in KINDS:
         s = sub_spec(spec, kind)
         D._check(s)
@@ -167,7 +459,15 @@ def dx_geometry(spec: ModelSpec, kind: str | None = None) -> D.DenseGeometry:
 
 
 def layout(spec: ModelSpec, max_ctx: int = 4096, kind: str | None = None) -> D.DenseLayout:
-    return D.layout(sub_spec(spec, _kind(kind)), max_ctx)
+    L = D.layout(sub_spec(spec, _kind(kind)), max_ctx)
+    if not is_moe(spec):
+        return L
+    # 26B-A4B: the routed experts hold the pool from byte 0 (moeroute2's geometry); the attention
+    # and the dense MLP follow them
+    b = moe_layout(spec).POOL_DENSE
+    return replace(L, POOL_Q=L.POOL_Q + b, POOL_K=L.POOL_K + b, POOL_V=L.POOL_V + b, POOL_O=L.POOL_O + b,
+                   POOL_UP=L.POOL_UP + b, POOL_GATE=L.POOL_GATE + b, POOL_DOWN=L.POOL_DOWN + b,
+                   POOL_BYTES=L.POOL_BYTES + b)
 
 
 def pool_bytes(spec: ModelSpec) -> int:
@@ -225,6 +525,8 @@ def _layer_plan(spec: ModelSpec, kind: str) -> dict:
 
 
 def pack_plan(spec: ModelSpec) -> dict:
+    if is_moe(spec):
+        return _moe_pack_plan(spec)
     s = sub_spec(spec, "local")
     L = D.layout(s)
     hid = spec.hidden
@@ -364,8 +666,8 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096, pool_quant: str | None = No
     leaves it out: None means the sequential path, byte for byte what it was. `pool_quant`
     is the chunk law the GEMMs read: the spec's own (the f32-scale twin's or the Q4_0-native
     view's), or q4_1's for the compact view (finalize_gguf_manifest)."""
-    if not gguf_direct(spec.quant) or not gemm_on():
-        return None
+    if not gguf_direct(spec.quant) or not gemm_on() or is_moe(spec):
+        return None              # 26B-A4B: sequential prefill only, for now (OPEN-FAMILY-GEMMA4-MOE)
     pool_quant = pool_quant or D.pool_quant(spec)
     if pool_quant not in SFX:
         raise OpRangeError(f"gemma4 gemm route: no GEMM build reads {pool_quant!r} pools")
@@ -482,6 +784,8 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     """dx_local on the local design's context, dx on the global one's. Each attnpos kernel
     names its own KV and position-record row (the engine's per-kernel geometry); each layer
     type its own consts / act / state sizes and position table."""
+    if is_moe(spec):
+        return _moe_programs(spec, max_ctx)
     sets = _kernel_sets(spec)
     lm_set = "lm_head_q4" + SFX[D.pool_quant(spec)]
     Ll = layout(spec, max_ctx, "local")
@@ -530,6 +834,8 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
 
 
 def builds(spec: ModelSpec) -> dict[str, dict]:
+    if is_moe(spec):
+        return _moe_builds(spec)
     n = D.cores_for(sub_spec(spec, "local"))
     rows = D.lm_rows(spec)
     b = {"ln": {"design": "ln/ln.py", "build_dir": f"ln/build_{spec.hidden}_{spec.norm_eps:g}",
@@ -581,7 +887,7 @@ def finalize_gguf_manifest(spec: ModelSpec, manifest: dict) -> None:
     GGUF section keeps its reader (std_perm_gguf, the scaled embedding, the f32 norms and
     their folded layer scale) and takes the q4_1 section's pool geometry, buffers, decode
     kernels and head. The block prefill route's GEMMs become the q4_1-law builds."""
-    if spec.quant != "q4_1" or "gguf" not in manifest or not compact_on() or q40_on():
+    if spec.quant != "q4_1" or "gguf" not in manifest or not compact_on() or q40_on() or is_moe(spec):
         return
     g, b = manifest["gguf"], manifest
     g["spec"] = copy.deepcopy(b["spec"])      # the pool law the view's kernels compile for
@@ -636,6 +942,12 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
     out["pool_bytes"] = pool_bytes(spec)
     if spec.final_softcap:
         out["final_logit_softcapping"] = spec.final_softcap
+    if is_moe(spec):
+        out["chunk_bytes"] = D.chunk_bytes(MOE_QUANT)
+        out["vocab"] = lm_q8_rows(spec)
+        out["lmhead_pool_bytes"] = lm_q8_bytes(spec)
+        out["lmhead_chunk_bytes"] = 8704
+        out["moe"] = moe_geometry(spec)
     return out
 
 
@@ -653,8 +965,14 @@ def hf_config_check(spec: ModelSpec) -> dict:
             "rope_parameters": {
                 "full_attention": {"partial_rotary_factor": spec.global_rotary_dim / (spec.global_head_dim or spec.head_dim),
                                    "rope_theta": spec.rope_theta, "rope_type": "proportional"},
-                "sliding_attention": {"rope_theta": spec.rope_local_theta, "rope_type": "default"}}}
+                "sliding_attention": {"rope_theta": spec.rope_local_theta, "rope_type": "default"}},
+            # 26B-A4B: the experts' shape is baked into gm_moe and the pool (OPEN-FAMILY-GEMMA4-MOE)
+            **({"intermediate_size": spec.intermediate, "enable_moe_block": True, "num_experts": spec.num_experts,
+                "top_k_experts": spec.experts_per_tok, "moe_intermediate_size": spec.moe_intermediate}
+               if is_moe(spec) else {})}
 
 
 GEN_KERNELS = D.GEN_KERNELS
 KERNEL_SOURCES = list(D.KERNEL_SOURCES)
+# 26B-A4B's gm_moe (cache.py adds these for a spec with experts only, so the 12B's key keeps its files)
+KERNEL_SOURCES_MOE = ["designs/gemma4_moe/*.py", "designs/gemma4_moe/*.cc"]

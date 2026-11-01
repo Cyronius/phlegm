@@ -32,6 +32,9 @@ def source_files(spec: ModelSpec, root: Path = ROOT) -> list[Path]:
         # only a q8 spec compiles the q8 GEMV header, so listing it unconditionally would
         # move every shipped kernel set's build key for a file none of them include
         pats += list(getattr(F, "KERNEL_SOURCES_Q8", ()))
+    if spec.num_experts:
+        # a family whose routed experts have a design of their own (gemma4: designs/gemma4_moe)
+        pats += list(getattr(F, "KERNEL_SOURCES_MOE", ()))
     if spec.hadamard and spec.hadamard.get("lm_head") == "rotated":
         # the rotated ternary head's design (OPEN-QUANT-T2), for that spec only
         pats += list(getattr(F, "KERNEL_SOURCES_T2_HEAD", ()))

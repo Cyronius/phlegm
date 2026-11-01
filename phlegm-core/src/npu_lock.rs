@@ -1,9 +1,11 @@
 //! Exclusive lockfile over the shared physical NPU device, used by every
 //! NPU-touching backend (previously duplicated in `generate_5li3` and
 //! `generate_l30`; consolidated here). Mirrors `l30_run_npu.py`'s
-//! `acquire_lock`/`release_lock`: create-exclusive with retry, stale-lock
-//! removal after ~40 minutes, a 30-minute acquire timeout, and release on
-//! `Drop`. A heartbeat keeps long benchmark suites from appearing stale.
+//! `acquire_lock`/`release_lock`: create-exclusive with retry, a 30-minute
+//! acquire timeout, and release on `Drop`. A lock whose recorded owner pid no
+//! longer exists is removed at once; the ~40-minute age rule remains as a
+//! fallback for pid reuse or an unreadable file. A heartbeat keeps long
+//! benchmark suites from appearing stale.
 
 use std::io::Write;
 use std::{path::PathBuf, sync::mpsc, thread::JoinHandle, time::Duration};
@@ -44,6 +46,15 @@ impl NpuLock {
                     return Ok(Self::start(path_buf, Duration::from_secs(60)));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Some(pid) = Self::dead_owner(path) {
+                        eprintln!("{tag}: removing NPU lock of dead pid {pid}");
+                        // Re-read just before removing so a live process that took the
+                        // lock in between is left alone (narrows, not closes, the race).
+                        if Self::dead_owner(path) == Some(pid) {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        continue;
+                    }
                     if let Ok(meta) = std::fs::metadata(path) {
                         if let Ok(age) = meta.modified().and_then(|m| {
                             m.elapsed()
@@ -70,6 +81,17 @@ impl NpuLock {
                 Err(e) => return Err(format!("acquire NPU lock: {e}")),
             }
         }
+    }
+
+    /// The pid recorded in the lock, if it parses and no such process exists.
+    /// Returns None (keep waiting / fall back to the age rule) when the file is
+    /// unreadable, holds no pid, or liveness can't be checked (no `/proc`).
+    fn dead_owner(path: &std::path::Path) -> Option<u32> {
+        let pid: u32 = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+        if pid == 0 || !std::path::Path::new("/proc/self").exists() {
+            return None;
+        }
+        (!std::path::Path::new(&format!("/proc/{pid}")).exists()).then_some(pid)
     }
 
     fn start(path: PathBuf, interval: Duration) -> Self {
@@ -154,6 +176,35 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+        lock.ensure_held().unwrap();
+        drop(lock);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn dead_owner_lock_is_detected_and_live_or_unreadable_is_not() {
+        let path = fixture();
+        // Our own pid is alive.
+        assert_eq!(NpuLock::dead_owner(&path), None);
+        // A pid above the kernel's pid_max (2^22) can't exist.
+        std::fs::write(&path, "4194305").unwrap();
+        assert_eq!(NpuLock::dead_owner(&path), Some(4194305));
+        // Garbage falls back to the age rule.
+        std::fs::write(&path, "not a pid").unwrap();
+        assert_eq!(NpuLock::dead_owner(&path), None);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(NpuLock::dead_owner(&path), None);
+    }
+
+    #[test]
+    fn acquire_takes_over_a_dead_owners_lock_at_once() {
+        let path = fixture();
+        std::fs::write(&path, "4194305").unwrap();
+        std::env::set_var("PHLEGM_NPU_LOCK", &path);
+        let start = Instant::now();
+        let lock = NpuLock::acquire("test").unwrap();
+        std::env::remove_var("PHLEGM_NPU_LOCK");
+        assert!(start.elapsed() < Duration::from_secs(2));
         lock.ensure_held().unwrap();
         drop(lock);
         assert!(!path.exists());

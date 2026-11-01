@@ -91,15 +91,35 @@ def test_gguf_section_names_only_built_kernels(spec_path: Path):
 
 @pytest.mark.parametrize("spec_path", _specs(), ids=lambda p: p.stem)
 def test_gguf_section_is_the_f32_program(spec_path: Path):
-    """The section is the f32-scale program's own view: its quant is the f32
-    one, and the pool layout it declares is the f32-scale one."""
+    """The section is either the f32-scale program's own view (quant q4_1_f32), or
+    -- Qwen3.5 MoE (OPEN-FAMILY-QWEN36MOE-GGUF) -- the q4_1 program itself with the
+    runtime's GGUF-direct q35_* pack ops writing the q4_1 law's chunks, so no
+    second kernel set exists."""
     m = _manifest(spec_path)
     section = m.get("gguf")
     if not section:
         return
     gguf_spec = section.get("spec")
     assert gguf_spec, f"{spec_path.name}: the gguf section carries no spec"
-    assert gguf_spec.get("quant") == "q4_1_f32", gguf_spec.get("quant")
+    quant = gguf_spec.get("quant")
+    if quant == "q4_1":
+        ops = set()
+
+        def walk(node):
+            if isinstance(node, dict):
+                if isinstance(node.get("op"), str):
+                    ops.add(node["op"])
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+
+        walk(section.get("pack", {}))
+        assert ops and all(o.startswith("q35_") for o in ops), (
+            f"{spec_path.name}: a q4_1 gguf view must pack through the q35_* ops, got {sorted(ops)}")
+        return
+    assert quant == "q4_1_f32", quant
 
 
 def test_no_hand_written_family_list_remains():

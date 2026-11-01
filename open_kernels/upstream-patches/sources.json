@@ -360,5 +360,133 @@
     "note": "per-core KV windows (OPEN-ATTN-KVSLICE) in this runtime: the manifest's kernel `kvslice` (2 or 4 rows an element, attnpos only, rb 1), attnpos tables over several window fills (each fill's length patched to the window padded to whole elements times its own words a row, its offset to its compiled in-row base plus the window's first row), and kvslice - 1 rows of KV slack. stream_patch.hpp's kvslice parts are phlegm's own header's (open_kernels/harness), without its rb_win, slot and attnposv additions. kvslice_patch_test checks Gemma 4's local (four fills, 1024-row window) and global (two fills) streams at positions 0..4095. Gemma 4's dx_local / dx kernels carry kvslice 4 (recipes/gemma4.py dx_attention); the test covers 2 and 4. A diff over base plus the eight earlier Gemma 4 patches",
     "patch": "gemma4-kvslice-runtime.patch",
     "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "gptoss_runtime_20261031": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030"
+    ],
+    "files": [
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/gguf_file.cpp",
+      "src/open_qwen36/gguf_file.hpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp",
+      "src/open_qwen36/pools.cpp"
+    ],
+    "note": "GPT-OSS from the GGUF (OPEN-FAMILY-GPTOSS, recipes/gptoss.py): the MXFP4 GGUF type (39); a GGUF embedding row and an F32 norm zero-extended into a padded width; pack ops gx_q8 (Q8_0 -> q8 half-tiles, the bias in the pad), gx_ug / gx_down (MXFP4 experts -> half-tiles, up | gate per band), gx_lmhead (Q8_0 -> lm_head_q8's f32-scale chunks), the same bytes as recipes/gptoss_pack.py; the gptoss_route program step (the router on the host between gx_att and gx_moe: top-k, softmax over the chosen, weights and weighted down biases into act, moe2_apply on gx_moe's fills) and host_step dispatching it beside moeroute2; arm_route_records limited to moeroute2 steps. A diff over base plus the nine Gemma 4 patches",
+    "patch": "gptoss-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "gemma4_moe_20261031": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030"
+    ],
+    "files": [
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/gguf_pack_test.cpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp",
+      "src/open_qwen36/pools.cpp"
+    ],
+    "note": "Gemma 4 26B-A4B from its QAT Q4_0 GGUF (OPEN-FAMILY-GEMMA4-MOE, recipes/gemma4.py): pack ops g4_q40 (Q4_0 2-D / expert 3-D tensors into Q4_0-native band-law chunks, zero-padded rows and columns, expert and band strides) and g4_lmhead_q8 (the Q6_K tied embedding requantised to lm_head_q8's bf16-scale chunks); program steps gemma4_route (host router, top 8 renormalised * per_expert_scale, pre_ffw_norm_2 into gm_moe's input, moeroute2 patch) and gemma4_combine (post_ffw_norm of t1 + post_ffw_norm_2(m), folded layer scalar, into xres); host_step; arm_route_records limited to moeroute2 steps; gguf_pack_test cases. A diff over base plus the nine Gemma 4 patches (independent of gptoss-runtime.patch); built in target/npu-dev/gemma4-moe-runtime",
+    "patch": "gemma4-moe-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "gemma4_moe_decode_20261101": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gemma4_moe_20261031"
+    ],
+    "files": [
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp"
+    ],
+    "note": "Gemma 4 26B-A4B decode (OPEN-FAMILY-GEMMA4-MOE, 2026-11-01): gemma4_route's router over the host threads with eight partial sums a logit (7-9 ms -> ~1 ms a token, logits byte-identical); gemma4_combine's moe_parts (m = the sum of that many partials, for the gm8 probe); OFLM_G4_SPLIT host-split timers. sha256 e1cd6b793d05c8fd1534bdc131e05b92f03aa95f2036aafce34bf452cc0abab9; built in target/npu-dev/gemma4-moe-runtime",
+    "patch": "gemma4-moe-decode-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "qwen35moe_gguf_20261031": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gptoss_runtime_20261031"
+    ],
+    "files": [
+      "src/open_qwen36/CMakeLists.txt",
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/gguf_file.cpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp",
+      "src/open_qwen36/pools.cpp",
+      "src/open_qwen36/q35_pack_dump.cpp"
+    ],
+    "note": "Qwen3.5 / 3.6 MoE straight from a llama.cpp qwen35moe GGUF (OPEN-FAMILY-QWEN36MOE-GGUF, recipes/qwen36moe.py gguf_view): pack ops q35_mat / q35_stripes / q35_down / q35_lmhead / q35_t / q35_vec / q35_conv write the q4nx ops' bytes in the q4_1 law (Q4_0 / Q4_1 / Q4_K codes kept, scale pair bf16 RNE; Q8_0 / Q5_0 / Q6_K requantized), with the per-head [q | gate] split and the linear-attention value-head untile (PackOp period / take / offset / kheads / vperk / vdim / v0 / vaxis); the Q5_0 size in gguf_type_bytes; op_region accepts q35_mat; the MoE block route's host stages read their small weights from the packed consts on a GGUF; q35_pack_dump (no XRT) for open_kernels/model/qwen35moe_gguf_check.py. A diff over base plus the nine Gemma 4 patches and gptoss-runtime.patch (sha256 8a5f808e..., as recorded, not the gptoss-runtime working tree)",
+    "patch": "qwen35moe-gguf-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "gptoss_prefill_runtime_20261031": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gptoss_runtime_20261031"
+    ],
+    "files": [
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/engine.cpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp",
+      "src/open_qwen36/pools.cpp"
+    ],
+    "note": "GPT-OSS's native MXFP4 experts and block prefill (OPEN-FAMILY-GPTOSS, OPEN-PREFILL-GPTOSS): pack ops gx_ug_mx4 / gx_down_mx4 (MXFP4 experts as mx4 half-tiles, the GGUF's nibbles re-signed for gemv_mx4.h), gp_bfp16 (a GGUF tensor's rows into a gemm_bfp16 B operand at any 64-multiple K, split hi / lo) and gp_mx4 (MXFP4 experts as gemm_bfp16 GB_B=mx4 tiles); the manifest's gptoss_prefill section and the gxexpert stream patch (an expert GEMM's buffer-0 fills re-pointed per dispatch, two stream copies alternating); Core::step_gptoss_prompt, the layer-major route behind step_gemm_prompt / layer_major_ok; block_prefill_min and the engine's use of it. A diff over base plus the nine Gemma 4 patches and gptoss-runtime.patch (sha256 8a5f808e...); target/npu-dev/gptoss-prefill-patch.sh regenerates it and checks the chain reproduces the clone",
+    "patch": "gptoss-prefill-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
   }
 }

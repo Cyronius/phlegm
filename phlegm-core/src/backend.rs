@@ -30,4 +30,10 @@ pub trait Backend {
         params: &mut GenParams,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<(), String>;
+
+    /// Tokens the backend can hold (prompt plus output), when it has a fixed context. The
+    /// server bounds an open-ended request by it, as llama.cpp's server does.
+    fn context_capacity(&self) -> Option<usize> {
+        None
+    }
 }

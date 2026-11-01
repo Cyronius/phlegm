@@ -6,7 +6,8 @@ r"""Test vectors for one dit_ew op, for open_kernels/harness's run_kernel.
     open_kernels\harness\out\run_kernel.exe <testdir>\run.cfg
     python compare.py <testdir>
 
-ops: ln_mod, res_ln_mod, qk, swiglu, euler, silu. Shapes follow FLUX.2 [klein] 4B:
+ops: ln_mod, res_ln_mod, qk, qk_moss, swiglu, situ, euler, silu. Most shapes
+follow FLUX.2 [klein] 4B:
 hidden 3072, 24 heads of 128, the SwiGLU half 9216 read out of an [T, 18432] ff_in
 output, q/k read out of an [T, 9216] fused QKV buffer, latents [T, 128] with the
 velocity in an [T, 1024] (N-padded proj_out) buffer.
@@ -19,12 +20,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 from ml_dtypes import bfloat16
 
-EL = 3072
+EL = int(os.environ.get("DE_EL", "3072"))
 HD = 128
 THETA = 2000.0
 
@@ -72,12 +74,64 @@ def qwen_qk_params(wq, wk) -> np.ndarray:
     return np.concatenate([e0, qwen_rope_tables().view(np.uint16).view(bfloat16)])
 
 
+def moss_qk_params(wq, wk, grid_h: int, grid_w: int) -> np.ndarray:
+    """Q/k norm weights and MOSS's compact bf16 four-axis RoPE table."""
+    freq = 10000.0 ** (-np.arange(16, dtype=np.float64) / 16)
+    tab = np.zeros(2 * EL, bfloat16)
+    cursor = 0
+    for positions in (64 * np.arange(65), np.arange(64),
+                      np.array([-(grid_h - 1) / 2]), np.array([-(grid_w - 1) / 2])):
+        angle = np.asarray(positions)[:, None] * freq
+        values = np.concatenate([np.cos(angle), np.sin(angle)], 1)
+        n = values.size
+        tab[cursor:cursor + n] = bf(values).reshape(-1)
+        cursor += n
+    e0 = np.zeros(EL, bfloat16)
+    e0[:HD], e0[HD:2 * HD] = bf(wq), bf(wk)
+    return np.concatenate([e0, tab])
+
+
 def qk_params(wq, wk) -> np.ndarray:
     """dit_ew qk parameter block: 3 elements (bf16 slots)."""
     e0 = np.zeros(EL, dtype=bfloat16)
     e0[:HD], e0[HD:2 * HD] = bf(wq), bf(wk)
     tab = rope_tables().view(np.uint16).view(bfloat16)
     return np.concatenate([e0, tab])
+
+
+def flux3_qk_params(wq, wk) -> np.ndarray:
+    """FLUX 3 q/k scale and θ=10000 tables, including its half image step."""
+    freq = 10000.0 ** (-np.arange(0, 32, 2, dtype=np.float64) / 32)
+    tab = np.zeros(EL, np.float32)
+    for p in range(64):
+        angle = p * freq
+        tab[p * 32:p * 32 + 16] = np.cos(angle)
+        tab[p * 32 + 16:p * 32 + 32] = np.sin(angle)
+    for p in range(8):
+        angle = 64 * p * freq
+        at = 64 * 32 + p * 32
+        tab[at:at + 16] = np.cos(angle)
+        tab[at + 16:at + 32] = np.sin(angle)
+    angle = 0.5 * freq
+    at = 64 * 32 + 8 * 32
+    tab[at:at + 16] = np.cos(angle)
+    tab[at + 16:at + 32] = np.sin(angle)
+    e0 = np.zeros(EL, bfloat16)
+    e0[:HD], e0[HD:2 * HD] = bf(wq), bf(wk)
+    return np.concatenate([e0, tab.view(np.uint16).view(bfloat16)])
+
+
+def qwen21_qk_params(wq, wk) -> np.ndarray:
+    """Qwen Image 2.1's 3-axis theta=10000 table, factored at position 32."""
+    freqs = np.concatenate([10000.0 ** (-np.arange(0, dim, 2) / dim)
+                            for dim in (16, 56, 56)])
+    tables = []
+    for step in (1, 32):
+        angle = np.arange(32)[:, None] * step * freqs[None]
+        tables.append(bf(np.stack((np.cos(angle), np.sin(angle)), -1)).reshape(-1))
+    e0 = np.zeros(EL, bfloat16)
+    e0[:HD], e0[HD:2 * HD] = bf(wq), bf(wk)
+    return np.concatenate([e0, *tables])
 
 
 REF_T = 10                        # diffusers' time coordinate of an edit's first reference
@@ -110,31 +164,56 @@ def ln(x, eps=1e-6):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--op", required=True,
-                    choices=["ln_mod", "res_ln_mod", "qk", "swiglu", "euler", "silu",
+                    choices=["ln_mod", "res_ln_mod", "qk", "qk_flux3", "qk_moss", "qk_qwen21", "swiglu", "situ", "euler", "silu", "gelu_tanh", "bias",
                              "rms", "res_rms", "qk_qwen"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--T", type=int, default=None)
+    ap.add_argument("--W", type=int, default=None, help="RMSNorm logical channel width")
+    ap.add_argument("--E", type=int, default=3, help="bias: 1..3 elements per row")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--grid-h", type=int, default=None, help="qk_moss image-token grid height")
+    ap.add_argument("--grid-w", type=int, default=None, help="qk_moss image-token grid width")
+    ap.add_argument("--text-len", type=int, default=None,
+                    help="qk_moss true text length; remaining rows are padded")
+    ap.add_argument("--ref-row", type=int, default=None,
+                    help="qk_flux3: first image row of a reference image (l=-1)")
     ap.add_argument("--build", default=None, help="build dir: write run.cfg against it")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--edit", action="store_true",
                     help="qk: an edit's [text | generated | reference] sequence at 512² "
                          "(grid 32, T = 512 + 2 x 1024)")
+    ap.add_argument("--tanh-gate", action="store_true",
+                    help="res_ln_mod: apply Qwen Image 2.1's tanh to the residual gate")
     a = ap.parse_args()
     out = Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(a.seed)
     op = a.op
-    T = a.T or {"silu": 16, "euler": 4096}.get(op, 2560 if a.edit else 4608)
+    T = a.T or {"silu": 16, "gelu_tanh": 512, "euler": 4096}.get(op, 2560 if a.edit else 4608)
     row = lambda T_, off=0, ld=EL, E=1: {"off": off, "ld": ld, "T": T_, "E": E}  # noqa: E731
     pvec = lambda n: (rng.standard_normal((n, EL)) * 0.5).astype(np.float32)  # noqa: E731
     bufs, ref, spec = {}, {}, {"op": op}
 
     def with_pad(p):
         """P = [pad, p..., pad]: dit_ew reads one vector either side of the run."""
-        return np.concatenate([np.zeros(EL, bfloat16), bf(p).reshape(-1), np.zeros(EL, bfloat16)])
+        values = np.asarray(p)
+        # Q/k tables store raw FP32 words inside BF16 slots. A BF16 -> FP32
+        # -> BF16 conversion here would canonicalize some NaN bit patterns.
+        values = values.reshape(-1) if values.dtype == bfloat16 else bf(values).reshape(-1)
+        return np.concatenate([np.zeros(EL, bfloat16), values, np.zeros(EL, bfloat16)])
 
-    if op == "ln_mod":
+    if op == "bias":
+        if a.E not in (1, 2, 3):
+            raise ValueError("bias fixture needs E=1, 2, or 3")
+        x = bf(rng.standard_normal((T, a.E * EL)) * 2)
+        p = pvec(a.E)
+        bufs = {"X": x, "P": with_pad(p)}
+        spec |= {"a": row(T, 0, a.E * EL, a.E),
+                 "y": row(T, 0, a.E * EL, a.E),
+                 "p_off": EL, "n_par": a.E, "bias_period": a.E}
+        ref["Y"] = (x.astype(np.float64).reshape(T, a.E, EL) +
+                    bf(p).astype(np.float64)[None]).reshape(T, a.E * EL)
+    elif op == "ln_mod":
         x = bf(rng.standard_normal((T, EL)) * 2 + rng.standard_normal((T, 1)))
         p = pvec(2)                                     # shift, scale
         bufs = {"X": x, "P": with_pad(p)}
@@ -148,9 +227,11 @@ def main() -> int:
         p = pvec(3)                                     # gate, shift, scale
         bufs = {"X": x, "B": y, "P": with_pad(p)}
         spec |= {"a": row(T), "b": row(T), "y": row(T), "z": row(T), "p_off": EL, "n_par": 3,
-                 "idx": {"gate": 0, "shift": 1, "scale": 2}}
+                 "idx": {"gate": 0, "shift": 1, "scale": 2},
+                 "tanh_gate": int(a.tanh_gate)}
         ps = bf(p).astype(np.float64)
-        xn = x.astype(np.float64) + ps[0] * y.astype(np.float64)
+        gate = bf(np.tanh(ps[0])).astype(np.float64) if a.tanh_gate else ps[0]
+        xn = x.astype(np.float64) + gate * y.astype(np.float64)
         ref["Z"] = xn
         ref["Y"] = ln(bf(xn).astype(np.float64)) * (1 + ps[2]) + ps[1]
     elif op == "qk":
@@ -166,6 +247,132 @@ def main() -> int:
             h = qkv[:, cols].astype(np.float64).reshape(T, 24, HD)
             hn = h / np.sqrt((h ** 2).mean(-1, keepdims=True) + 1e-6) * bf(w).astype(np.float64)
             ref[name] = rope_ref(hn, g, n_txt, grid_w).reshape(T, EL)
+    elif op == "qk_flux3":
+        n_txt = a.text_len if a.text_len is not None else 80
+        grid_w = a.grid_w if a.grid_w is not None else 32
+        grid_h = a.grid_h if a.grid_h is not None else 32
+        if not 0 <= n_txt <= 512 or not 1 <= grid_w <= 64 or not 1 <= grid_h <= 64:
+            raise ValueError("qk_flux3 fixture exceeds the current text/image RoPE table")
+        if T < n_txt + grid_h * grid_w:
+            raise ValueError("qk_flux3 fixture is smaller than its real token count")
+        qkv = bf(rng.standard_normal((T, 3 * EL)) * 2)
+        wq, wk = rng.uniform(0.5, 1.5, HD), rng.uniform(0.5, 1.5, HD)
+        bufs = {"X": qkv, "B": qkv,
+                "P": with_pad(flux3_qk_params(wq, wk).reshape(3, EL))}
+        spec |= {"op": "qk_flux3", "a": row(T, 0, 3 * EL),
+                 "b": row(T, EL, 3 * EL), "y": row(T), "z": row(T),
+                 "p_off": EL, "n_par": 3, "tok0": 0, "n_txt": n_txt,
+                 "grid_h": grid_h, "grid_w": grid_w, "heads": 24}
+        ref_row = a.ref_row if a.ref_row is not None else 64
+        if ref_row != 64:
+            spec["ref_row"] = ref_row
+        pos = np.zeros((T, 4), np.float64)
+        pos[:n_txt, 3] = np.arange(n_txt)
+        image = np.arange(grid_h * grid_w)
+        rows_h = image // grid_w
+        is_ref = rows_h >= ref_row
+        # Published FLUX 3 reference ids: h restarts per reference, l = -1.
+        pos[n_txt:n_txt + image.size, 1] = np.where(is_ref, rows_h - ref_row, rows_h) * 0.5
+        pos[n_txt:n_txt + image.size, 2] = (image % grid_w) * 0.5
+        pos[n_txt:n_txt + image.size, 3] = np.where(is_ref, -1.0, 0.0)
+        freq = 10000.0 ** (-np.arange(0, 32, 2, dtype=np.float64) / 32)
+        angle = (pos[:, :, None] * freq).reshape(T, 64)
+        cos = np.repeat(np.cos(angle), 2, axis=1)[:, None]
+        sin = np.repeat(np.sin(angle), 2, axis=1)[:, None]
+        for name, cols, weight in (("Y", slice(0, EL), wq),
+                                   ("Z", slice(EL, 2 * EL), wk)):
+            h = qkv[:, cols].astype(np.float64).reshape(T, 24, HD)
+            hn = h / np.sqrt((h ** 2).mean(-1, keepdims=True) + 1e-6)
+            hn *= bf(weight).astype(np.float64)
+            rot = np.stack((-hn[..., 1::2], hn[..., 0::2]), -1).reshape(hn.shape)
+            ref[name] = (hn * cos + rot * sin).reshape(T, EL)
+            ref[name][n_txt + grid_h * grid_w:] = 0     # the kernel zeroes padded rows
+    elif op == "qk_qwen21":
+        n_txt = a.text_len if a.text_len is not None else 15
+        grid_h = a.grid_h if a.grid_h is not None else 4
+        grid_w = a.grid_w if a.grid_w is not None else 4
+        if EL != 4096 or not 0 <= n_txt <= 1023 or not 1 <= grid_h <= 64 or not 1 <= grid_w <= 64:
+            raise ValueError("Qwen Image 2.1 q/k fixture needs EL=4096 and supported text/grid size")
+        cond = a.ref_row or 0                         # edit: first condition-image row
+        hw, gap = grid_h * grid_w, max(grid_h, grid_w)
+        valid = n_txt + hw * (2 if cond else 1)
+        if T < valid or not 0 <= cond < max(n_txt, 1):
+            raise ValueError("Qwen Image 2.1 q/k fixture lacks token rows")
+        qkv = bf(rng.standard_normal((T, 3 * EL)) * 2)
+        wq, wk = rng.uniform(0.5, 1.5, HD), rng.uniform(0.5, 1.5, HD)
+        bufs = {"X": qkv, "B": qkv, "P": with_pad(qwen21_qk_params(wq, wk).reshape(3, EL))}
+        spec |= {"a": row(T, 0, 3 * EL), "b": row(T, EL, 3 * EL),
+                 "y": row(T), "z": row(T), "p_off": EL, "n_par": 3,
+                 "tok0": 0, "n_txt": n_txt, "grid_h": grid_h,
+                 "grid_w": grid_w, "heads": 32, **({"cond_row": cond} if cond else {})}
+        # Positions as diffusers' QwenImage21Rope: text advances all axes; an image
+        # block freezes the frame at the text position before it on a centred grid, and
+        # the following text resumes max(h, w) further on.
+        image = np.arange(hw)
+        grid = np.stack((image // grid_w - (grid_h - grid_h // 2),
+                         image % grid_w - (grid_w - grid_w // 2)), -1)
+        layout = ([("text", n_txt), ("image", hw)] if not cond else
+                  [("text", cond), ("image", hw), ("text", n_txt - cond), ("image", hw)])
+        rows, position = [], 0
+        for kind, n in layout:
+            if kind == "text":
+                rows.append(np.repeat(np.arange(position, position + n)[:, None], 3, 1))
+                position += n
+            else:
+                rows.append(np.concatenate((np.full((hw, 1), position), grid), 1))
+                position += gap
+        coords = np.concatenate(rows).astype(np.int32)
+        angles = np.concatenate([
+            coords[:, axis, None] * (10000.0 ** (-np.arange(0, dim, 2) / dim))[None]
+            for axis, dim in enumerate((16, 56, 56))], axis=1)
+        cos, sin = np.cos(angles)[:, None], np.sin(angles)[:, None]
+        for name, cols, weight in (("Y", slice(0, EL), wq),
+                                   ("Z", slice(EL, 2 * EL), wk)):
+            h = qkv[:valid, cols].astype(np.float64).reshape(valid, 32, HD)
+            hn = h / np.sqrt((h ** 2).mean(-1, keepdims=True) + 1e-6)
+            hn = bf(hn * bf(weight).astype(np.float64)).astype(np.float64)
+            paired = hn.reshape(valid, 32, 64, 2)
+            rotated = np.empty_like(paired)
+            rotated[..., 0] = paired[..., 0] * cos - paired[..., 1] * sin
+            rotated[..., 1] = paired[..., 0] * sin + paired[..., 1] * cos
+            values = np.zeros((T, EL), np.float64)
+            values[:valid] = rotated.reshape(valid, EL)
+            ref[name] = values
+    elif op == "qk_moss":
+        grid_h = a.grid_h or int(np.sqrt(T // 2))
+        grid_w = a.grid_w or grid_h
+        if grid_h < 1 or grid_w < 1 or grid_h > 64 or grid_w > 64 or grid_h * grid_w >= T:
+            raise ValueError("qk_moss fixture needs grid in [1, 64] and text tokens")
+        n_img = grid_h * grid_w
+        n_txt = a.text_len if a.text_len is not None else T - n_img
+        if not 1 <= n_txt <= min(4096, T - n_img):
+            raise ValueError("qk_moss needs 1..4096 real text tokens within T")
+        qkv = bf(rng.standard_normal((T, 3 * EL)) * 2)
+        wq, wk = rng.uniform(0.5, 1.5, HD), rng.uniform(0.5, 1.5, HD)
+        bufs = {"X": qkv, "B": qkv,
+                "P": with_pad(moss_qk_params(wq, wk, grid_h, grid_w).reshape(3, EL))}
+        spec |= {"a": row(T, 0, 3 * EL), "b": row(T, EL, 3 * EL),
+                 "y": row(T), "z": row(T), "p_off": EL, "n_par": 3,
+                 "tok0": 0, "n_txt": n_txt, "grid_h": grid_h, "grid_w": grid_w,
+                 "heads": 24}
+        pos = np.zeros((T, 4), np.float64)
+        g = np.arange(n_img)
+        pos[:n_img, 1] = n_txt
+        pos[:n_img, 2] = g // grid_w - (grid_h - 1) / 2
+        pos[:n_img, 3] = g % grid_w - (grid_w - 1) / 2
+        pos[n_img:n_img + n_txt, 1] = np.arange(n_txt)
+        freq = 10000.0 ** (-np.arange(16, dtype=np.float64) / 16)
+        angle = (pos[:, :, None] * freq).reshape(T, 64)
+        cos, sin = np.cos(angle)[:, None], np.sin(angle)[:, None]
+        for name, cols, weight in (("Y", slice(0, EL), wq),
+                                   ("Z", slice(EL, 2 * EL), wk)):
+            h = qkv[:, cols].astype(np.float64).reshape(T, 24, HD)
+            hn = h / np.sqrt((h ** 2).mean(-1, keepdims=True) + 1e-6)
+            hn *= bf(weight).astype(np.float64)
+            rot = np.concatenate([-hn[..., 64:], hn[..., :64]], -1)
+            ref[name] = (hn * np.concatenate([cos, cos], -1) +
+                         rot * np.concatenate([sin, sin], -1)).reshape(T, EL)
+            ref[name][n_img + n_txt:] = 0
     elif op == "swiglu":
         ff = bf(rng.standard_normal((T, 6 * EL)) * 2)
         bufs = {"X": ff, "B": ff}
@@ -173,6 +380,16 @@ def main() -> int:
                  "y": row(T, 0, 3 * EL, 3)}
         g, u = ff[:, :3 * EL].astype(np.float64), ff[:, 3 * EL:].astype(np.float64)
         ref["Y"] = g / (1 + np.exp(-g)) * u
+    elif op == "situ":
+        ff = np.zeros((T, 6 * EL), bfloat16)
+        ff[:, :8192] = bf(rng.standard_normal((T, 8192)) * 2)
+        ff[:, 3 * EL:3 * EL + 8192] = bf(rng.standard_normal((T, 8192)) * 2)
+        bufs = {"X": ff, "B": ff}
+        spec |= {"a": row(T, 0, 6 * EL, 3), "b": row(T, 3 * EL, 6 * EL, 3),
+                 "y": row(T, 0, 3 * EL, 3)}
+        hidden, gate = ff[:, :3 * EL].astype(np.float64), ff[:, 3 * EL:].astype(np.float64)
+        sig = 1 / (1 + np.exp(-gate))
+        ref["Y"] = (4 * np.tanh(gate / 4) * sig) * (25 * np.tanh(hidden / 25))
     elif op == "euler":
         n = -(-T // 24)
         n += (-n) % 16                                  # whole elements per core
@@ -191,8 +408,10 @@ def main() -> int:
         spec |= {"a": tile(128), "b": tile(1024), "y": tile(128), "p_off": EL, "n_par": 1,
                  "real_T": T}
         ref["Y"] = x.astype(np.float64) + float(dt) * v[:, :128].astype(np.float64)
-    elif op in ("rms", "res_rms"):         # Qwen3 RMSNorm over W = 2560 of the 3072 element
-        W = 2560
+    elif op in ("rms", "res_rms"):
+        W = a.W or 2560
+        if not 32 <= W <= EL:
+            raise ValueError("RMSNorm width must be in 32..EL")
         x = np.zeros((T, EL), bfloat16)
         x[:, :W] = bf(rng.standard_normal((T, W)) * 3)
         wv = np.zeros((1, EL), np.float32)
@@ -236,12 +455,14 @@ def main() -> int:
         k = norm_rope(x64[:, 32:40], wk)
         ref["Y"] = q[:, :24].reshape(T, EL)
         ref["Z"] = np.concatenate([q[:, 24:], k, x64[:, 40:]], 1).reshape(T, EL)
-    elif op == "silu":
+    elif op in ("silu", "gelu_tanh"):
         x = bf(rng.standard_normal((T, EL)) * 3)
         bufs = {"X": x}
         spec |= {"a": row(T), "y": row(T)}
         xf = x.astype(np.float64)
-        ref["Y"] = xf / (1 + np.exp(-xf))
+        ref["Y"] = (xf / (1 + np.exp(-xf)) if op == "silu" else
+                    0.5 * xf * (1 + np.tanh(np.sqrt(2 / np.pi) *
+                                                (xf + 0.044715 * xf ** 3))))
 
     outs = {"Y": ref["Y"].shape}
     if "Z" in ref:

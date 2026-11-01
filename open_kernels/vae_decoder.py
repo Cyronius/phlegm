@@ -1,7 +1,11 @@
-r"""vae_decoder: FLUX.2 [klein]'s VAE decoder on the NPU -- weight packing, buffer layout and
+r"""vae_decoder: FLUX.2 and MOSS Image VAE decoders on the NPU -- weight packing, layout and
 dispatch schedule, shared by the kernel exporter (export_dit_kernels.py builds the streams)
 and whatever runs them (utilities/dit-chain/chain_test_vae.py, later the engine).
 Design: .claude/plans/image-diffusion-phase5-vae.md.
+
+The default FLUX.2 profile has 128/256/512/512 decoder blocks. MOSS uses
+96/192/384/384, with conv buffers padded to 128-channel output tiles and vae_ew's
+non-RGBA element size reduced to 3072 so each element contains whole logical pixels.
 
 Kernel sets (export_dit_kernels.py): conv/ (dit_conv, 3x3), conv1/ (dit_conv, 1x1), vew/
 (vae_ew), and one stream each in the DiT's gemm and fa sets.
@@ -13,12 +17,12 @@ What runs, from the DiT's final latents LAT ([T, 128] packed, T = (R/16)^2):
   conv_in     conv 3x3 -> the mid block's input
   resnet      [gn_stats] gn_apply+SiLU, conv, gn_stats, gn_apply+SiLU, conv, [1x1
               shortcut], add (+ the next GroupNorm's sums); the add is in place
-  attention   gn_apply -> QIN [T, 1024] (column 512 is a constant 1: the biases' row),
+  attention   gn_apply -> QIN [T, 1024 or 512] (column 512 or 384 is a constant 1),
               one dit_gemm [q' x4 | k' x4 | v''] (N 2048), dit_fa (4 heads of 128), add.
-              The one d = 512 head runs as 4 heads of 128 because its score form
+              The one d = 512 or 384 head runs as 4 heads of 128 because its score form
               [x,1] Ma x^T (Ma = [Wq^T Wk; bq Wk]) is factored at rank 128 (plain SVD, s^1/2
               on each side; utilities/dit-ref/vae_attn_rank.py: LPIPS 0.0004); q' carries
-              1/2 (dit_fa scales by 1/sqrt(128), the VAE by 1/sqrt(512)); Wo and both
+              sqrt(128/d) (dit_fa scales by 1/sqrt(128), the VAE by 1/sqrt(d)); Wo and both
               value/output biases fold into v'' (P's rows sum to 1)
   upsample    conv 3x3 on the source grid, 4 output phases (nearest 2x folded in)
   norm_out    gn_apply+SiLU, conv_out (3 of 128 channels), rgba -> RGBA8
@@ -45,6 +49,7 @@ HERE = Path(__file__).resolve().parent
 
 LATENT_CH = 32
 BLOCK_OUT = (128, 256, 512, 512)
+MOSS_BLOCK_OUT = (96, 192, 384, 384)
 LAYERS = 2                      # resnets per up block = LAYERS + 1
 EL = 4096                       # vae_ew element
 BLOCK = 19                      # GroupNorm parameter block, elements (vae_ew.py)
@@ -66,10 +71,16 @@ def _dit_conv_pack():
 
 
 def attention_weights(sd: dict, prefix: str, rank: int = RANK) -> np.ndarray:
-    """The attention GEMM's B [QIN_W, QKV_N] (float64), see the module docstring."""
+    """The attention GEMM's padded B, with one shared rank-128 QK product per VAE head."""
     g = lambda k: np.asarray(sd[prefix + k], np.float64)  # noqa: E731
     Wq, bq, Wk = g("to_q.weight"), g("to_q.bias"), g("to_k.weight")
     Wv, bv, Wo, bo = g("to_v.weight"), g("to_v.bias"), g("to_out.0.weight"), g("to_out.0.bias")
+    channels = Wq.shape[0]
+    if channels not in (384, 512) or channels % rank:
+        raise ValueError(f"unsupported VAE attention width: {channels}")
+    heads = 4  # dit_fa assigns heads evenly to two core groups
+    qin_w = 512 if channels == 384 else QIN_W
+    qkv_n = QKV_N
     Ma = np.concatenate([Wq.T @ Wk, (bq @ Wk)[None]], 0)          # [513, 512]
     P, s, Qt = np.linalg.svd(Ma, full_matrices=False)
     # Each singular pair's sign is LAPACK's choice and changes between numpy builds; the
@@ -77,14 +88,14 @@ def attention_weights(sd: dict, prefix: str, rank: int = RANK) -> np.ndarray:
     # does not), so a flip moves pixels. Fix it: each k' column's largest entry positive.
     sign = np.sign(Qt[np.arange(len(s)), np.abs(Qt).argmax(1)])
     P, Qt = P * sign, Qt * sign[:, None]
-    U = P[:, :rank] * np.sqrt(s[:rank]) * 0.5                       # q' = [x, 1] U
+    U = P[:, :rank] * np.sqrt(s[:rank]) * np.sqrt(rank / channels)  # q' = [x, 1] U
     V = Qt[:rank].T * np.sqrt(s[:rank])                             # k' = x V
-    B = np.zeros((QIN_W, QKV_N))
-    for h in range(4):
-        B[:513, 128 * h:128 * (h + 1)] = U
-        B[:512, 512 + 128 * h:512 + 128 * (h + 1)] = V
-    B[:512, 1024:1536] = Wv.T @ Wo.T
-    B[512, 1024:1536] = bv @ Wo.T + bo
+    B = np.zeros((qin_w, qkv_n))
+    for h in range(heads):
+        B[:channels + 1, rank * h:rank * (h + 1)] = U
+        B[:channels, 512 + rank * h:512 + rank * (h + 1)] = V
+    B[:channels, 1024:1024 + channels] = Wv.T @ Wo.T
+    B[channels, 1024:1024 + channels] = bv @ Wo.T + bo
     return B
 
 
@@ -109,6 +120,11 @@ def pack_weights(sd: dict) -> tuple[np.ndarray, dict[str, tuple[int, int]], np.n
     """diffusers AutoencoderKLFlux2 state dict (numpy) -> (weights bytes, {key: (offset,
     nbytes)}, GroupNorm blocks (bf16 [n * BLOCK * EL]), {gn key: block index})."""
     conv_pack, pack_b = _dit_conv_pack()
+    mid = sd["decoder.conv_in.weight"].shape[0]
+    out = sd["decoder.conv_norm_out.weight"].shape[0]
+    if (mid, out) not in ((512, 128), (384, 96)):
+        raise ValueError(f"unsupported VAE decoder channels: mid={mid}, out={out}")
+    el = 3072 if mid == 384 else EL
     parts, table, off = [], {}, 0
 
     def add(key, arr):
@@ -130,18 +146,19 @@ def pack_weights(sd: dict) -> tuple[np.ndarray, dict[str, tuple[int, int]], np.n
                 and k not in ("decoder.conv_in.weight",):
             base = k[:-len(".weight")]
             taps = sd[k].shape[2] * sd[k].shape[3]
+            cin = -(-sd[k].shape[1] // 128) * 128
             add(base, conv_pack.pack_conv(f(k), f(base + ".bias"), taps=taps,
-                                          up=".upsamplers." in base))
+                                          up=".upsamplers." in base, cin=cin))
         if k.startswith("decoder.") and k.endswith(".weight") and sd[k].ndim == 1 \
                 and "norm" in k.split(".")[-2]:
             gns.append(k[:-len(".weight")])
     attn = "decoder.mid_block.attentions.0."
     add("attn_qkv", pack_b(attention_weights(sd, attn).astype(np.float32)))
-    blocks = np.zeros(len(gns) * BLOCK * EL, bfloat16)
+    blocks = np.zeros(len(gns) * BLOCK * el, bfloat16)
     index = {}
     for i, key in enumerate(gns):
         gamma, beta = f(key + ".weight"), f(key + ".bias")
-        e = (i * BLOCK + 1) * EL
+        e = (i * BLOCK + 1) * el
         blocks[e:e + gamma.size] = gamma.astype(bfloat16)
         blocks[e + 512:e + 512 + beta.size] = beta.astype(bfloat16)
         index[key] = i
@@ -171,6 +188,7 @@ class Buf:
 @dataclass
 class Plan:
     R: int
+    profile: str = "vae"
     buffers: dict[str, Buf] = field(default_factory=dict)
     ops: list[dict] = field(default_factory=list)
     streams: dict[str, dict[str, dict]] = field(default_factory=dict)   # set -> name -> spec
@@ -179,7 +197,7 @@ class Plan:
     def stream(self, kset: str, spec: dict) -> str:
         key = (kset, json.dumps(spec, sort_keys=True))
         if key not in self._by_spec:
-            name = f"vae{self.R}_{kset}{len(self.streams.setdefault(kset, {})):02d}"
+            name = f"{self.profile}{self.R}_{kset}{len(self.streams.setdefault(kset, {})):02d}"
             self.streams[kset][name] = spec
             self._by_spec[key] = name
         return self._by_spec[key]
@@ -193,17 +211,30 @@ def _parts(W: int) -> int:
     return max(1, 128 // W)
 
 
-def plan(R: int) -> Plan:
+def plan(R: int, block_out: tuple[int, ...] = BLOCK_OUT) -> Plan:
     """The whole decode at R x R: buffers, ops (in order), and the streams they use."""
-    pl = Plan(R)
+    if len(block_out) != 4 or any(c < 32 or c % 32 for c in block_out):
+        raise ValueError(f"unsupported decoder block widths: {block_out}")
+    moss = tuple(block_out) == MOSS_BLOCK_OUT
+    if tuple(block_out) != BLOCK_OUT and not moss:
+        raise ValueError(f"unsupported decoder profile: {block_out}")
+    if moss and R not in (512, 1024):
+        raise ValueError(f"MOSS decoder needs a supported 512 or 1024 pixel square, got {R}")
+    pl = Plan(R, "mossvae" if moss else "vae")
     B = pl.buffers
     L, h = R // 8, R // 16
-    rev = list(reversed(BLOCK_OUT))                     # up block output channels
+    rev = list(reversed(block_out))                     # logical up block channels
+    physical = lambda c: -(-c // 128) * 128             # dit_conv output tile
+    mid = rev[0]
+    heads = 4
+    qin_w = 512 if moss else QIN_W
+    qkv_n = QKV_N
+    ew_el = 3072 if moss else EL
     res = [L * 2 ** i for i in range(4)]
     B["LAT"] = Buf(h, h, 4 * LATENT_CH, h, border=0, extra_rows=4)
     B["Z0"] = Buf(L, L, 128, _parts(h) * (L + 2))
-    B["QIN"] = Buf(L, L, QIN_W, L, border=0)
-    B["QKV"] = Buf(L, L, QKV_N, L, border=0)
+    B["QIN"] = Buf(L, L, qin_w, L, border=0)
+    B["QKV"] = Buf(L, L, qkv_n, L, border=0)
     B["O"] = Buf(L, L, 512, L, border=0)
     B["OUT"] = Buf(R, R, 128, R + 2)
     B["RGBA"] = Buf(R * R // 1024, 1, EL, 1, border=0)
@@ -216,26 +247,30 @@ def plan(R: int) -> Plan:
     for i, r in enumerate(res):
         cin = rev[max(i - 1, 0)]                        # the stage's input channels
         src = L if i == 0 else res[i - 1]               # the producer's source grid
-        B[f"X{i}"] = Buf(r, r, cin, _parts(src) * (r + 2), extra_rows=1)
+        B[f"X{i}"] = Buf(r, r, physical(cin), _parts(src) * (r + 2), extra_rows=1)
         for n in ("G", "T", "S"):
-            B[f"{n}{i}"] = Buf(r, r, rev[i], _parts(r) * (r + 2), extra_rows=1)
+            B[f"{n}{i}"] = Buf(r, r, physical(rev[i]), _parts(r) * (r + 2), extra_rows=1)
         if cin != rev[i]:
-            B[f"GI{i}"] = Buf(r, r, cin, _parts(r) * (r + 2), extra_rows=1)
+            B[f"GI{i}"] = Buf(r, r, physical(cin), _parts(r) * (r + 2), extra_rows=1)
 
     def conv(taps, src, dst, H, W, cin, cout, wkey, up=False, what=""):
-        spec = {"H": H, "W": W, "Cin": cin, "Cout": cout, "up": up,
+        spec = {"H": H, "W": W, "Cin": B[src].C, "Cout": B[dst].C, "up": up,
                 "x": B[src].view(), "y": B[dst].view()}
         pl.op("conv" if taps == 9 else "conv1", spec,
               [("buf", src), ("w", wkey), ("buf", dst)], what or wkey)
 
     def vew(op, C, H, W, a=None, b=None, y=None, gn=None, what="", **kw):
+        el = EL if op == "rgba" else ew_el
         spec = {"op": op, "C": C, "H": H, "W": W, **kw, "stats_off": 0}
-        sizes = {"X": EL, "B": EL, "S": BLOCK * EL, "Y": EL}
+        if moss:
+            spec["el"] = el
+        sizes = {"X": el, "B": el, "S": BLOCK * el, "Y": el}
         for role, (name, extra) in (("a", a or (None, {})), ("b", b or (None, {})),
                                     ("y", y or (None, {}))):
             if name is None:
                 continue
-            v = B[name].view(**extra)
+            stride = {"px_stride": B[name].C} if B[name].C != C else {}
+            v = B[name].view(**(stride | extra))
             spec[role] = v
             ps = v.get("px_stride", C)
             sizes[{"a": "X", "b": "B", "y": "Y"}[role]] = \
@@ -275,24 +310,24 @@ def plan(R: int) -> Plan:
     def attention(key, next_gn):
         r, x = res[0], state["x"]
         if state["fresh"] != key + ".group_norm":
-            vew("gn_stats", 512, r, r, a=(x, {}), gn=key + ".group_norm")
-        vew("gn_apply", 512, r, r, a=(x, {}), y=("QIN", {"px_stride": QIN_W}),
+            vew("gn_stats", mid, r, r, a=(x, {}), gn=key + ".group_norm")
+        vew("gn_apply", mid, r, r, a=(x, {}), y=("QIN", {"px_stride": qin_w}),
             gn=key + ".group_norm", what=key + ".group_norm")
         T = r * r
-        pl.op("gemm", {"M": T, "K": QIN_W, "N": QKV_N},
+        pl.op("gemm", {"M": T, "K": qin_w, "N": qkv_n},
               [("buf", "QIN"), ("w", "attn_qkv"), ("buf", "QKV")], key + " q'|k'|v''")
-        pl.op("fa", {"L": T, "heads": 4, "kv_heads": 4, "causal": 0, "valid_len": 0,
-                     "layout": {"qkv_ld": QKV_N, "k_col": 512, "v_col": 1024, "o_ld": 512}},
+        pl.op("fa", {"L": T, "heads": heads, "kv_heads": heads, "causal": 0, "valid_len": 0,
+                     "layout": {"qkv_ld": qkv_n, "k_col": 512, "v_col": 1024, "o_ld": 512}},
               [("buf", "QKV"), ("buf", "QKV"), ("buf", "QKV"), ("buf", "O")], key + " attention")
-        vew("add", 512, r, r, a=(x, {}), b=("O", {}), y=(x, {}), gn=next_gn,
+        vew("add", mid, r, r, a=(x, {}), b=("O", {}), y=(x, {}), gn=next_gn,
             stats=next_gn is not None, what=key + " residual")
         state["fresh"] = next_gn
 
     # the units in order, each with the GroupNorm it starts with (None: an upsample conv)
-    units = [("resnet", "decoder.mid_block.resnets.0", 0, 512, 512),
+    units = [("resnet", "decoder.mid_block.resnets.0", 0, mid, mid),
              ("attn", "decoder.mid_block.attentions.0"),
-             ("resnet", "decoder.mid_block.resnets.1", 0, 512, 512)]
-    ci = 512
+             ("resnet", "decoder.mid_block.resnets.1", 0, mid, mid)]
+    ci = mid
     for b, co in enumerate(rev):
         for j in range(LAYERS + 1):
             units.append(("resnet", f"decoder.up_blocks.{b}.resnets.{j}", b, ci, co))
@@ -307,7 +342,7 @@ def plan(R: int) -> Plan:
 
     conv(1, "LAT", "Z0", h, h, 4 * LATENT_CH, 128, "latent_in", up=True,
          what="latent_in (BN, unpatchify, post_quant_conv)")
-    conv(9, "Z0", "X0", L, L, 128, 512, "decoder.conv_in")
+    conv(9, "Z0", "X0", L, L, 128, mid, "decoder.conv_in")
     for n, u in enumerate(units):
         nxt = first_gn(units[n + 1]) if n + 1 < len(units) else None
         if u[0] == "resnet":
@@ -320,18 +355,18 @@ def plan(R: int) -> Plan:
             state.update(x=f"X{i + 1}", fresh=None)
         else:
             r = res[3]
-            vew("gn_apply", 128, r, r, a=(state["x"], {}), y=("G3", {}), gn=u[1], silu=True,
+            vew("gn_apply", rev[3], r, r, a=(state["x"], {}), y=("G3", {}), gn=u[1], silu=True,
                 what=u[1])
-            conv(9, "G3", "OUT", r, r, 128, 128, "decoder.conv_out")
+            conv(9, "G3", "OUT", r, r, rev[3], 128, "decoder.conv_out")
             vew("rgba", 128, r, r, a=("OUT", {}), y=("RGBA", {}), what="rgba")
     return pl
 
 
-def stream_specs(resolutions: list[int]) -> dict[str, dict[str, dict]]:
+def stream_specs(resolutions: list[int], block_out: tuple[int, ...] = BLOCK_OUT) -> dict[str, dict[str, dict]]:
     """{kernel set: {stream: spec}} over the resolutions (the exporter's view)."""
     out: dict[str, dict[str, dict]] = {}
     for R in resolutions:
-        for kset, streams in plan(R).streams.items():
+        for kset, streams in plan(R, block_out).streams.items():
             out.setdefault(kset, {}).update(streams)
     return out
 

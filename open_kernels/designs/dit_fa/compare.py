@@ -32,6 +32,7 @@ def main() -> int:
     d = Path(a.testdir)
     r = np.load(d / "ref.npz")
     L, H, KVH = int(r["L"]), int(r["heads"]), int(r["kv_heads"])
+    LK = int(r["lk"]) if "lk" in r else L
     causal, valid = bool(r["causal"]), int(r["valid_len"])
     q, k, v = bf(r["q"]), bf(r["k"]), bf(r["v"])
     o = np.fromfile(d / "o.bin", dtype=bfloat16).astype(np.float64).reshape(L, H * D)
@@ -44,7 +45,7 @@ def main() -> int:
         qh = q[rows, h * D:(h + 1) * D]
         kk, vv = k[:, kh * D:(kh + 1) * D], v[:, kh * D:(kh + 1) * D]
         s = qh @ kk.T / np.sqrt(D)
-        cols = np.arange(L)[None, :]
+        cols = np.arange(LK)[None, :]
         mask = cols >= valid
         if causal:
             mask = mask | (cols > rows[:, None])

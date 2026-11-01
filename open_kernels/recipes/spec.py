@@ -1685,7 +1685,7 @@ def _gemma3_gguf(md: Mapping[str, Any], tensors=None) -> ModelSpec:
         extra={"architecture": a, "source": "gguf"},
     )
 
-def _gemma4_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+def _gemma4_hf(cfg: Mapping[str, Any], real_vocab: int | None, moe: bool = False) -> ModelSpec:
     """Gemma 4 12B (`gemma4_unified`, text tower `gemma4_unified_text`): Gemma 3 12B's
     sliding layers, plus global layers with their own geometry. From transformers 5.15
     `modeling_gemma4.py`: head_dim 512 and ONE kv head on the global layers, whose V is the raw
@@ -1697,11 +1697,11 @@ def _gemma4_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
     layers, which nothing here builds -- refused by name rather than run without them."""
     tc = cfg.get("text_config", cfg)
     mt = tc.get("model_type", cfg.get("model_type"))
-    if mt != "gemma4_unified_text":
-        raise SpecError(f"gemma4: text model_type {mt!r}: only the 12B's gemma4_unified_text is implemented "
-                        f"(the E2B / E4B need per-layer embeddings and KV sharing)")
+    if mt != ("gemma4_text" if moe else "gemma4_unified_text"):
+        raise SpecError(f"gemma4: text model_type {mt!r}: only the 12B's gemma4_unified_text and the 26B-A4B's "
+                        f"gemma4_text are implemented (the E2B / E4B need per-layer embeddings and KV sharing)")
     for key, want in (("num_kv_shared_layers", 0), ("hidden_size_per_layer_input", 0),
-                      ("use_double_wide_mlp", False), ("enable_moe_block", False), ("attention_bias", False)):
+                      ("use_double_wide_mlp", False), ("enable_moe_block", moe), ("attention_bias", False)):
         if (tc.get(key) or want) != want:
             raise SpecError(f"gemma4: {key} = {tc.get(key)!r} is not implemented (need {want!r})")
     if tc.get("hidden_activation", "gelu_pytorch_tanh") != "gelu_pytorch_tanh":
@@ -1753,15 +1753,24 @@ def _gemma4_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
         v_norm=True,
         attn_scale=1.0,
         final_softcap=float(tc.get("final_logit_softcapping") or 0.0),
+        # 26B-A4B (OPEN-FAMILY-GEMMA4-MOE): the routed experts beside the dense MLP in every layer
+        num_experts=int(_need(tc, "num_experts")) if moe else 0,
+        experts_per_tok=int(_need(tc, "top_k_experts")) if moe else 0,
+        moe_intermediate=int(_need(tc, "moe_intermediate_size")) if moe else 0,
         quant="q4_1",
         extra={"model_type": cfg.get("model_type", mt), "source": "hf_config"},
     )
 
 
 def _gemma4_unsupported(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+    """model_type gemma4: the 26B-A4B (routed experts, no per-layer inputs, no KV sharing) derives
+    (OPEN-FAMILY-GEMMA4-MOE); the E2B / E4B are refused."""
+    tc = cfg.get("text_config", cfg)
+    if tc.get("enable_moe_block") and not tc.get("hidden_size_per_layer_input") and not tc.get("num_kv_shared_layers"):
+        return _gemma4_hf(cfg, real_vocab, moe=True)
     raise SpecError("gemma4: the E2B / E4B (model_type gemma4) are not implemented on the open "
                     "kernels: per-layer embeddings and KV sharing across layers have no recipe. "
-                    "The 12B (gemma4_unified) is.")
+                    "The 12B (gemma4_unified) and the 26B-A4B (enable_moe_block) are.")
 
 
 # `qwen3_5_moe_text` is the text-only derivative of the VLM `qwen3_5_moe` (Ornith-1.0-35B-A3B

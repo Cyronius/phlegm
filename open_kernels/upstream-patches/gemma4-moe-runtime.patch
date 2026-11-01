@@ -1,0 +1,537 @@
+diff --git a/src/open_qwen36/core.cpp b/src/open_qwen36/core.cpp
+index fa9f0ae..10da6bf 100644
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -1435,7 +1435,7 @@ void Core::bench_decode(int reps) {
+     auto replay = [&](int l, std::map<std::string, BenchStat>& into) {
+         double ms = 0;
+         for (const Step& s : types_[l]->program) {
+-            if (s.op != "run") { route(kerns_.at(s.kernel), l, s.act_off); continue; }
++            if (s.op != "run") { host_step(s, l); continue; }
+             const auto [submit, wait] = run_split(kerns_.at(s.kernel), s.args, l);
+             into[s.kernel].add(submit, wait);
+             ms += submit + wait;
+@@ -1883,13 +1883,155 @@ void Core::route(Kern& k, int layer, uint64_t act_off) {
+     timing_.route_ms += ms_since(t0);
+ }
+ 
++void Core::host_step(const Step& s, int layer) {
++    if (s.op == "gemma4_route") gemma4_route(s, layer);
++    else if (s.op == "gemma4_combine") gemma4_combine(s, layer);
++    else route(kerns_.at(s.kernel), layer, s.act_off);
++}
++
++Core::G4Moe& Core::g4moe(const Step& s, int layer) {
++    auto it = g4moe_.find(layer);
++    if (it != g4moe_.end() && !(s.op == "gemma4_route" ? it->second.router.empty() : it->second.post_norm.empty()))
++        return it->second;
++    G4Moe& g = g4moe_[layer];
++    auto name = [&](const std::string& t, const char* key, int v) {
++        std::string n = t;
++        for (size_t p = n.find(key); p != std::string::npos; p = n.find(key)) n.replace(p, 3, std::to_string(v));
++        return n;
++    };
++    const size_t hid = w_->hidden, E = w_->moe.experts;
++    auto want = [&](const std::vector<float>& v, size_t n, const std::string& what) {
++        if (v.size() != n)
++            throw std::runtime_error("open_qwen36: layer " + std::to_string(layer) + ": " + what + " has " +
++                                     std::to_string(v.size()) + " values, not " + std::to_string(n));
++    };
++    if (s.op == "gemma4_route") {
++        g.router = file_->f32(name(s.router, "{l}", layer));
++        g.router_scale = file_->f32(name(s.router_scale, "{l}", layer));
++        g.expert_scale = file_->f32(name(s.expert_scale, "{l}", layer));
++        g.pre_norm = file_->f32(name(s.pre_norm, "{l}", layer));
++        want(g.router, E * hid, "the router");
++        want(g.router_scale, hid, "the router scale");
++        want(g.expert_scale, E, "the per-expert scale");
++        want(g.pre_norm, hid, "pre_ffw_norm_2");
++    } else {
++        g.post_norm2 = file_->f32(name(s.post_norm2, "{l}", layer));
++        g.post_norm = file_->f32(name(s.post_norm, "{l}", layer));
++        want(g.post_norm2, hid, "post_ffw_norm_2");
++        want(g.post_norm, hid, "post_ffw_norm");
++        // the residual is carried divided by the layer scalars before this layer (pools.cpp put's
++        // div_running), so the block output added to it is too
++        double div = 1.0;
++        for (int j = 0; j < layer; ++j) {
++            const std::vector<float> v = file_->f32(name(s.div_running, "{j}", j));
++            if (v.size() != 1) throw std::runtime_error("open_qwen36: " + name(s.div_running, "{j}", j) + " is not one value");
++            div *= v[0];
++        }
++        if (!(div > 0.0) || !std::isfinite(div)) throw std::runtime_error("open_qwen36: gemma4_combine fold " + std::to_string(div));
++        for (float& w : g.post_norm) w = static_cast<float>(w / div);
++    }
++    return g;
++}
++
++namespace {
++// x * (mean(x^2) + eps)^-0.5 in double, then the weight (Gemma 4: x * w)
++void g4_rms(const float* x, size_t n, double eps, const float* w, double* out) {
++    double ss = 0.0;
++    for (size_t i = 0; i < n; ++i) ss += static_cast<double>(x[i]) * x[i];
++    const double r = 1.0 / std::sqrt(ss / static_cast<double>(n) + eps);
++    for (size_t i = 0; i < n; ++i) out[i] = x[i] * r * (w ? static_cast<double>(w[i]) : 1.0);
++}
++}  // namespace
++
++void Core::gemma4_route(const Step& s, int layer) {
++    // Gemma 4 26B-A4B's router (OPEN-FAMILY-GEMMA4-MOE; transformers Gemma4TextRouter, llama.cpp
++    // gemma4.cpp): over res, the residual after attention, RMS-normed without weight, times the router
++    // scale and hidden^-0.5; logits through the F32 router; softmax over every expert, the top k (ties
++    // to the lower expert), renormalised over those, times per_expert_scale. xm2 = pre_ffw_norm_2(res)
++    // goes to gm_moe as bf16 with the weights at a_w; the chosen experts into its fills (moeroute2).
++    auto t0 = std::chrono::steady_clock::now();
++    Kern& k = kerns_.at(s.kernel);
++    if (k.moe2.empty()) throw std::runtime_error("open_qwen36: gemma4_route on " + k.name + ", which has no routed-expert table");
++    const size_t hid = w_->hidden, E = w_->moe.experts, K = w_->moe.topk;
++    if (K > 8 || K > E) throw std::runtime_error("open_qwen36: gemma4_route geometry");
++    G4Moe& g = g4moe(s, layer);
++    xrt::bo& act = act_[layer];
++    read_back(act, hid * 4, s.a_res);
++    uint8_t* a = act.map<uint8_t*>();
++    const float* res = reinterpret_cast<const float*>(a + s.a_res);
++    std::vector<double> r(hid), xm(hid);
++    g4_rms(res, hid, s.eps, nullptr, r.data());
++    const double sc = 1.0 / std::sqrt(static_cast<double>(hid));
++    for (size_t i = 0; i < hid; ++i) r[i] *= g.router_scale[i] * sc;
++    std::vector<double> logit(E);
++    for (size_t e = 0; e < E; ++e) {
++        const float* wr = g.router.data() + e * hid;
++        double acc = 0.0;
++        for (size_t i = 0; i < hid; ++i) acc += static_cast<double>(wr[i]) * r[i];
++        logit[e] = acc;
++    }
++    std::vector<uint32_t> order(E);
++    for (size_t e = 0; e < E; ++e) order[e] = static_cast<uint32_t>(e);
++    std::stable_sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) { return logit[x] > logit[y]; });
++    uint32_t idx[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++    float wv[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++    const double mx = logit[order[0]];
++    double sum = 0.0;
++    for (size_t j = 0; j < K; ++j) sum += std::exp(logit[order[j]] - mx);
++    for (size_t j = 0; j < K; ++j) {
++        idx[j] = order[j];
++        wv[j] = static_cast<float>(std::exp(logit[order[j]] - mx) / sum * g.expert_scale[idx[j]]);
++    }
++    g4_rms(res, hid, s.eps, g.pre_norm.data(), xm.data());
++    uint16_t* xb = reinterpret_cast<uint16_t*>(a + s.a_xm);
++    for (size_t i = 0; i < hid; ++i) xb[i] = f32_to_bf16(static_cast<float>(xm[i]));
++    std::memcpy(a + s.a_w, wv, sizeof wv);
++    act.sync(XCL_BO_SYNC_BO_TO_DEVICE, s.a_w + sizeof wv - s.a_xm, s.a_xm);
++    if (route_log_on_) {
++        std::vector<uint8_t> rec(sizeof idx + sizeof wv);
++        std::memcpy(rec.data(), idx, sizeof idx);
++        std::memcpy(rec.data() + sizeof idx, wv, sizeof wv);
++        route_log_.push_back({layer, rec});
++    }
++    stream_patch::moe2_apply(k.iw(), k.moe2, idx, w_->moe);
++    k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
++    timing_.route_ms += ms_since(t0);
++}
++
++void Core::gemma4_combine(const Step& s, int layer) {
++    // Gemma 4 26B-A4B's FFN close (OPEN-FAMILY-GEMMA4-MOE): xres = res + post_ffw_norm'(t1 +
++    // post_ffw_norm_2(m)), t1 = post_ffw_norm_1(mlp) from dx, m the experts' sum from gm_moe,
++    // post_ffw_norm' the file's weight divided by the earlier layers' scalars (g4moe).
++    auto t0 = std::chrono::steady_clock::now();
++    const size_t hid = w_->hidden;
++    G4Moe& g = g4moe(s, layer);
++    xrt::bo& act = act_[layer];
++    read_back(act, hid * 4, s.a_res);
++    read_back(act, hid * 4, s.a_t1);
++    read_back(act, hid * 4, s.a_moe);
++    const uint8_t* a = act.map<uint8_t*>();
++    const float* res = reinterpret_cast<const float*>(a + s.a_res);
++    const float* t1 = reinterpret_cast<const float*>(a + s.a_t1);
++    const float* m = reinterpret_cast<const float*>(a + s.a_moe);
++    std::vector<double> t2(hid), y(hid);
++    g4_rms(m, hid, s.eps, g.post_norm2.data(), t2.data());
++    std::vector<float> sum(hid);
++    for (size_t i = 0; i < hid; ++i) sum[i] = static_cast<float>(t1[i] + t2[i]);
++    g4_rms(sum.data(), hid, s.eps, g.post_norm.data(), y.data());
++    xrt::bo& xres = buffer("xres", 0);
++    float* x = xres.map<float*>();
++    for (size_t i = 0; i < hid; ++i) x[i] = static_cast<float>(res[i] + y[i]);
++    xres.sync(XCL_BO_SYNC_BO_TO_DEVICE, hid * 4, 0);
++    timing_.route_ms += ms_since(t0);
++}
++
+ void Core::arm_route_records() {
+     // Every router record's idx slot -> the sentinel, so route() can tell a record this step's
+     // dispatch wrote from one it has not landed yet. Called with nothing outstanding; the
+     // first dispatch of each layer overwrites the whole record before anything reads it.
+     for (int l = 0; l < nl_; ++l)
+         for (const Step& s : types_[l]->program) {
+-            if (s.op == "run") continue;
++            if (s.op != "moeroute2") continue;
+             const size_t off = s.act_off + w_->rout_idx_off;
+             uint32_t* p = reinterpret_cast<uint32_t*>(act_[l].map<uint8_t*>() + off);
+             for (int i = 0; i < 8; ++i) p[i] = kRouteSentinel;
+@@ -2042,7 +2184,7 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
+                     (nrun++ == 0 ? timing_.part0_ms : timing_.part1_ms) += ms;
+                     timing_.dispatch_ms += ms;
+                 } else {
+-                    route(k, l, s.act_off);
++                    host_step(s, l);
+                 }
+             }
+             if (deepstack && l < n_deepstack) {
+@@ -2095,7 +2237,7 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
+                     timing_.part1_ms += ms;
+                     timing_.dispatch_ms += ms;
+                 } else {
+-                    route(kerns_.at(s.kernel), l, s.act_off);
++                    host_step(s, l);
+                 }
+             }
+             tail_in = start_run(kerns_.at(prog.back().kernel), prog.back().args, l);
+diff --git a/src/open_qwen36/core.hpp b/src/open_qwen36/core.hpp
+index a55bbba..e84ae12 100644
+--- a/src/open_qwen36/core.hpp
++++ b/src/open_qwen36/core.hpp
+@@ -565,6 +565,18 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
+     /// honest one to add up once a dispatch has been running while the host did something else.
+     std::pair<double, double> wait_run(Inflight& f);
+     void route(Kern& k, int layer, uint64_t act_off);
++    /// A program step that is not a dispatch: moeroute2 (route), gemma4_route or gemma4_combine.
++    void host_step(const Step& s, int layer);
++    /// Gemma 4 26B-A4B's router and FFN close on the host around gm_moe (manifest.hpp Step).
++    void gemma4_route(const Step& s, int layer);
++    void gemma4_combine(const Step& s, int layer);
++    /// their per-layer F32 weights, read from the file on first use
++    struct G4Moe {
++        std::vector<float> router, router_scale, expert_scale, pre_norm;   ///< [E][hidden], [hidden], [E], [hidden]
++        std::vector<float> post_norm2, post_norm;                          ///< [hidden]; post_norm divided by the fold
++    };
++    std::map<int, G4Moe> g4moe_;
++    G4Moe& g4moe(const Step& s, int layer);
+     void log(const std::string& s) const;
+ 
+     // ---- the block route's helpers (core.cpp)
+diff --git a/src/open_qwen36/gguf_pack_test.cpp b/src/open_qwen36/gguf_pack_test.cpp
+index 40568df..6a3f47d 100644
+--- a/src/open_qwen36/gguf_pack_test.cpp
++++ b/src/open_qwen36/gguf_pack_test.cpp
+@@ -448,6 +448,86 @@ int main() {
+         std::printf("%s std_perm_gguf refuses a pool chunk of neither law\n", refused ? "ok   " : "FAIL");
+         if (!refused) return 1;
+ 
++        // ---- g4_q40 (Gemma 4 26B-A4B, OPEN-FAMILY-GEMMA4-MOE): at the file's own shape, std_perm_gguf's
++        // Q4_0-native bytes; with rows and columns padded, the tensor read as two 32-row "experts" of 24
++        // rows from row 4, and the bands strided, every pool value is the file's or zero.
++        PackOp q;
++        q.op = "g4_q40";
++        q.tensor = op.tensor;
++        q.nch = op.nch;
++        q.in_dim = q.src_dim = 512;
++        q.rows = q.n_total = 64;
++        q.experts = 1;
++        std::vector<uint8_t> pg(pq.size(), 0);
++        pools::apply(q, g0, 0, pg.data(), pg.size(), 4608);
++        const bool same = pg == pq;
++        std::printf("%s g4_q40 at the file's shape is std_perm_gguf's Q4_0-native pool\n", same ? "ok   " : "FAIL");
++        if (!same) return 1;
++        auto pool_value = [](const uint8_t* pool, size_t in_dim, size_t row, size_t col) {
++            const size_t per_band = in_dim / 128, band = row / 64, part = (row % 64) / 32, kt = col / 256;
++            const uint8_t* d = pool + (band * per_band + kt * 2 + part) * 4608;
++            const size_t r = row % 32, k = col % 256, kb = k / 32;
++            uint16_t d16;
++            std::memcpy(&d16, d + 2 * (kb * 32 + r), 2);
++            const size_t p = (r / 16) * 4096 + k * 16 + (r % 16);
++            const uint8_t byte = d[512 + (p >> 1)];
++            const int nib = (p & 1) ? byte >> 4 : byte & 0xF;
++            return (static_cast<float>(nib) - 8.f) * bf16_to_f32(d16);
++        };
++        q.in_dim = 768;
++        q.nch = 2 * (768 / 256) * 2;                                // 128 pool rows: two bands
++        q.rows = 24;
++        q.row0 = 4;
++        q.n_total = 32;
++        q.experts = 2;
++        const size_t bbx = 768 / 128 * 4608;
++        q.stripe_bytes = 2 * bbx;
++        q.expert_bytes = 4 * bbx;
++        std::vector<uint8_t> px(2 * q.expert_bytes, 0);
++        pools::apply(q, g0, 0, px.data(), px.size(), 4608);
++        size_t badx = 0;
++        for (size_t e = 0; e < 2; ++e)
++            for (size_t b = 0; b < 2; ++b) {
++                const uint8_t* band = px.data() + e * q.expert_bytes + b * q.stripe_bytes;
++                for (size_t r = 0; r < 64; ++r)
++                    for (size_t k = 0; k < 768; ++k) {
++                        const size_t prow = 64 * b + r;
++                        const float want = (prow < 24 && k < 512) ? pool_value(pq.data(), 512, e * 32 + 4 + prow, k) : 0.f;
++                        const float gotx = pool_value(band - b * bbx, 768, prow, k);
++                        badx += gotx != want;                    // == : a zero d decodes as -0
++                    }
++                // the gaps between strided bands stay untouched
++                for (size_t i = 0; i < bbx; ++i) badx += band[bbx + i] != 0;
++            }
++        std::printf("%s g4_q40 pads rows / columns, offsets experts and strides bands (%zu mismatches)\n",
++                    badx ? "FAIL" : "ok   ", badx);
++        if (badx) return 1;
++
++        // ---- g4_lmhead_q8: lm_head_q8's bf16-scale chunks in 128-row band order, within half a step
++        PackOp h;
++        h.op = "g4_lmhead_q8";
++        h.tensor = "model.embed_tokens.weight";
++        h.rows = 128;
++        h.in_dim = 256;
++        std::vector<uint8_t> ph(128 / 32 * 8704, 0);
++        pools::apply(h, g0, 0, ph.data(), ph.size(), 4608);
++        size_t badh = 0;
++        for (size_t row = 0; row < 128; ++row)
++            for (size_t k = 0; k < 256; ++k) {
++                const size_t qtr = row / 32, rr = row % 32, kb = k / 32;
++                const uint8_t* c = ph.data() + qtr * 8704;              // one k-tile: chunk kt*4 + quarter
++                uint16_t s16;
++                std::memcpy(&s16, c + 2 * (kb * 32 + rr), 2);
++                const float sc = bf16_to_f32(s16);
++                const int8_t code = static_cast<int8_t>(c[512 + (rr / 16) * 4096 + k * 16 + rr % 16]);
++                const float got = sc * code;
++                const float want = row < 32 ? emb.values[row * 256 + k] : 0.f;
++                badh += std::fabs(got - want) > 0.5f * sc * 1.0001f + 1e-12f;
++                badh += row >= 32 && (code != 0 || sc != 0.f);
++            }
++        std::printf("%s g4_lmhead_q8 requantises the head to its chunks (%zu mismatches)\n", badh ? "FAIL" : "ok   ", badh);
++        if (badh) return 1;
++
+         // bfp16_gemm (OPEN-PREFILL-BFP16) from the GGUF's own Q4_0 blocks: the [64, 512] tensor at row 256 of a
+         // 1024-row B operand. Checked against pack.py's order (pack_b's reshape / transpose written out) and a
+         // frexp encoder: every written block is the GGUF values' encoding, every other block zero.
+diff --git a/src/open_qwen36/manifest.cpp b/src/open_qwen36/manifest.cpp
+index 7f3390e..66dfbc1 100644
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -77,7 +77,7 @@ PackOp parse_op(const json& j, const std::string& where) {
+     };
+     if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm" || p.op == "bfp16_gemm" ||
+         p.op == "put" || p.op == "expert_down" || p.op == "conv_transpose" || p.op == "lmhead_q8" ||
+-        p.op == "transpose" || p.op == "transpose_banked") {
++        p.op == "transpose" || p.op == "transpose_banked" || p.op == "g4_q40" || p.op == "g4_lmhead_q8") {
+         if (p.tensor.empty()) fail(where, p.op + " without a tensor");
+     } else if (p.op == "expert_stripes") {
+         if (p.up.empty() || p.gate.empty()) fail(where, "expert_stripes without up / gate");
+@@ -95,6 +95,10 @@ PackOp parse_op(const json& j, const std::string& where) {
+     else if (p.op == "put") need_all({{"cap", p.cap}});
+     else if (p.op == "lmhead_q8") need_all({{"chunk_bytes", p.chunk_bytes}, {"in_dim", p.in_dim}});
+     else if (p.op == "conv_transpose") need_all({{"taps", p.taps}, {"groups", p.groups}, {"width", p.width}});
++    else if (p.op == "g4_q40")
++        need_all({{"nch", p.nch}, {"in_dim", p.in_dim}, {"src_dim", p.src_dim}, {"rows", p.rows}, {"experts", p.experts},
++                  {"n_total", p.n_total}});
++    else if (p.op == "g4_lmhead_q8") need_all({{"rows", p.rows}, {"in_dim", p.in_dim}});
+     return p;
+ }
+ 
+@@ -116,6 +120,25 @@ std::vector<Step> parse_program(const json& j, const std::string& where) {
+                 fail(where, "run " + st.kernel + ": a bfp16 step needs n_pad and cannot be split");
+         } else if (st.op == "moeroute2") {
+             st.act_off = get<uint64_t>(s, "act_off", where);
++        } else if (st.op == "gemma4_route" || st.op == "gemma4_combine") {
++            st.a_res = get<uint64_t>(s, "a_res", where);
++            st.eps = get<double>(s, "eps", where);
++            if (st.op == "gemma4_route") {
++                st.a_xm = get<uint64_t>(s, "a_xm", where);
++                st.a_w = get<uint64_t>(s, "a_w", where);
++                st.router = get<std::string>(s, "router", where);
++                st.router_scale = get<std::string>(s, "router_scale", where);
++                st.expert_scale = get<std::string>(s, "expert_scale", where);
++                st.pre_norm = get<std::string>(s, "pre_norm", where);
++            } else {
++                st.a_t1 = get<uint64_t>(s, "a_t1", where);
++                st.a_moe = get<uint64_t>(s, "a_moe", where);
++                st.post_norm2 = get<std::string>(s, "post_norm2", where);
++                st.post_norm = get<std::string>(s, "post_norm", where);
++                st.div_running = get<std::string>(s, "div_running", where);
++                if (st.div_running.find("{j}") == std::string::npos)
++                    fail(where, "gemma4_combine: div_running names a per-layer {j} tensor");
++            }
+         } else {
+             fail(where, "unknown program op '" + st.op + "'");
+         }
+@@ -129,7 +152,7 @@ std::vector<Step> parse_program(const json& j, const std::string& where) {
+ void check_step(const Manifest& m, const Step& s, const std::string& where, const char* what) {
+     auto it = m.kernels.find(s.kernel);
+     if (it == m.kernels.end()) fail(where, std::string(what) + " names unknown kernel " + s.kernel);
+-    if (s.op == "moeroute2" && it->second.patch != "moeroute2")
++    if ((s.op == "moeroute2" || s.op == "gemma4_route") && it->second.patch != "moeroute2")
+         fail(where, std::string(what) + ": moeroute2 on kernel " + s.kernel + ", whose patch is '" +
+                         (it->second.patch.empty() ? std::string("none") : it->second.patch) + "'");
+ }
+diff --git a/src/open_qwen36/manifest.hpp b/src/open_qwen36/manifest.hpp
+index 3e5b2a8..1c4c08a 100644
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -25,7 +25,7 @@ namespace open_qwen36 {
+ /// One packing-plan op: which tensor lands at which byte offset in which
+ /// chunk order (open_kernels/recipes/pack.py is the same interpreter in NumPy).
+ struct PackOp {
+-    std::string op;                          ///< std_perm | std_perm_gguf | std_fuse | q8_perm | expert_stripes | expert_down | put | conv_transpose | lmhead_q8 | transpose | transpose_banked
++    std::string op;                          ///< std_perm | std_perm_gguf | std_fuse | q8_perm | expert_stripes | expert_down | put | conv_transpose | lmhead_q8 | transpose | transpose_banked | g4_q40 | g4_lmhead_q8
+     std::string tensor, up, gate;            ///< tensor names; "{l}" stands for the layer index
+     uint64_t dst = 0;
+     uint64_t cap = 0;                        ///< put: the slot's capacity
+@@ -58,8 +58,17 @@ struct PackOp {
+ 
+ /// One verb of a layer type's (or the tail's) program.
+ struct Step {
+-    std::string op;                          ///< run | moeroute2
++    std::string op;                          ///< run | moeroute2 | gemma4_route | gemma4_combine
+     std::string kernel;
++    /// gemma4_route / gemma4_combine (Gemma 4 26B-A4B, OPEN-FAMILY-GEMMA4-MOE): the router and the
++    /// FFN close on the host around the routed-expert dispatch. route reads res (f32 [hidden] at a_res),
++    /// writes xm2 = pre_norm(res) as bf16 at a_xm and the top-k weights (softmax over every expert,
++    /// renormalised over the chosen, times expert_scale) as f32[8] at a_w, and points `kernel`'s routed
++    /// fills at the chosen experts. combine writes xres = res + post_norm'(t1 + post_norm2(m)), t1 at
++    /// a_t1, m at a_moe, post_norm' divided by the product of div_running over the earlier layers.
++    uint64_t a_res = 0, a_xm = 0, a_w = 0, a_t1 = 0, a_moe = 0;
++    double eps = 1e-6;
++    std::string router, router_scale, expert_scale, pre_norm, post_norm2, post_norm, div_running;
+     std::vector<std::string> args;           ///< run: buffer names (per-layer: pool consts act state; else globals)
+     uint64_t act_off = 0;                    ///< moeroute2: the router record's offset in `act`
+     std::string fmt;                         ///< run, dense block route: "" = the q4_1 GEMMs, "bfp16" = gemm_bfp16
+diff --git a/src/open_qwen36/pools.cpp b/src/open_qwen36/pools.cpp
+index 821e0fe..e467794 100644
+--- a/src/open_qwen36/pools.cpp
++++ b/src/open_qwen36/pools.cpp
+@@ -7,6 +7,7 @@
+ #include <cstring>
+ #include <stdexcept>
+ #include <string>
++#include <thread>
+ #include <utility>
+ #include <vector>
+ 
+@@ -839,6 +840,131 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
+                 std::memcpy(dd + c * ch, ds + (2 * rt + cg) * ch, ch);
+             }
+         }
++    } else if (op.op == "g4_q40") {
++        // Gemma 4 26B-A4B (OPEN-FAMILY-GEMMA4-MOE, recipes/gemma4.py _q40_op): `rows` rows of a Q4_0
++        // GGUF tensor, from file row row0 (+ e * n_total for expert e of `experts`), each src_dim long,
++        // as Q4_0-native chunks (4608 B: the bf16 d plane, then the codes; the cores take m = -8 d) of a
++        // [nch / (in_dim / 256) * 32, in_dim] matrix in std_perm's band law. Rows and columns past the
++        // file's stay zero (the dense MLP's 2112 -> 2304 and an expert's 704 -> 768). Band b of expert e
++        // lands at dst + e * expert_bytes + b * stride, stride = stripe_bytes (the gate | up bands
++        // interleaved) or one band. The bytes std_perm_gguf writes under the Q4_0 law, at other offsets.
++        const std::string name = with_layer(op.tensor, layer);
++        ktiles_or_fail("g4_q40", op.in_dim);
++        if (ch != Q40_CHUNK) fail("g4_q40 " + name + ": pool chunk " + std::to_string(ch) + " is not the Q4_0-native 4608");
++        const GgufFile* g = dynamic_cast<const GgufFile*>(&m);
++        if (!g) fail("g4_q40 " + name + ": a GGUF-only op");
++        const GgufFile::TensorInfo& t = g->tensor(name);
++        if (t.type != GgufFile::Type::Q4_0) fail(name + " is " + GgufFile::type_name(t.type) + "; g4_q40 packs Q4_0 only");
++        if (op.src_dim % 32 || op.src_dim > op.in_dim || t.dims.empty() || t.dims[0] != op.src_dim)
++            fail("g4_q40 " + name + ": file rows of " + std::to_string(t.dims.empty() ? 0 : t.dims[0]) +
++                 " values, the plan reads " + std::to_string(op.src_dim) + " into " + std::to_string(op.in_dim));
++        const uint64_t frows = t.nvalues() / op.src_dim;
++        const uint64_t E = op.experts, per_band = op.in_dim / 128, ncol = op.in_dim / 256;
++        if (op.nch % per_band) fail("g4_q40 " + name + ": nch " + std::to_string(op.nch) + " is not whole bands");
++        const uint64_t bands = op.nch / per_band, band_bytes = per_band * ch;
++        const uint64_t stride = op.stripe_bytes ? op.stripe_bytes : band_bytes;
++        if (op.rows > bands * 64 || stride < band_bytes || op.row0 + op.rows > op.n_total ||
++            (E - 1) * op.n_total + op.n_total > frows)
++            fail("g4_q40 " + name + ": rows [" + std::to_string(op.row0) + ", +" + std::to_string(op.rows) + ") of " +
++                 std::to_string(E) + " x " + std::to_string(op.n_total) + " (file " + std::to_string(frows) +
++                 ") into " + std::to_string(bands * 64) + " pool rows");
++        const uint64_t span = (bands - 1) * stride + band_bytes;
++        if (E > 1 && op.expert_bytes < span) fail("g4_q40 " + name + ": expert_bytes under one expert's bands");
++        bounds(op, (E - 1) * op.expert_bytes + span, dst_bytes);
++        const size_t nb = op.src_dim / 32;                       // file k blocks per row
++        size_t n = 0;
++        const uint8_t* src = raw(m, name, 0, &n);
++        if (n < frows * nb * 18) fail(name + " is " + std::to_string(n) + " B, shorter than its Q4_0 rows");
++        auto one = [&](uint64_t e) {
++            for (uint64_t c = 0; c < op.nch; ++c) {
++                const uint64_t band = c / per_band, i = c % per_band, part = i % 2, kt = i / 2;
++                (void)ncol;
++                uint8_t* d = dst + op.dst + e * op.expert_bytes + band * stride + i * ch;
++                for (size_t r = 0; r < 32; ++r) {
++                    const uint64_t prow = 64 * band + 32 * part + r;
++                    if (prow >= op.rows) break;                  // padded rows: zero scales and codes
++                    const uint8_t* srow = src + (op.row0 + e * op.n_total + prow) * nb * 18;
++                    const uint8_t rb = static_cast<uint8_t>(r / 16), rl = static_cast<uint8_t>(r % 16);
++                    for (size_t kb = 0; kb < 8; ++kb) {
++                        const size_t fb = kt * 8 + kb;
++                        if (fb >= nb) break;                     // padded columns stay zero
++                        const uint8_t* b = srow + fb * 18;
++                        uint16_t ud;
++                        std::memcpy(&ud, b, 2);
++                        const uint16_t db = bf16_rne(fp16_to_f32(ud));
++                        std::memcpy(d + 2 * (kb * 32 + r), &db, 2);
++                        for (size_t q = 0; q < 16; ++q) {
++                            const uint8_t byte = b[2 + q];
++                            const uint8_t lo = byte & 0xF, hi = byte >> 4;
++                            const size_t p0 = rb * 4096 + (kb * 32 + q) * 16 + rl;
++                            d[512 + (p0 >> 1)] |= (p0 & 1) ? lo << 4 : lo;
++                            const size_t p1 = p0 + 256;
++                            d[512 + (p1 >> 1)] |= (p1 & 1) ? hi << 4 : hi;
++                        }
++                    }
++                }
++            }
++        };
++        if (E == 1) {
++            one(0);
++        } else {
++            // experts write disjoint bytes: spread them over a few threads
++            const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency() / 2));
++            std::vector<std::thread> th;
++            for (unsigned w = 0; w < nt; ++w)
++                th.emplace_back([&, w] { for (uint64_t e = w; e < E; e += nt) one(e); });
++            for (auto& x : th) x.join();
++        }
++    } else if (op.op == "g4_lmhead_q8") {
++        // Gemma 4 26B-A4B's head (OPEN-FAMILY-GEMMA4-MOE): the GGUF's tied token_embd (Q6_K) as
++        // lm_head_q8.h's bf16-scale chunks -- 32 rows x 256 K, scale[kb*32 + r] bf16 at [0:512), int8
++        // code[(r/16)*4096 + k*16 + r%16] at [512:8704) -- in 128-row band order (chunk band*4*nk + kt*4 +
++        // quarter). Each row is read as exact f32 (embed_row) and requantised per 32-value block: scale =
++        // bf16(max|v| / 127), code = round(v / scale) in [-127, 127]. Rows past the file's stay zero.
++        const std::string name = with_layer(op.tensor, layer);
++        ktiles_or_fail("g4_lmhead_q8", op.in_dim);
++        const GgufFile* g = dynamic_cast<const GgufFile*>(&m);
++        if (!g) fail("g4_lmhead_q8 " + name + ": a GGUF-only op");
++        const GgufFile::TensorInfo& t = g->tensor(name);
++        if (t.dims.size() < 2 || t.dims[0] != op.in_dim)
++            fail("g4_lmhead_q8 " + name + ": not [rows, " + std::to_string(op.in_dim) + "]");
++        const uint64_t real = t.dims[1], K = op.in_dim, nk = K / 256;
++        if (op.rows % 128 || real > op.rows) fail("g4_lmhead_q8 " + name + ": " + std::to_string(real) +
++                                                  " rows into " + std::to_string(op.rows));
++        constexpr size_t CH8 = 8704;
++        bounds(op, op.rows / 32 * nk * CH8, dst_bytes);
++        const uint64_t nbands = op.rows / 128;
++        auto band_fn = [&](uint64_t band) {
++            std::vector<float> v(K);
++            for (uint64_t rl = 0; rl < 128; ++rl) {
++                const uint64_t row = band * 128 + rl;
++                if (row >= real) break;
++                g->embed_row(name, row, K, v.data());
++                const uint64_t qtr = rl / 32, rr = rl % 32;
++                for (uint64_t kt = 0; kt < nk; ++kt) {
++                    uint8_t* d = dst + op.dst + (band * 4 * nk + kt * 4 + qtr) * CH8;
++                    for (uint64_t kb = 0; kb < 8; ++kb) {
++                        const float* x = v.data() + kt * 256 + kb * 32;
++                        float amax = 0.f;
++                        for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[i]));
++                        const uint16_t sb = bf16_rne(amax / 127.f);
++                        const float sf = bf16_to_f32(sb), inv = sf > 0.f ? 1.f / sf : 0.f;
++                        std::memcpy(d + 2 * (kb * 32 + rr), &sb, 2);
++                        for (int i = 0; i < 32; ++i) {
++                            const long q = std::lround(x[i] * inv);
++                            const int8_t c8 = static_cast<int8_t>(q < -127 ? -127 : q > 127 ? 127 : q);
++                            const uint64_t k = kb * 32 + i;
++                            d[512 + (rr / 16) * 4096 + k * 16 + rr % 16] = static_cast<uint8_t>(c8);
++                        }
++                    }
++                }
++            }
++        };
++        const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency() / 2));
++        std::vector<std::thread> th;
++        for (unsigned w = 0; w < nt; ++w)
++            th.emplace_back([&, w] { for (uint64_t b = w; b < nbands; b += nt) band_fn(b); });
++        for (auto& x : th) x.join();
+     } else if (op.op == "put") {
+         const std::string name = with_layer(op.tensor, layer);
+         // div_running: the product of a per-layer scalar over every layer before this one

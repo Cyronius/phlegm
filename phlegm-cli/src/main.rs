@@ -1,5 +1,6 @@
 use phlegm_core::backend::{Backend, GenParams};
 use phlegm_core::bench::reference::{NpuBackend, NpuOptions};
+use phlegm_core::image::{self, ImageConfig, ImageRequest};
 use phlegm_core::mock_backend::MockBackend;
 use phlegm_core::sampler::Sampler;
 use phlegm_core::server::{self, ServerConfig};
@@ -13,9 +14,11 @@ mod bench;
 const USAGE: &str = "usage: phlegm <command>
 
 commands:
-  run --model-dir DIR --kernels DIR --bridge EXE --prompt TEXT [--max-tokens N] [--turbo]
+  run --model-dir DIR --kernels DIR --bridge EXE --prompt TEXT [--max-tokens N (default -1: until the context is full)] [--turbo]
   serve --model-dir DIR --kernels DIR --bridge EXE [--max-ctx N] [--turbo]
   serve --mock
+  image --config JSON --prompt TEXT --out DIR [--image REF] [--size 512x512] [--steps N] [--guidance N]
+  serve-images --config JSON [--host 127.0.0.1] [--port 52626]
   bench     benchmark protocol, machine metadata, and result validation
   version   print the version
 
@@ -78,16 +81,18 @@ fn npu_options(map: &HashMap<String, String>) -> Result<NpuOptions, String> {
     })
 }
 
+// Like llama.cpp (`-n -1`, its default): generate until a stop token or the end of the context.
+// A positive --max-tokens bounds the reply, clamped to the room the context has left.
 fn run(args: &[String]) -> Result<(), String> {
     let opts = flags(args)?;
     let npu = npu_options(&opts)?;
     let prompt = required(&opts, "--prompt")?;
-    let max_tokens: usize = opts
+    let requested: i64 = opts
         .get("--max-tokens")
         .map(|n| n.parse().map_err(|_| "invalid --max-tokens".to_string()))
-        .unwrap_or(Ok(128))?;
-    if max_tokens == 0 {
-        return Err("--max-tokens must be positive".into());
+        .unwrap_or(Ok(-1))?;
+    if requested == 0 || requested < -1 {
+        return Err("--max-tokens must be positive, or -1 for until the context is full".into());
     }
     let tokenizer = Tokenizer::load(&npu.model_dir)?;
     let text = tokenizer.apply_chat_template(
@@ -99,6 +104,16 @@ fn run(args: &[String]) -> Result<(), String> {
         true,
     )?;
     let ids = tokenizer.encode(&text)?;
+    // The backend holds prompt + max_tokens - 1 tokens (the last one is never fed back).
+    let capacity = npu.context_capacity;
+    if ids.len() > capacity {
+        return Err(format!(
+            "prompt is {} tokens; --max-ctx {capacity} holds fewer",
+            ids.len()
+        ));
+    }
+    let room = capacity + 1 - ids.len();
+    let max_tokens = if requested < 0 { room } else { (requested as usize).min(room) };
     let mut backend = NpuBackend::load(npu)?;
     let mut output = Vec::new();
     let mut params = GenParams {
@@ -107,7 +122,26 @@ fn run(args: &[String]) -> Result<(), String> {
         stop_ids: tokenizer.stop_ids(),
     };
     backend.generate(&ids, &mut params, &mut |id| output.push(id))?;
-    println!("{}", tokenizer.decode(&output)?);
+    let reply = tokenizer.decode(&output)?;
+    // A reasoning model (harmony, Gemma 4's thought channel, Qwen's <think>) thinks before it
+    // answers: the reasoning on stderr, the answer alone on stdout.
+    match tokenizer.reasoning_for(&text) {
+        Some(r) => {
+            let (reasoning, answer) = r.split(&reply);
+            if !reasoning.is_empty() {
+                eprintln!("[reasoning]\n{reasoning}\n[/reasoning]");
+            }
+            if answer.is_empty() && output.len() >= max_tokens {
+                if max_tokens == room {
+                    eprintln!("[no answer before the context filled; raise --max-ctx]");
+                } else {
+                    eprintln!("[no answer within --max-tokens {max_tokens}; raise it]");
+                }
+            }
+            println!("{answer}");
+        }
+        None => println!("{reply}"),
+    }
     Ok(())
 }
 
@@ -137,12 +171,64 @@ fn serve(args: &[String]) -> Result<(), String> {
     server::serve(Box::new(backend), cfg)
 }
 
+fn image_run(args: &[String]) -> Result<(), String> {
+    let opts = flags(args)?;
+    const ALLOWED: &[&str] = &["--config", "--prompt", "--out", "--model",
+        "--negative-prompt", "--size", "--steps", "--guidance", "--seed", "--image"];
+    for key in opts.keys() {
+        if !ALLOWED.contains(&key.as_str()) {
+            return Err(format!("unknown image option {key}"));
+        }
+    }
+    let cfg = ImageConfig::load(&PathBuf::from(required(&opts, "--config")?))?;
+    let out = PathBuf::from(required(&opts, "--out")?);
+    let out = if out.is_absolute() { out } else {
+        std::env::current_dir().map_err(|e| e.to_string())?.join(out)
+    };
+    let request = ImageRequest {
+        prompt: required(&opts, "--prompt")?,
+        model: opts.get("--model").cloned(),
+        negative_prompt: opts.get("--negative-prompt").cloned().unwrap_or_default(),
+        size: opts.get("--size").cloned().unwrap_or_else(|| "512x512".into()),
+        steps: opts.get("--steps").map(|v| v.parse()
+            .map_err(|_| "invalid --steps".to_string())).transpose()?,
+        guidance_scale: opts.get("--guidance").map(|v| v.parse()
+            .map_err(|_| "invalid --guidance".to_string())).transpose()?,
+        seed: opts.get("--seed").map(|v| v.parse()
+            .map_err(|_| "invalid --seed".to_string())).unwrap_or(Ok(41))?,
+        n: 1,
+        response_format: "b64_json".into(),
+        // --image REF edits REF instead of generating from text alone.
+        image: opts.get("--image").map(|p| std::fs::canonicalize(p)
+            .map_err(|e| format!("reading --image {p}: {e}"))).transpose()?,
+    };
+    let path = image::generate(&cfg, &request, &out)?;
+    println!("{}", path.display());
+    Ok(())
+}
+
+fn serve_images(args: &[String]) -> Result<(), String> {
+    let opts = flags(args)?;
+    for key in opts.keys() {
+        if !["--config", "--host", "--port"].contains(&key.as_str()) {
+            return Err(format!("unknown image server option {key}"));
+        }
+    }
+    let cfg = ImageConfig::load(&PathBuf::from(required(&opts, "--config")?))?;
+    let host = opts.get("--host").map(String::as_str).unwrap_or("127.0.0.1");
+    let port: u16 = opts.get("--port").map(|v| v.parse()
+        .map_err(|_| "invalid --port".to_string())).unwrap_or(Ok(52626))?;
+    image::serve(cfg, host, port)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("bench") => bench::command(&args[1..]),
         Some("run") => run(&args[1..]),
         Some("serve") => serve(&args[1..]),
+        Some("image") => image_run(&args[1..]),
+        Some("serve-images") => serve_images(&args[1..]),
         Some("version") | Some("--version") => {
             println!("phlegm {}", env!("CARGO_PKG_VERSION"));
             Ok(())

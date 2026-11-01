@@ -1,4 +1,4 @@
-r"""vae_ew: the elementwise ops of FLUX.2 [klein]'s VAE decoder, one xclbin.
+r"""vae_ew: elementwise ops for FLUX.2 and MOSS Image VAE decoders, one xclbin.
 
     gn_stats   per-core partial GroupNorm sums of A                  -> S (the layer's block)
     gn_apply   Y = GroupNorm(A) (* SiLU): reads the layer's block from S, then A
@@ -16,7 +16,8 @@ over part of the tensor they were gathered on (the encoder's space-to-depth phas
 
 Topology: dit_ew's -- 16 cores, 2 per column (rows 2-3); per column two input streams (A,
 B) split between the pair and two output streams (Y, Z) joined; the ops are DDR-bound.
-The unit is an element of EL = 4096 bf16, whole pixels. Column c takes image rows
+The unit is an element of 4096 bf16 for FLUX.2, or 3072 for MOSS's GroupNorm
+and residual ops ("el" in the stream spec), always whole pixels. Column c takes image rows
 [c H/8, (c+1) H/8); a column's elements alternate between its two cores.
 
 GroupNorm over 32 groups needs statistics of the whole tensor, so it is two dispatches:
@@ -77,14 +78,16 @@ def col_elements(s: dict) -> int:
     rows = s["H"] // N_COLS
     per_px = 4 if s["op"] == "rgba" else s["C"]
     n = rows * s["W"] * per_px
-    assert n % (PER_COL * EL) == 0, f"{n} values per column is not a whole number of element pairs"
-    return n // EL
+    el = s.get("el", EL)
+    assert n % (PER_COL * el) == 0, f"{n} values per column is not a whole number of element pairs"
+    return n // el
 
 
 @iron.jit(aiecc_flags=["--dynamic-objFifos", "--alloc-scheme=basic-sequential"])
 def vae_ew(X: In, B: In, S: In, Y: Out, *, spec: CompileTime[str]):
     s = json.loads(spec)
     op, C, H, W = s["op"], s["C"], s["H"], s["W"]
+    EL = s.get("el", 4096)
     assert H % N_COLS == 0 and C % 32 == 0 and C <= 512 and EL % (4 if op == "rgba" else C) == 0
 
     el_ty = np.ndarray[(EL,), np.dtype[bfloat16]]
@@ -192,6 +195,10 @@ def vae_ew(X: In, B: In, S: In, Y: Out, *, spec: CompileTime[str]):
         """(offset, sizes, strides) of column c's rows of view v (C channels per pixel)."""
         ps = v.get("px_stride", C)
         if ps != C:
+            if W > 512:
+                assert W % 512 == 0
+                return (view_base(v, C, c * rows), [rows, W // 512, 512, C],
+                        [v["pitch"] * ps, 512 * ps, ps, 1])
             return view_base(v, C, c * rows), [rows, W, C], [v["pitch"] * ps, ps, 1]
         return (view_base(v, C, c * rows), [rows, W * C // CHUNK, CHUNK],
                 [v["pitch"] * C, CHUNK, 1])
@@ -216,12 +223,13 @@ def vae_ew(X: In, B: In, S: In, Y: Out, *, spec: CompileTime[str]):
                                 strides=[EL, EL, CHUNK, 1], group=tg)
             if op == "rgba":            # 4 channels of each pixel, <= 64 rows per BD
                 v = s["a"]
+                ps = v.get("px_stride", C)
                 for r0 in range(0, rows, 64):
                     n = min(64, rows - r0)
                     a_prods[c].fill(x, offset=view_base(v, C, c * rows + r0),
                                     sizes=[n, W // 512, 512, 4] if W > 512 else [n, W, 4],
-                                                    strides=([v["pitch"] * C, 512 * C, C, 1] if W > 512
-                                             else [v["pitch"] * C, C, 1]), group=tg)
+                                    strides=([v["pitch"] * ps, 512 * ps, ps, 1] if W > 512
+                                             else [v["pitch"] * ps, ps, 1]), group=tg)
             else:
                 off, sz, stv = data_fill(s["a"], c)
                 a_prods[c].fill(x, offset=off, sizes=sz, strides=stv, group=tg)

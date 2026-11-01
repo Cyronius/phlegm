@@ -775,6 +775,10 @@ impl Backend for NpuBackend {
         }
         Ok(())
     }
+
+    fn context_capacity(&self) -> Option<usize> {
+        Some(self.context_capacity)
+    }
 }
 
 #[cfg(all(test, unix))]
