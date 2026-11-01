@@ -118,6 +118,94 @@ pub fn harmony_progress(text: &str) -> (String, String) {
     (reasoning, answer)
 }
 
+/// How a model's chat template marks reasoning apart from the answer, read from the model's own
+/// files at load (`Tokenizer::load`), never from its name.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReasoningFormat {
+    /// GPT-OSS's harmony channels (`harmony_progress` / `harmony_split`).
+    Harmony,
+    /// A reasoning block between two markers ahead of the answer: Gemma 4's
+    /// `<|channel>thought\n ... <channel|>` (its tokenizer_config `response_template`), Qwen3.5's
+    /// `<think> ... </think>` (its chat template).
+    Tagged { open: String, close: String },
+}
+
+/// One reply's reasoning/answer splitter: the format, plus whether the rendered prompt already
+/// opened the reasoning block (Qwen's generation prompt ends in `<think>\n`, so its reply starts
+/// inside the block and never repeats the opener).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reasoning {
+    pub format: ReasoningFormat,
+    pub opened_by_prompt: bool,
+}
+
+impl Reasoning {
+    pub fn for_prompt(format: ReasoningFormat, prompt: &str) -> Reasoning {
+        let opened_by_prompt = match &format {
+            ReasoningFormat::Tagged { open, .. } => prompt.trim_end().ends_with(open.trim_end()),
+            ReasoningFormat::Harmony => false,
+        };
+        Reasoning { format, opened_by_prompt }
+    }
+
+    /// The reply so far as (reasoning, answer), for streaming: each side only grows as text is
+    /// appended, and a partly decoded marker is held back until it resolves.
+    pub fn progress(&self, text: &str) -> (String, String) {
+        self.derive(text, true)
+    }
+
+    /// `progress` once the reply is complete: nothing more is held back.
+    pub fn progress_done(&self, text: &str) -> (String, String) {
+        self.derive(text, false)
+    }
+
+    /// A finished reply as (reasoning, answer), trimmed. A reply cut short inside its reasoning
+    /// has an empty answer.
+    pub fn split(&self, text: &str) -> (String, String) {
+        if self.format == ReasoningFormat::Harmony {
+            if let Some(parts) = harmony_split(text) {
+                return parts;
+            }
+        }
+        let (r, a) = self.derive(text, false);
+        (r.trim().to_owned(), a.trim().to_owned())
+    }
+
+    fn derive(&self, text: &str, partial: bool) -> (String, String) {
+        let (open, close) = match &self.format {
+            ReasoningFormat::Harmony => return harmony_progress(text),
+            ReasoningFormat::Tagged { open, close } => (open.trim_end(), close.as_str()),
+        };
+        // Drop a trailing piece of text that may be the start of `marker`.
+        let hold = |t: &'_ str, marker: &str| -> usize {
+            if !partial {
+                return t.len();
+            }
+            (1..marker.len().min(t.len() + 1))
+                .rev()
+                .find(|&n| t.is_char_boundary(t.len() - n) && marker.starts_with(&t[t.len() - n..]))
+                .map_or(t.len(), |n| t.len() - n)
+        };
+        let lead = text.trim_start();
+        let inside = if self.opened_by_prompt {
+            text
+        } else if let Some(rest) = lead.strip_prefix(open) {
+            rest
+        } else if partial && open.starts_with(lead) {
+            return (String::new(), String::new());
+        } else {
+            return (String::new(), lead.to_owned());
+        };
+        match inside.find(close) {
+            Some(i) => (
+                inside[..i].trim_start().to_owned(),
+                inside[i + close.len()..].trim_start().to_owned(),
+            ),
+            None => (inside[..hold(inside, close)].trim_start().to_owned(), String::new()),
+        }
+    }
+}
+
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -239,6 +327,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tagged_reasoning_streams_monotonically_and_splits() {
+        let gemma = Reasoning::for_prompt(
+            ReasoningFormat::Tagged { open: "<|channel>thought\n".into(), close: "<channel|>".into() },
+            "<|turn>user\nHi<turn|>\n<|turn>model\n",
+        );
+        assert!(!gemma.opened_by_prompt);
+        let reply = "<|channel>thought\nThe user greets.<channel|>Hello!";
+        let mut last = (String::new(), String::new());
+        for end in (0..=reply.len()).filter(|&i| reply.is_char_boundary(i)) {
+            let now = gemma.progress(&reply[..end]);
+            assert!(now.0.starts_with(&last.0) && now.1.starts_with(&last.1), "{end}: {last:?} -> {now:?}");
+            last = now;
+        }
+        assert_eq!(last, ("The user greets.".into(), "Hello!".into()));
+        assert_eq!(gemma.progress("<|channel>thought\nHm <chan"), ("Hm ".into(), String::new()));
+        assert_eq!(gemma.split("Hello!"), (String::new(), "Hello!".into()));
+        assert_eq!(gemma.split("<|channel>thought\ncut"), ("cut".into(), String::new()));
+
+        let qwen = Reasoning::for_prompt(
+            ReasoningFormat::Tagged { open: "<think>".into(), close: "</think>".into() },
+            "<|im_start|>assistant\n<think>\n",
+        );
+        assert!(qwen.opened_by_prompt);
+        assert_eq!(qwen.split("Plan.\n</think>\n\nParis."), ("Plan.".into(), "Paris.".into()));
+        assert_eq!(qwen.progress("Plan.\n</thi"), ("Plan.\n".into(), String::new()));
+        let closed = Reasoning::for_prompt(qwen.format.clone(), "<think>\n\n</think>\n\n");
+        assert_eq!(closed.split("Paris."), (String::new(), "Paris.".into()));
+        let harmony = Reasoning::for_prompt(ReasoningFormat::Harmony, "");
+        assert_eq!(harmony.split("<|channel|>analysis<|message|>cut short"), ("cut short".into(), String::new()));
+    }
+
+    #[test]
     fn strftime_utc_matches_known_dates() {
         assert_eq!(strftime_utc("%Y-%m-%d", 0), "1970-01-01");
         assert_eq!(strftime_utc("%Y-%m-%d %H:%M:%S", 1_793_404_800 + 3723), "2026-10-31 01:02:03");
@@ -298,7 +418,7 @@ pub(crate) mod tests {
 }
 
 pub struct Tokenizer {
-    harmony: bool,
+    reasoning: Option<ReasoningFormat>,
     tk: HfTokenizer,
     env: Environment<'static>,
     add_bos_token: bool,
@@ -384,7 +504,23 @@ impl Tokenizer {
                 .unwrap_or(0);
             strftime_utc(&fmt, secs)
         });
-        let harmony = template_src.contains("<|channel|>");
+        // Where the reply's reasoning ends, from the model's own files: harmony channels in the
+        // template; else the tokenizer_config `response_template` thinking field (Gemma 4); else
+        // `<think>`/`</think>` in the template (Qwen3.5).
+        let tagged = |open: &str, close: &str| ReasoningFormat::Tagged { open: open.into(), close: close.into() };
+        let thinking = config.pointer("/response_template/fields/thinking");
+        let reasoning = if template_src.contains("<|channel|>") {
+            Some(ReasoningFormat::Harmony)
+        } else if let (Some(open), Some(close)) = (
+            thinking.and_then(|t| t.get("open")).and_then(Value::as_str),
+            thinking.and_then(|t| t.get("close")).and_then(Value::as_str),
+        ) {
+            Some(tagged(open, close))
+        } else if template_src.contains("<think>") && template_src.contains("</think>") {
+            Some(tagged("<think>", "</think>"))
+        } else {
+            None
+        };
         env.add_template_owned("chat", template_src)
             .map_err(|e| format!("compiling chat_template.jinja: {e}"))?;
 
@@ -441,7 +577,7 @@ impl Tokenizer {
         Ok(Tokenizer {
             tk,
             env,
-            harmony,
+            reasoning,
             add_bos_token,
             bos_token,
             eos_ids,
@@ -499,7 +635,13 @@ impl Tokenizer {
     /// The chat template speaks OpenAI's harmony format (GPT-OSS): replies arrive as an analysis
     /// channel then a final one, which the CLI and server separate (`harmony_split`).
     pub fn is_harmony(&self) -> bool {
-        self.harmony
+        self.reasoning == Some(ReasoningFormat::Harmony)
+    }
+
+    /// The splitter for a reply to `prompt` (the rendered chat template), or None when the model's
+    /// files mark no reasoning block.
+    pub fn reasoning_for(&self, prompt: &str) -> Option<Reasoning> {
+        self.reasoning.clone().map(|f| Reasoning::for_prompt(f, prompt))
     }
 
     // ---- chat template ----------------------------------------------------

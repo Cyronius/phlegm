@@ -22,7 +22,7 @@
 use crate::backend::{Backend, GenParams};
 use crate::placeholder_tokenizer::PlaceholderTokenizer;
 use crate::sampler::Sampler;
-use crate::tokenizer::{ChatMessage, Tokenizer};
+use crate::tokenizer::{ChatMessage, Reasoning, Tokenizer};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::Write;
@@ -41,7 +41,10 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub model_id: String,
+    /// Output tokens for a request without `max_tokens`; 0 = until a stop token or the end of
+    /// the context (llama.cpp's server default, `n_predict = -1`).
     pub default_max_tokens: usize,
+    /// Upper bound on any request's `max_tokens`; 0 = none beyond the context.
     pub max_tokens_cap: usize,
     /// Directory containing `tokenizer.json` / `tokenizer_config.json` /
     /// `chat_template.jinja` (or an inline template in tokenizer_config.json).
@@ -61,10 +64,8 @@ impl ServerConfig {
             host: env_or("PHLEGM_HOST", "127.0.0.1"),
             port: env_or("PHLEGM_PORT", "52625").parse().unwrap_or(52625),
             model_id: env_or("PHLEGM_MODEL_ID", "phlegm-mock"),
-            default_max_tokens: env_or("PHLEGM_MAX_TOKENS", "64").parse().unwrap_or(64),
-            max_tokens_cap: env_or("PHLEGM_MAX_TOKENS_CAP", "512")
-                .parse()
-                .unwrap_or(512),
+            default_max_tokens: env_or("PHLEGM_MAX_TOKENS", "0").parse().unwrap_or(0),
+            max_tokens_cap: env_or("PHLEGM_MAX_TOKENS_CAP", "0").parse().unwrap_or(0),
             model_dir: std::env::var("PHLEGM_MODEL_DIR").ok().map(PathBuf::from),
             backend_name: env_or("PHLEGM_BACKEND", "mock"),
         }
@@ -159,8 +160,11 @@ impl ServerTokenizer {
         }
     }
 
-    fn harmony(&self) -> bool {
-        matches!(self, ServerTokenizer::Real(t) if t.is_harmony())
+    fn reasoning_for(&self, prompt: &str) -> Option<Reasoning> {
+        match self {
+            ServerTokenizer::Real(t) => t.reasoning_for(prompt),
+            ServerTokenizer::Placeholder(_) => None,
+        }
     }
 
     fn stop_ids(&self) -> HashSet<u32> {
@@ -171,12 +175,47 @@ impl ServerTokenizer {
     }
 }
 
+/// Without a fixed context (the mock backend) an open-ended request still needs a bound.
+const UNBOUNDED_FALLBACK_TOKENS: usize = 4096;
+
+/// The output-token budget for one request, the way llama.cpp's server sets it: the request's
+/// `max_tokens`, else the configured default (0 = open-ended), under the configured cap (0 =
+/// none), and never past the end of the backend's context (a request that reaches it finishes
+/// with `length`). A prompt that leaves no room for one token is an error.
+fn output_budget(
+    requested: Option<usize>,
+    cfg: &ServerConfig,
+    context_capacity: Option<usize>,
+    prompt_len: usize,
+) -> Result<usize, String> {
+    let room = match context_capacity {
+        // The backend holds prompt + max_tokens - 1 (the last token is never fed back).
+        Some(cap) if prompt_len > cap => {
+            return Err(format!(
+                "prompt is {prompt_len} tokens; the model's context holds {cap}"
+            ))
+        }
+        Some(cap) => cap + 1 - prompt_len,
+        None => UNBOUNDED_FALLBACK_TOKENS,
+    };
+    let mut n = match requested.unwrap_or(cfg.default_max_tokens) {
+        0 => room,
+        n => n,
+    };
+    if cfg.max_tokens_cap > 0 {
+        n = n.min(cfg.max_tokens_cap);
+    }
+    Ok(n.min(room).max(1))
+}
+
 // --------------------------------------------------------------------------
 // Server state / entry points
 // --------------------------------------------------------------------------
 
 struct ServerState {
     backend: Mutex<Box<dyn Backend + Send>>,
+    /// The backend's fixed context, read once at start (None for a backend without one).
+    context_capacity: Option<usize>,
     tokenizer: ServerTokenizer,
     cfg: ServerConfig,
 }
@@ -199,8 +238,10 @@ pub fn run(
     let tokenizer = ServerTokenizer::build(&cfg)?;
     let backend_name = cfg.backend_name.clone();
     let model_id = cfg.model_id.clone();
+    let context_capacity = backend.context_capacity();
     let state = Arc::new(ServerState {
         backend: Mutex::new(backend),
+        context_capacity,
         tokenizer,
         cfg,
     });
@@ -329,12 +370,10 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let max_tokens = req_json
+    let requested_max_tokens = req_json
         .get("max_tokens")
         .and_then(Value::as_u64)
-        .map(|v| v as usize)
-        .unwrap_or(state.cfg.default_max_tokens);
-    let max_tokens = max_tokens.max(1).min(state.cfg.max_tokens_cap);
+        .map(|v| v as usize);
     let temperature = req_json
         .get("temperature")
         .and_then(Value::as_f64)
@@ -358,7 +397,24 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
 
     let prompt = state.tokenizer.apply_chat_template(&messages);
     let prompt_ids = state.tokenizer.encode(&prompt);
+    let max_tokens = match output_budget(
+        requested_max_tokens,
+        &state.cfg,
+        state.context_capacity,
+        prompt_ids.len(),
+    ) {
+        Ok(n) => n,
+        Err(msg) => {
+            respond_json(
+                request,
+                400,
+                &json!({"error": {"message": msg, "type": "invalid_request_error"}}),
+            );
+            return;
+        }
+    };
     let stop_ids = state.tokenizer.stop_ids();
+    let reasoning = state.tokenizer.reasoning_for(&prompt);
 
     let sampler = Sampler::new(
         temperature.unwrap_or(0.0),
@@ -374,9 +430,9 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
     };
 
     if stream {
-        stream_response(request, state, prompt_ids, params, model);
+        stream_response(request, state, prompt_ids, params, model, reasoning);
     } else {
-        full_response(request, state, prompt_ids, params, model);
+        full_response(request, state, prompt_ids, params, model, reasoning);
     }
 }
 
@@ -404,6 +460,7 @@ fn full_response(
     prompt_ids: Vec<u32>,
     mut params: GenParams,
     model: String,
+    reasoning: Option<Reasoning>,
 ) {
     let max_tokens = params.max_tokens;
     let mut out_ids: Vec<u32> = Vec::new();
@@ -428,13 +485,15 @@ fn full_response(
     } else {
         "stop"
     };
-    // A harmony model's reply is its final channel; the analysis goes beside it as
-    // reasoning_content (the field llama.cpp's and vLLM's OpenAI servers use).
-    let message = if state.tokenizer.harmony() {
-        let (reasoning, answer) = crate::tokenizer::harmony_progress(&text);
-        json!({"role": "assistant", "content": answer, "reasoning_content": reasoning})
-    } else {
-        json!({"role": "assistant", "content": text})
+    // A reasoning model's thinking (harmony analysis, Gemma 4's thought channel, Qwen's <think>)
+    // goes beside the answer as reasoning_content (the field llama.cpp's and vLLM's OpenAI
+    // servers use).
+    let message = match &reasoning {
+        Some(r) => {
+            let (reasoning, answer) = r.split(&text);
+            json!({"role": "assistant", "content": answer, "reasoning_content": reasoning})
+        }
+        None => json!({"role": "assistant", "content": text}),
     };
     let resp = json!({
         "id": cmpl_id(),
@@ -461,6 +520,7 @@ fn stream_response(
     prompt_ids: Vec<u32>,
     mut params: GenParams,
     model: String,
+    reasoning: Option<Reasoning>,
 ) {
     let max_tokens = params.max_tokens;
     let cid = cmpl_id();
@@ -485,7 +545,6 @@ fn stream_response(
     let mut emitted = String::new();
     let mut decode_error = None;
     let mut decoder = state.tokenizer.decode_stream();
-    let harmony = state.tokenizer.harmony();
     let (mut sent_reasoning, mut sent_answer) = (String::new(), String::new());
     let gen_result = {
         let mut backend = state.backend.lock().unwrap();
@@ -503,9 +562,9 @@ fn stream_response(
                 }
             };
             emitted.push_str(&piece);
-            if harmony {
+            if let Some(r) = &reasoning {
                 // each side's new suffix, re-derived from everything decoded so far
-                let (reasoning, answer) = crate::tokenizer::harmony_progress(&emitted);
+                let (reasoning, answer) = r.progress(&emitted);
                 for (field, now, sent) in [("reasoning_content", reasoning, &mut sent_reasoning),
                                            ("content", answer, &mut sent_answer)] {
                     if let Some(delta) = now.strip_prefix(sent.as_str()).filter(|d| !d.is_empty()) {
@@ -540,12 +599,12 @@ fn stream_response(
         }
         let full = state.tokenizer.final_decode(&out_ids)?;
         let tail = final_stream_tail(&full, &emitted)?;
-        if harmony {
+        if let Some(r) = &reasoning {
             // whatever the last token completed, through the same derivation
-            let (reasoning, answer) = crate::tokenizer::harmony_progress(&full);
+            let (reasoning, answer) = r.progress_done(&full);
             for (field, now, sent) in [("reasoning_content", reasoning, &sent_reasoning),
                                        ("content", answer, &sent_answer)] {
-                let delta = now.strip_prefix(sent.as_str()).ok_or("harmony stream rewrote emitted text")?;
+                let delta = now.strip_prefix(sent.as_str()).ok_or("reasoning stream rewrote emitted text")?;
                 if !delta.is_empty() {
                     sse_write(&mut *writer, &sse_frame(&sse_chunk(&cid, created, &model, json!({ field: delta }), None)))
                         .map_err(|e| e.to_string())?;
@@ -740,6 +799,7 @@ mod tests {
             let addr = server.server_addr().to_ip().unwrap().to_string();
             let state = Arc::new(ServerState {
                 backend: Mutex::new(Box::new(Tokens(ids))),
+                context_capacity: None,
                 tokenizer: ServerTokenizer::Real(tokenizer),
                 cfg,
             });
@@ -967,6 +1027,30 @@ mod tests {
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
         assert!(v["usage"]["completion_tokens"].as_u64().unwrap() > 0);
         assert!(v["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn output_budget_follows_llama_cpp_server() {
+        let mut cfg = ServerConfig::from_env();
+        cfg.default_max_tokens = 0;
+        cfg.max_tokens_cap = 0;
+        // Open-ended: everything the context has left (prompt + n - 1 <= capacity).
+        assert_eq!(output_budget(None, &cfg, Some(4096), 100), Ok(3997));
+        // An explicit request is kept, but never runs past the context.
+        assert_eq!(output_budget(Some(200), &cfg, Some(4096), 100), Ok(200));
+        assert_eq!(output_budget(Some(9999), &cfg, Some(4096), 100), Ok(3997));
+        // A prompt that fills the context exactly still gets one token; one past it is an error.
+        assert_eq!(output_budget(None, &cfg, Some(4096), 4096), Ok(1));
+        assert!(output_budget(None, &cfg, Some(4096), 4097).is_err());
+        // Configured default and cap still apply when set.
+        cfg.default_max_tokens = 64;
+        cfg.max_tokens_cap = 512;
+        assert_eq!(output_budget(None, &cfg, Some(4096), 100), Ok(64));
+        assert_eq!(output_budget(Some(1000), &cfg, Some(4096), 100), Ok(512));
+        // No fixed context (mock): the fallback bound.
+        cfg.default_max_tokens = 0;
+        cfg.max_tokens_cap = 0;
+        assert_eq!(output_budget(None, &cfg, None, 10), Ok(UNBOUNDED_FALLBACK_TOKENS));
     }
 
     #[test]

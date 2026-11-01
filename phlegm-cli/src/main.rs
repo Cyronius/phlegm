@@ -81,16 +81,18 @@ fn npu_options(map: &HashMap<String, String>) -> Result<NpuOptions, String> {
     })
 }
 
+// Like llama.cpp (`-n -1`, its default): generate until a stop token or the end of the context.
+// A positive --max-tokens bounds the reply, clamped to the room the context has left.
 fn run(args: &[String]) -> Result<(), String> {
     let opts = flags(args)?;
     let npu = npu_options(&opts)?;
     let prompt = required(&opts, "--prompt")?;
-    let max_tokens: usize = opts
+    let requested: i64 = opts
         .get("--max-tokens")
         .map(|n| n.parse().map_err(|_| "invalid --max-tokens".to_string()))
-        .unwrap_or(Ok(128))?;
-    if max_tokens == 0 {
-        return Err("--max-tokens must be positive".into());
+        .unwrap_or(Ok(-1))?;
+    if requested == 0 || requested < -1 {
+        return Err("--max-tokens must be positive, or -1 for until the context is full".into());
     }
     let tokenizer = Tokenizer::load(&npu.model_dir)?;
     let text = tokenizer.apply_chat_template(
@@ -102,6 +104,16 @@ fn run(args: &[String]) -> Result<(), String> {
         true,
     )?;
     let ids = tokenizer.encode(&text)?;
+    // The backend holds prompt + max_tokens - 1 tokens (the last one is never fed back).
+    let capacity = npu.context_capacity;
+    if ids.len() > capacity {
+        return Err(format!(
+            "prompt is {} tokens; --max-ctx {capacity} holds fewer",
+            ids.len()
+        ));
+    }
+    let room = capacity + 1 - ids.len();
+    let max_tokens = if requested < 0 { room } else { (requested as usize).min(room) };
     let mut backend = NpuBackend::load(npu)?;
     let mut output = Vec::new();
     let mut params = GenParams {
@@ -110,17 +122,25 @@ fn run(args: &[String]) -> Result<(), String> {
         stop_ids: tokenizer.stop_ids(),
     };
     backend.generate(&ids, &mut params, &mut |id| output.push(id))?;
-    let text = tokenizer.decode(&output)?;
-    // A harmony model (GPT-OSS) answers in a final channel after its analysis: the answer on
-    // stdout, the analysis on stderr.
-    match phlegm_core::tokenizer::harmony_split(&text) {
-        Some((analysis, answer)) => {
-            if !analysis.is_empty() {
-                eprintln!("[analysis] {analysis}");
+    let reply = tokenizer.decode(&output)?;
+    // A reasoning model (harmony, Gemma 4's thought channel, Qwen's <think>) thinks before it
+    // answers: the reasoning on stderr, the answer alone on stdout.
+    match tokenizer.reasoning_for(&text) {
+        Some(r) => {
+            let (reasoning, answer) = r.split(&reply);
+            if !reasoning.is_empty() {
+                eprintln!("[reasoning]\n{reasoning}\n[/reasoning]");
+            }
+            if answer.is_empty() && output.len() >= max_tokens {
+                if max_tokens == room {
+                    eprintln!("[no answer before the context filled; raise --max-ctx]");
+                } else {
+                    eprintln!("[no answer within --max-tokens {max_tokens}; raise it]");
+                }
             }
             println!("{answer}");
         }
-        None => println!("{text}"),
+        None => println!("{reply}"),
     }
     Ok(())
 }
