@@ -34,6 +34,7 @@ def main() -> int:
     ap.add_argument("--stream")
     ap.add_argument("--out", required=True)
     ap.add_argument("--L", type=int)
+    ap.add_argument("--lk", type=int, default=0, help="padded K/V rows; defaults to L")
     ap.add_argument("--heads", type=int)
     ap.add_argument("--kv-heads", type=int, default=0)
     ap.add_argument("--causal", action="store_true")
@@ -53,23 +54,25 @@ def main() -> int:
         if s.get("layout"):
             ap.error(f"stream {a.stream!r} uses a runtime layout not supported by this test generator")
         L, heads, kvh = s["L"], s["heads"], s.get("kv_heads", s["heads"])
+        lk = s.get("lk", L)
         causal, valid = bool(s.get("causal", 0)), s.get("valid_len", 0)
     else:
         xclbin, insts = Path(a.xclbin).resolve(), Path(a.insts).resolve()
         L, heads, kvh = a.L, a.heads, a.kv_heads or a.heads
+        lk = a.lk or L
         causal, valid = a.causal, a.valid_len
-    valid = valid or L
+    valid = valid or lk
 
     out = Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(a.seed)
     q = (rng.standard_normal((L, heads * D), dtype=np.float32) * a.qk_scale).astype(bfloat16)
-    k = (rng.standard_normal((L, kvh * D), dtype=np.float32) * a.qk_scale).astype(bfloat16)
-    v = rng.standard_normal((L, kvh * D), dtype=np.float32).astype(bfloat16)
+    k = (rng.standard_normal((lk, kvh * D), dtype=np.float32) * a.qk_scale).astype(bfloat16)
+    v = rng.standard_normal((lk, kvh * D), dtype=np.float32).astype(bfloat16)
     for n, x in (("q", q), ("k", k), ("v", v)):
         x.tofile(out / f"{n}.bin")
     np.savez(out / "ref.npz", q=q.view(np.uint16), k=k.view(np.uint16), v=v.view(np.uint16),
-             L=L, heads=heads, kv_heads=kvh, causal=causal, valid_len=valid)
+             L=L, lk=lk, heads=heads, kv_heads=kvh, causal=causal, valid_len=valid)
 
     ob = L * heads * D * 2
     cfg = ["device", f"xclbin G {xclbin}", f"kernelx k G {insts}",
@@ -77,8 +80,8 @@ def main() -> int:
            f"buf o {ob}"]
     cfg += ["run k q k v o"] * a.runs + [f"dump o o.bin {ob}", ""]
     (out / "run.cfg").write_text("\n".join(cfg))
-    gflop = 4 * heads * L * L * D / 1e9
-    print(f"L={L} heads={heads}/{kvh} causal={causal} valid={valid}: {gflop:.1f} GFLOP -> {out}")
+    gflop = 4 * heads * L * lk * D / 1e9
+    print(f"L={L} lk={lk} heads={heads}/{kvh} causal={causal} valid={valid}: {gflop:.1f} GFLOP -> {out}")
     return 0
 
 

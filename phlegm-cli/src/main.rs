@@ -1,5 +1,6 @@
 use phlegm_core::backend::{Backend, GenParams};
 use phlegm_core::bench::reference::{NpuBackend, NpuOptions};
+use phlegm_core::image::{self, ImageConfig, ImageRequest};
 use phlegm_core::mock_backend::MockBackend;
 use phlegm_core::sampler::Sampler;
 use phlegm_core::server::{self, ServerConfig};
@@ -13,9 +14,11 @@ mod bench;
 const USAGE: &str = "usage: phlegm <command>
 
 commands:
-  run --model-dir DIR --kernels DIR --bridge EXE --prompt TEXT [--max-tokens N] [--turbo]
+  run --model-dir DIR --kernels DIR --bridge EXE --prompt TEXT [--max-tokens N (default -1: until the context is full)] [--turbo]
   serve --model-dir DIR --kernels DIR --bridge EXE [--max-ctx N] [--turbo]
   serve --mock
+  image --config JSON --prompt TEXT --out DIR [--image REF] [--size 512x512] [--steps N] [--guidance N]
+  serve-images --config JSON [--host 127.0.0.1] [--port 52626]
   bench     benchmark protocol, machine metadata, and result validation
   version   print the version
 
@@ -148,12 +151,64 @@ fn serve(args: &[String]) -> Result<(), String> {
     server::serve(Box::new(backend), cfg)
 }
 
+fn image_run(args: &[String]) -> Result<(), String> {
+    let opts = flags(args)?;
+    const ALLOWED: &[&str] = &["--config", "--prompt", "--out", "--model",
+        "--negative-prompt", "--size", "--steps", "--guidance", "--seed", "--image"];
+    for key in opts.keys() {
+        if !ALLOWED.contains(&key.as_str()) {
+            return Err(format!("unknown image option {key}"));
+        }
+    }
+    let cfg = ImageConfig::load(&PathBuf::from(required(&opts, "--config")?))?;
+    let out = PathBuf::from(required(&opts, "--out")?);
+    let out = if out.is_absolute() { out } else {
+        std::env::current_dir().map_err(|e| e.to_string())?.join(out)
+    };
+    let request = ImageRequest {
+        prompt: required(&opts, "--prompt")?,
+        model: opts.get("--model").cloned(),
+        negative_prompt: opts.get("--negative-prompt").cloned().unwrap_or_default(),
+        size: opts.get("--size").cloned().unwrap_or_else(|| "512x512".into()),
+        steps: opts.get("--steps").map(|v| v.parse()
+            .map_err(|_| "invalid --steps".to_string())).transpose()?,
+        guidance_scale: opts.get("--guidance").map(|v| v.parse()
+            .map_err(|_| "invalid --guidance".to_string())).transpose()?,
+        seed: opts.get("--seed").map(|v| v.parse()
+            .map_err(|_| "invalid --seed".to_string())).unwrap_or(Ok(41))?,
+        n: 1,
+        response_format: "b64_json".into(),
+        // --image REF edits REF instead of generating from text alone.
+        image: opts.get("--image").map(|p| std::fs::canonicalize(p)
+            .map_err(|e| format!("reading --image {p}: {e}"))).transpose()?,
+    };
+    let path = image::generate(&cfg, &request, &out)?;
+    println!("{}", path.display());
+    Ok(())
+}
+
+fn serve_images(args: &[String]) -> Result<(), String> {
+    let opts = flags(args)?;
+    for key in opts.keys() {
+        if !["--config", "--host", "--port"].contains(&key.as_str()) {
+            return Err(format!("unknown image server option {key}"));
+        }
+    }
+    let cfg = ImageConfig::load(&PathBuf::from(required(&opts, "--config")?))?;
+    let host = opts.get("--host").map(String::as_str).unwrap_or("127.0.0.1");
+    let port: u16 = opts.get("--port").map(|v| v.parse()
+        .map_err(|_| "invalid --port".to_string())).unwrap_or(Ok(52626))?;
+    image::serve(cfg, host, port)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("bench") => bench::command(&args[1..]),
         Some("run") => run(&args[1..]),
         Some("serve") => serve(&args[1..]),
+        Some("image") => image_run(&args[1..]),
+        Some("serve-images") => serve_images(&args[1..]),
         Some("version") | Some("--version") => {
             println!("phlegm {}", env!("CARGO_PKG_VERSION"));
             Ok(())

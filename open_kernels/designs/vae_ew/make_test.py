@@ -51,6 +51,8 @@ def main() -> int:
     ap.add_argument("--test", required=True, choices=list(STEPS))
     for d in ("C", "H", "W"):
         ap.add_argument(f"--{d}", type=int, required=True)
+    ap.add_argument("--physical-c", type=int, help="channels per stored pixel (default: C)")
+    ap.add_argument("--el", type=int, default=EL, help="bf16 values per NPU stream element")
     ap.add_argument("--silu", action="store_true")
     ap.add_argument("--plain-out", action="store_true", help="Y as a plain [H*W, C] tensor")
     ap.add_argument("--out", required=True)
@@ -60,14 +62,23 @@ def main() -> int:
     ap.add_argument("--mean", type=float, default=0.5, help="input offset (GroupNorm cancellation)")
     a = ap.parse_args()
     C, H, W = a.C, a.H, a.W
+    physical = a.physical_c or C
+    el = a.el
+    assert physical >= C and physical % 32 == 0
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     P = W + 2
     pad_view = {"off": 0, "pitch": P}
-    n_pad = (H + 2) * P * C
-    y_view = {"off": 0, "pitch": W, "border": 0} if a.plain_out else pad_view
-    n_y = H * W * C if a.plain_out else n_pad
-    sizes = {"X": n_pad, "B": n_pad, "S": BLOCK * EL, "Y": n_y}
+    if physical != C:
+        pad_view["px_stride"] = physical
+    y_view = {"off": 0, "pitch": W, "border": 0}
+    if physical != C:
+        y_view["px_stride"] = physical
+    if not a.plain_out:
+        y_view = pad_view
+    n_pad = (H + 2) * P * physical
+    n_y = H * W * physical if a.plain_out else n_pad
+    sizes = {"X": n_pad, "B": n_pad, "S": BLOCK * el, "Y": n_y}
     specs = {
         "stats": {"op": "gn_stats", "C": C, "H": H, "W": W, "a": pad_view, "stats_off": 0},
         "apply": {"op": "gn_apply", "C": C, "H": H, "W": W, "a": pad_view, "y": y_view,
@@ -80,6 +91,8 @@ def main() -> int:
         sizes["Y"] = H * W * 8
     for step in STEPS[a.test]:
         specs[step]["sizes"] = sizes
+        if el != EL:
+            specs[step]["el"] = el
         (out / f"spec_{step}.json").write_text(json.dumps(specs[step]))
     if not a.build:
         print(f"wrote specs {STEPS[a.test]} to {out}")
@@ -95,8 +108,8 @@ def main() -> int:
     beta = (0.2 * rng.standard_normal(C)).astype(bfloat16)
 
     def padded(t):
-        z = np.zeros((H + 2, P, C), bfloat16)
-        z[1:H + 1, 1:W + 1] = t
+        z = np.zeros((H + 2, P, physical), bfloat16)
+        z[1:H + 1, 1:W + 1, :C] = t
         return z
 
     npu = Npu()
@@ -111,9 +124,9 @@ def main() -> int:
     Bb = npu.buf("B", sizes["B"] * 2)
     Bb.write(padded(bx))
     S = npu.buf("S", sizes["S"] * 2)
-    blk = np.zeros(BLOCK * EL, bfloat16)
-    blk[EL:EL + C] = gamma
-    blk[EL + 512:EL + 512 + C] = beta
+    blk = np.zeros(BLOCK * el, bfloat16)
+    blk[el:el + C] = gamma
+    blk[el + 512:el + 512 + C] = beta
     S.write(blk)
     Y = npu.buf("Y", sizes["Y"] * 2)
     Y.zero()
@@ -146,12 +159,13 @@ def main() -> int:
     if a.silu:
         ref = silu(ref)
     y = raw.view(bfloat16)
-    got = (y.reshape(H, W, C) if a.plain_out else y.reshape(H + 2, P, C)[1:H + 1, 1:W + 1]) \
-        .astype(np.float64)
+    got = ((y.reshape(H, W, physical) if a.plain_out
+            else y.reshape(H + 2, P, physical)[1:H + 1, 1:W + 1])[..., :C]
+           .astype(np.float64))
     r = rel(got, ref)
     ok &= bool(np.isfinite(got).all()) and r < (2e-2 if a.silu else 1e-2)
     if not a.plain_out:
-        yp = y.reshape(H + 2, P, C).astype(np.float32)
+        yp = y.reshape(H + 2, P, physical).astype(np.float32)
         border = np.concatenate([yp[0].ravel(), yp[-1].ravel(), yp[:, 0].ravel(), yp[:, W + 1].ravel()])
         ok &= not border.any()
     t = " + ".join(f"{k} {v:.2f} ms" for k, v in ms.items())
