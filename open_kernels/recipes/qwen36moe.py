@@ -122,13 +122,16 @@ def q8_chunk_bytes(quant: str) -> int:
     raise OpRangeError(f"quant={quant!r}: no open q8 pool chunk layout")
 
 
-# The MoE family's GGUF-direct twin: the expert weights are 3D tensors
-# ([experts, n, k]), and the pack ops that lay them out (expert_stripes,
-# expert_down) have no GGUF form yet -- a GGUF's expert tensors are
-# quantized, and the packer would have to requantize and re-stripe them.
-# Until those ops exist the family ships no twin: a manifest that advertises
-# the section would send the engine to kernels whose experts it cannot pack.
-GGUF_EXPERT_OPS_READY = False
+# The MoE family's GGUF-direct view (OPEN-FAMILY-QWEN36MOE-GGUF): a llama.cpp GGUF (arch
+# qwen35moe) packed by the runtime's q35_* ops (upstream-patches/qwen35moe-gguf-runtime.patch)
+# into the q4_1 law's 5120-B chunks, so the view runs the q4_1 kernels and block prefill route
+# this manifest already names. Q4_0 / Q4_1 / Q4_K blocks keep their codes and their scale pair
+# (bf16 RNE, which is what the f32-scale kernels narrow it to on the core); other types are
+# requantized to the same law. `gguf_view` builds the section; `finalize_gguf_manifest` adds it.
+# The f32-scale twin (GGUF.section / twin_builds) stays off for this family: its pool does not
+# fit the block prefill GEMM's chunk law, and the q4_1-law view needs no second kernel set.
+GGUF_EXPERT_OPS_READY = True
+GGUF_F32_TWIN = False
 
 
 def pool_quant(spec: ModelSpec) -> str:
@@ -1660,7 +1663,7 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         for name, types in r.get("variants", {}).items():
             for lt, gb in types.items():
                 out["layer_types"][lt].setdefault("gemm_block_variants", {})[name] = gb
-    sec = GGUF.section(spec, max_ctx, programs, twins_built=GGUF_EXPERT_OPS_READY)
+    sec = GGUF.section(spec, max_ctx, programs, twins_built=GGUF_F32_TWIN)
     if sec:
         # The GGUF-direct twin: the same layer designs against the f32-scale pool
         # layout (the q4_1 codes with f32 block scales). The engine swaps this whole
@@ -1668,6 +1671,123 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         # are the *_f32 builds the export makes.
         out["gguf"] = sec
     return out
+
+
+# ---- the GGUF-direct view: the q4nx pack plan, op for op, read from a llama.cpp qwen35moe GGUF
+GGUF_GLOBALS = {"model.embed_tokens.weight": "token_embd.weight", "model.norm.weight": "output_norm.weight",
+                "lm_head.weight": "output.weight"}
+_G = "blk.{l}."
+# container tensor suffix -> GGUF tensor suffix, for the ops that keep their meaning (`put`)
+GGUF_PUT = {"input_layernorm.weight": "attn_norm.weight",
+            "post_attention_layernorm.weight": "post_attention_norm.weight",
+            "self_attn.q_norm.weight": "attn_q_norm.weight", "self_attn.k_norm.weight": "attn_k_norm.weight",
+            "linear_attn.ssm_norm.weight": "ssm_norm.weight", "shared_expert_gate.weight": "ffn_gate_inp_shexp.weight"}
+GGUF_MAT = {"mlp.share_up_exps_proj.weight": "ffn_up_shexp.weight",
+            "mlp.share_gate_exps_proj.weight": "ffn_gate_shexp.weight",
+            "mlp.share_down_exps_proj.weight": "ffn_down_shexp.weight",
+            "linear_attn.qkv_proj.weight": "attn_qkv.weight", "self_attn.gate_proj.weight": "attn_gate.weight",
+            "linear_attn.ssm_out_proj.weight": "ssm_out.weight", "self_attn.q_proj.weight": "attn_q.weight",
+            "self_attn.k_proj.weight": "attn_k.weight", "self_attn.v_proj.weight": "attn_v.weight",
+            "self_attn.o_proj.weight": "attn_output.weight"}
+
+
+def gguf_vtile(spec: ModelSpec, v0: int, vdim: int, axis: int = 0) -> dict:
+    """llama.cpp's conversion (conversion/qwen.py `_LinearAttentionVReorderBase`) stores the
+    linear-attention value heads TILED (GGUF head j * kheads + k) where HF and these kernels
+    group them by key head (k * vperk + j). The fields name the runtime's undo; nothing when
+    the head counts agree (the converter reorders nothing then)."""
+    kh, vh = spec.lin_key_heads, spec.lin_value_heads
+    if kh == vh:
+        return {}
+    if vh % kh:
+        raise OpRangeError(f"gguf view: {vh} value heads over {kh} key heads is not a whole group")
+    return {"kheads": kh, "vperk": vh // kh, "vdim": vdim, "v0": v0, "vaxis": axis}
+
+
+def _gguf_op(spec: ModelSpec, op: dict) -> dict:
+    """One container pack op -> the q35_* op that writes the same bytes from the GGUF."""
+    t = op.get("tensor", op.get("up", ""))
+    stem = t.replace("model.layer.{l}.", "")
+    o = op["op"]
+    hd, kd, vd, kh = spec.head_dim, spec.lin_key_dim, spec.lin_value_dim, spec.lin_key_heads
+    if o == "expert_stripes":
+        return {"op": "q35_stripes", "up": _G + "ffn_up_exps.weight", "gate": _G + "ffn_gate_exps.weight",
+                "dst": op["dst"], "experts": op["experts"], "stripes": op["stripes"],
+                "stripe_bytes": op["stripe_bytes"], "in_dim": op["in_dim"]}
+    if o == "expert_down":
+        return {"op": "q35_down", "tensor": _G + "ffn_down_exps.weight", "dst": op["dst"],
+                "experts": op["experts"], "expert_bytes": op["expert_bytes"]}
+    if o == "lmhead_q8":
+        return {"op": "q35_lmhead", "tensor": GGUF_GLOBALS[t], "dst": op["dst"], "in_dim": op["in_dim"]}
+    if o == "std_perm":
+        if stem not in GGUF_MAT:
+            raise OpRangeError(f"gguf view: no GGUF form for the projection {t}")
+        g = {"op": "q35_mat", "tensor": _G + GGUF_MAT[stem], "dst": op["dst"], "nch": op["nch"], "in_dim": op["in_dim"]}
+        if stem == "self_attn.q_proj.weight":
+            # [q | gate] per head in the GGUF; the container's chunk0 picked the half
+            g.update(period=2 * hd, take=hd, offset=hd if op.get("chunk0", 0) else 0)
+        elif stem == "linear_attn.qkv_proj.weight":
+            g.update(gguf_vtile(spec, 2 * kh * kd, vd))
+        elif stem == "self_attn.gate_proj.weight":
+            g.update(gguf_vtile(spec, 0, vd))
+        elif stem == "linear_attn.ssm_out_proj.weight":
+            g.update(gguf_vtile(spec, 0, vd, axis=1))
+        return g
+    if o == "put":
+        if stem in GGUF_PUT:
+            return {"op": "put", "tensor": _G + GGUF_PUT[stem], "dst": op["dst"], "cap": op["cap"]}
+        heads = spec.lin_value_heads
+        if stem in ("linear_attn.ssm_alpha_proj.weight", "linear_attn.ssm_beta_proj.weight"):
+            lanes = ab_lanes(spec)
+            if spec.hidden * lanes * 2 > op["cap"]:
+                raise OpRangeError(f"gguf view: {t}'s [hidden, {lanes}] does not fit its {op['cap']} B slot")
+            g = {"op": "q35_t", "tensor": _G + ("ssm_alpha.weight" if "alpha" in stem else "ssm_beta.weight"),
+                 "dst": op["dst"], "rows": heads, "cols": spec.hidden, **gguf_vtile(spec, 0, 1)}
+            if lanes != heads:
+                g["dst_rows"] = lanes
+            return g
+        if stem in ("linear_attn.ssm_a", "linear_attn.ssm_dt.bias"):
+            return {"op": "q35_vec", "tensor": _G + ("ssm_a" if stem.endswith("ssm_a") else "ssm_dt.bias"),
+                    "dst": op["dst"], "cap": op["cap"], "elem": 4, **gguf_vtile(spec, 0, 1)}
+        if stem == "moe_router.weight":
+            if spec.hidden * spec.num_experts * 2 > op["cap"]:
+                raise OpRangeError(f"gguf view: the router does not fit its {op['cap']} B slot")
+            return {"op": "q35_t", "tensor": _G + "ffn_gate_inp.weight", "dst": op["dst"],
+                    "rows": spec.num_experts, "cols": spec.hidden}
+        raise OpRangeError(f"gguf view: no GGUF form for {t}")
+    if o == "conv_transpose":
+        return {"op": "q35_conv", "tensor": _G + "ssm_conv1d.weight", "dst": op["dst"], "taps": op["taps"],
+                "groups": op["groups"], "width": op["width"], **gguf_vtile(spec, 2 * kh * kd, vd)}
+    raise OpRangeError(f"gguf view: no GGUF form for pack op {o} ({t})")
+
+
+def gguf_view(spec: ModelSpec, base: dict) -> dict | None:
+    """The manifest's `gguf` section: the q4_1 manifest itself -- its kernels, programs,
+    block prefill route and layouts -- with every pack op translated by `_gguf_op`, in the
+    same order (the block route's weights name pool / consts ops by index) at the same
+    offsets. None where a projection is not q4_1 (no q35 op writes a q8 or t2 pool)."""
+    if not GGUF_EXPERT_OPS_READY or spec.quant != "q4_1" or any(q != "q4_1" for q in spec.quant_map.values()) \
+            or spec.hadamard:
+        return None
+    import copy
+    g = copy.deepcopy({k: v for k, v in base.items() if k != "gguf"})
+    for lt in g["layer_types"].values():
+        for key in ("pool", "consts"):
+            lt["pack"][key] = [_gguf_op(spec, op) for op in lt["pack"][key]]
+    pk = g["pack"]
+    pk["lm_head"]["ops"] = [_gguf_op(spec, op) for op in pk["lm_head"]["ops"]]
+    pk["embed"]["tensor"] = GGUF_GLOBALS[pk["embed"]["tensor"]]
+    pk["norm"]["tensor"] = GGUF_GLOBALS[pk["norm"]["tensor"]]
+    return g
+
+
+def finalize_gguf_manifest(spec: ModelSpec, manifest: dict) -> None:
+    """recipes/manifest.py's family hook: add the GGUF-direct view (`gguf_view`)."""
+    if "gguf" in manifest:
+        return
+    view = gguf_view(spec, manifest)
+    if view is not None:
+        manifest["gguf"] = view
 
 
 def hf_config_check(spec: ModelSpec) -> dict:
@@ -1727,7 +1847,7 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
         # layout (the q4_1 codes with f32 block scales). The env says which variant
         # to build (designs/layer_x/layout.py reads it); the q4_1 builds above are
         # untouched, so a shipped model keeps the kernels it has.
-        if GGUF_EXPERT_OPS_READY:
+        if GGUF_F32_TWIN:
             b.update(GGUF.twin_builds(b, skip=("ln", "lm_head_q8")))
     r = gemm_route(spec)
     if r:
