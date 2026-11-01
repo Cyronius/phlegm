@@ -49,6 +49,7 @@ sync is a plain diff of these two directories.
 | 2026-10-28 | #225's four Gemma 4 attention flags live in `recipes/dense.attn_flags`, phlegm's one flag source for `dx.py` and the attention gate; `recipes/gemma4.py` re-exports it. `attn.h` refuses `ATTN_QLOCAL` with the `ATTN_TREE8` / `ATTN_G5` scorers, which postdate #225's base and index q by global head. |
 | 2026-10-28 | `dx.py` streams o's og elements only when they outnumber the norms' x depth (`OG_STREAM`), not at og > 2 as #225 does: phlegm's x fifo already holds og elements, so #225's condition moved Qwen3-14B (og 3, from #223) onto the new path. At depth 4 Gemma 4's global layer would also overflow its main cores. Upstream needs the same condition once #223 lands. |
 | 2026-10-28 | `OPEN-FAMILY-GEMMA4` is defined in `specs/open-engine/spec.md`; #225's test traces the ID, but the PR does not add it. |
+| 2026-11-01 | `designs/trit_embed/`: the trit-embed-3l sentence-embedder encoder, moved here from an unversioned experiment. It is standalone, with its own build and host library, and uses no recipe, manifest or runtime ABI. |
 
 ## Pushed out to openflowlm-next
 

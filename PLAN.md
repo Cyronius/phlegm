@@ -201,6 +201,20 @@ Sources: [speculative decoding](specs/open-engine/plans/spec-decode.md),
 [expert quantization](specs/open-engine/plans/expert-quant-2bit.md),
 [drafter/model work](specs/open-engine/plans/dflash-drafters.md).
 
+### trit-embed-3l sentence embedder
+
+- [ ] Keep the weights resident or replicated: today all 2.09 MB stream from DDR on every
+  dispatch, and data movement is 54% of the 0.83 ms dispatch.
+- [ ] Fill the 4096-byte weight packets, which are 56-81% full.
+- [ ] Add an embeddings route to `phlegm serve`, and run the encoder on Windows.
+
+`open_kernels/designs/trit_embed/` runs all three ternary layers (2-bit weights, int8
+activations) in one dispatch per 128-token slot. On a quiet machine it encodes 1,199 SciFact
+abstracts/s and 9,928 packed STSB sentences/s; its vectors score with the CPU reference
+(four-task nDCG@10 33.80 against 33.85).
+
+Source: [design README](open_kernels/designs/trit_embed/README.md).
+
 ## 6. Port inference to Rust last
 
 - [ ] Port container reads/packing, manifest handling, XRT dispatch and stream
