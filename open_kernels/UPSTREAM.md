@@ -300,6 +300,30 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   `gptoss-runtime.patch` (sha256 `8a5f808e`, unchanged); `target/npu-dev/gptoss-prefill-patch.sh`
   regenerates it and checks the chain reproduces the clone.
 
+- `upstream-patches/flint-runtime.patch` (2026-10-31) runs Recursive Flint from its Q4_1 GGUF
+  (OPEN-FAMILY-FLINT, `recipes/flint.py`). Pack op `fl_q4`: a rows x in_dim block of a Q4_0 / Q4_1
+  tensor (trailing dims flattened into rows), per expert at a row / column step, into q4_1-law chunks
+  (`std_perm_gguf`'s bytes: codes kept, d / m RNE to bf16) with a per-expert and a per-band destination
+  stride, so a slot's gate and up bands interleave and the shared expert / dense MLP split into
+  512-row slots. Program step `flint_route`: the sigmoid router over xm (no bias, top 6 renormalised)
+  plus fixed shared-expert slots at weight 1, the weights beside xm and moeroute2 on the MoE dispatch.
+  `gguf_pack_test` pins `fl_q4` to `std_perm_gguf`. The diff applies over `beccd46`, the nine Gemma 4
+  patches, `gptoss-runtime.patch` (`8a5f808e`) and `gptoss-prefill-runtime.patch` (`f28a389e`), both
+  unchanged; GPT-OSS's code paths are untouched. `target/npu-dev/flint-patch.sh` regenerates it and
+  checks the chain reproduces the clone (`target/npu-dev/flint-runtime`).
+
+- `upstream-patches/hyv3-runtime.patch` (2026-10-31) runs Tencent Hy-Memory-30B-A3B (hy_v3) from our
+  pure Q4_0 GGUF (OPEN-FAMILY-HYV3, `recipes/hyv3.py`). Program step `hy_route`: the sigmoid router
+  with the per-expert selection bias (`exp_probs_b` picks, the unbiased scores weigh, renormalised and
+  scaled by `router_scaling_factor`), the shared expert's slot at weight 1, up to 16 slots in an
+  f32[16] record beside xm, moeroute2's stock apply on `hy_moe`; a dense mode points the slots at the
+  dense MLP's slices. The moe geometry's topk limit rises from 8 to 16; the device router's 8-slot
+  record is checked in `Core::route` instead. No new pack op (`fl_q4`, `gx_lmhead`, `put` are the
+  chain's). The diff applies over `beccd46`, the nine Gemma 4 patches, `gptoss-runtime.patch`,
+  `gptoss-prefill-runtime.patch` and `flint-runtime.patch` (`323e4dc8`), all unchanged;
+  `target/npu-dev/hyv3-patch.sh` regenerates it and checks the chain reproduces the clone
+  (`target/npu-dev/hyv3-runtime`).
+
 - `upstream-patches/gemma4-moe-runtime.patch` (2026-10-31) runs Gemma 4 26B-A4B from its QAT
   Q4_0 GGUF (OPEN-FAMILY-GEMMA4-MOE). Two pack ops: `g4_q40` (a Q4_0 tensor, 2-D or the
   experts' 3-D, into Q4_0-native chunks in `std_perm`'s band law, with rows and columns padded

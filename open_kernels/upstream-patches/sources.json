@@ -488,5 +488,58 @@
     "note": "GPT-OSS's native MXFP4 experts and block prefill (OPEN-FAMILY-GPTOSS, OPEN-PREFILL-GPTOSS): pack ops gx_ug_mx4 / gx_down_mx4 (MXFP4 experts as mx4 half-tiles, the GGUF's nibbles re-signed for gemv_mx4.h), gp_bfp16 (a GGUF tensor's rows into a gemm_bfp16 B operand at any 64-multiple K, split hi / lo) and gp_mx4 (MXFP4 experts as gemm_bfp16 GB_B=mx4 tiles); the manifest's gptoss_prefill section and the gxexpert stream patch (an expert GEMM's buffer-0 fills re-pointed per dispatch, two stream copies alternating); Core::step_gptoss_prompt, the layer-major route behind step_gemm_prompt / layer_major_ok; block_prefill_min and the engine's use of it. A diff over base plus the nine Gemma 4 patches and gptoss-runtime.patch (sha256 8a5f808e...); target/npu-dev/gptoss-prefill-patch.sh regenerates it and checks the chain reproduces the clone",
     "patch": "gptoss-prefill-runtime.patch",
     "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "flint_runtime_20261031": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gptoss_runtime_20261031",
+      "gptoss_prefill_runtime_20261031"
+    ],
+    "files": [
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/gguf_pack_test.cpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp",
+      "src/open_qwen36/pools.cpp"
+    ],
+    "note": "Recursive Flint from its Q4_1 GGUF (OPEN-FAMILY-FLINT, recipes/flint.py): pack op fl_q4 (a block of a Q4_0 / Q4_1 tensor per expert at a row / column step into q4_1-law chunks, std_perm_gguf's bytes, per-expert and per-band destination strides); the flint_route program step (sigmoid router, top-k renormalised, fixed shared-expert slots at weight 1, moe2_apply on fl_moe's fills) and host_step dispatching it; a gguf_pack_test case pinning fl_q4 to std_perm_gguf. A diff over base plus the nine Gemma 4 patches, gptoss-runtime.patch (8a5f808e) and gptoss-prefill-runtime.patch (f28a389e); target/npu-dev/flint-patch.sh regenerates it and checks the chain",
+    "patch": "flint-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "hyv3_runtime_20261031": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gptoss_runtime_20261031",
+      "gptoss_prefill_runtime_20261031",
+      "flint_runtime_20261031"
+    ],
+    "files": [
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp"
+    ],
+    "note": "Tencent HY V3 / Hy-Memory-30B-A3B from our pure Q4_0 GGUF (OPEN-FAMILY-HYV3, recipes/hyv3.py): the hy_route program step (sigmoid router with the per-expert selection bias exp_probs_b, top-k of score + bias, the unbiased scores renormalised times router_scaling_factor, the shared expert's slot at weight 1, up to 16 slots in an f32[16] record; a dense mode pointing the slots at a dense MLP's slices at weight 1; moe2_apply on hy_moe's fills) and host_step dispatching it; the moe geometry's topk limit raised from 8 to 16 with the 8-slot device-router record checked in Core::route instead. The pack ops (fl_q4, gx_lmhead, put) are the chain's. A diff over base plus the nine Gemma 4 patches, gptoss-runtime.patch (8a5f808e), gptoss-prefill-runtime.patch (f28a389e) and flint-runtime.patch (323e4dc8); target/npu-dev/hyv3-patch.sh regenerates it and checks the chain",
+    "patch": "hyv3-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
   }
 }

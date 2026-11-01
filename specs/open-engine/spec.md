@@ -4485,6 +4485,252 @@ explicitly excludes.
   it computes in fp32 whatever the parameter dtype -- closes the gap to 1e-12, which is what
   says the 1e-5 is transformers' rounding and not a missing piece.
 
+### OPEN-FAMILY-FLINT: Recursive Flint derives its own spec and runs on its own recipe from the GGUF
+**Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_flint_hf`, `families.py`, `flint.py`,
+`flint_pack.py`, `designs/flint/{fl.py,gen_kernels.py,check_layer.py}`, `model/flint_gguf_reference.py`;
+runtime `upstream-patches/flint-runtime.patch`)
+**Test category:** unit (`tests/test_flint.py`); manual (the procedure below, which needs the NPU and the GGUF)
+
+A config whose `model_type` is `flint` shall derive a `ModelSpec` with `family` `flint`. The architecture,
+read from transformers' `modular_flint.py` and llama.cpp's `src/models/flint.cpp` (build 12015), which agree:
+
+- attention: 32 q / 4 kv heads at head dim 128, no bias, Qwen3's per-head RMSNorm on q and k (weights
+  [128]) before the rotation, scale 1/sqrt(128), and GPT-OSS's learned per-head sink (`softmax_type`
+  "learnable": one extra softmax logit per head with no value behind it, F32 in HF);
+- position: default RoPE (half split, theta 1e4, all 128 dims) on the `sliding_attention` layers only;
+  the `full_attention` layers have NO positional encoding (`no_rope_layer_indices` = exactly those);
+- the sliding window: query t sees keys (t - 513, t], itself and 512 before (HF's mask, llama.cpp's
+  `LLAMA_SWA_TYPE_STANDARD`, the runtime's `attn_window(pos, 513)`);
+- FFN: pre-norm residual blocks; `mlp_only_layers` [0, 1] are a SiLU MLP of 6144; every other layer has
+  256 SiLU experts of 512 routed by SIGMOID scores of an F32 router with no bias, the top 6 renormalised
+  (`norm_topk_prob`), plus an UNGATED shared expert of 1024 always added in full.
+
+The sink, NoPE on the full layers, the sigmoid router and the ungated shared expert are family properties:
+the derivation refuses a config that says otherwise, by key. `dense_lead` (the leading dense-MLP layers)
+is a spec field dropped from `to_dict()` at 0, so no other family's hash moves. `families.family_module
+("flint")` is `recipes/flint.py`; routing Flint through the GPT-OSS recipe (no q/k norm, softmax router,
+no shared expert) or the Qwen3.5 MoE one (DeltaNet, gated attention, softmax router) would compute a
+different model.
+
+**The recipe (2026-10-31), from the GGUF.** The source is RecursiveSI's `flint-int4-q4_1.gguf` (every
+matrix Q4_1 -- "the MLX export's trained INT4 codes" -- the embedding and every norm / sink / router F32).
+Its fp16 scales and mins are bf16 values (11 sampled tensors, 100 %), so the q4_1 pool law (5120-B chunks,
+d / m bf16) holds them exactly, codes kept: `fl_q4` (runtime) / `flint_pack.py` (NumPy), pinned to
+`std_perm_gguf` in `gguf_pack_test`. A layer is two dispatches with the router on the host:
+
+- `fl_att` (`designs/flint/fl.py`, FL_PART=att; attnpos): entry norm, q | k | v (gemv_q4.h), the q / k
+  norms and the rotation (attn.h ATTN_QKNORM=1), attention with the sink (ATTN_SINK=1) over 4 cores of 8
+  heads (VEXP, RB 4), o, res = x + o, xm = ffn_norm(res). The full layers' position table has zero
+  frequencies: cos 1, sin 0 is the identity rotation exactly, so one program serves NoPE and RoPE layers;
+  the sliding layers' kernel entry carries window 513.
+- `flint_route` (runtime): sigmoid scores over the bf16 xm (double accumulation), top 6 (ties to the lower
+  id), renormalised; slots 6 and 7 are the shared expert's two 512-row halves, stored as pool experts 256
+  and 257 at weight 1 (SwiGLU is per row and down sums over rows, so the split is exact); moeroute2 points
+  the 8 slots' fills.
+- `fl_moe` (FL_PART=moe; moeroute2): per slot gate | up, w_e silu(g) u, down accumulated per core over the
+  slots, xres = res + down (ln_add2).
+- the dense layers 0, 1: `fl_att_d` (the same core program over their own pool layout) and `fl_dense`, the
+  6144-wide MLP as 12 unweighted 512-row slots of the same expert program.
+- tail: `ln` and `lm_head_q4` (the Q4_1 head, std_perm_gguf, exact under the same condition).
+
+Budgets (fullest core / 16384 B; L1 end incl. stack / 65536): fl_att 16320 (the attention core 0; the
+main cores 4160) / 48640; fl_moe 7984 / 50464; fl_dense 7808 / 50464; ln 3344; lm_head_q4 3136. The
+layer pool is 495 MiB (258 x 3 x 640 KiB of experts + 11.8 MB of attention), ~24 GB for 49 layers.
+
+**Acceptance (manual):** (1) `model/flint_gguf_reference.py` against llama.cpp on the same GGUF
+(teacher-forced top-20); (2) `designs/flint/check_layer.py` for a dense, a full and a sliding layer at the
+compiled position; (3) `open_qwen36_cli --prefill-logits --dump-logits` over a chat prompt agrees with
+llama.cpp's greedy tokens, and a prompt past the 513-row window compares every position against the
+reference, llama.cpp and the `--npu-like` control; (4) `phlegm run` and `serve` answer.
+
+**Result 2026-10-31 (Strix Halo, XRT 2.27.0, development runs on a machine other sessions kept at load
+average 40-65, not a clean benchmark):** the file's sha256 equals the HF LFS oid; every one of its
+2,465,808,384 Q4_1 scales and mins and every F32 tensor but the embedding is bf16-exact (checked over the
+whole file), so no stage of the pack rounds. (1) the reference against llama.cpp (Vulkan), 815-token chat
+prompt teacher-forced: argmax 741/815, partial KL(top-20) median 7.7e-3, the same before and after the
+513-row window (7.8e-3 / 7.7e-3); the bf16 rounding control alone is 745/815, median 8.0e-3 from fp32 --
+this model is that rounding-sensitive, and llama.cpp's own gap is the same size. (2) layers 0 (dense), 2
+(sliding) and 5 (full, NoPE) at position 1: K 1.4-2.0e-3, attention out 2.1-2.9e-3, xm 1.7-3.4e-3 rel L2;
+the route equals the reference's; h_e against the reference fed the NPU's xm 1e-5; layer out 0.8-5.3e-3
+against fp32. (3) the short chat prompt: 48 greedy tokens equal llama.cpp's up to the EOS both rank first
+(llama.cpp's ignore_eos bans it); the 815-token prompt: NPU vs llama.cpp 740/815, median 8.3e-3; vs fp32
+745/815, 9.1e-3; vs the rounding control 742/815, 8.6e-3, no step at the window; its 32 greedy tokens equal
+llama.cpp's. (4) `phlegm run` and `serve` answer (non-streamed and streamed); the `<think>` block goes to
+reasoning_content by SERVER-REASONING (not checked live on this model). Load 53 s; sequential prefill 215-241 ms a token; decode 187-210 ms a token
+(fl_att ~100, route 15-18, fl_moe ~80, head 7 ms).
+
+Not established: block prefill, a clean benchmark, contexts past 4096 rows, one context per layer.
+
+### OPEN-FAMILY-HYV3: Tencent HY V3 (Hy-Memory-30B-A3B) derives its own spec and runs on its own recipe from the GGUF
+**Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_hyv3_hf`, `families.py`, `hyv3.py`,
+`designs/hyv3/{hy.py,gen_kernels.py,check_layer.py}`, `model/hyv3_gguf_reference.py`; runtime
+`upstream-patches/hyv3-runtime.patch`)
+**Test category:** unit (`tests/test_hyv3.py`); manual (the procedure below, which needs the NPU and the GGUF)
+
+A config whose `model_type` is `hy_v3` shall derive a `ModelSpec` with `family` `hyv3`. The architecture,
+read from transformers 5.21's `modular_hy_v3.py` and llama.cpp's `src/models/hy-v3.cpp` /
+`build_moe_ffn` (build 12015), which agree:
+
+- attention: 32 q / 4 kv heads at head dim 128, no bias, Qwen3's per-head RMSNorm on q and k (weights
+  [128], eps 1e-5) BEFORE the rotation, scale 1/sqrt(128), causal over every row (no window, no sink);
+- position: NEOX RoPE (rotate_half), theta 11158840, all 128 dims, every layer, no scaling;
+- FFN: pre-norm residual blocks; `mlp_layer_types` "dense" layers (layer 0) are a SiLU MLP of 6912; the
+  "sparse" layers have 128 SiLU experts routed by SIGMOID scores s of an F32 router, chosen as the top 8
+  of s + `expert_bias` (GGUF `exp_probs_b`) -- the bias selects only -- weighted by the UNBIASED s of the
+  chosen, renormalised, times `router_scaling_factor` (2.826), plus an UNGATED shared expert
+  (`num_shared_experts` 1) added in full; the combine is f32.
+
+**The expert width is the stored one.** Hy-Memory-30B-A3B's published config says
+`moe_intermediate_size` 1536, but every expert and shared-expert tensor is 768 wide (the safetensors
+headers; `expert_hidden_dim` 768), so the derivation takes `expert_hidden_dim` when present (and refuses a
+pairing other than equal or 2x) and records the published value in `extra`. A GGUF needs the config patched
+to 768 before llama.cpp's converter, which writes `expert_feed_forward_length` from moe_intermediate_size.
+The router's constants are host arithmetic, so they ride in `extra` (outside the kernel hash); a config that
+routes otherwise (softmax, no bias, no renormalisation), MTP layers, or a non-default RoPE are refused by key.
+`families.family_module("hyv3")` is `recipes/hyv3.py`; Flint's recipe (sinks, NoPE layers, no bias, 512-wide
+experts) or the Qwen3.5 MoE one (DeltaNet, softmax router, gated shared expert) would compute another model.
+
+**The recipe (2026-10-31), from the GGUF.** The source is our own pure Q4_0 (llama.cpp build 12015
+`convert_hf_to_gguf.py --outtype bf16 --no-mtp` over tencent @ 64a460a9 with the width patch, then
+`llama quantize --pure --output-tensor-type q8_0 ... Q4_0`): from a BF16 source a Q4_0 scale is block
+max / -8, a bf16 value, so `fl_q4` (Flint's pack op) holds every matrix exactly in the q4_1 law (5120-B
+chunks, m = -8 d); the Q8_0 head goes to lm_head_q8's f32-scale chunks (`gx_lmhead`) exactly. A layer is two
+dispatches with the router on the host:
+
+- `hy_att` (`designs/hyv3/hy.py`, HY_PART=att; attnpos): fl_att's program without the sink (ATTN_SINK=0):
+  entry norm, q | k | v, q / k norms, RoPE, attention over 4 cores of 8 heads (VEXP, RB 4), o, res, xm.
+- `hy_route` (runtime): the router above over the bf16 xm (double accumulation, ties to the lower id),
+  slot 8 = the shared expert (pool expert 128) at weight 1, the weights f32[16] beside xm; its dense mode
+  (layer 0) points slots 0..8 at the MLP's nine 768-wide slices (pool experts 0..8) at weight 1, so the
+  dense layer runs the same two programs over the same pool law. moeroute2's stock table / apply re-point
+  the 9 slots (the moe geometry's topk is 9; the device router record's 8-slot limit moves to
+  `Core::route`).
+- `hy_moe` (HY_PART=moe; moeroute2): 768 rows are 12 64-row bands, not whole bands over 8 cores, so gate |
+  up takes slots in PAIRS -- slot 2v on cores 0-3, 2v + 1 on cores 4-7, 3 bands a core, the odd ninth on
+  cores 0-3 -- each core's fill compiled inside its own slot's stripe set (so moe2_table reads the slot off
+  the offset). Down is per slot over all 8 cores (K 768), accumulated per core; xres = res + down.
+- tail: `ln` and `lm_head_q8` (LMHEAD_SCALES_F32=1).
+
+Budgets (fullest core / 16384 B; L1 end incl. stack / 65536): hy_att 16112 (attention core 0; main cores
+4160) / 48640; hy_moe 9328 / 50496; ln and lm_head_q8 2928. The layer pool is 375 MiB (129 x 3 x 960 KiB
+of experts + 11.8 MB of attention), ~18.4 GiB for 48 layers, plus a 266 MiB head.
+
+**Acceptance (manual):** (1) `model/hyv3_gguf_reference.py` against llama.cpp on the same GGUF
+(teacher-forced top-20), plus its `--npu-like` bf16 control; (2) `designs/hyv3/check_layer.py` for the dense
+layer and MoE layers at the compiled position; (3) `open_qwen36_cli --prefill-logits --dump-logits` agrees
+with llama.cpp's greedy tokens on a chat prompt, and an ~800-token prompt compares every position against
+the reference, llama.cpp and the control; (4) `phlegm run` and `serve` answer with the chat template.
+
+**Result 2026-10-31 (Strix Halo, development runs on a machine other sessions kept at load average
+35-60, not a clean benchmark):** all 51 BF16 shards' sha256 equal the Hub LFS oids; our `model.gguf` is
+17083366976 B, sha256 `7be5836f...150da`; all 931,397,632 Q4_0 scales are bf16-exact (the whole file), so no
+pack stage rounds; the head's Q8_0 scales stay f32. Prompts tokenize as llama-server does (6 / 27 / 836).
+(1) the reference against llama.cpp (Vulkan), teacher-forced top-20: the 836-token chat prompt 802/836
+argmax, partial KL median 1.0e-3; the bf16 control is 812/836, KL median 2.1e-3 from fp32. (2) layers 0
+(dense), 1, 24 and 47 at position 1: K 1.5-1.8e-3, attention out 2.4-4.4e-3, xm 1.8-3.7e-3 rel L2; routes
+equal the reference's except layer 47's eighth slot (a near tie under the bf16 xm); every h_e of both pair
+halves and the odd ninth slot against the reference fed the NPU's xm 0.8-1.9e-5 (the dense slices 1e-4);
+layer out 0.6-1.2e-3 against fp32. (3) the short chat prompt: "The capital of France is Paris." then EOS,
+= llama.cpp's tokens, both ranking EOS first there (llama.cpp's ignore_eos bans it); prompt positions
+27/27, partial KL median 8.9e-4. The 836-token prompt: NPU vs llama.cpp 797/836, median 1.1e-3; vs fp32
+815/836, KL median 2.1e-3; vs the control 808/836, 2.3e-3. Its greedy continuation parts from llama.cpp's
+at token 2, a three-way near tie (NPU -1.30 / -1.36 / -1.39); teacher-forced over llama.cpp's 32 tokens
+32/33 positions agree, median 1.4e-5 (the miss is that tie). (4) `phlegm run` answers "The capital of
+France is Paris." (29.8 s wall incl. load); `serve` answers non-streamed and streamed. Phlegm's template
+environment now sets trim_blocks / lstrip_blocks as transformers does (HY V3's template otherwise opens
+with two newlines); the other installed templates render unchanged. Sequential prefill 226 ms a token;
+decode 217-242 ms a token (hy_att ~90-100, route 9-11, hy_moe ~80-98, head 8-11 ms).
+
+Not established: block prefill, a clean benchmark, contexts past 4096 rows, one context per layer.
+
+### OPEN-FAMILY-LFM2MOE: LiquidAI LFM2-MoE (LFM2.5-24B-A2B) derives its own spec and runs on its own recipe from the GGUF
+**Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_lfm2moe_hf`, `families.py`, `lfm2moe.py`,
+`designs/lfm2moe/{lm.py,gen_kernels.py,check_layer.py}`, `model/lfm2moe_gguf_reference.py`; runtime: the
+flint-runtime chain plus `upstream-patches/hyv3-runtime.patch`, no patch of its own)
+**Test category:** unit (`tests/test_lfm2moe.py`); manual (the procedure below, which needs the NPU and the GGUF)
+
+A config whose `model_type` is `lfm2_moe` shall derive a `ModelSpec` with `family` `lfm2moe`. The architecture,
+read from transformers' `modular_lfm2_moe.py` (over lfm2's `Lfm2ShortConv`, `Lfm2Attention`,
+`Lfm2DecoderLayer`) and llama.cpp's `src/models/lfm2moe.cpp` / `lfm2.cpp` / `lfm-base.cpp` (build 12015,
+arch `lfm2moe`), which agree:
+
+- layers: LFM2's hybrid, `layer_types` "conv" (`short_conv`) or "full_attention"; LFM2.5-24B-A2B has 40, the
+  attention ones at 2, 6, ..., 38;
+- short conv (OPEN-FAMILY-LFM2's block): in_proj gives B | C | u by rows; bx = B u; a 3-tap depthwise causal
+  conv over bx with no bias, the LAST tap on this token (llama.cpp `ggml_ssm_conv` over [state | bx]); y = C conv;
+  out_proj. The state is the two previous bx rows;
+- attention: 32 q / 8 kv heads at head dim 64, no bias, per-head RMSNorm on q and k before a NEOX (rotate_half)
+  RoPE over all 64 dims, theta 1e7, causal, scale 1/sqrt(64), no window, no sink;
+- FFN: pre-norm (operator_norm = GGUF attn_norm, then ffn_norm), RMSNorm without +1, eps 1e-5. The first
+  `num_dense_layers` (2) are a SiLU MLP of 11776; every other layer, conv or attention alike, has 64 SiLU experts
+  of 1536 (the stored width, GGUF expert_feed_forward_length 1536) and no shared expert;
+- router: s = sigmoid(xm Wr) (F32 [64, 2048]; GGUF expert_gating_func 2); the top 4 of s + `expert_bias`
+  (GGUF `exp_probs_b.bias`) are chosen, but the weights are the UNBIASED s of those four, renormalised
+  (HF adds 1e-6 to the sum, llama.cpp clamps it at 6.1e-5: no difference for four sigmoids) times
+  `routed_scaling_factor` (1.0);
+- final norm HF `embedding_norm` (GGUF `token_embd_norm`, applied after the layers despite the name), and a head
+  TIED to the embedding (vocab 128000).
+
+The sigmoid router with a selection-only bias, renormalisation, no conv bias and the tied head are family
+properties: the derivation refuses a config that says otherwise, by key. `families.family_module("lfm2moe")` is
+`recipes/lfm2moe.py`. The `lfm2` recipe (dense FFN on every layer, the old q4nx dense layout) and the MoE recipes
+(Flint: a shared expert and no conv; HY V3: a shared expert, attention only; GPT-OSS: softmax router, sinks) would
+each compute a different model.
+
+**The recipe (2026-10-31), from the GGUF.** No published GGUF packs exactly (LiquidAI's QAD-Q4_0 has a Q6_K tied
+head; the rest are K / IQ mixes), so the file is our own pure Q4_0 from LiquidAI's BF16 GGUF (`llama quantize
+--pure`, the embedding Q8_0). From a BF16 source every Q4_0 scale is a bf16 value (checked over the whole file),
+so the q4_1 pool law (5120-B chunks, d and m = -8 d bf16; `fl_q4`) holds every matrix exactly. A layer is two
+dispatches with the router on the host:
+
+- the mixer, over ONE pool offset `POOL_MIX` (after the 64 experts in every layer's pool, so the dense layers'
+  MLP slots sit far below it and one build serves both pool kinds):
+  - `lm_conv` (`designs/lfm2moe/lm.py`, LM_PART=conv; the conv layers): entry norm, B | C | u (three 2048-row
+    slices of in_proj, `fl_q4` at row0 0 / 2048 / 4096), the conv core at Tile(2, 3) on cx.py's four streams
+    (512 channels an element; sc.h's arithmetic in `lm_sc`, the taps f32 tap-major -- the `transpose` pack op
+    over the GGUF's F32 [2048, 3] -- converted to bf16 in the core, exactly, since they are bf16 values), out over
+    y (bf16), res = x + out, xm = ffn_norm(res). State: the `linear` kind, 2 x 2048 f32, zeroed at reset. The
+    conv element's three taps are issued with the element (all up front, the fourth element's would wait in the
+    issuing sequence on buffers the core frees only after B / C / u arrive: a hang, measured);
+  - `lm_att` (LM_PART=att; attnpos; the attention layers): HY V3's attention program at head dim 64 (ATTN_QKNORM=1,
+    no sink, VEXP, RB 4, 4 cores x 8 heads).
+- `hy_route` (hyv3-runtime.patch, reused unchanged: its arithmetic IS this router; `shared` empty, 4 slots).
+- `lm_moe` (LM_PART=moe; moeroute2): Flint's expert program at 1536 = 24 bands = 3 a core, so a slot's gate
+  (24 x 81920 B) and its down (32 x 61440 B) are the same size (moe2's law) with no padding and no pair law; the
+  16-float weight record hy_route writes sits in xm's second x element.
+- `lm_dense` (LM_PART=dense; the 2 dense layers, no route): the 11776-wide MLP as 23 unweighted 512-row slots of
+  the same expert program (11776 is not whole 1536s).
+- tail: `ln` (token_embd_norm) and `lm_head_q8` (LMHEAD_SCALES_F32=1, gx_lmhead over the Q8_0 token_embd; exact).
+
+Budgets (fullest core / 16384 B; L1 end incl. stack / 65536): lm_att 13904 (attention core 0; main cores 4864) /
+35840; lm_conv 5040 (the norm core; the conv core 1760, main cores 4864) / 39936; lm_moe 9184 / 45888; lm_dense
+7808 / 45888. The layer pool is 370 MiB (64 x 3 x 1.875 MiB of experts + 10.5 MB of conv or 6.6 MB of attention
+mixer), 40 layers ~14.5 GiB, plus a 282 MiB head.
+
+**Acceptance (manual):** (1) `model/lfm2moe_gguf_reference.py` against llama.cpp on the same GGUF (teacher-forced
+top-20, pure greedy: this GGUF carries `general.sampling.*` with a 1.05 repeat penalty that llama-server applies
+unless the request overrides it), plus its `--npu-like` bf16 control; (2) `designs/lfm2moe/check_layer.py` for a
+dense conv layer, a MoE conv layer and a MoE attention layer at position 1; (3) `open_qwen36_cli --prefill-logits
+--dump-logits` agrees with llama.cpp's greedy tokens on a chat prompt, and an ~800-token prompt compares every
+position against the reference, llama.cpp and the control; (4) `phlegm run` and `serve` answer with the chat
+template.
+
+**Result 2026-10-31 (Strix Halo, development runs on a machine shared with other sessions, not a clean
+benchmark):** layer checks (rel L2 vs fp32 at position 1): layer 0 (dense conv) B / C / u 6e-4, y 1.0e-3, the new
+state exact / 4e-4, xm 2.0e-3, every h vs the NPU-conditioned reference 1.4e-5, out 2.1e-3; layer 2 (MoE
+attention) K / V 1.8e-3 / 1.9e-3, og 5.1e-3, xm 4.9e-3, route = the reference's, h 1.7e-5, out 2.0e-3; layer 3 (MoE
+conv) y 3.0e-3, xm 1.8e-3, route = the reference's, h 3.0e-5, out 4.3e-4. Full model: a 22-token chat prompt, 64
+greedy tokens: identical to llama.cpp (pure greedy) for 51, then a near-tie (NPU 267 / 734 at -0.658 / -0.729,
+llama.cpp the reverse at -0.680 / -0.706); prompt positions 22/22 argmax vs fp32 (KL median 5.8e-4); decode
+positions before the divergence vs llama.cpp KL median 9.5e-6. An 843-token prompt: 32 greedy tokens identical to
+llama.cpp; every prompt position: NPU vs fp32 737/843 argmax, KL median 2.65e-2; the bf16 control vs fp32 734/843,
+2.0e-2; fp32 vs llama.cpp 688/843, partial KL median 3.6e-2; NPU vs llama.cpp 684/843, 3.2e-2 -- the NPU sits
+inside the band the rounding control and llama.cpp's own gap span, with no drift by position (the model is
+rounding-sensitive on this prompt; inferred: route flips over 38 top-4 sigmoid routers). Timing (loaded): weights
+resident in ~25 s; sequential prefill 151 ms/token (843 tokens 127 s); decode 182-184 ms/token (mixers ~60 ms,
+route 3-5 ms, experts ~70 ms, head ~9 ms a token). `phlegm run` and `phlegm serve` (OpenAI chat, streamed and not)
+answer; the reasoning is not split from the reply.
+
 ### OPEN-WIDTH-PAD: the padded width a recipe may derive, and what it does not settle
 **Applies to:** openflowlm-next (`open_kernels/recipes/qwen36moe.py`,
 `open_kernels/recipes/pack.py`)
