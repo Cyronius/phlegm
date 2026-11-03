@@ -30,8 +30,10 @@ from recipes.families import for_spec  # noqa: E402
 
 def files(R) -> dict[str, str]:
     G = R.geo
+    from recipes import lfm3 as FR
     q4 = f'''#define GEMV_PER_CALL {G.PER_CALL}
-#include "gemv_q4.h"
+''' + ('''#define GEMV_Q4_0_NATIVE 1      // LFM3_Q40: 4608-B chunks, m = -8 d
+''' if FR.q40_on() else '') + '''#include "gemv_q4.h"
 '''
     return {
         "lg_gy.cc": q4 + '''// A q4_1 band into its y element (runtime band law: per_band chunks, row split rs).

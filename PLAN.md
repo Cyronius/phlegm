@@ -200,10 +200,10 @@ gated attention in two kinds -- full with a half-rotated head, sliding 256 -- an
 layer) on the existing LFM2.5 runtime, no patch of its own. 16/64/32 greedy tokens of a raw, a chat and an 843-token prompt
 equal llama.cpp's; every prompt position sits at the bf16 control's distance from the fp32 reference (835/843 argmax-equal,
 KL median 8.7e-5). `phlegm run` / `serve` answer. Decode ~100 ms a token (dispatch-bound: 48 dispatches and context
-switches; `LFM3_FUSED=1` runs one dispatch a layer: 49 ms a token, bit-identical logits, `LFM3_SHARED=1` puts conv and attention in one xclbin with two streams: ~32-38 ms a token at load ~30, bit-identical logits), sequential prefill 60-102 ms a token. Block prefill (`LFM3_BLOCK=1`, 2026-11-03, the LFM2.5 `lfm` route generalised:
+switches; `LFM3_FUSED=1` runs one dispatch a layer: 49 ms a token, bit-identical logits, `LFM3_SHARED=1` puts conv and attention in one xclbin with two streams: ~32-38 ms a token at load ~30, bit-identical logits; `LFM3_Q40=1` + `LFM3_HEAD=bf16`: Q4_0-native pools and bf16 head scales, exact, ~37 -> 34.6 ms at load ~16), sequential prefill 60-102 ms a token. Block prefill (`LFM3_BLOCK=1`, 2026-11-03, the LFM2.5 `lfm` route generalised:
 q4 GEMMs on the decode pool's bytes in place, host conv / attention middles, sandwich norms): the 843-token prompt in 2.6 s against
 50 s sequential (development, loaded), 32/32 greedy equal to llama.cpp, mean KL 2.46e-4 against 2.43e-4 sequential and 2.42e-4 for the
-bf16 control; not yet the model dir's default. Open: decode bytes (head, the 16-row gate, Q4_0-native pools), a quiet-machine timing, attention products on the NPU for prefill,
+bf16 control; not yet the model dir's default. Open: the head's context switches (~2 ms a token) and a Q6_K-native head, the 16-row gate, a quiet-machine timing, attention products on the NPU for prefill,
 a clean benchmark. Plan:
 [.plans/lfm3-native.md](.plans/lfm3-native.md); spec: OPEN-FAMILY-LFM3.
 

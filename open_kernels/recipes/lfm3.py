@@ -36,6 +36,18 @@ from .qwen36moe import BAND_ROWS, ELEM, MB, roundup, tab_bytes
 from .spec import DENSE_LOCAL, FULL, SHORT_CONV, ModelSpec
 
 CH = 5120                 # a q4_1 chunk: 32 rows x 256 K, bf16 d | m planes (gemv_q4.h)
+CH_Q40 = 4608             # a Q4_0-native chunk: the bf16 d plane and the codes (m = -8 d on the core; LFM3_Q40=1)
+
+
+def q40_on() -> bool:
+    """Q4_0-native pools (LFM3_Q40=1): the QAD Q4_0's scales are bf16 values, so 4608-B chunks (no m plane) hold every
+    matrix exactly in 10 % fewer bytes than the q4_1 law. Off, every emission is what it was."""
+    return os.environ.get("LFM3_Q40") == "1"
+
+
+def chunk() -> int:
+    """The pool's chunk law in bytes."""
+    return CH_Q40 if q40_on() else CH
 PER_CALL = 2              # chunks per w element (10240 B)
 N_CORES = 8
 ATTN_CORES = 4            # attnknobs.attn_cores(16): the largest divisor of 16 heads <= 6
@@ -43,6 +55,17 @@ STACK = 0x1800
 LM_CORES = 8
 LM_BAND_ROWS = 128        # lm_head_q8: 128-row bands
 LM_TILE = 9216            # lm_head_q8.h's f32-scale chunk: 32 rows x 256 K
+LM_TILE_BF16 = 8704       # ... its bf16-scale chunk (LFM3_HEAD=bf16)
+
+
+def head_bf16() -> bool:
+    """The head's chunks with bf16 scales (LFM3_HEAD=bf16: gx_lmhead_bf16, lm_head_q8.h's default 8704-B law). The
+    f32-scale kernel rounds its scales to bf16 RNE on the core, so the logits are bit-identical in 5.6 % fewer bytes."""
+    return os.environ.get("LFM3_HEAD") == "bf16"
+
+
+def head_tile() -> int:
+    return LM_TILE_BF16 if head_bf16() else LM_TILE
 TAPS = 7                  # conv_L_cache; the conv core holds taps - 1 rows of state
 SCW = 128                 # channels in one conv-core element (a block of TAPS rows is TAPS x SCW f32)
 SLOT = 1536               # the dense MLP's slot width: 7680 = 5 x 1536 (a whole number of 64-row bands over 8 cores)
@@ -51,8 +74,8 @@ MIX_CONV, MIX_ATT = "conv", "att"
 
 
 def band_bytes(K: int) -> int:
-    """64 rows x K: K/256 k-tiles x 2 thirty-two-row chunks of CH bytes."""
-    return K // 128 * CH
+    """64 rows x K: K/256 k-tiles x 2 thirty-two-row chunks of chunk() bytes."""
+    return K // 128 * chunk()
 
 
 @dataclass(frozen=True)
@@ -141,7 +164,7 @@ def geometry(spec: ModelSpec) -> Geometry:
     return Geometry(
         HID=hid, FF=SLOT, DFF=spec.intermediate,
         NH=nh, KVH=kvh, HD=hd, ROT=spec.rotary_dim, QW=qw, KVW=kvw,
-        N_CORES=N_CORES, PER_CALL=PER_CALL, CALL_BYTES=PER_CALL * CH,
+        N_CORES=N_CORES, PER_CALL=PER_CALL, CALL_BYTES=PER_CALL * chunk(),
         Q_PC=qw // BAND_ROWS // N_CORES, KV_PC=kvw // BAND_ROWS // N_CORES, O_PC=hid // BAND_ROWS // N_CORES,
         SC_PC=hid // BAND_ROWS // N_CORES, DOWN_PC=hid // BAND_ROWS // N_CORES,
         E_A=e_a, HPE=e_a // (hd * 4), HPO=e_a // (hd * 2), Q_AIN_ELEMS=nh // (e_a // (hd * 4)),
@@ -205,7 +228,7 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> Layout:
         raise OpRangeError("lfm3: a layer pool past 4 GiB does not fit a 32-bit fill offset")
     rows = lm_rows(spec)
     bands = rows // LM_BAND_ROWS
-    lm_band = 4 * (G.HID // 256) * LM_TILE
+    lm_band = 4 * (G.HID // 256) * head_tile()
     kv_row = 2 * G.E_A
     ptab_row = G.PTAB_ELEMS * G.E_A
     return Layout(
@@ -329,11 +352,11 @@ def pack_plan(spec: ModelSpec) -> dict:
     for lt in spec.layer_types:
         out.setdefault(lt, _layer_plan(spec, mixer_of(lt)))
     return {
-        "pool_bytes": L.POOL_BYTES, "chunk_bytes": CH,
+        "pool_bytes": L.POOL_BYTES, "chunk_bytes": chunk(),
         "layer_types": out,
         # the head is tied: the (derived) Q8_0 token table, through lm_head_q8's f32-scale chunks
         "lm_head": {"pool_bytes": L.LMHEAD_POOL_BYTES,
-                    "ops": [{"op": "gx_lmhead", "tensor": EMBED, "dst": 0, "rows": L.LM_ROWS, "in_dim": G.HID}]},
+                    "ops": [{"op": "gx_lmhead_bf16" if head_bf16() else "gx_lmhead", "tensor": EMBED, "dst": 0, "rows": L.LM_ROWS, "in_dim": G.HID}]},
         "embed": {"tensor": EMBED, "dim": G.HID},
         "norm": {"tensor": "output_norm.weight", "bytes": L.ELN},
     }
@@ -534,6 +557,24 @@ def _programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
 
 
 def builds(spec: ModelSpec) -> dict[str, dict]:
+    out = _fused_builds(spec)
+    if head_bf16():
+        b = out["lm_head_q8"]
+        b["build_dir"] = b["build_dir"].replace("build_gguf_", "build_gguf_bf16s_")
+        b["env"] = {k: v for k, v in b["env"].items() if k != "LMHEAD_SCALES_F32"}
+    if q40_on():
+        # the Q4_0-native chunk law: its own build directories, and the block route's GEMMs read the pool as q4_0
+        for name, b in out.items():
+            if b["design"] == "lfm3/lg.py":
+                b["build_dir"] += "_q40"
+                b["env"] = {**b["env"], "LFM3_Q40": "1"}
+            elif b["design"] == "gemm_q4_prefill/gemm_q4_prefill.py":
+                b["build_dir"] += "_q40"
+                b["env"] = {**b["env"], "GQP_FMT": "q4_0"}
+    return out
+
+
+def _fused_builds(spec: ModelSpec) -> dict[str, dict]:
     out = _builds(spec)
     if not fused_on():
         return out
@@ -582,8 +623,8 @@ def _builds(spec: ModelSpec) -> dict[str, dict]:
 
 def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
     L, G = layout(spec, max_ctx), geometry(spec)
-    return {"hidden": G.HID, "vocab": L.LM_ROWS, "real_vocab": spec.real_vocab, "chunk_bytes": CH,
-            "pool_bytes": L.POOL_BYTES, "lmhead_pool_bytes": L.LMHEAD_POOL_BYTES, "lmhead_chunk_bytes": LM_TILE,
+    return {"hidden": G.HID, "vocab": L.LM_ROWS, "real_vocab": spec.real_vocab, "chunk_bytes": chunk(),
+            "pool_bytes": L.POOL_BYTES, "lmhead_pool_bytes": L.LMHEAD_POOL_BYTES, "lmhead_chunk_bytes": head_tile(),
             "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim, "rope_theta": spec.rope_theta,
             "rope_inv_freq": rope_table(spec, False)}
 

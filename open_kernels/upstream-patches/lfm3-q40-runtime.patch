@@ -1,0 +1,182 @@
+--- a/src/open_qwen36/gguf_pack_test.cpp
++++ b/src/open_qwen36/gguf_pack_test.cpp
+@@ -416,6 +416,27 @@
+         std::printf("%s std_perm_gguf Q4_0 (%zu values differ)\n", bad0 ? "FAIL" : "ok", bad0);
+         if (bad0) return 1;
+ 
++        // fl_q4 under the Q4_0-native law (4608 B; LFM3_Q40): byte-identical to std_perm_gguf's Q4_0-native pool,
++        // whole and as two column "experts" one band apart
++        {
++            std::vector<uint8_t> want40(static_cast<size_t>(op.nch) * 4608, 0), got40(want40.size(), 0), two40(want40.size(), 0);
++            pools::apply(op, g0, 0, want40.data(), want40.size(), 4608);
++            PackOp f;
++            f.op = "fl_q4";
++            f.tensor = "blk.0.attn_q.weight";
++            f.rows = 64;
++            f.in_dim = 512;
++            pools::apply(f, g0, 0, got40.data(), got40.size(), 4608);
++            f.in_dim = 256;
++            f.experts = 2;
++            f.cols = 256;
++            f.expert_bytes = 2 * 4608;
++            pools::apply(f, g0, 0, two40.data(), two40.size(), 4608);
++            const bool ok40 = got40 == want40 && two40 == want40;
++            std::printf("%s fl_q4 = std_perm_gguf's Q4_0-native law (whole, two column experts)\n", ok40 ? "ok   " : "FAIL");
++            if (!ok40) return 1;
++        }
++
+         // The q4_1 law (5120 B, the compact GGUF view): the same codes, and each f32 scale
+         // plane value RNE-rounded to bf16 -- what the f32-scale kernels narrow it to on the core.
+         std::vector<uint8_t> pc(static_cast<size_t>(op.nch) * 5120, 0);
+@@ -568,6 +589,35 @@
+         std::printf("ok    embed_row Q8_0 (bit-exact)\n");
+     }
+ 
++    // ---- gx_lmhead_bf16 (LFM3_HEAD=bf16): gx_lmhead's codes, its f32 scales RNE to bf16, in 8704-B chunks
++    {
++        PackOp h;
++        h.op = "gx_lmhead";
++        h.tensor = "token_embd.weight";
++        h.rows = 128;
++        h.in_dim = 256;
++        std::vector<uint8_t> f32c(4 * 9216, 0), bfc(4 * 8704, 0);
++        pools::apply(h, g, 0, f32c.data(), f32c.size(), 5120);
++        h.op = "gx_lmhead_bf16";
++        pools::apply(h, g, 0, bfc.data(), bfc.size(), 5120);
++        size_t bad = 0;
++        for (size_t q = 0; q < 4; ++q) {
++            const uint8_t* a = f32c.data() + q * 9216;
++            const uint8_t* b = bfc.data() + q * 8704;
++            for (size_t i = 0; i < 256; ++i) {
++                float f;
++                std::memcpy(&f, a + 4 * i, 4);
++                uint16_t u;
++                std::memcpy(&u, b + 2 * i, 2);
++                const uint32_t fb = f32_bits(f);
++                bad += u != static_cast<uint16_t>((fb + 0x7FFFu + ((fb >> 16) & 1u)) >> 16);
++            }
++            bad += std::memcmp(a + 1024, b + 512, 8192) != 0;
++        }
++        std::printf("%s gx_lmhead_bf16 = gx_lmhead with bf16 scales (%zu mismatches)\n", bad ? "FAIL" : "ok   ", bad);
++        if (bad) return 1;
++    }
++
+     // ---- embed_row (Q6_K, the qh-advance regression: every super-block half)
+     {
+         BlocksQ6K q6 = make_blocks_q6k(4, 512, rng);      // 4 rows x 2 super-blocks
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -81,7 +81,7 @@
+     if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm" || p.op == "bfp16_gemm" ||
+         p.op == "put" || p.op == "expert_down" || p.op == "conv_transpose" || p.op == "lmhead_q8" ||
+         p.op == "transpose" || p.op == "transpose_banked" || p.op == "gx_q8" || p.op == "gx_down" ||
+-        p.op == "gx_down_mx4" || p.op == "gx_lmhead" || p.op == "gp_bfp16" || p.op == "fl_q4") {
++        p.op == "gx_down_mx4" || p.op == "gx_lmhead" || p.op == "gx_lmhead_bf16" || p.op == "gp_bfp16" || p.op == "fl_q4") {
+         if (p.tensor.empty()) fail(where, p.op + " without a tensor");
+     } else if (p.op == "expert_stripes" || p.op == "gx_ug" || p.op == "gx_ug_mx4") {
+         if (p.up.empty() || p.gate.empty()) fail(where, p.op + " without up / gate");
+--- a/src/open_qwen36/pools.cpp
++++ b/src/open_qwen36/pools.cpp
+@@ -1180,7 +1180,13 @@
+         const bool q41 = t.type == GgufFile::Type::Q4_1;
+         if (!q41 && t.type != GgufFile::Type::Q4_0)
+             fail(name + " is " + GgufFile::type_name(t.type) + "; fl_q4 packs Q4_0 / Q4_1 with their codes kept");
+-        if (ch != Q4_CHUNK) fail("fl_q4 " + name + ": the pool's chunk law is " + std::to_string(ch) + ", not q4_1's 5120");
++        // the pool's chunk law: q4_1 (5120: d | m bf16 planes, codes at 1024) or, for a Q4_0 tensor, the Q4_0-native
++        // law (4608: the d plane, codes at 512; m = -8 d on the core -- LFM3's LFM3_Q40 pools)
++        const bool q40_law = ch == Q40_CHUNK;
++        if (ch != Q4_CHUNK && !q40_law)
++            fail("fl_q4 " + name + ": the pool's chunk law is " + std::to_string(ch) + ", not q4_1's 5120 or Q4_0's 4608");
++        if (q40_law && q41) fail("fl_q4 " + name + ": a Q4_1 tensor cannot be held by the Q4_0-native 4608 law");
++        const size_t CH_ = q40_law ? Q40_CHUNK : Q4_CHUNK, CODES = q40_law ? 512 : 1024;
+         const uint64_t cols = t.dims[0];
+         uint64_t total_rows = 1;
+         for (size_t i = 1; i < t.dims.size(); ++i) total_rows *= t.dims[i];
+@@ -1194,7 +1200,7 @@
+             fail("fl_q4 " + name + ": the blocks reach row " + std::to_string(last_row) + " / column " +
+                  std::to_string(last_col) + " of a " + std::to_string(total_rows) + " x " + std::to_string(cols) + " tensor");
+         const size_t blk = q41 ? 20 : 18, nb = cols / 32, ktiles = op.in_dim / 256;
+-        const size_t band = 2 * ktiles * Q4_CHUNK, nbands = op.rows / 64;
++        const size_t band = 2 * ktiles * CH_, nbands = op.rows / 64;
+         const size_t bstride = op.stripe_bytes ? op.stripe_bytes : band;
+         if (op.stripe_bytes && op.stripe_bytes < band) fail("fl_q4 " + name + ": a band stride under one band");
+         const size_t one = (nbands - 1) * bstride + band;
+@@ -1208,7 +1214,7 @@
+                 uint8_t* bd = dst + op.dst + e * op.expert_bytes + b * bstride;
+                 std::memset(bd, 0, band);
+                 for (size_t j = 0; j < 2 * ktiles; ++j) {          // std_perm within a band: (32-row half, k-tile)
+-                    uint8_t* d = bd + j * Q4_CHUNK;
++                    uint8_t* d = bd + j * CH_;
+                     const size_t rowc = 64 * b + 32 * (j % 2), blkc = (j / 2) * 8;
+                     for (size_t r = 0; r < 32; ++r) {
+                         const uint8_t* srow = src + (r0 + rowc + r) * nb * blk;
+@@ -1222,14 +1228,14 @@
+                             const uint16_t db = bf16_rne(df), mb = bf16_rne(mf);
+                             const size_t jj = kb * 32 + r;
+                             std::memcpy(d + 2 * jj, &db, 2);
+-                            std::memcpy(d + 512 + 2 * jj, &mb, 2);
++                            if (!q40_law) std::memcpy(d + 512 + 2 * jj, &mb, 2);
+                             for (size_t i = 0; i < 16; ++i) {
+                                 const uint8_t byte = q[(q41 ? 4 : 2) + i];
+                                 const uint8_t lo = byte & 0xF, hi = byte >> 4;   // GGUF: value i | value i + 16
+                                 const size_t p0 = rb * 4096 + (kb * 32 + i) * 16 + rl;
+-                                d[1024 + (p0 >> 1)] |= (p0 & 1) ? lo << 4 : lo;
++                                d[CODES + (p0 >> 1)] |= (p0 & 1) ? lo << 4 : lo;
+                                 const size_t p1 = p0 + 256;
+-                                d[1024 + (p1 >> 1)] |= (p1 & 1) ? hi << 4 : hi;
++                                d[CODES + (p1 >> 1)] |= (p1 & 1) ? hi << 4 : hi;
+                             }
+                         }
+                     }
+@@ -1313,7 +1319,7 @@
+                         tmp.data());
+             for (size_t i = 0; i < tmp.size(); ++i) d[i] |= tmp[i];
+         }
+-    } else if (op.op == "gx_lmhead") {
++    } else if (op.op == "gx_lmhead" || op.op == "gx_lmhead_bf16") {
+         // the head, Q8_0 [vocab, hidden] -> lm_head_q8.h's f32-scale chunks (32 rows x 256 K, 9216 B):
+         // f32 scale[kb*32 + r] at [0:1024), code[(r/16)*4096 + k*16 + r%16] at [1024:9216); 128-row
+         // bands of 4 quarters x K/256 k-tiles, chunk c of a band the quarter c % 4 and k-tile c / 4
+@@ -1323,8 +1329,13 @@
+         if (rows > op.rows || cols > op.in_dim || op.rows % 128 || op.in_dim % 256 || cols % 32)
+             fail("gx_lmhead " + name + ": [" + std::to_string(rows) + ", " + std::to_string(cols) +
+                  "] does not pad to [" + std::to_string(op.rows) + ", " + std::to_string(op.in_dim) + "]");
++        // gx_lmhead_bf16 (LFM3_HEAD=bf16): lm_head_q8.h's default 8704-B chunks, the scales RNE to bf16 at [0:512),
++        // codes at [512:8704). The f32-scale kernel rounds its scales to bf16 the same way on the core, so the logits
++        // are bit-identical to gx_lmhead's in 5.6 % fewer bytes.
++        const bool bf = op.op == "gx_lmhead_bf16";
++        const size_t TILE = bf ? 8704 : GX_HEAD, CODES = bf ? 512 : 1024;
+         const size_t nB = op.rows / 128, nkt = op.in_dim / 256, bpr = cols / 32;
+-        bounds(op, nB * nkt * 4 * GX_HEAD, dst_bytes);
++        bounds(op, nB * nkt * 4 * TILE, dst_bytes);
+         const uint8_t* src = raw(m, name, rows * cols / 32 * 34);
+         uint8_t* out = dst + op.dst;
+ #pragma omp parallel for schedule(dynamic)
+@@ -1332,8 +1343,8 @@
+             const size_t B = static_cast<size_t>(Bl);
+             for (size_t kt = 0; kt < nkt; ++kt)
+                 for (size_t q = 0; q < 4; ++q) {
+-                    uint8_t* c = out + ((B * nkt + kt) * 4 + q) * GX_HEAD;
+-                    std::memset(c, 0, GX_HEAD);
++                    uint8_t* c = out + ((B * nkt + kt) * 4 + q) * TILE;
++                    std::memset(c, 0, TILE);
+                     for (size_t r = 0; r < 32; ++r) {
+                         const size_t row = 128 * B + 32 * q + r;
+                         if (row >= rows) continue;
+@@ -1344,9 +1355,14 @@
+                             uint16_t h;
+                             std::memcpy(&h, b, 2);
+                             const float d = fp16_to_f32(h);
+-                            std::memcpy(c + 4 * (kb * 32 + r), &d, 4);
++                            if (bf) {
++                                const uint16_t db = bf16_rne(d);
++                                std::memcpy(c + 2 * (kb * 32 + r), &db, 2);
++                            } else {
++                                std::memcpy(c + 4 * (kb * 32 + r), &d, 4);
++                            }
+                             for (size_t i = 0; i < 32; ++i)
+-                                c[1024 + (r / 16) * 4096 + (kb * 32 + i) * 16 + r % 16] = b[2 + i];
++                                c[CODES + (r / 16) * 4096 + (kb * 32 + i) * 16 + r % 16] = b[2 + i];
+                         }
+                     }
+                 }

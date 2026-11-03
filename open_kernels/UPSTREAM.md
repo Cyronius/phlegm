@@ -347,6 +347,12 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   count with a (taps - 1)-row f32 state. `target/npu-dev/lfm3-block-patch.sh` regenerates it and checks the
   chain reproduces the clone (`target/npu-dev/lfm3-runtime`).
 
+- `upstream-patches/lfm3-q40-runtime.patch` (2026-11-03) is LFM3-1.7B's decode bytes (OPEN-FAMILY-LFM3,
+  `LFM3_Q40=1`, `LFM3_HEAD=bf16`), over `lfm3-block-runtime.patch`. `fl_q4` gains the Q4_0-native 4608-B chunk
+  law (bf16 d plane, m = -8 d on the core; byte-identical to `std_perm_gguf`'s Q4_0 pool, checked in
+  `gguf_pack_test`) and a new pack op `gx_lmhead_bf16` packs the tied Q8_0 head with RNE bf16 per-32 scales
+  (8704-B chunks). `target/npu-dev/lfm3-q40-patch.sh` regenerates it and checks the chain.
+
 - `upstream-patches/gemma4-moe-runtime.patch` (2026-10-31) runs Gemma 4 26B-A4B from its QAT
   Q4_0 GGUF (OPEN-FAMILY-GEMMA4-MOE). Two pack ops: `g4_q40` (a Q4_0 tensor, 2-D or the
   experts' 3-D, into Q4_0-native chunks in `std_perm`'s band law, with rows and columns padded

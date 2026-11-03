@@ -4826,6 +4826,15 @@ Result: logits bit-identical to the fused route over 843 positions; greedy equal
 attention dispatch in the walk 2.3 -> 1.1 ms; CLI decode 32-38 ms a token at load ~30; ~29 ms estimated unloaded (not measured).
 What is left is bytes: the head (282 MB, 6-8 ms), the repeated-row gate, the q4_1 m plane (11 % over Q4_0).
 
+**Decode bytes (2026-11-03, development; `LFM3_Q40=1`, `LFM3_HEAD=bf16`).** The pools in the Q4_0-native law (4608-B chunks, bf16 d,
+m = -8 d on the core): exact, since every QAD scale is a bf16 value; the layer pool 40.9 -> 36.7 MB and the block route's GEMMs read
+q4_0 in place (`GQP_FMT=q4_0`). The tied head with bf16 per-32 scales (8704-B chunks, 282 -> 266 MB): bit-identical, because the
+f32-scale kernel already rounds its scales to bf16 on the core. Runtime `lfm3-q40-runtime.patch` (`fl_q4` at 4608, `gx_lmhead_bf16`).
+Both are bit-identical to the previous route over all 843 prompt positions and the block-prefill logits; greedy equal to llama.cpp.
+Decode step ~37 -> 34.6 ms (paired, load ~16). Measured on the head: 7.3 ms of bytes plus ~2 ms of context switches into and out of its
+xclbin a token; folding it into the shared image (a runtime-selected core mode) and a Q6_K-native head (exact to the published file,
+~215 MB) are the remaining head options, neither built.
+
 **Block prefill (2026-11-03, development; `LFM3_BLOCK=1`).** The LFM2.5 `lfm` gemm_block kind (OPEN-FAMILY-LFM2MOE), generalised: each
 layer is the mixer's fused input GEMM (conv in_proj B | C | u, or attention q | gate | k | v with the expanded gate), a host
 middle (the 7-tap conv with its 6-row f32 state slid over the block, or attention over the block with the layer type's zero-tail
