@@ -226,6 +226,26 @@ The C++ embedding differs from torch's LayerNorm by at most 1e-6 (half the value
 NPU's int8 rounding that leaves the native vectors within cosine 0.9993 of the Python loop's (STSB sentences).
 Three or four buffer sets measured the same as two. Not yet timed on a quiet machine.
 
+**Whole host path in C++, 2026-11-03 (later).** `tdn_encode` now takes tokenized texts (flat ids and offsets)
+and does everything after tokenization: `pack`'s best-fit decreasing (same layout), embedding, the runs, pooling,
+the 384×384 output projection (four texts per pass over the weights, FMA allowed) and L2 normalization. A second
+thread finishes runs (wait, read back, pool, head) while the first embeds and starts the next; three buffer sets
+by default (`TRIT_NPU_SETS`). Python only tokenizes (in a thread, by chunks). Hot loops are `__restrict` kernels
+so GCC vectorizes them, and word rows are prefetched four tokens ahead. In isolation (CPU only) a 256-row dispatch
+needs 0.07 ms to embed and 0.005 ms to pool, and the head 0.01 ms a text.
+
+Paired against the previous commit, alternating in one sitting with the machine heavily loaded (load average
+30–43: another session's llama on 16 cores, Spice86, rustc, a GPU job), four rounds each:
+
+| | previous commit | this | ratio per round |
+|---|---|---|---|
+| STSB sentences/s | 14.5k–23.0k | 16.3k–30.4k | 1.22, 1.12, 1.74, 1.17 |
+| SciFact abstracts/s | 2.9k–3.6k | 3.0k–3.7k | 0.97, 1.01, 1.17, 1.02 |
+| batch-1 latency | 0.73–1.66 ms | 0.60–0.66 ms | |
+
+Vectors are unchanged against the Python loop (STSB minimum cosine 0.99934, as before). Absolute speed still needs
+a quiet machine. The NPU alone bounds the STSB set at about 59 ms (154 dispatches × 0.38 ms), 47k sentences/s.
+
 **Open:**
 
 - a clean (`dibs run --measure`) `npu_eval.py` run of `r9`;

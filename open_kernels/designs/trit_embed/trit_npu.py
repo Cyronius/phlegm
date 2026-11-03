@@ -35,7 +35,7 @@ SLOT = 128
 SLOTS = 2               # slots a dispatch
 TOKENS = SLOTS * SLOT
 OUT = 6912              # a core's output packet (trit_design.OSZ)
-SETS = int(os.environ.get('TRIT_NPU_SETS', '2'))   # buffer sets in flight
+SETS = int(os.environ.get('TRIT_NPU_SETS', '3'))   # buffer sets in flight
 PACKETS = 170
 ELEMENT = 8192   # broadcast element bytes
 CUT = 1000       # characters: tokenize cuts longer texts first (exact; see TritNpu.tokenize)
@@ -57,10 +57,10 @@ def load_runtime(library=LIBRARY):
     dll.tdn_close.argtypes, dll.tdn_close.restype = [ct.c_void_p], None
     dll.tdn_last_error.argtypes, dll.tdn_last_error.restype = [], ct.c_char_p
     vp, ip = ct.c_void_p, ct.POINTER(ct.c_int)
-    dll.tdn_host_init.argtypes = [vp, vp, vp, ct.c_int, vp, vp, ct.c_int, vp, vp, vp, ct.c_float,
+    dll.tdn_host_init.argtypes = [vp, vp, vp, ct.c_int, vp, vp, ct.c_int, vp, vp, vp, ct.c_float, vp,
                                   ct.c_int, ip, ip, ip, ip, ct.c_int]
     dll.tdn_host_init.restype = ct.c_int
-    dll.tdn_encode.argtypes = [vp, ct.c_int, vp, vp, vp, ct.c_int, vp, vp, vp, vp]
+    dll.tdn_encode.argtypes = [vp, ct.c_int, vp, vp, ct.c_int, vp, ip]
     dll.tdn_encode.restype = ct.c_int
 
     def check(result, function, arguments):
@@ -186,8 +186,9 @@ def load_model(model_dir):
 class TritNpu:
     def __init__(self, model_dir, build=BUILD, library=LIBRARY, profiling=False, native=True):
         """profiling=True (bench.py) also accepts stub and variant builds, whose outputs are not vectors.
-        native=True runs each layout's dispatches in the host library (tdn_encode: embedding, input LayerNorm,
-        runs and pooling in C++); native=False keeps the Python loop below, with the model's own embed."""
+        native=True leaves everything after tokenization to the host library (tdn_encode: packing, embedding and
+        input LayerNorm, the runs, pooling, output projection and normalization in C++); native=False keeps the
+        Python loop below, with the model's own embed and output head."""
         self.model = load_model(model_dir)
         self.backend = copy.deepcopy(self.model.tokenizer.backend_tokenizer)
         self.backend.enable_truncation(SLOT)
@@ -239,33 +240,35 @@ class TritNpu:
         self.dispatch_ms = []
 
     def init_native(self):
-        """Hand the host library the embedding tables and the buffer sets (tdn_host_init)."""
+        """Hand the host library the embedding tables, output head and buffer sets (tdn_host_init; it copies them)."""
         m = self.model
-        self.tables = [np.ascontiguousarray(a) for a in (
+        assert m.out.bias is None and m.out.weight.shape == (384, 384)
+        tables = [np.ascontiguousarray(a) for a in (
             m.word.qweight.numpy(), m.word.scale.float().numpy(), m.pos.qweight.numpy(), m.pos.scale.float().numpy(),
             m.tok_type.weight[0].detach().float().numpy(), m.ln_e.weight.detach().float().numpy(),
-            m.ln_e.bias.detach().float().numpy())]
-        word, wscale, pos, pscale, tok, gamma, beta = self.tables
+            m.ln_e.bias.detach().float().numpy(), m.out.weight.detach().float().numpy())]
+        word, wscale, pos, pscale, tok, gamma, beta, head = tables
         assert word.dtype == pos.dtype == np.int8 and word.shape[1] == pos.shape[1] == 384
         col = lambda j: (ct.c_int * SETS)(*[idx[j] for _, idx in self.sets])
         self.dll.tdn_host_init(self.handle, word.ctypes.data, wscale.ctypes.data, len(word), pos.ctypes.data,
                                pscale.ctypes.data, len(pos), tok.ctypes.data, gamma.ctypes.data, beta.ctypes.data,
-                               float(m.ln_e.eps), SETS, (ct.c_int * SETS)(*[r for r, _ in self.sets]),
+                               float(m.ln_e.eps), head.ctypes.data, SETS, (ct.c_int * SETS)(*[r for r, _ in self.sets]),
                                col(0), col(1), col(3), OUT // 4)
 
-    def run_native(self, layout, pooled):
-        """One layout through tdn_encode; pooled rows base .. base + n - 1 are filled. Returns its dispatch count."""
-        base, runs, first, lengths, ids, pos, seg, _, _ = layout
-        n = len(first)
+    def run_native(self, token_ids, base, out):
+        """Vectors of pre-tokenized texts into out ([len(token_ids), 384] fp32, C-contiguous) through
+        tdn_encode; their segment IDs start at base + 1. Returns the dispatch count."""
+        n = len(token_ids)
         if not n:
             return 0
-        first, lengths = np.ascontiguousarray(first, np.int64), np.ascontiguousarray(lengths, np.int64)
-        rows = np.arange(base, base + n, dtype=np.int64)
-        ids, pos, seg = (np.ascontiguousarray(a) for a in (ids, pos, seg))
-        assert ids.dtype == pos.dtype == np.int64 and seg.dtype == np.int32 and pooled.flags.c_contiguous
-        self.dll.tdn_encode(self.handle, runs, ids.ctypes.data, pos.ctypes.data, seg.ctypes.data, n,
-                            first.ctypes.data, lengths.ctypes.data, rows.ctypes.data, pooled.ctypes.data)
-        return runs
+        lengths = np.fromiter(map(len, token_ids), np.int64, n)
+        offsets = np.zeros(n + 1, np.int64)
+        np.cumsum(lengths, out=offsets[1:])
+        ids = np.fromiter(itertools.chain.from_iterable(token_ids), np.int32, int(offsets[-1]))
+        assert out.dtype == np.float32 and out.flags.c_contiguous and out.shape == (n, 384)
+        runs = ct.c_int()
+        self.dll.tdn_encode(self.handle, n, ids.ctypes.data, offsets.ctypes.data, base, out.ctypes.data, ct.byref(runs))
+        return runs.value
 
     def alloc(self, size):
         ptr = self.dll.tdn_buf(self.handle, size)
@@ -385,10 +388,6 @@ class TritNpu:
         m = self.model
         pooled = np.empty((n, 384), np.float32)
         runs, pending = 0, None
-        if self.native:
-            for layout in layouts:
-                runs += self.run_native(layout, pooled)
-            layouts = ()
 
         def pool(s, index, which, cuts, count, used):
             pooled[index] = np.add.reduceat(self.wait(s, used), cuts)[which] / count[:, None]
@@ -413,7 +412,10 @@ class TritNpu:
 
     def encode_ids(self, token_ids, align=1):
         """Unit-norm vectors (torch, [n, 384]) and the dispatch count, for pre-tokenized texts
-        (lists of ids including [CLS]/[SEP], at most 128 each)."""
+        (lists of ids including [CLS]/[SEP], at most 128 each). align > 1 takes the Python loop."""
+        if self.native and align == 1:
+            out = np.empty((len(token_ids), 384), np.float32)
+            return torch.from_numpy(out), self.run_native(token_ids, 0, out)
         return self.run([self.layout(token_ids, 0, align)], len(token_ids))
 
     def encode(self, texts):
@@ -425,6 +427,10 @@ class TritNpu:
         texts = list(texts)
         n = len(texts)
         if n <= CHUNK:
+            if self.native:
+                out = np.empty((n, 384), np.float32)
+                self.run_native(self.tokenize(texts), 0, out)
+                return out
             return self.run([self.layout(self.tokenize(texts))], n)[0].numpy()
         chunks = queue.Queue()
 
@@ -432,7 +438,8 @@ class TritNpu:
             try:
                 start, size = 0, CHUNK
                 while start < n:
-                    chunks.put(self.layout(self.tokenize(texts[start:start + size]), start))
+                    ids = self.tokenize(texts[start:start + size])
+                    chunks.put((start, ids) if self.native else self.layout(ids, start))
                     start, size = start + size, size * 4
                 chunks.put(None)
             except BaseException as e:
@@ -447,6 +454,11 @@ class TritNpu:
         worker = threading.Thread(target=produce, daemon=True)
         worker.start()
         try:
+            if self.native:
+                out = np.empty((n, 384), np.float32)
+                for start, ids in consume():
+                    self.run_native(ids, start, out[start:start + len(ids)])
+                return out
             return self.run(consume(), n)[0].numpy()
         finally:
             worker.join()
