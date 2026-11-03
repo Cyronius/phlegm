@@ -199,8 +199,12 @@ projection) through its own recipe `recipes/lfm3.py` (`designs/lfm3/lg.py`: the 
 gated attention in two kinds -- full with a half-rotated head, sliding 256 -- and a dense MLP on every layer; two dispatches a
 layer) on the existing LFM2.5 runtime, no patch of its own. 16/64/32 greedy tokens of a raw, a chat and an 843-token prompt
 equal llama.cpp's; every prompt position sits at the bf16 control's distance from the fp32 reference (835/843 argmax-equal,
-KL median 8.7e-5). `phlegm run` answers. Decode ~100 ms a token (dispatch-bound), sequential prefill 102 ms a token
-(development, loaded machine). Open: block prefill, one dispatch a layer, a clean benchmark. Plan:
+KL median 8.7e-5). `phlegm run` / `serve` answer. Decode ~100 ms a token (dispatch-bound: 48 dispatches and context
+switches), sequential prefill 60-102 ms a token. Block prefill (`LFM3_BLOCK=1`, 2026-11-03, the LFM2.5 `lfm` route generalised:
+q4 GEMMs on the decode pool's bytes in place, host conv / attention middles, sandwich norms): the 843-token prompt in 2.6 s against
+50 s sequential (development, loaded), 32/32 greedy equal to llama.cpp, mean KL 2.46e-4 against 2.43e-4 sequential and 2.42e-4 for the
+bf16 control; not yet the model dir's default. Open: one dispatch a layer for decode, attention products on the NPU for prefill,
+a clean benchmark. Plan:
 [.plans/lfm3-native.md](.plans/lfm3-native.md); spec: OPEN-FAMILY-LFM3.
 
 ## Gemma 4 26B-A4B (MoE)

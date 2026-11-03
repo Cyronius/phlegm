@@ -1,0 +1,283 @@
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -119,6 +119,8 @@
+     std::vector<size_t> ops;      ///< indices into LayerType::pool / consts, in order, byte-contiguous
+     std::vector<PackOp> pack;     ///< from "pack": std_perm ops that pack this buffer alone -- the hi and
+                                   ///< lo halves of a projection the sequential kernel streams at q8
++    uint64_t range_off = 0, range_bytes = 0;   ///< from "pool" with `range`: a byte range of the pool as it is (LFM3's
++                                               ///< interleaved gate | up slots are band-law bytes, but no one pack op)
+ };
+ 
+ /// The token-batched expert kernel (OPEN-MOE-BATCH, open_kernels/designs/moe_batch):
+@@ -222,6 +224,14 @@
+     // the FFN is ffn_program (a leading dense layer) or the routed experts through moe_batch.
+     std::string mixer;
+     uint64_t taps = 0;
++    // LFM3 (OPEN-FAMILY-LFM3 block prefill): sandwich norms on both block outputs (the consts offsets of
++    // post_attention_norm / post_ffw_norm), an elementwise sigmoid output gate (the fused input GEMM is
++    // q | gate | k | v), a sliding window and the layer type's own RoPE table, and the dense MLP as `ffn_slots`
++    // (gate | up, down) GEMM pairs whose outputs are summed
++    bool lfm_sandwich = false, lfm_gate = false;
++    int64_t cd_postop = -1;                       // (cd_postffn is the dense route's, above)
++    uint64_t window = 0, ffn_slots = 0;
++    std::vector<double> rope_inv_freq;
+     int64_t cd_ln = -1, cd_ffn = -1, cd_conv = -1, cd_qnorm = -1, cd_knorm = -1;
+     std::string route_router, route_bias;
+     uint64_t route_experts = 0, route_topk = 0;
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -431,6 +431,14 @@
+                         continue;
+                     }
+                     if (w.from != "pool" && w.from != "consts") fail(gw, "weight " + name + ": from must be pool, consts or pack");
++                    if (w.from == "pool" && wj.contains("range")) {
++                        const auto r = get<std::vector<uint64_t>>(wj, "range", gw + "." + key + "." + name);
++                        if (r.size() != 2 || r[1] == 0) fail(gw, "weight " + name + ": range is [offset, bytes]");
++                        w.range_off = r[0];
++                        w.range_bytes = r[1];
++                        into[name] = w;
++                        continue;
++                    }
+                     w.ops = get<std::vector<size_t>>(wj, "ops", gw + "." + key + "." + name);
+                     if (w.ops.empty()) fail(gw, "weight " + name + " names no pack ops");
+                     into[name] = w;
+@@ -635,7 +643,7 @@
+                 if (g.mixer == "conv") {
+                     g.taps = get<uint64_t>(gj, "taps", gw);
+                     g.cd_conv = get<int64_t>(gj, "cd_conv", gw);
+-                    if (g.taps != 3) fail(gw, "the host conv middle is the 3-tap window the LFM2-MoE kernel holds");
++                    if (g.taps < 2) fail(gw, "a conv route needs at least 2 taps");
+                     if (t.state_kind != "linear") fail(gw, "a conv route on a layer type whose state is not linear");
+                 } else {
+                     g.qw = get<uint64_t>(gj, "qw", gw);
+@@ -650,11 +658,21 @@
+                     if (g.qw != g.nh * g.hd || g.kvw != g.kvh * g.hd || g.rot != g.hd || g.rot != m.rotary_dim)
+                         fail(gw, "qw / kvw / rot disagree with the heads and the layout rotary dim (the full-head rotation)");
+                 }
++                g.lfm_sandwich = gj.value("sandwich", false);
++                g.lfm_gate = gj.value("gate", false);
++                g.window = gj.value("window", uint64_t{0});
++                if (gj.contains("rope_inv_freq")) g.rope_inv_freq = get<std::vector<double>>(gj, "rope_inv_freq", gw);
++                if (g.lfm_sandwich) {
++                    g.cd_postop = get<int64_t>(gj, "cd_postop", gw);
++                    g.cd_postffn = get<int64_t>(gj, "cd_postffn", gw);
++                }
+                 if (gj.contains("ffn_program")) {
+                     g.ff = get<uint64_t>(gj, "ff", gw);
++                    g.ffn_slots = gj.value("ffn_slots", uint64_t{0});
+                     g.ffn_program = parse_program(gj["ffn_program"], gw + ".ffn_program");
+-                    if (g.ffn_program.size() != 2)
+-                        fail(gw, "ffn_program has exactly 2 steps (up|gate, down), has " + std::to_string(g.ffn_program.size()));
++                    if (g.ffn_program.size() != (g.ffn_slots ? 2 * g.ffn_slots : 2))
++                        fail(gw, "ffn_program has 2 steps (up|gate, down), or 2 per ffn_slots; has " +
++                                     std::to_string(g.ffn_program.size()));
+                     for (const auto& s : g.ffn_program) {
+                         check_step(m, s, gw, "gemm_block.ffn_program");
+                         if (s.op != "run" || s.args.size() != 3)
+--- a/src/open_qwen36/core.hpp
++++ b/src/open_qwen36/core.hpp
+@@ -444,6 +444,7 @@
+         size_t lanes = 0;
+         std::vector<float> qn, kn;                      ///< full: [hd] x2
+         std::vector<float> sgw;                         ///< the shared expert's sigmoid gate, [hid]
++        std::vector<float> postop, postffn;             ///< lfm sandwich: post_attention_norm, post_ffw_norm, [hid]
+     };
+     std::vector<HostConsts> hc_;                       ///< per layer, filled for a linear / full route
+     /// What a MoE layer's attention half leaves for its expert block: the residual, its
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -656,6 +656,12 @@
+                 continue;
+             }
+             size_t off0 = 0, total = 0;
++            if (gw.range_bytes) {
++                if (from != "pool" || gw.range_off + gw.range_bytes > w_->pool_bytes)
++                    throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": the pool range of " + name + " is outside the pool");
++                off0 = gw.range_off;
++                total = gw.range_bytes;
++            }
+             for (size_t i = 0; i < gw.ops.size(); ++i) {
+                 auto [off, bytes] = op_region(lt, from, gw.ops[i]);
+                 if (i == 0) off0 = off;
+@@ -764,6 +770,10 @@
+                 };
+                 h.ln = bf16_at(gb.cd_ln, w_->hidden, "entry norm");
+                 h.postln = bf16_at(gb.cd_ffn, w_->hidden, "ffn norm");
++                if (gb.lfm_sandwich) {
++                    h.postop = bf16_at(gb.cd_postop, w_->hidden, "post-operator norm");
++                    h.postffn = bf16_at(gb.cd_postffn, w_->hidden, "post-ffn norm");
++                }
+                 if (gb.mixer == "conv") {
+                     if (gb.cd_conv < 0 || static_cast<uint64_t>(gb.cd_conv) + gb.taps * w_->hidden * 4 > lt.consts_bytes)
+                         throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": the conv taps are outside the consts");
+@@ -4991,31 +5001,32 @@
+             timing_.part1_ms += ms_since(tt);
+             timing_.gemm_tr_ms += ms_since(tt);
+         }
+-        // the two previous bx rows (oldest first) live in the state BO; the host slides them over the block
++        // the taps - 1 previous bx rows (oldest first) live in the state BO; the host slides them over the block
+         auto ts = std::chrono::steady_clock::now();
+         read_back(st, lt.state_bytes, 0);
+         timing_.state_ms += ms_since(ts);
+-        float* s0 = reinterpret_cast<float*>(st.map<uint8_t*>());
+-        float* s1 = s0 + hid;
++        const size_t taps = gb.taps;
++        if (lt.state_bytes != (taps - 1) * hid * 4)
++            throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": the conv state is not taps - 1 rows");
++        float* sbase = reinterpret_cast<float*>(st.map<uint8_t*>());
+         float* y = BlockScratch::fit(bs_.og, T * hid);
+         auto t0 = std::chrono::steady_clock::now();
+-        const float* w0 = hc.convw.data();
+-        const float* w1 = w0 + hid;
+-        const float* w2 = w1 + hid;
++        const float* wt = hc.convw.data();               // [taps][hid], the newest token on the LAST tap
+ #pragma omp parallel for
+         for (long long cc = 0; cc < static_cast<long long>(hid); ++cc) {
+             const size_t c = static_cast<size_t>(cc);
+-            float p2 = s0[c], p1 = s1[c];
++            float win[16];                               // the window, oldest first; win[taps - 1] is the new token
++            for (size_t k = 0; k + 1 < taps; ++k) win[k] = sbase[k * hid + c];
+             for (size_t t = 0; t < t_real; ++t) {
+                 const float bx = Bp[t * hid + c] * Up[t * hid + c];
+-                const float conv = p2 * w0[c] + p1 * w1[c] + bx * w2[c];
++                win[taps - 1] = bx;
++                float conv = 0.f;
++                for (size_t k = 0; k < taps; ++k) conv += win[k] * wt[k * hid + c];
+                 y[t * hid + c] = Cp[t * hid + c] * conv;
+-                p2 = p1;
+-                p1 = bx;
++                for (size_t k = 0; k + 1 < taps; ++k) win[k] = win[k + 1];
+             }
+             for (size_t t = t_real; t < T; ++t) y[t * hid + c] = 0.f;
+-            s0[c] = p2;
+-            s1[c] = p1;
++            for (size_t k = 0; k + 1 < taps; ++k) sbase[k * hid + c] = win[k];
+         }
+         timing_.part1_ms += ms_since(t0);
+         timing_.mid_ms += ms_since(t0);
+@@ -5025,15 +5036,17 @@
+         mid = y;
+         mid_k = hid;
+     } else {
+-        const size_t qw = gb.qw, kvw = gb.kvw;
+-        const float* yf = gemm_run(gb.program[0], xn, T, hid, qw + 2 * kvw, l);
++        const size_t qw = gb.qw, kvw = gb.kvw, ng = gb.lfm_gate ? qw : 0;
++        const float* yf = gemm_run(gb.program[0], xn, T, hid, qw + ng + 2 * kvw, l);
+         float* q = BlockScratch::fit(bs_.part[0], T * qw);
+         float* k = BlockScratch::fit(bs_.part[1], T * kvw);
+         float* v = BlockScratch::fit(bs_.part[2], T * kvw);
++        float* gate = gb.lfm_gate ? BlockScratch::fit(bs_.part[3], T * qw) : nullptr;
+         {
++            // the fused projection's rows: q | [gate] | k | v
+             auto tt = std::chrono::steady_clock::now();
+-            const host::TransposePart parts[3] = {{q, 0, qw}, {k, qw, kvw}, {v, qw + kvw, kvw}};
+-            host::transpose_parts(yf, T, parts, 3);
++            const host::TransposePart parts[4] = {{q, 0, qw}, {k, qw + ng, kvw}, {v, qw + ng + kvw, kvw}, {gate, qw, qw}};
++            host::transpose_parts(yf, T, parts, gb.lfm_gate ? 4 : 3);
+             timing_.part1_ms += ms_since(tt);
+             timing_.gemm_tr_ms += ms_since(tt);
+         }
+@@ -5043,11 +5056,11 @@
+         timing_.state_ms += ms_since(ts);
+         host::AttnGeom g;
+         g.T = T; g.t_real = t_real; g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
+-        g.pos0 = pos0; g.eps = gb.eps;
++        g.pos0 = pos0; g.eps = gb.eps; g.window = gb.window;
+         float* og = BlockScratch::fit(bs_.og, T * qw);
+         auto t0 = std::chrono::steady_clock::now();
+-        host::attention_block(g, q, k, v, nullptr, hc.qn.data(), hc.kn.data(), w_->rope_inv_freq.data(),
+-                              st.map<uint16_t*>(), row / 2, og);
++        const double* inv = gb.rope_inv_freq.empty() ? w_->rope_inv_freq.data() : gb.rope_inv_freq.data();
++        host::attention_block(g, q, k, v, gate, hc.qn.data(), hc.kn.data(), inv, st.map<uint16_t*>(), row / 2, og);
+         timing_.part1_ms += ms_since(t0);
+         timing_.mid_ms += ms_since(t0);
+         timing_.attn_ms += ms_since(t0);
+@@ -5059,13 +5072,57 @@
+     }
+     gemm(gb.program[1], mid, T, mid_k, hid, l, gout_);
+     auto t1 = std::chrono::steady_clock::now();
+-    const std::vector<float>& out = gout_;
++    const std::vector<float>* outp = &gout_;
++    if (gb.lfm_sandwich) {          // t = post_operator_norm(out): the norm sits on the block output, before the residual
++        float* tn_ = BlockScratch::fit(bs_.d_o, T * hid);
++        host::rmsnorm_rows(gout_.data(), T, hid, hc.postop.data(), gb.eps, tn_);
+ #pragma omp parallel for
+-    for (long long i = 0; i < static_cast<long long>(T * hid); ++i) res[i] = xres[i] + out[i];
++        for (long long i = 0; i < static_cast<long long>(T * hid); ++i) res[i] = xres[i] + tn_[i];
++    } else {
++        const std::vector<float>& out = *outp;
++#pragma omp parallel for
++        for (long long i = 0; i < static_cast<long long>(T * hid); ++i) res[i] = xres[i] + out[i];
++    }
+     host::rmsnorm_rows(res, T, hid, hc.postln.data(), gb.eps, xm);
+     timing_.part1_ms += ms_since(t1);
+     timing_.tail_ms += ms_since(t1);
+     if (gb.has_dense_ffn()) {
++        if (gb.ffn_slots) {
++            // the dense MLP as ffn_slots pairs: [gate | up] bands (3072 rows, alternating 64-row bands), silu(gate) * up,
++            // then the slot's down; the slots' down outputs add up. x' = res + post_ffn_norm(sum).
++            const size_t ff = gb.ff, hh = 2 * ff;
++            std::vector<float>& ysum = bs_.d_down;
++            BlockScratch::fit(ysum, T * hid);
++            std::fill(ysum.begin(), ysum.begin() + T * hid, 0.f);
++            std::vector<float> hbuf(T * ff);
++            for (size_t e = 0; e < gb.ffn_slots; ++e) {
++                gemm(gb.ffn_program[2 * e], xm, T, hid, hh, l, bs_.d_gate);
++                const std::vector<float>& ug = bs_.d_gate;
++                auto ta = std::chrono::steady_clock::now();
++#pragma omp parallel for
++                for (long long tt = 0; tt < static_cast<long long>(T); ++tt) {
++                    const float* u = ug.data() + static_cast<size_t>(tt) * hh;
++                    float* ho = hbuf.data() + static_cast<size_t>(tt) * ff;
++                    for (size_t b = 0; b < ff / 64; ++b) {
++                        const float* g = u + (2 * b) * 64;
++                        const float* up = u + (2 * b + 1) * 64;
++                        for (size_t j = 0; j < 64; ++j) ho[b * 64 + j] = g[j] / (1.f + std::exp(-g[j])) * up[j];
++                    }
++                }
++                timing_.shared_ms += ms_since(ta);
++                gemm(gb.ffn_program[2 * e + 1], hbuf.data(), T, ff, hid, l, bs_.d_up);
++                const std::vector<float>& yd = bs_.d_up;
++#pragma omp parallel for
++                for (long long i = 0; i < static_cast<long long>(T * hid); ++i) ysum[static_cast<size_t>(i)] += yd[static_cast<size_t>(i)];
++            }
++            auto tb = std::chrono::steady_clock::now();
++            float* tf = BlockScratch::fit(bs_.d_o, T * hid);
++            host::rmsnorm_rows(ysum.data(), T, hid, hc.postffn.data(), gb.eps, tf);
++#pragma omp parallel for
++            for (long long i = 0; i < static_cast<long long>(T * hid); ++i) xres[i] = res[i] + tf[i];
++            timing_.tail_ms += ms_since(tb);
++            return;
++        }
+         ffn_block(l, gb.ffn_program, gb.ff, xm, res, T, t_real, nullptr);
+         std::memcpy(xres, res, T * hid * 4);
+         return;
+--- a/src/open_qwen36/block_host.cpp
++++ b/src/open_qwen36/block_host.cpp
+@@ -638,8 +638,9 @@
+         const float* qv = Q.data() + t * qw + h * g.hd;
+         const size_t kh_off = (h / grp) * g.hd;
+         std::vector<float> s(p + 1);
++        const size_t r0 = g.window && p + 1 > g.window ? p + 1 - g.window : 0;   // a sliding window: rows (p - window, p]
+         float mx = -1e30f;
+-        for (size_t r = 0; r <= p; ++r) {
++        for (size_t r = r0; r <= p; ++r) {
+             const float* kr = K.data() + r * kvw + kh_off;
+             float acc = 0;
+             for (size_t j = 0; j < g.hd; ++j) acc += kr[j] * qv[j];
+@@ -647,13 +648,13 @@
+             mx = std::max(mx, s[r]);
+         }
+         double denom = 0;
+-        for (size_t r = 0; r <= p; ++r) {
++        for (size_t r = r0; r <= p; ++r) {
+             s[r] = std::exp(s[r] - mx);
+             denom += s[r];
+         }
+         const float inv = static_cast<float>(1.0 / denom);
+         std::vector<float> o(g.hd, 0.f);
+-        for (size_t r = 0; r <= p; ++r) {
++        for (size_t r = r0; r <= p; ++r) {
+             const float* vr = V.data() + r * kvw + kh_off;
+             const float a = s[r] * inv;
+             for (size_t j = 0; j < g.hd; ++j) o[j] += a * vr[j];

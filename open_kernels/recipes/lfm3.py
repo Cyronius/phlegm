@@ -354,6 +354,76 @@ def rope_table(spec: ModelSpec, local: bool) -> list[float]:
     return [theta ** (-2.0 * i / hd) for i in range(n)] + [0.0] * (hd // 2 - n)
 
 
+# ---- block prefill (the LFM2.5-24B-A2B route, recipes/lfm2moe.py gemm_route, kind `lfm`; .plans/lfm3-native.md "block prefill")
+def block_on() -> bool:
+    """The block prefill route's kernels and manifest keys: opt-in (LFM3_BLOCK=1). Off, programs() / builds() are byte
+    for byte what they were; pack_plan() is never touched (the route reads the decode pool's bytes as they are)."""
+    return os.environ.get("LFM3_BLOCK") == "1"
+
+
+def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
+    """Per layer type the `gemm_block` (kind `lfm`) the driver reads, plus the contexts / kernels / globals / builds the
+    route adds. None unless LFM3_BLOCK=1. A layer is the mixer's fused input GEMM (conv in_proj B | C | u; attention
+    q | gate | k | v with the derived GGUF's expanded gate), the host's middle (the 7-tap conv with its 6-row state, or
+    attention over the block with the layer type's RoPE table and window, the sigmoid gate on the output), the out GEMM, the
+    sandwich norm and residual, then the dense MLP and its sandwich norm. The MLP reads the decode pool in place: slot e's
+    gate | up bands (alternating 64-row bands, EXPERT_UG bytes at e * EXPERT_UG) are one GEMM weight of 2 x 1536 rows and its
+    down bands (UP_BYTES at POOL_DOWN + e * UP_BYTES) another of K = 1536; the host sums the slots' down outputs."""
+    if not block_on():
+        return None
+    from .qwen36moe import GEMM_T
+    L, G, F, T = layout(spec, max_ctx), geometry(spec), ffn(spec), GEMM_T
+    hid, qw, kvw = G.HID, G.QW, G.KVW
+    shapes: set[tuple[int, int]] = set()
+
+    def ctx(N: int, K: int) -> str:
+        if N % 256 or K % 256:
+            raise OpRangeError(f"lfm3 gemm route: [{N}, {K}] is not a multiple of 256 in both dims")
+        shapes.add((N, K))
+        return f"gemm_n{N}_k{K}"
+
+    def run(N: int, K: int, w: str) -> dict:
+        return {"op": "run", "kernel": ctx(N, K), "args": [w, f"gemm_x_k{K}", f"gemm_y_n{N}"]}
+
+    sq = (hid // BAND_ROWS) * band_bytes(hid)
+    qb = (qw // BAND_ROWS) * band_bytes(hid)
+    kb = (kvw // BAND_ROWS) * band_bytes(hid)
+    out: dict = {"layer_types": {}, "contexts": {}, "kernels": {}, "globals": {}, "builds": {}}
+    ffn_w, ffn_prog = {}, []
+    for e in range(F.SLOTS):
+        ffn_w[f"gug{e}_w"] = {"from": "pool", "range": [e * F.EXPERT_UG, F.EXPERT_UG]}
+        ffn_w[f"gdn{e}_w"] = {"from": "pool", "range": [F.POOL_DOWN + e * F.UP_BYTES, F.UP_BYTES]}
+        ffn_prog += [run(2 * F.FF, hid, f"gug{e}_w"), run(hid, F.FF, f"gdn{e}_w")]
+    for lt in sorted(set(spec.layer_types)):
+        gb: dict = {"kind": "lfm", "mixer": mixer_of(lt), "t": T, "eps": spec.norm_eps, "sandwich": True,
+                    "cd_ln": L.CD_LNW, "cd_ffn": L.CD_FFNN, "cd_postop": L.CD_POSTOP, "cd_postffn": L.CD_POSTFFN,
+                    "ff": F.FF, "ffn_slots": F.SLOTS, "ffn_program": ffn_prog, "ffn_weights": ffn_w}
+        if lt == SHORT_CONV:
+            gb.update(program=[run(3 * hid, hid, "gin_w"), run(hid, hid, "gout_w")],
+                      weights={"gin_w": {"from": "pool", "range": [L.POOL_B, 3 * sq]},
+                               "gout_w": {"from": "pool", "range": [L.POOL_OUT, sq]}},
+                      taps=G.TAPS, cd_conv=L.CD_CONV)
+        else:
+            local = lt == DENSE_LOCAL
+            gb.update(program=[run(2 * qw + 2 * kvw, hid, "gqkv_w"), run(hid, qw, "go_w")],
+                      weights={"gqkv_w": {"from": "pool", "range": [L.POOL_Q, 2 * qb + 2 * kb]},
+                               "go_w": {"from": "pool", "range": [L.POOL_O, (hid // BAND_ROWS) * band_bytes(qw)]}},
+                      gate=True, qw=qw, kvw=kvw, nh=G.NH, kvh=G.KVH, hd=G.HD, rot=spec.rotary_dim,
+                      cd_qnorm=L.CD_META, cd_knorm=L.CD_META + 2 * G.HD,
+                      window=spec.sliding_window if local else 0, rope_inv_freq=rope_table(spec, local))
+        out["layer_types"][lt] = gb
+    for N, K in sorted(shapes):
+        name = f"gemm_n{N}_k{K}"
+        out["contexts"].setdefault("gemm", f"{name}/final.xclbin")
+        out["kernels"][name] = {"context": "gemm", "insts": f"{name}/insts.bin", "build": name}
+        out["globals"][f"gemm_x_k{K}"] = K * T * 2
+        out["globals"][f"gemm_y_n{N}"] = max(out["globals"].get(f"gemm_y_n{N}", 0), N * T * 4)
+        out["builds"][name] = {"design": "gemm_q4_prefill/gemm_q4_prefill.py",
+                               "build_dir": f"gemm_q4_prefill/build_n{N}_k{K}_t{T}",
+                               "env": {"GQP_N": str(N), "GQP_K": str(K), "GQP_T": str(T)}}
+    return out
+
+
 def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     L, G = layout(spec, max_ctx), geometry(spec)
     check_buffer_args("lg_conv", CONV_ARGS)
@@ -393,6 +463,14 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             state = {"kind": "kv", "row": L.KV_ROW}
         out["layer_types"][lt] = {"buffers": {"consts": L.CD_BYTES, "act": L.AD_BYTES, "state": state},
                                   "program": [first, mlp]}
+    gr = gemm_route(spec, max_ctx)
+    if gr:
+        for lt, gb in gr["layer_types"].items():
+            out["layer_types"][lt]["gemm_block"] = gb
+        for k in ("contexts", "kernels"):
+            out[k].update(gr[k])
+        for k, v in gr["globals"].items():
+            out["globals"][k] = max(out["globals"].get(k, 0), v)
     return out
 
 
@@ -414,6 +492,9 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
     if FULL in spec.layer_types or DENSE_LOCAL in spec.layer_types:
         out["lg_att"] = {"design": "lfm3/lg.py", "build_dir": f"lfm3/build_att_h{G.HID}_d{G.HD}",
                          "env": {"LG_PART": "att"}}
+    gr = gemm_route(spec)
+    if gr:
+        out.update(gr["builds"])
     return out
 
 

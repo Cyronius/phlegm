@@ -4761,8 +4761,8 @@ comparison. Open: NPU attention products, hi / lo expert weights, bfp16 GEMMs, t
 ### OPEN-FAMILY-LFM3: LiquidAI LFM3 (LFM3-1.7B) derives its own spec and runs on its own recipe from the GGUF
 **Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_lfm3_hf`, `families.py`, `lfm3.py`,
 `designs/lfm3/{lg.py,gen_kernels.py,check_layer.py}`, `model/lfm3_gguf_reference.py`, `model/lfm3_gguf_make.py`; runtime: the
-LFM2.5 bridge / CLI (flint chain + `hyv3-runtime.patch`), no patch of its own)
-**Test category:** unit (`tests/test_lfm3.py`); manual (the procedure in `.plans/lfm3-native.md`, which needs the NPU and the GGUF)
+LFM2.5 bridge / CLI (flint chain + `hyv3-runtime.patch`), no patch of its own for decode; `lfm3-block-runtime.patch` for block prefill)
+**Test category:** unit (`tests/test_lfm3.py`, `tests/test_lfm3_block.py`); manual (the procedure in `.plans/lfm3-native.md`, which needs the NPU and the GGUF)
 
 A config whose `model_type` is `lfm3` shall derive a `ModelSpec` with `family` `lfm3`. The architecture, read from the Hub's
 `modeling_lfm3.py` and llama.cpp build 12015's arch `lfm3` (which agree: 40 / 40 greedy tokens of a free generation):
@@ -4803,8 +4803,27 @@ checks vs fp32 at position 1: conv layers y 2.2-2.4e-3, out 4.7e-4 .. 1.6e-3; th
 NPU-fed reference 3e-5. Full model: 16 / 64 / 32 greedy tokens (raw prompt, chat prompt, 843-token prompt) identical to llama.cpp.
 Every prompt position of the 843-token prompt: NPU vs fp32 835 / 843 argmax-equal, KL median 8.7e-5, mean 2.4e-4, max 2.95e-2; the
 bf16 control vs fp32 837 / 843, 1.05e-4, 2.4e-4; no drift by position; the 256-row window edge (positions 250-262) 3e-7 .. 1.8e-4.
-Timing (loaded): sequential prefill 102 ms a token, decode 95-105 ms a token (48 dispatches). `phlegm run` answers with the
-reasoning split. Open: block prefill (see below if built), fusing the two dispatches, the vision / audio siblings.
+Timing (loaded): sequential prefill 60-102 ms a token (by load), decode 95-105 ms a token (48 dispatches). `phlegm run` and
+`phlegm serve` answer with the reasoning split. Open: fusing the two dispatches, the vision / audio siblings.
+
+**Block prefill (2026-11-03, development; `LFM3_BLOCK=1`).** The LFM2.5 `lfm` gemm_block kind (OPEN-FAMILY-LFM2MOE), generalised: each
+layer is the mixer's fused input GEMM (conv in_proj B | C | u, or attention q | gate | k | v with the expanded gate), a host
+middle (the 7-tap conv with its 6-row f32 state slid over the block, or attention over the block with the layer type's zero-tail
+RoPE table, the 256-row window and the sigmoid gate), the out GEMM, the sandwich norm and residual, then the dense MLP as five
+slot pairs (the gate | up and down GEMMs read the decode pool's bytes in place -- manifest `weights.<n>.range` -- silu on the host,
+the down outputs summed in f32) and its sandwich norm. The pack plan and every decode kernel are unchanged (asserted with the
+gate on and off); the only new builds are five `gemm_q4_prefill` shapes (`kernels/lfm3-blk`). Runtime `lfm3-block-runtime.patch` over
+`lfm2moe-block-runtime.patch` (new keys: sandwich + its consts, gate, window, rope_inv_freq, taps, ffn_slots). Gate on hardware:
+16 / 16 (chat) and 32 / 32 (843 tokens, 4 blocks) greedy tokens equal to llama.cpp; per-position KL(fp32 || x) over the 843 prompt
+positions: block 836 / 843 argmax-equal, median 1.21e-4, mean 2.46e-4; sequential 835, 8.7e-5, 2.43e-4; bf16 control 837, 1.05e-4,
+2.42e-4; no drift by block, the window edge (positions 250-262) at most 4.4e-4, the block boundaries 255 / 256 / 257 at 9e-5 /
+1.9e-4 / 4.4e-4; 1-token, 256-token and 257-token prompts: 8 / 8 greedy tokens identical to sequential and the three decode
+steps after the block prefill agree to relL2 <= 1.3e-2 (the conv state and the KV rows carry over). Development timing (load
+4.6-8.9, alternating, 843 tokens, 1 decode token): block 2.57 s (3.0 ms a token), sequential 50.2 s (60 ms a token), ~19.6x; a
+256-token block is ~670 ms (GEMMs 411, host 231 of which attention 153). No quiet-machine timing, no ArtLite comparison. Open:
+attention on the host (the head-dim-128 `ag_*` products exist, unwired), the MLP's 10 small dispatches a layer, hi / lo, bfp16,
+and `phlegm run` wiring (the model dir prefills sequentially unless `open_kernels/` is the `lfm3-blk` set and the engine's gemm
+route is on).
 
 ### OPEN-WIDTH-PAD: the padded width a recipe may derive, and what it does not settle
 **Applies to:** openflowlm-next (`open_kernels/recipes/qwen36moe.py`,

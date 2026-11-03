@@ -337,6 +337,15 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   `target/npu-dev/lfm2moe-block-patch.sh` regenerates it and checks the chain reproduces the clone
   (`target/npu-dev/lfm2moe-runtime`).
 
+- `upstream-patches/lfm3-block-runtime.patch` (2026-11-03) is LFM3-1.7B's block prefill (OPEN-FAMILY-LFM3,
+  `LFM3_BLOCK=1`), over `lfm2moe-block-runtime.patch`. A GEMM weight may be a byte `range` of the decode pool
+  as it is (the gate | up slots' alternating 64-row bands and the mixer projections), so the pack plan and
+  every decode kernel stay as they were. The `lfm` kind gains sandwich norms (`cd_postop`, `cd_postffn`), the
+  elementwise sigmoid gate (`gate`: q | gate | k | v), a sliding `window`, the layer type's own
+  `rope_inv_freq`, `ffn_slots` (gate | up and down GEMM pairs whose outputs the host sums) and any conv tap
+  count with a (taps - 1)-row f32 state. `target/npu-dev/lfm3-block-patch.sh` regenerates it and checks the
+  chain reproduces the clone (`target/npu-dev/lfm3-runtime`).
+
 - `upstream-patches/gemma4-moe-runtime.patch` (2026-10-31) runs Gemma 4 26B-A4B from its QAT
   Q4_0 GGUF (OPEN-FAMILY-GEMMA4-MOE). Two pack ops: `g4_q40` (a Q4_0 tensor, 2-D or the
   experts' 3-D, into Q4_0-native chunks in `std_perm`'s band law, with rows and columns padded

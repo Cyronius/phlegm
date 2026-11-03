@@ -595,5 +595,34 @@
     "note": "LFM2.5-24B-A2B block prefill (OPEN-FAMILY-LFM2MOE, 2026-11-03, LFM2MOE_BLOCK=1): gemm_block kind `lfm` (mixer conv | att; the fused input GEMM, the out GEMM, a leading dense layer's up|gate + down GEMMs or `route` + `moe_batch`): block_layer_lfm runs the host entry norm, the 3-tap conv middle over the block with the carried 2-row f32 state (or attention_block without a gate), the residual and ffn_norm, hy_route's router math over the block (lfm_route_rows) and moe_block with mbl's [rbg][half][row] y order (moe_batch.y_layout); op_region reads a one-tensor fl_q4 op as the band law; attention_block takes a null gate. Independent of gemma4-moe-block-runtime.patch (both edit moe_block's y read: they conflict if stacked); no new pack op. sha256 f0d645712f14186cab05955a6223eae6f1571d69f6d6b6566b4c0989d328c3a6; chain-verified by target/npu-dev/lfm2moe-block-patch.sh; built in target/npu-dev/lfm2moe-runtime",
     "patch": "lfm2moe-block-runtime.patch",
     "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "lfm3_block_20261103": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gptoss_runtime_20261031",
+      "gptoss_prefill_runtime_20261031",
+      "flint_runtime_20261031",
+      "hyv3_runtime_20261031",
+      "lfm2moe_block_20261103"
+    ],
+    "files": [
+      "src/open_qwen36/block_host.cpp",
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp"
+    ],
+    "note": "LFM3-1.7B block prefill (OPEN-FAMILY-LFM3, 2026-11-03, LFM3_BLOCK=1) on top of lfm2moe-block-runtime.patch's `lfm` gemm_block kind: GemmWeight `range` (a byte range of the decode pool as a GEMM weight: LFM3's gate|up slots and its mixer projections are band-law bytes in place, no pack-plan change); lfm manifest keys sandwich (+cd_postop / cd_postffn; res = x + rms(out) * post_attention_norm, x' = res + rms(sum of the slots' down) * post_ffw_norm), gate (the fused GEMM is q|gate|k|v, attention_block applies sigmoid(gate)), window (attention_block's rows (p - window, p]), rope_inv_freq (the layer type's zero-tail table), ffn_slots (gate|up and down GEMM pairs summed on the host), any conv tap count with a (taps-1)-row f32 state slid on the host; HostConsts gains postop / postffn. sha256 0aef516ec6415c6bd81975e96ec88c509321b69d69ae97625bbdf203032065e3; chain-verified by target/npu-dev/lfm3-block-patch.sh; built in target/npu-dev/lfm3-runtime",
+    "patch": "lfm3-block-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
   }
 }
