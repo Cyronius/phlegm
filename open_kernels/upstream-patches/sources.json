@@ -436,6 +436,32 @@
     "patch": "gemma4-moe-decode-runtime.patch",
     "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
   },
+  "gemma4_moe_block_20261103": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gemma4_moe_20261031",
+      "gemma4_moe_decode_20261101"
+    ],
+    "files": [
+      "src/open_qwen36/cli.cpp",
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp"
+    ],
+    "note": "Gemma 4 26B-A4B block prefill (OPEN-FAMILY-GEMMA4-MOE, 2026-11-03): a dense gemm_block gains `g4_moe` (steps gemma4_route + gemma4_combine, and a `moe_batch` of designs/gemma4_moe_batch streams) and may name attn_kernel \"\" when it carries an attn_block; step_gemm_block_layer closes such a layer with g4_moe_tail (t1 = post_ffw_norm_1(mlp), the router over the f32 residual, moe_block with mb4's [rbg][half][row] y order, the combine); op_region reads a one-tensor g4_q40 op as the band law; dense_staged_ok is off for it; cli --force-ids-file feeds teacher-forced tokens in the decode loop. sha256 e65b29f3512242e61a5fdecb1fc497daaef7aa23e5362e84e548bab21fd69144; built in target/npu-dev/gemma4-moe-runtime",
+    "patch": "gemma4-moe-block-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
   "qwen35moe_gguf_20261031": {
     "base": "beccd4699d812642b63741255322d19a0c1dd738",
     "applies_after": [

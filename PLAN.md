@@ -200,8 +200,13 @@ logit's KL against an fp32 reference matches a bf16-rounding control. `phlegm ru
 `serve` answer through the bridge. Development timing (2026-11-01, paired against the 10-31
 build): decode step 0.80x (106 against 132 ms median at load 8-20; 82 ms a token on a quieter
 run), sequential prefill 88 ms a token, logits byte-identical. Phlegm returns Gemma's thought
-channel as `reasoning_content` (SERVER-REASONING). Open: block prefill; the ten local / global
-context changes a token; a clean benchmark. Plan:
+channel as `reasoning_content` (SERVER-REASONING). Block prefill (2026-11-03, `G4_MOE_BATCH=1` kernels,
+`gemma4-moe-block-runtime.patch`, `designs/gemma4_moe_batch`): 1450 tokens in 13-15 ms a token against
+74-99 sequential (paired, alternating, load 20-30; development timing); short prompt 32/32 equal to
+llama.cpp, long prompt 17/32 then a 0.374 / 0.371 near-tie flip, prompt log-KL within the bf16
+control (mean 0.064 against 0.065) but 147 flips against the sequential route's 133. Teacher-forced decode over the same prompt: KL mean 9.0e-4 against the bf16 control's 1.0e-3, max 8.6e-3, one
+flip (the control's one). Open: the experts' weights are rounded to bf16 on the core (a hi/lo split would
+remove that); bfp16 dense GEMMs; the ten local / global context changes a token; a clean benchmark. Plan:
 [.plans/gemma4-moe.md](.plans/gemma4-moe.md); spec `OPEN-FAMILY-GEMMA4-MOE`.
 
 ## Qwen3.5 MoE 35B-A3B (Ornith 1.5, Nex N2.5 mini, KAT Coder V2.5 Dev)

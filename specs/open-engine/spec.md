@@ -2420,6 +2420,15 @@ and its down hold the same number of chunks, as `moeroute2`'s geometry requires.
 - the dense MLP pads to 2304 and the experts to 768; the 12B's recipe, pool plan and builds do not move.
 - the pool holds the experts from byte 0 (gate | up per expert, then the down slices), the attention and dense MLP after them, and every offset fits a 32-bit fill word.
 
+Block prefill (2026-11-03, `G4_MOE_BATCH=1` kernels, `gemma4-moe-block-runtime.patch`): a
+`gemm_block` of kind `dense` per layer type: the five q4 GEMMs on the GGUF's Q4_0-native pool
+(qkv3, o, gate, up, down at the padded 2304; `gemm_q4_prefill`, T = 256), the attention as the
+`attn_block` products (no dxB build), then the layer's close on the host: `t1`, the router over
+the f32 residual, the experts through `designs/gemma4_moe_batch/mb4.py` (each expert streamed
+once per up to eight tokens, a transposed product, the weight codes dequantised to bf16 on the
+core; y leaves in its own [rbg][half][row] order), and the combine. Eight tokens share an
+expert visit, so the expert stream reads each expert's bytes once per eight tokens.
+
 **Procedure (manual):** greedy tokens against llama.cpp on the same GGUF; every prefill
 position's log-KL against an independent fp32 reference and against a BF16-rounding
 control; a prompt past the 1024-row window; `phlegm run` and `phlegm serve`.

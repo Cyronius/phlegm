@@ -320,6 +320,16 @@ def _moe_programs(spec: ModelSpec, max_ctx: int) -> dict:
                         {"op": "run", "kernel": gk, "args": args if merged else ["pool", "act"]},
                         moe_combine_step(spec, kind)],
         }
+    if moe_batch_on():
+        mb = moe_batch(spec)
+        for k in ("contexts", "kernels", "globals"):
+            out[k].update(mb[k])
+        r = gemm_route(spec, max_ctx)             # the dense half of the layer in blocks, with the experts above
+        if r:
+            for k in ("contexts", "kernels", "globals"):
+                out[k].update(r[k])
+            for lt, gb in r["layer_types"].items():
+                out["layer_types"][lt]["gemm_block"] = gb
     if spec.quant != MOE_QUANT:
         out["gguf"] = True            # the same program at the view's own law (manifest.py nests it)
     return out
@@ -349,7 +359,55 @@ def _moe_builds(spec: ModelSpec) -> dict[str, dict]:
             b[name + "_q40" + sfx] = {"design": "gemma4_moe/dxm.py",
                                       "build_dir": f"gemma4_moe/build_dxm_{kind}_h{spec.hidden}_{stream}",
                                       "env": {**env, "G4_DXM_STREAM": stream}}
+    if moe_batch_on():
+        b.update(moe_batch(spec)["builds"])
+        r = gemm_route(replace(spec, quant=MOE_QUANT))      # the GGUF view's route (the nested manifest's), as dense's builds()
+        if r:
+            b.update(r["builds"])
     return b
+
+
+def moe_batch_on() -> bool:
+    """The block prefill route's token-batched expert streams in the 26B kernel set: opt-in (G4_MOE_BATCH=1)
+    until the route that uses them (runtime step_block_moe for gemma4) has passed its gate."""
+    return os.environ.get("G4_MOE_BATCH") == "1"
+
+
+MB_NT = 8             # designs/gemma4_moe_batch/mb4.py token slots per expert visit (one 8-token MAC tile)
+
+
+def moe_batch_slots(spec: ModelSpec) -> list[int]:
+    """mb4's dispatch lengths: a binary ladder down from the expert count (qwen36moe's reasoning: an unused
+    slot streams a real expert and is wasted, so the rungs decide the padding)."""
+    return [s for s in (spec.num_experts >> i for i in range(30)) if s >= 8 and s % 8 == 0]
+
+
+def moe_batch(spec: ModelSpec) -> dict:
+    """The token-batched expert kernel of the block route (OPEN-FAMILY-GEMMA4-MOE, designs/gemma4_moe_batch):
+    the `moe_batch` entry of a layer type's gemm_block, plus the contexts / kernels / globals / builds it
+    needs. One xclbin (context `mb`), one instruction stream per dispatch length; the runtime patches the
+    slots' expert offsets (`moebatch`, moe_geometry's pool law: expert_stripes = 2 up_bytes is mb4's EXP_UG).
+    y leaves [rbg][half][row][1024 B] (designs/gemma4_moe_batch/layout.py), not moe_batch's C-tile order."""
+    M = moe_layout(spec)
+    slots = moe_batch_slots(spec)
+    args = ["pool", "mb_x", "mb_h", "mb_y"]
+    check_buffer_args("moe_batch", args)
+    out: dict = {"contexts": {}, "kernels": {}, "globals": {}, "builds": {}}
+    for s in slots:
+        name = f"mb_s{s}"
+        out["contexts"].setdefault("mb", f"mb_s{slots[0]}/final.xclbin")
+        out["kernels"][name] = {"context": "mb", "insts": f"{name}/insts.bin", "patch": "moebatch", "build": name}
+        out["builds"][name] = {"design": "gemma4_moe_batch/mb4.py",
+                               "build_dir": f"gemma4_moe_batch/build_s{s}_h{M.HID}_f{M.FF}_e{spec.num_experts}",
+                               "env": {"MB_SLOTS": str(s), "MB_NT": str(MB_NT), "MB_HID": str(M.HID), "MB_FF": str(M.FF),
+                                       "MB_EXPERTS": str(spec.num_experts), "MB_POOL_DOWN": str(M.POOL_DOWN),
+                                       "MB_POOL_BYTES": str(M.POOL_END)}}
+    out["globals"]["mb_x"] = slots[0] * M.HID * MB_NT * 2
+    out["globals"]["mb_h"] = slots[0] * M.FF * MB_NT * 2
+    out["globals"]["mb_y"] = slots[0] * M.HID * MB_NT * 4
+    out["moe_batch"] = {"kernels": {str(s): f"mb_s{s}" for s in slots}, "args": args, "nt": MB_NT,
+                        "y_layout": "rbg_half_row"}
+    return out
 
 
 def moe_geometry(spec: ModelSpec) -> dict:
@@ -666,14 +724,21 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096, pool_quant: str | None = No
     leaves it out: None means the sequential path, byte for byte what it was. `pool_quant`
     is the chunk law the GEMMs read: the spec's own (the f32-scale twin's or the Q4_0-native
     view's), or q4_1's for the compact view (finalize_gguf_manifest)."""
-    if not gguf_direct(spec.quant) or not gemm_on() or is_moe(spec):
-        return None              # 26B-A4B: sequential prefill only, for now (OPEN-FAMILY-GEMMA4-MOE)
-    pool_quant = pool_quant or D.pool_quant(spec)
+    moe = is_moe(spec)
+    if not gguf_direct(spec.quant) or not gemm_on() or (moe and not moe_batch_on()):
+        return None              # 26B-A4B: sequential prefill unless the token-batched experts are built (G4_MOE_BATCH=1)
+    if moe and not attn_block_on():
+        raise OpRangeError("gemma4 moe block route: attention is the block products only (no dxB build at hidden 2816); "
+                           "G4_ATTN_BLOCK=0 has nothing to fall back to")
+    pool_quant = MOE_QUANT if moe else (pool_quant or D.pool_quant(spec))
     if pool_quant not in SFX:
         raise OpRangeError(f"gemma4 gemm route: no GEMM build reads {pool_quant!r} pools")
     sfx = SFX[pool_quant]
     T = D.GEMM_T
-    hid, ff = spec.hidden, spec.intermediate
+    hid = spec.hidden
+    ff = moe_ff(spec) if moe else spec.intermediate       # the 26B's dense MLP is packed at its padded width
+    n_up, n_gate, n_down = (("ffn_up.weight", "ffn_gate.weight", "ffn_down.weight") if moe else
+                            ("mlp.up_proj.weight", "mlp.gate_proj.weight", "mlp.down_proj.weight"))
     plans = pack_plan(spec)["layer_types"]
     shapes: set[tuple[int, int]] = set()
 
@@ -707,9 +772,9 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096, pool_quant: str | None = No
             raise OpRangeError(f"gemma4 gemm route: {lt}'s q / k / v pack ops are not consecutive")
         weights = {"gqkv3_w": {"from": "pool", "ops": qkv},
                    "go_w": {"from": "pool", "ops": ops("self_attn.o_proj.weight")},
-                   "ggate_w": {"from": "pool", "ops": ops("mlp.gate_proj.weight")},
-                   "gup_w": {"from": "pool", "ops": ops("mlp.up_proj.weight")},
-                   "gdown_w": {"from": "pool", "ops": ops("mlp.down_proj.weight")}}
+                   "ggate_w": {"from": "pool", "ops": ops(n_gate)},
+                   "gup_w": {"from": "pool", "ops": ops(n_up)},
+                   "gdown_w": {"from": "pool", "ops": ops(n_down)}}
         qw, kvw = G.QW, G.KVW
         program = [run(qw + 2 * kvw, hid, "gqkv3_w"), run(hid, qw, "go_w"),
                    run(ff, hid, "ggate_w"), run(ff, hid, "gup_w"), run(hid, ff, "gdown_w")]
@@ -717,21 +782,29 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096, pool_quant: str | None = No
         build = f"dx_attn_{kind}"
         args = ["pool", "xres", "consts", "state", "act", tab]
         check_buffer_args(kn, args)
-        out["contexts"][ctxn] = f"{build}/final.xclbin"
-        out["kernels"][kn] = {"context": ctxn, "insts": f"{build}/insts.bin", "patch": "attnpos", "build": build,
-                              "window": spec.sliding_window if local else 0,
-                              "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW}
-        out["builds"][build] = {"design": "dense/dx_attn.py",
-                                "build_dir": f"dense/build_dxa_gemma4_{kind}_h{hid}", "env": {KIND_ENV: kind}}
+        if not moe:
+            out["contexts"][ctxn] = f"{build}/final.xclbin"
+            out["kernels"][kn] = {"context": ctxn, "insts": f"{build}/insts.bin", "patch": "attnpos", "build": build,
+                                  "window": spec.sliding_window if local else 0,
+                                  "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW}
+            out["builds"][build] = {"design": "dense/dx_attn.py",
+                                    "build_dir": f"dense/build_dxa_gemma4_{kind}_h{hid}", "env": {KIND_ENV: kind}}
         out["layer_types"][lt] = {"kind": "dense", "t": T, "eps": spec.norm_eps,
                                   "program": program, "weights": weights,
                                   "qw": qw, "kvw": kvw, "ff": ff,
                                   "ad_q": L.AD_Q, "ad_kvn": L.AD_KVN, "ad_og": L.AD_OG,
-                                  "attn_kernel": kn, "attn_args": args,
                                   "sandwich": True, "act": spec.activation, "norm_groups": spec.norm_groups,
                                   # the FFN-side norms from the consts, where post_feedforward carries the
                                   # folded scale; the file's copy (Gemma 3's source) does not
                                   "cd_preffn": L.CD_PREFFN, "cd_postffn": L.CD_POSTFFN}
+        if moe:
+            # no per-token dxB at hidden 2816 (attn_kernel ""), and the layer closes with the routed experts:
+            # cd_postffn holds post_ffw_norm_1 here, the route / combine steps carry the sequential program's names
+            out["layer_types"][lt]["attn_kernel"] = ""
+            out["layer_types"][lt]["g4_moe"] = {"steps": [moe_route_step(spec, kind), moe_combine_step(spec, kind)],
+                                                "moe_batch": moe_batch(spec)["moe_batch"]}
+        else:
+            out["layer_types"][lt].update({"attn_kernel": kn, "attn_args": args})
         act_max = max(act_max, L.AD_BYTES)
         if attn_block_on():
             # the dxB kernel above stays: OFLM_OPEN_ATTN_BLOCK=0 at run time goes back to it
@@ -755,7 +828,8 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096, pool_quant: str | None = No
                         out["globals"][g_] = max(out["globals"].get(g_, 0), size)
     # the T-wide attention scratch the engine shuttles each token's act slice through, at the
     # larger kind's act size (core.cpp indexes it per layer with that layer's own act_bytes)
-    out["globals"]["gact"] = T * act_max
+    if not moe:
+        out["globals"]["gact"] = T * act_max
     # one GEMM context for every shape: the core program depends on neither N nor K (dense)
     for N, K in sorted(shapes):
         name = ctx(N, K)
@@ -769,7 +843,7 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096, pool_quant: str | None = No
                                        **({"GQP_SCALES_F32": "1"} if pool_quant == "q4_1_f32" else
                                           {"GQP_FMT": "q4_0"} if pool_quant == "q4_0" else {})}}
     out["variants"] = {}
-    if bfp16_on():
+    if bfp16_on() and not moe:
         # bfp16 is gemm_block (fast, the default); the q4 route above becomes `lean`
         bf = _bfp16_route(out, plans)
         for lt, gb in bf["layer_types"].items():
@@ -975,4 +1049,5 @@ def hf_config_check(spec: ModelSpec) -> dict:
 GEN_KERNELS = D.GEN_KERNELS
 KERNEL_SOURCES = list(D.KERNEL_SOURCES)
 # 26B-A4B's gm_moe (cache.py adds these for a spec with experts only, so the 12B's key keeps its files)
-KERNEL_SOURCES_MOE = ["designs/gemma4_moe/*.py", "designs/gemma4_moe/*.cc"]
+KERNEL_SOURCES_MOE = ["designs/gemma4_moe/*.py", "designs/gemma4_moe/*.cc",
+                      "designs/gemma4_moe_batch/mb4.py", "designs/gemma4_moe_batch/*.cc", "designs/gemma4_moe_batch/*.h"]

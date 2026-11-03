@@ -350,6 +350,18 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   as `lx` / `ax` already are). Applies over `beccd46`, the nine Gemma 4 patches and
   `gemma4-moe-runtime.patch` (`target/npu-dev/gemma4-moe-runtime`).
 
+- `upstream-patches/gemma4-moe-block-runtime.patch` (2026-11-03, sha256 `e65b29f3...`) is Gemma 4
+  26B-A4B's block prefill over `gemma4-moe-decode-runtime.patch` (OPEN-FAMILY-GEMMA4-MOE). A dense
+  `gemm_block` may carry `g4_moe` (the route / combine steps and a `moe_batch` of
+  `designs/gemma4_moe_batch` streams) and an empty `attn_kernel` when it has an `attn_block`
+  (the 26B has no per-token dxB build); `step_gemm_block_layer` then closes the layer with
+  `g4_moe_tail` (t1, the host router over the f32 residual, `moe_block` reading mb4's y order, the
+  combine). The CLI gains `--force-ids-file` (teacher forcing in the decode loop). `op_region` accepts a contiguous `g4_q40` op, and the staged schedule is off for the
+  kind. Needs `G4_MOE_BATCH=1` kernels; without them the manifest has no block route and prefill
+  is sequential, as before. Applies over `beccd46`, the nine Gemma 4 patches,
+  `gemma4-moe-runtime.patch` and `gemma4-moe-decode-runtime.patch`
+  (`target/npu-dev/gemma4-moe-runtime`).
+
 - `upstream-patches/qwen35moe-gguf-runtime.patch` (2026-10-31) runs Qwen3.5 / 3.6 MoE text
   models (Ornith 1.5 35B-A3B, Nex N2.5 mini, KAT Coder V2.5 Dev) from a llama.cpp `qwen35moe`
   GGUF (OPEN-FAMILY-QWEN36MOE-GGUF). Seven pack ops write the q4nx ops' bytes in the q4_1 law:
