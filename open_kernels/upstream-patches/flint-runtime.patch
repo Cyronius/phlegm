@@ -1,0 +1,284 @@
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -25,7 +25,7 @@
+ /// One packing-plan op: which tensor lands at which byte offset in which
+ /// chunk order (open_kernels/recipes/pack.py is the same interpreter in NumPy).
+ struct PackOp {
+-    std::string op;                          ///< std_perm | std_perm_gguf | std_fuse | q8_perm | expert_stripes | expert_down | put | conv_transpose | lmhead_q8 | transpose | transpose_banked | gx_q8 | gx_ug | gx_down | gx_ug_mx4 | gx_down_mx4 | gx_lmhead | gp_bfp16 | gp_mx4
++    std::string op;                          ///< std_perm | std_perm_gguf | std_fuse | q8_perm | expert_stripes | expert_down | put | conv_transpose | lmhead_q8 | transpose | transpose_banked | gx_q8 | gx_ug | gx_down | gx_ug_mx4 | gx_down_mx4 | gx_lmhead | gp_bfp16 | gp_mx4 | fl_q4
+     std::string tensor, up, gate;            ///< tensor names; "{l}" stands for the layer index
+     /// gx_q8 / gx_ug (GPT-OSS, OPEN-FAMILY-GPTOSS): the per-row f32 bias that rides in each
+     /// k-tile-0 half-tile's pad (gemv_q8.h GEMV_Q8_PAD_BIAS); "" = none
+@@ -61,7 +61,7 @@
+ 
+ /// One verb of a layer type's (or the tail's) program.
+ struct Step {
+-    std::string op;                          ///< run | moeroute2 | gptoss_route
++    std::string op;                          ///< run | moeroute2 | gptoss_route | flint_route
+     std::string kernel;
+     /// gptoss_route (GPT-OSS): the router on the host between the attention and MoE dispatches.
+     /// It reads xm (bf16 [hidden_real] at act a_xm), takes the top experts of `router` (F32
+@@ -70,6 +70,11 @@
+     /// routed fills (moeroute2's table) at the chosen experts.
+     uint64_t a_xm = 0, a_w = 0, a_bsum = 0, hidden_real = 0;
+     std::string router, router_bias, down_bias;
++    /// flint_route (Flint, OPEN-FAMILY-FLINT): sigmoid scores of `router` (F32 [r_experts][hidden_real], no
++    /// bias) over xm, the top `r_topk` renormalised into slots 0..r_topk-1, then each `shared` pool expert
++    /// in the next slot at weight 1; the weights (f32[8]) at a_w, the slots' experts into `kernel`'s fills.
++    uint64_t r_experts = 0, r_topk = 0;
++    std::vector<uint32_t> shared;
+     std::vector<std::string> args;           ///< run: buffer names (per-layer: pool consts act state; else globals)
+     uint64_t act_off = 0;                    ///< moeroute2: the router record's offset in `act`
+     std::string fmt;                         ///< run, dense block route: "" = the q4_1 GEMMs, "bfp16" = gemm_bfp16
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -81,7 +81,7 @@
+     if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm" || p.op == "bfp16_gemm" ||
+         p.op == "put" || p.op == "expert_down" || p.op == "conv_transpose" || p.op == "lmhead_q8" ||
+         p.op == "transpose" || p.op == "transpose_banked" || p.op == "gx_q8" || p.op == "gx_down" ||
+-        p.op == "gx_down_mx4" || p.op == "gx_lmhead" || p.op == "gp_bfp16") {
++        p.op == "gx_down_mx4" || p.op == "gx_lmhead" || p.op == "gp_bfp16" || p.op == "fl_q4") {
+         if (p.tensor.empty()) fail(where, p.op + " without a tensor");
+     } else if (p.op == "expert_stripes" || p.op == "gx_ug" || p.op == "gx_ug_mx4") {
+         if (p.up.empty() || p.gate.empty()) fail(where, p.op + " without up / gate");
+@@ -95,6 +95,7 @@
+     if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm")
+         need_all({{"nch", p.nch}, {"in_dim", p.in_dim}});
+     else if (p.op == "bfp16_gemm") need_all({{"nch", p.nch}, {"in_dim", p.in_dim}, {"n_total", p.n_total}});
++    else if (p.op == "fl_q4") need_all({{"rows", p.rows}, {"in_dim", p.in_dim}});
+     else if (p.op == "std_fuse") need_all({{"nch", p.nch}, {"in_dim", p.in_dim}, {"src_dim", p.src_dim}, {"rg", p.rg}});
+     else if (p.op == "transpose" || p.op == "transpose_banked")
+         need_all({{"rows", p.rows}, {"cols", p.cols}, {"elem", p.elem}});
+@@ -139,6 +140,16 @@
+             st.router_bias = get<std::string>(s, "router_bias", where);
+             st.down_bias = get<std::string>(s, "down_bias", where);
+             if (!st.hidden_real) fail(where, "gptoss_route without hidden_real");
++        } else if (st.op == "flint_route") {
++            st.a_xm = get<uint64_t>(s, "a_xm", where);
++            st.a_w = get<uint64_t>(s, "a_w", where);
++            st.hidden_real = get<uint64_t>(s, "hidden_real", where);
++            st.router = get<std::string>(s, "router", where);
++            st.r_experts = get<uint64_t>(s, "experts", where);
++            st.r_topk = get<uint64_t>(s, "topk", where);
++            st.shared = s.value("shared", std::vector<uint32_t>{});
++            if (!st.hidden_real || !st.r_experts || !st.r_topk || st.r_topk > st.r_experts || st.r_topk + st.shared.size() > 8)
++                fail(where, "flint_route: hidden_real / experts / topk, and topk + shared slots within the route's 8");
+         } else {
+             fail(where, "unknown program op '" + st.op + "'");
+         }
+@@ -152,7 +163,7 @@
+ void check_step(const Manifest& m, const Step& s, const std::string& where, const char* what) {
+     auto it = m.kernels.find(s.kernel);
+     if (it == m.kernels.end()) fail(where, std::string(what) + " names unknown kernel " + s.kernel);
+-    if ((s.op == "moeroute2" || s.op == "gptoss_route") && it->second.patch != "moeroute2")
++    if ((s.op == "moeroute2" || s.op == "gptoss_route" || s.op == "flint_route") && it->second.patch != "moeroute2")
+         fail(where, std::string(what) + ": " + s.op + " on kernel " + s.kernel + ", whose patch is '" +
+                         (it->second.patch.empty() ? std::string("none") : it->second.patch) + "'");
+ }
+--- a/src/open_qwen36/pools.cpp
++++ b/src/open_qwen36/pools.cpp
+@@ -1168,6 +1168,74 @@
+                 std::memcpy(d + (2 * b + 1) * band, tg.data() + b * band, band);
+             }
+         }
++    } else if (op.op == "fl_q4") {
++        // Flint (OPEN-FAMILY-FLINT): for e < experts, the rows x in_dim block at (row0 + e n_total, chunk0 +
++        // e cols) of a Q4_0 / Q4_1 GGUF tensor -- its trailing dims flattened into rows, so a 3-D expert
++        // tensor's expert e is rows [e R, e R + R) -- as 64-row bands of q4_1 chunks in std_perm_gguf's byte
++        // law (the codes kept, d and m RNE to bf16; Q4_0's m = -8 d). Band b lands at dst + e expert_bytes +
++        // b stripe_bytes (0: the bands contiguous), so a slot's gate and up bands can interleave.
++        const std::string name = with_layer(op.tensor, layer);
++        const GgufFile& g = dynamic_cast<const GgufFile&>(m);
++        const GgufFile::TensorInfo& t = g.tensor(name);
++        const bool q41 = t.type == GgufFile::Type::Q4_1;
++        if (!q41 && t.type != GgufFile::Type::Q4_0)
++            fail(name + " is " + GgufFile::type_name(t.type) + "; fl_q4 packs Q4_0 / Q4_1 with their codes kept");
++        if (ch != Q4_CHUNK) fail("fl_q4 " + name + ": the pool's chunk law is " + std::to_string(ch) + ", not q4_1's 5120");
++        const uint64_t cols = t.dims[0];
++        uint64_t total_rows = 1;
++        for (size_t i = 1; i < t.dims.size(); ++i) total_rows *= t.dims[i];
++        const uint64_t experts = op.experts ? op.experts : 1;
++        if (op.rows % 64 || op.in_dim % 256 || op.chunk0 % 32 || op.cols % 32 || cols % 32)
++            fail("fl_q4 " + name + ": rows " + std::to_string(op.rows) + " / in_dim " + std::to_string(op.in_dim) +
++                 " are not whole bands / k-tiles, or a column offset is not whole blocks");
++        const uint64_t last_row = op.row0 + (experts - 1) * op.n_total + op.rows;
++        const uint64_t last_col = op.chunk0 + (experts - 1) * op.cols + op.in_dim;
++        if (last_row > total_rows || last_col > cols)
++            fail("fl_q4 " + name + ": the blocks reach row " + std::to_string(last_row) + " / column " +
++                 std::to_string(last_col) + " of a " + std::to_string(total_rows) + " x " + std::to_string(cols) + " tensor");
++        const size_t blk = q41 ? 20 : 18, nb = cols / 32, ktiles = op.in_dim / 256;
++        const size_t band = 2 * ktiles * Q4_CHUNK, nbands = op.rows / 64;
++        const size_t bstride = op.stripe_bytes ? op.stripe_bytes : band;
++        if (op.stripe_bytes && op.stripe_bytes < band) fail("fl_q4 " + name + ": a band stride under one band");
++        const size_t one = (nbands - 1) * bstride + band;
++        if (experts > 1 && op.expert_bytes < one) fail("fl_q4 " + name + ": an expert slot of " + std::to_string(op.expert_bytes) +
++                                                       " B holds " + std::to_string(one));
++        bounds(op, (experts - 1) * op.expert_bytes + one, dst_bytes);
++        const uint8_t* src = raw(m, name, total_rows * nb * blk);
++        for (uint64_t e = 0; e < experts; ++e) {
++            const uint64_t r0 = op.row0 + e * op.n_total, kb0 = (op.chunk0 + e * op.cols) / 32;
++            for (size_t b = 0; b < nbands; ++b) {
++                uint8_t* bd = dst + op.dst + e * op.expert_bytes + b * bstride;
++                std::memset(bd, 0, band);
++                for (size_t j = 0; j < 2 * ktiles; ++j) {          // std_perm within a band: (32-row half, k-tile)
++                    uint8_t* d = bd + j * Q4_CHUNK;
++                    const size_t rowc = 64 * b + 32 * (j % 2), blkc = (j / 2) * 8;
++                    for (size_t r = 0; r < 32; ++r) {
++                        const uint8_t* srow = src + (r0 + rowc + r) * nb * blk;
++                        const uint8_t rb = static_cast<uint8_t>(r / 16), rl = static_cast<uint8_t>(r % 16);
++                        for (size_t kb = 0; kb < 8; ++kb) {
++                            const uint8_t* q = srow + (kb0 + blkc + kb) * blk;
++                            uint16_t ud, um = 0;
++                            std::memcpy(&ud, q, 2);
++                            if (q41) std::memcpy(&um, q + 2, 2);
++                            const float df = fp16_to_f32(ud), mf = q41 ? fp16_to_f32(um) : -8.f * df;
++                            const uint16_t db = bf16_rne(df), mb = bf16_rne(mf);
++                            const size_t jj = kb * 32 + r;
++                            std::memcpy(d + 2 * jj, &db, 2);
++                            std::memcpy(d + 512 + 2 * jj, &mb, 2);
++                            for (size_t i = 0; i < 16; ++i) {
++                                const uint8_t byte = q[(q41 ? 4 : 2) + i];
++                                const uint8_t lo = byte & 0xF, hi = byte >> 4;   // GGUF: value i | value i + 16
++                                const size_t p0 = rb * 4096 + (kb * 32 + i) * 16 + rl;
++                                d[1024 + (p0 >> 1)] |= (p0 & 1) ? lo << 4 : lo;
++                                const size_t p1 = p0 + 256;
++                                d[1024 + (p1 >> 1)] |= (p1 & 1) ? hi << 4 : hi;
++                            }
++                        }
++                    }
++                }
++            }
++        }
+     } else if (op.op == "gp_bfp16") {
+         // the block prefill's attention projections (OPEN-PREFILL-GPTOSS): a GGUF tensor's rows (its
+         // own blocks, Q8_0 exactly, GgufFile::embed_row) as rows [row0, row0 + rows) of an n_total-row
+--- a/src/open_qwen36/core.hpp
++++ b/src/open_qwen36/core.hpp
+@@ -607,6 +607,9 @@
+         std::vector<float> w, bias, down_bias;   ///< [experts][hidden_real], [experts], [experts][hidden_real]
+     };
+     std::map<int, GxRouter> gx_router_;
++    /// Flint's router on the host between fl_att and fl_moe (manifest.hpp Step::flint_route).
++    void flint_route(const Step& s, int layer);
++    std::map<int, std::vector<float>> fl_router_;   ///< flint_route's per-layer F32 router [experts][hidden_real]
+     void log(const std::string& s) const;
+ 
+     // ---- the block route's helpers (core.cpp)
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -1920,9 +1920,77 @@
+ 
+ void Core::host_step(const Step& s, int layer) {
+     if (s.op == "gptoss_route") gptoss_route(s, layer);
++    else if (s.op == "flint_route") flint_route(s, layer);
+     else route(kerns_.at(s.kernel), layer, s.act_off);
+ }
+ 
++void Core::flint_route(const Step& s, int layer) {
++    // Flint's router (OPEN-FAMILY-FLINT; transformers' FlintTopKRouter, llama.cpp's build_moe_ffn with
++    // the sigmoid gate): logits = W xm over xm as fl_att wrote it (bf16), in double; scores = sigmoid;
++    // the top `r_topk` scores (ties to the lower expert, as a stable sort gives), renormalised over the
++    // chosen -- no bias, scale 1. Then each `shared` pool expert (the ungated shared expert's halves) in
++    // the next slot at weight 1. The weights go beside xm, inside the x element fl_moe's cores take
++    // (fl_wgrab); the slots' experts into fl_moe's fills (moeroute2's table).
++    auto t0 = std::chrono::steady_clock::now();
++    Kern& k = kerns_.at(s.kernel);
++    if (k.moe2.empty()) throw std::runtime_error("open_qwen36: flint_route on " + k.name + ", which has no routed-expert table");
++    const size_t hr = s.hidden_real, E = s.r_experts, K = s.r_topk, S = K + s.shared.size();
++    if (hr > w_->hidden || S != w_->moe.topk || E > w_->moe.experts)
++        throw std::runtime_error("open_qwen36: flint_route geometry (topk + shared must be the moe slots)");
++    auto it = fl_router_.find(layer);
++    if (it == fl_router_.end()) {
++        std::string n = s.router;
++        for (size_t p = n.find("{l}"); p != std::string::npos; p = n.find("{l}")) n.replace(p, 3, std::to_string(layer));
++        std::vector<float> w = file_->f32(n);
++        if (w.size() != E * hr)
++            throw std::runtime_error("open_qwen36: layer " + std::to_string(layer) + ": flint_route's router is not [" +
++                                     std::to_string(E) + ", " + std::to_string(hr) + "]");
++        it = fl_router_.emplace(layer, std::move(w)).first;
++    }
++    const std::vector<float>& W = it->second;
++    xrt::bo& act = act_[layer];
++    read_back(act, hr * 2, s.a_xm);
++    const uint16_t* xb = reinterpret_cast<const uint16_t*>(act.map<uint8_t*>() + s.a_xm);
++    std::vector<double> x(hr);
++    for (size_t i = 0; i < hr; ++i) x[i] = bf16_to_f32(xb[i]);
++    std::vector<double> score(E);
++    for (size_t e = 0; e < E; ++e) {
++        const float* wr = W.data() + e * hr;
++        double acc = 0.0;
++        for (size_t i = 0; i < hr; ++i) acc += static_cast<double>(wr[i]) * x[i];
++        score[e] = 1.0 / (1.0 + std::exp(-acc));
++    }
++    std::vector<uint32_t> order(E);
++    for (size_t e = 0; e < E; ++e) order[e] = static_cast<uint32_t>(e);
++    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return score[a] > score[b]; });
++    uint32_t idx[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++    float wv[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++    double sum = 0.0;
++    for (size_t j = 0; j < K; ++j) sum += score[order[j]];
++    for (size_t j = 0; j < K; ++j) {
++        idx[j] = order[j];
++        wv[j] = static_cast<float>(score[order[j]] / sum);
++    }
++    for (size_t j = 0; j < s.shared.size(); ++j) {
++        idx[K + j] = s.shared[j];
++        wv[K + j] = 1.0f;
++    }
++    uint8_t* a = act.map<uint8_t*>();
++    std::memcpy(a + s.a_w, wv, sizeof wv);
++    act.sync(XCL_BO_SYNC_BO_TO_DEVICE, sizeof wv, s.a_w);
++    if (route_log_on_) {
++        std::vector<uint8_t> rec(sizeof idx + sizeof wv);
++        std::memcpy(rec.data(), idx, sizeof idx);
++        std::memcpy(rec.data() + sizeof idx, wv, sizeof wv);
++        route_log_.push_back({layer, rec});
++    }
++    for (size_t j = 0; j < S; ++j)
++        if (idx[j] >= w_->moe.experts) throw std::runtime_error("open_qwen36: flint_route slot expert " + std::to_string(idx[j]));
++    stream_patch::moe2_apply(k.iw(), k.moe2, idx, w_->moe);
++    k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
++    timing_.route_ms += ms_since(t0);
++}
++
+ void Core::gptoss_route(const Step& s, int layer) {
+     // GPT-OSS's router (OPEN-FAMILY-GPTOSS), on the host because the host has to read the choice
+     // anyway to point gx_moe's fills: logits = W xm + b over xm as gx_att wrote it (bf16), the
+--- a/src/open_qwen36/gguf_pack_test.cpp
++++ b/src/open_qwen36/gguf_pack_test.cpp
+@@ -360,6 +360,35 @@
+     std::printf("%s std_perm_gguf (%zu of %u values differ)\n", bad ? "FAIL" : "ok", bad, op.nch * 32u * 256u);
+     if (bad) return 1;
+ 
++    // ---- fl_q4 (Flint): the whole tensor is std_perm_gguf's q4_1-law bytes, and so are two 256-column
++    // "experts" one band apart (expert e = k-tile e: std_perm's chunks 2e, 2e + 1); gate | up interleave
++    // through the band stride
++    {
++        std::vector<uint8_t> want(static_cast<size_t>(op.nch) * 5120, 0), got(want.size(), 0), two(want.size(), 0);
++        pools::apply(op, g, 0, want.data(), want.size(), 5120);
++        PackOp f;
++        f.op = "fl_q4";
++        f.tensor = "blk.0.attn_q.weight";
++        f.rows = 64;
++        f.in_dim = 512;
++        pools::apply(f, g, 0, got.data(), got.size(), 5120);
++        f.in_dim = 256;
++        f.experts = 2;
++        f.cols = 256;
++        f.expert_bytes = 2 * 5120;
++        pools::apply(f, g, 0, two.data(), two.size(), 5120);
++        std::vector<uint8_t> il(4 * 5120, 0);                   // band stride 2 bands: expert 0 at 0, 1 at 1 band
++        f.expert_bytes = 2 * 5120;
++        f.stripe_bytes = 4 * 5120;
++        f.experts = 1;
++        f.chunk0 = 256;
++        pools::apply(f, g, 0, il.data() + 2 * 5120, 2 * 5120, 5120);
++        const bool ok = got == want && two == want && std::memcmp(il.data() + 2 * 5120, want.data() + 2 * 5120, 2 * 5120) == 0;
++        std::printf("%s fl_q4 = std_perm_gguf's q4_1 law (whole, two column experts, one offset column block)\n",
++                    ok ? "ok   " : "FAIL");
++        if (!ok) return 1;
++    }
++
+     // Q4_0 has a two-byte header (d only), unlike Q4_1's d+m header. Exercise
+     // the same pack path separately so its code offset cannot drift to +4.
+     {

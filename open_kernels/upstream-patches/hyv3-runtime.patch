@@ -1,0 +1,191 @@
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -61,7 +61,7 @@
+ 
+ /// One verb of a layer type's (or the tail's) program.
+ struct Step {
+-    std::string op;                          ///< run | moeroute2 | gptoss_route | flint_route
++    std::string op;                          ///< run | moeroute2 | gptoss_route | flint_route | hy_route
+     std::string kernel;
+     /// gptoss_route (GPT-OSS): the router on the host between the attention and MoE dispatches.
+     /// It reads xm (bf16 [hidden_real] at act a_xm), takes the top experts of `router` (F32
+@@ -75,6 +75,14 @@
+     /// in the next slot at weight 1; the weights (f32[8]) at a_w, the slots' experts into `kernel`'s fills.
+     uint64_t r_experts = 0, r_topk = 0;
+     std::vector<uint32_t> shared;
++    /// hy_route (HY V3, OPEN-FAMILY-HYV3): sigmoid scores s of `router` over xm; the top `r_topk` of
++    /// s + `router_bias` (F32 [r_experts], the selection bias); their UNBIASED s renormalised times
++    /// `r_scale` into slots 0..r_topk-1, then each `shared` pool expert at weight 1 -- `r_slots` slots in
++    /// all, the weights f32[16] at a_w. `r_dense`: no router, slots 0..r_slots-1 = pool experts
++    /// 0..r_slots-1 at weight 1 (a dense MLP's slices).
++    double r_scale = 1.0;
++    uint64_t r_slots = 0;
++    bool r_dense = false;
+     std::vector<std::string> args;           ///< run: buffer names (per-layer: pool consts act state; else globals)
+     uint64_t act_off = 0;                    ///< moeroute2: the router record's offset in `act`
+     std::string fmt;                         ///< run, dense block route: "" = the q4_1 GEMMs, "bfp16" = gemm_bfp16
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -150,6 +150,24 @@
+             st.shared = s.value("shared", std::vector<uint32_t>{});
+             if (!st.hidden_real || !st.r_experts || !st.r_topk || st.r_topk > st.r_experts || st.r_topk + st.shared.size() > 8)
+                 fail(where, "flint_route: hidden_real / experts / topk, and topk + shared slots within the route's 8");
++        } else if (st.op == "hy_route") {
++            st.a_w = get<uint64_t>(s, "a_w", where);
++            st.r_slots = get<uint64_t>(s, "slots", where);
++            st.r_dense = s.value("dense", false);
++            if (!st.r_slots || st.r_slots > 16) fail(where, "hy_route: slots must be 1..16 (the f32[16] weight record)");
++            if (!st.r_dense) {
++                st.a_xm = get<uint64_t>(s, "a_xm", where);
++                st.hidden_real = get<uint64_t>(s, "hidden_real", where);
++                st.router = get<std::string>(s, "router", where);
++                st.router_bias = get<std::string>(s, "bias", where);
++                st.r_experts = get<uint64_t>(s, "experts", where);
++                st.r_topk = get<uint64_t>(s, "topk", where);
++                st.r_scale = get<double>(s, "scale", where);
++                st.shared = s.value("shared", std::vector<uint32_t>{});
++                if (!st.hidden_real || !st.r_experts || !st.r_topk || st.r_topk > st.r_experts ||
++                    st.r_topk + st.shared.size() != st.r_slots)
++                    fail(where, "hy_route: hidden_real / experts / topk, and topk + shared must be the slots");
++            }
+         } else {
+             fail(where, "unknown program op '" + st.op + "'");
+         }
+@@ -163,7 +181,7 @@
+ void check_step(const Manifest& m, const Step& s, const std::string& where, const char* what) {
+     auto it = m.kernels.find(s.kernel);
+     if (it == m.kernels.end()) fail(where, std::string(what) + " names unknown kernel " + s.kernel);
+-    if ((s.op == "moeroute2" || s.op == "gptoss_route" || s.op == "flint_route") && it->second.patch != "moeroute2")
++    if ((s.op == "moeroute2" || s.op == "gptoss_route" || s.op == "flint_route" || s.op == "hy_route") && it->second.patch != "moeroute2")
+         fail(where, std::string(what) + ": " + s.op + " on kernel " + s.kernel + ", whose patch is '" +
+                         (it->second.patch.empty() ? std::string("none") : it->second.patch) + "'");
+ }
+@@ -231,7 +249,8 @@
+     m.moe.share_up = get<uint64_t>(moe, "share_up", mw);
+     m.moe.share_gate = get<uint64_t>(moe, "share_gate", mw);
+     m.moe.share_down = get<uint64_t>(moe, "share_down", mw);
+-    if (m.moe.topk > 8 || m.moe.topk == 0) fail(mw, "topk " + std::to_string(m.moe.topk) + " (the router record holds 8)");
++    // the device router's record holds 8 (Core::route checks it); a host route (hy_route) fills up to 16 slots
++    if (m.moe.topk > 16 || m.moe.topk == 0) fail(mw, "topk " + std::to_string(m.moe.topk) + " (at most 16 slots)");
+     }
+     m.attn.kv_row = m.kv_row;
+     m.attn.ptab_row = m.ptab_row;
+--- a/src/open_qwen36/core.hpp
++++ b/src/open_qwen36/core.hpp
+@@ -610,6 +610,9 @@
+     /// Flint's router on the host between fl_att and fl_moe (manifest.hpp Step::flint_route).
+     void flint_route(const Step& s, int layer);
+     std::map<int, std::vector<float>> fl_router_;   ///< flint_route's per-layer F32 router [experts][hidden_real]
++    /// HY V3's router on the host between hy_att and hy_moe (manifest.hpp Step::hy_route).
++    void hy_route(const Step& s, int layer);
++    std::map<int, std::pair<std::vector<float>, std::vector<float>>> hy_router_;   ///< per layer: router, bias
+     void log(const std::string& s) const;
+ 
+     // ---- the block route's helpers (core.cpp)
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -1855,6 +1855,8 @@
+ void Core::route(Kern& k, int layer, uint64_t act_off) {
+     auto t0 = std::chrono::steady_clock::now();
+     if (k.moe2.empty()) throw std::runtime_error("open_qwen36: moeroute2 on " + k.name + ", which has no routed-expert table");
++    if (w_->moe.topk > 8) throw std::runtime_error("open_qwen36: moeroute2's router record holds 8 slots, the moe geometry has " +
++                                                   std::to_string(w_->moe.topk));
+     xrt::bo& act = act_[layer];
+     const size_t off = act_off + w_->rout_idx_off;
+     if (route_log_on_) {
+@@ -1921,9 +1923,95 @@
+ void Core::host_step(const Step& s, int layer) {
+     if (s.op == "gptoss_route") gptoss_route(s, layer);
+     else if (s.op == "flint_route") flint_route(s, layer);
++    else if (s.op == "hy_route") hy_route(s, layer);
+     else route(kerns_.at(s.kernel), layer, s.act_off);
+ }
+ 
++void Core::hy_route(const Step& s, int layer) {
++    // HY V3's router (OPEN-FAMILY-HYV3; transformers' HYV3TopKRouter, llama.cpp's build_moe_ffn with the
++    // sigmoid gate, exp_probs_b, expert_weights_norm and expert_weights_scale): logits = W xm over xm as
++    // hy_att wrote it (bf16), in double; s = sigmoid; the top `r_topk` of s + bias (ties to the lower
++    // expert, as a stable sort gives); the weights are the chosen UNBIASED s / their sum * r_scale. Then
++    // each `shared` pool expert (the ungated shared expert) in the next slot at weight 1. Dense mode (the
++    // leading dense-MLP layer): slots 0..r_slots-1 are pool experts 0..r_slots-1 at weight 1. The weights
++    // (f32[16]) go beside xm, inside the x element hy_moe's cores take (hy_wgrab); the slots' experts into
++    // hy_moe's fills (moeroute2's table).
++    auto t0 = std::chrono::steady_clock::now();
++    Kern& k = kerns_.at(s.kernel);
++    if (k.moe2.empty()) throw std::runtime_error("open_qwen36: hy_route on " + k.name + ", which has no routed-expert table");
++    const size_t S = s.r_slots;
++    if (S != w_->moe.topk || S > 16)
++        throw std::runtime_error("open_qwen36: hy_route geometry (its slots must be the moe slots, at most 16)");
++    uint32_t idx[16] = {0};
++    float wv[16] = {0};
++    if (s.r_dense) {
++        for (size_t j = 0; j < S; ++j) {
++            idx[j] = static_cast<uint32_t>(j);
++            wv[j] = 1.0f;
++        }
++    } else {
++        const size_t hr = s.hidden_real, E = s.r_experts, K = s.r_topk;
++        if (hr > w_->hidden || E > w_->moe.experts || K + s.shared.size() != S)
++            throw std::runtime_error("open_qwen36: hy_route geometry (topk + shared must be the moe slots)");
++        auto it = hy_router_.find(layer);
++        if (it == hy_router_.end()) {
++            auto name = [&](std::string n) {
++                for (size_t p = n.find("{l}"); p != std::string::npos; p = n.find("{l}")) n.replace(p, 3, std::to_string(layer));
++                return n;
++            };
++            std::vector<float> w = file_->f32(name(s.router)), b = file_->f32(name(s.router_bias));
++            if (w.size() != E * hr || b.size() != E)
++                throw std::runtime_error("open_qwen36: layer " + std::to_string(layer) + ": hy_route's router is not [" +
++                                         std::to_string(E) + ", " + std::to_string(hr) + "] with a [" + std::to_string(E) +
++                                         "] bias");
++            it = hy_router_.emplace(layer, std::make_pair(std::move(w), std::move(b))).first;
++        }
++        const std::vector<float>& W = it->second.first;
++        const std::vector<float>& B = it->second.second;
++        xrt::bo& act = act_[layer];
++        read_back(act, hr * 2, s.a_xm);
++        const uint16_t* xb = reinterpret_cast<const uint16_t*>(act.map<uint8_t*>() + s.a_xm);
++        std::vector<double> x(hr);
++        for (size_t i = 0; i < hr; ++i) x[i] = bf16_to_f32(xb[i]);
++        std::vector<double> score(E), choice(E);
++        for (size_t e = 0; e < E; ++e) {
++            const float* wr = W.data() + e * hr;
++            double acc = 0.0;
++            for (size_t i = 0; i < hr; ++i) acc += static_cast<double>(wr[i]) * x[i];
++            score[e] = 1.0 / (1.0 + std::exp(-acc));
++            choice[e] = score[e] + static_cast<double>(B[e]);
++        }
++        std::vector<uint32_t> order(E);
++        for (size_t e = 0; e < E; ++e) order[e] = static_cast<uint32_t>(e);
++        std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return choice[a] > choice[b]; });
++        double sum = 0.0;
++        for (size_t j = 0; j < K; ++j) sum += score[order[j]];
++        for (size_t j = 0; j < K; ++j) {
++            idx[j] = order[j];
++            wv[j] = static_cast<float>(score[order[j]] / (sum + 1e-20) * s.r_scale);
++        }
++        for (size_t j = 0; j < s.shared.size(); ++j) {
++            idx[K + j] = s.shared[j];
++            wv[K + j] = 1.0f;
++        }
++    }
++    xrt::bo& act = act_[layer];
++    uint8_t* a = act.map<uint8_t*>();
++    std::memcpy(a + s.a_w, wv, sizeof wv);
++    act.sync(XCL_BO_SYNC_BO_TO_DEVICE, sizeof wv, s.a_w);
++    if (route_log_on_) {
++        std::vector<uint8_t> rec(sizeof idx + sizeof wv);
++        std::memcpy(rec.data(), idx, sizeof idx);
++        std::memcpy(rec.data() + sizeof idx, wv, sizeof wv);
++        route_log_.push_back({layer, rec});
++    }
++    for (size_t j = 0; j < S; ++j)
++        if (idx[j] >= w_->moe.experts) throw std::runtime_error("open_qwen36: hy_route slot expert " + std::to_string(idx[j]));
++    stream_patch::moe2_apply(k.iw(), k.moe2, idx, w_->moe);
++    k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
++    timing_.route_ms += ms_since(t0);
++}
++
+ void Core::flint_route(const Step& s, int layer) {
+     // Flint's router (OPEN-FAMILY-FLINT; transformers' FlintTopKRouter, llama.cpp's build_moe_ffn with
+     // the sigmoid gate): logits = W xm over xm as fl_att wrote it (bf16), in double; scores = sigmoid;

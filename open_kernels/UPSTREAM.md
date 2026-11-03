@@ -301,6 +301,52 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   `gptoss-runtime.patch` (sha256 `8a5f808e`, unchanged); `target/npu-dev/gptoss-prefill-patch.sh`
   regenerates it and checks the chain reproduces the clone.
 
+- `upstream-patches/flint-runtime.patch` (2026-10-31) runs Recursive Flint from its Q4_1 GGUF
+  (OPEN-FAMILY-FLINT, `recipes/flint.py`). Pack op `fl_q4`: a rows x in_dim block of a Q4_0 / Q4_1
+  tensor (trailing dims flattened into rows), per expert at a row / column step, into q4_1-law chunks
+  (`std_perm_gguf`'s bytes: codes kept, d / m RNE to bf16) with a per-expert and a per-band destination
+  stride, so a slot's gate and up bands interleave and the shared expert / dense MLP split into
+  512-row slots. Program step `flint_route`: the sigmoid router over xm (no bias, top 6 renormalised)
+  plus fixed shared-expert slots at weight 1, the weights beside xm and moeroute2 on the MoE dispatch.
+  `gguf_pack_test` pins `fl_q4` to `std_perm_gguf`. The diff applies over `beccd46`, the nine Gemma 4
+  patches, `gptoss-runtime.patch` (`8a5f808e`) and `gptoss-prefill-runtime.patch` (`f28a389e`), both
+  unchanged; GPT-OSS's code paths are untouched. `target/npu-dev/flint-patch.sh` regenerates it and
+  checks the chain reproduces the clone (`target/npu-dev/flint-runtime`).
+
+- `upstream-patches/hyv3-runtime.patch` (2026-10-31) runs Tencent Hy-Memory-30B-A3B (hy_v3) from our
+  pure Q4_0 GGUF (OPEN-FAMILY-HYV3, `recipes/hyv3.py`). Program step `hy_route`: the sigmoid router
+  with the per-expert selection bias (`exp_probs_b` picks, the unbiased scores weigh, renormalised and
+  scaled by `router_scaling_factor`), the shared expert's slot at weight 1, up to 16 slots in an
+  f32[16] record beside xm, moeroute2's stock apply on `hy_moe`; a dense mode points the slots at the
+  dense MLP's slices. The moe geometry's topk limit rises from 8 to 16; the device router's 8-slot
+  record is checked in `Core::route` instead. No new pack op (`fl_q4`, `gx_lmhead`, `put` are the
+  chain's). The diff applies over `beccd46`, the nine Gemma 4 patches, `gptoss-runtime.patch`,
+  `gptoss-prefill-runtime.patch` and `flint-runtime.patch` (`323e4dc8`), all unchanged;
+  `target/npu-dev/hyv3-patch.sh` regenerates it and checks the chain reproduces the clone
+  (`target/npu-dev/hyv3-runtime`).
+
+- `upstream-patches/lfm2moe-block-runtime.patch` (2026-11-03) is LFM2.5-24B-A2B's block prefill
+  (OPEN-FAMILY-LFM2MOE, `LFM2MOE_BLOCK=1`). A new `gemm_block` kind `lfm` (mixer `conv` | `att`):
+  `block_layer_lfm` runs the entry norm, the fused input GEMM, the conv's elementwise middle over the
+  block with the carried two-row f32 state (or `attention_block` with a null gate), the out GEMM, the
+  residual and `ffn_norm`; then a leading dense layer's up|gate and down GEMMs (`ffn_program`), or
+  hy_route's router arithmetic over the block (`lfm_route_rows`) and `moe_block` with mbl's
+  `[rbg][half][row]` y order (`moe_batch.y_layout`). `op_region` reads a one-tensor `fl_q4` op as the band
+  law. No new pack op. The diff applies over `beccd46`, the nine Gemma 4 patches, `gptoss-runtime.patch`,
+  `gptoss-prefill-runtime.patch`, `flint-runtime.patch` and `hyv3-runtime.patch`; it edits `moe_block`'s y
+  read like `gemma4-moe-block-runtime.patch` does, so the two are alternatives on one clone, not a stack.
+  `target/npu-dev/lfm2moe-block-patch.sh` regenerates it and checks the chain reproduces the clone
+  (`target/npu-dev/lfm2moe-runtime`).
+
+- `upstream-patches/lfm3-block-runtime.patch` (2026-11-03) is LFM3-1.7B's block prefill (OPEN-FAMILY-LFM3,
+  `LFM3_BLOCK=1`), over `lfm2moe-block-runtime.patch`. A GEMM weight may be a byte `range` of the decode pool
+  as it is (the gate | up slots' alternating 64-row bands and the mixer projections), so the pack plan and
+  every decode kernel stay as they were. The `lfm` kind gains sandwich norms (`cd_postop`, `cd_postffn`), the
+  elementwise sigmoid gate (`gate`: q | gate | k | v), a sliding `window`, the layer type's own
+  `rope_inv_freq`, `ffn_slots` (gate | up and down GEMM pairs whose outputs the host sums) and any conv tap
+  count with a (taps - 1)-row f32 state. `target/npu-dev/lfm3-block-patch.sh` regenerates it and checks the
+  chain reproduces the clone (`target/npu-dev/lfm3-runtime`).
+
 - `upstream-patches/gemma4-moe-runtime.patch` (2026-10-31) runs Gemma 4 26B-A4B from its QAT
   Q4_0 GGUF (OPEN-FAMILY-GEMMA4-MOE). Two pack ops: `g4_q40` (a Q4_0 tensor, 2-D or the
   experts' 3-D, into Q4_0-native chunks in `std_perm`'s band law, with rows and columns padded
@@ -326,6 +372,18 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   (`designs/gemma4_moe/dxm.py`) needs nothing new from the runtime (two kernels on one context,
   as `lx` / `ax` already are). Applies over `beccd46`, the nine Gemma 4 patches and
   `gemma4-moe-runtime.patch` (`target/npu-dev/gemma4-moe-runtime`).
+
+- `upstream-patches/gemma4-moe-block-runtime.patch` (2026-11-03, sha256 `e65b29f3...`) is Gemma 4
+  26B-A4B's block prefill over `gemma4-moe-decode-runtime.patch` (OPEN-FAMILY-GEMMA4-MOE). A dense
+  `gemm_block` may carry `g4_moe` (the route / combine steps and a `moe_batch` of
+  `designs/gemma4_moe_batch` streams) and an empty `attn_kernel` when it has an `attn_block`
+  (the 26B has no per-token dxB build); `step_gemm_block_layer` then closes the layer with
+  `g4_moe_tail` (t1, the host router over the f32 residual, `moe_block` reading mb4's y order, the
+  combine). The CLI gains `--force-ids-file` (teacher forcing in the decode loop). `op_region` accepts a contiguous `g4_q40` op, and the staged schedule is off for the
+  kind. Needs `G4_MOE_BATCH=1` kernels; without them the manifest has no block route and prefill
+  is sequential, as before. Applies over `beccd46`, the nine Gemma 4 patches,
+  `gemma4-moe-runtime.patch` and `gemma4-moe-decode-runtime.patch`
+  (`target/npu-dev/gemma4-moe-runtime`).
 
 - `upstream-patches/qwen35moe-gguf-runtime.patch` (2026-10-31) runs Qwen3.5 / 3.6 MoE text
   models (Ornith 1.5 35B-A3B, Nex N2.5 mini, KAT Coder V2.5 Dev) from a llama.cpp `qwen35moe`

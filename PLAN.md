@@ -146,6 +146,67 @@ long prompts, one shared copy of the experts (the prefill GEMM keeps its own 10.
 Safeguard variant. Plan: [.plans/gptoss-native.md](.plans/gptoss-native.md); spec:
 OPEN-FAMILY-GPTOSS, OPEN-PREFILL-GPTOSS.
 
+## Recursive Flint (40B-A2.5B MoE)
+
+Runs on the NPU from RecursiveSI's `flint-int4-q4_1.gguf` through its own recipe `recipes/flint.py`
+(`designs/flint/fl.py`: q4_1 GEMVs, Qwen3 q / k norms and GPT-OSS's learned sink in one attention
+program -- NoPE full layers as an identity position table, the 513-row window on the sliding ones --
+and an 8-slot expert dispatch: 6 sigmoid-routed experts plus the ungated shared expert as two
+slots) and `upstream-patches/flint-runtime.patch` (`fl_q4` pack op, `flint_route` host step). The
+GGUF's Q4_1 scales are bf16 values, so the pools are exact. `phlegm run` / `serve` answer (the
+`<think>` split, SERVER-REASONING, is not checked live on this model). Greedy tokens equal llama.cpp's; an 815-token prompt
+sits at the bf16 rounding control's distance from the fp32 reference at every position. Sequential
+prefill only (~215 ms a token on a loaded machine), decode ~190-210 ms a token. Open: block prefill,
+one context per layer, a live check of the reasoning split, a clean benchmark. Plan:
+[.plans/flint-native.md](.plans/flint-native.md); spec: OPEN-FAMILY-FLINT.
+
+## Tencent Hy-Memory-30B-A3B (hy_v3 MoE)
+
+Runs on the NPU from our own pure Q4_0 GGUF (tencent's BF16 safetensors through llama.cpp's converter
+and `llama quantize --pure`, Q8_0 head; no published file packs exactly) through its own recipe
+`recipes/hyv3.py` (`designs/hyv3/hy.py`: Flint's attention program without the sink, NEOX RoPE on every
+layer; a 9-slot expert dispatch whose 768-wide experts -- the stored width, not the config's 1536 -- run
+gate | up in slot pairs over 4 + 4 cores; the dense layer 0 as nine 768-wide slices of the same program)
+and `upstream-patches/hyv3-runtime.patch` (`hy_route`: sigmoid router, selection-only expert bias,
+renormalised x 2.826, the ungated shared expert at weight 1). Every Q4_0 scale is a bf16 value, so the
+pools are exact. A chat prompt's greedy tokens equal llama.cpp's up to the EOS both rank first; an
+836-token prompt sits at the bf16 control's distance from the fp32 reference at every position, and 32/33
+teacher-forced continuation positions agree with llama.cpp. Sequential prefill ~226 ms a token, decode
+~220-240 ms a token (development, loaded machine). `phlegm run` / `serve` answer. Open: block prefill,
+one context per layer, a clean benchmark. Plan: [.plans/hymemory-native.md](.plans/hymemory-native.md);
+spec: OPEN-FAMILY-HYV3.
+
+## LiquidAI LFM2.5-24B-A2B (lfm2_moe)
+
+Runs on the NPU from our own pure Q4_0 GGUF (LiquidAI's BF16 GGUF through `llama quantize --pure`,
+Q8_0 tied embedding; no published file packs exactly) through its own recipe `recipes/lfm2moe.py`
+(`designs/lfm2moe/lm.py`: LFM2's short conv in fl.py's fabric with f32 taps, HY V3's attention at
+head dim 64, Flint's expert program at 1536 = 3 bands a core, the dense MLP as 23 slots of 512) and
+HY V3's `hy_route` host step, unchanged (no runtime patch of its own). 51 greedy tokens of a chat
+prompt and all 32 after an 843-token prompt equal llama.cpp's; every prompt position sits inside the
+bf16 control's / llama.cpp's distance from the fp32 reference. Decode ~183 ms a token, sequential
+prefill ~151 ms a token (development, loaded machine). `phlegm run` / `serve` answer. Open: block
+prefill, the reasoning split, the QAD-Q4_0 checkpoint (a Q6_K head), a clean benchmark. Block prefill
+(`LFM2MOE_BLOCK=1`, 2026-11-03, token-batched `mbl` experts + q4 GEMMs, host elementwise middles and attention): the
+843-token prompt in 7.8 s against 105-116 s sequential (development, loaded), 32/32 greedy identical, every position inside
+the bf16 control's spread; not yet the model dir's default. Plan:
+[.plans/lfm2moe-native.md](.plans/lfm2moe-native.md); spec: OPEN-FAMILY-LFM2MOE.
+
+## LiquidAI LFM3-1.7B (lfm3)
+
+Runs on the NPU from LiquidAI's QAD-Q4_0 GGUF (derived: Q8_0 head, per-head gate rows repeated to a q-width
+projection) through its own recipe `recipes/lfm3.py` (`designs/lfm3/lg.py`: the LFM2 hybrid with a 7-tap conv, sandwich norms,
+gated attention in two kinds -- full with a half-rotated head, sliding 256 -- and a dense MLP on every layer; two dispatches a
+layer) on the existing LFM2.5 runtime, no patch of its own. 16/64/32 greedy tokens of a raw, a chat and an 843-token prompt
+equal llama.cpp's; every prompt position sits at the bf16 control's distance from the fp32 reference (835/843 argmax-equal,
+KL median 8.7e-5). `phlegm run` / `serve` answer. Decode ~100 ms a token (dispatch-bound: 48 dispatches and context
+switches; `LFM3_FUSED=1` runs one dispatch a layer: 49 ms a token, bit-identical logits, `LFM3_SHARED=1` puts conv and attention in one xclbin with two streams: ~32-38 ms a token at load ~30, bit-identical logits), sequential prefill 60-102 ms a token. Block prefill (`LFM3_BLOCK=1`, 2026-11-03, the LFM2.5 `lfm` route generalised:
+q4 GEMMs on the decode pool's bytes in place, host conv / attention middles, sandwich norms): the 843-token prompt in 2.6 s against
+50 s sequential (development, loaded), 32/32 greedy equal to llama.cpp, mean KL 2.46e-4 against 2.43e-4 sequential and 2.42e-4 for the
+bf16 control; not yet the model dir's default. Open: decode bytes (head, the 16-row gate, Q4_0-native pools), a quiet-machine timing, attention products on the NPU for prefill,
+a clean benchmark. Plan:
+[.plans/lfm3-native.md](.plans/lfm3-native.md); spec: OPEN-FAMILY-LFM3.
+
 ## Gemma 4 26B-A4B (MoE)
 
 Runs on the NPU from Google's QAT Q4_0 GGUF through `recipes/gemma4.py` (the 12B's dx.py
@@ -157,8 +218,13 @@ logit's KL against an fp32 reference matches a bf16-rounding control. `phlegm ru
 `serve` answer through the bridge. Development timing (2026-11-01, paired against the 10-31
 build): decode step 0.80x (106 against 132 ms median at load 8-20; 82 ms a token on a quieter
 run), sequential prefill 88 ms a token, logits byte-identical. Phlegm returns Gemma's thought
-channel as `reasoning_content` (SERVER-REASONING). Open: block prefill; the ten local / global
-context changes a token; a clean benchmark. Plan:
+channel as `reasoning_content` (SERVER-REASONING). Block prefill (2026-11-03, `G4_MOE_BATCH=1` kernels,
+`gemma4-moe-block-runtime.patch`, `designs/gemma4_moe_batch`): 1450 tokens in 13-15 ms a token against
+74-99 sequential (paired, alternating, load 20-30; development timing); short prompt 32/32 equal to
+llama.cpp, long prompt 17/32 then a 0.374 / 0.371 near-tie flip, prompt log-KL within the bf16
+control (mean 0.064 against 0.065) but 147 flips against the sequential route's 133. Teacher-forced decode over the same prompt: KL mean 9.0e-4 against the bf16 control's 1.0e-3, max 8.6e-3, one
+flip (the control's one). Open: the experts' weights are rounded to bf16 on the core (a hi/lo split would
+remove that); bfp16 dense GEMMs; the ten local / global context changes a token; a clean benchmark. Plan:
 [.plans/gemma4-moe.md](.plans/gemma4-moe.md); spec `OPEN-FAMILY-GEMMA4-MOE`.
 
 ## Qwen3.5 MoE 35B-A3B (Ornith 1.5, Nex N2.5 mini, KAT Coder V2.5 Dev)

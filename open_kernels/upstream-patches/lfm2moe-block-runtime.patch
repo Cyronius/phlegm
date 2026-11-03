@@ -1,0 +1,400 @@
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -130,6 +130,8 @@
+     std::map<size_t, std::string> kernels;   ///< slots -> kernel name
+     std::vector<std::string> args;           ///< pool, then the x / h / y globals
+     size_t nt = 0;                           ///< token slots per expert visit
++    /// how y[slot] comes back: "" = moe_batch's C tiles, "rbg_half_row" = designs/lfm2moe_batch/layout.py (mb4's order)
++    std::string y_layout;
+     bool present() const { return !kernels.empty(); }
+ };
+ 
+@@ -214,6 +216,16 @@
+     bool has_dense_ffn() const { return !ffn_program.empty(); }
+     // full: the attention products on the NPU (absent: attention on the host)
+     AttnBlock attn_block;
++    // kind "lfm" (LFM2-MoE, OPEN-FAMILY-LFM2MOE block prefill): the layer's mixer ("conv" | "att"), where the consts hold
++    // the entry / FFN norm weights (bf16), the conv taps (f32, tap-major [taps][hidden]) and the q / k norms (bf16),
++    // and the host router (hy_route's math). The projections are `program` (the fused input GEMM, the out GEMM);
++    // the FFN is ffn_program (a leading dense layer) or the routed experts through moe_batch.
++    std::string mixer;
++    uint64_t taps = 0;
++    int64_t cd_ln = -1, cd_ffn = -1, cd_conv = -1, cd_qnorm = -1, cd_knorm = -1;
++    std::string route_router, route_bias;
++    uint64_t route_experts = 0, route_topk = 0;
++    double route_scale = 1.0;
+ };
+ 
+ struct LayerType {
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -582,6 +582,7 @@
+                         const std::string bw = gw + ".moe_batch";
+                         MoeBatch& b = g.moe_batch;
+                         b.nt = get<uint64_t>(bj, "nt", bw);
++                        b.y_layout = bj.value("y_layout", std::string());
+                         b.args = get<std::vector<std::string>>(bj, "args", bw);
+                         if (b.nt == 0 || b.args.size() != 4 || b.args[0] != "pool")
+                             fail(bw, "wants nt > 0 and four args (pool, x, h, y)");
+@@ -623,8 +624,72 @@
+                     if (g.qw != g.nh * g.hd || g.kvw != g.kvh * g.hd || g.rot > g.hd || g.rot != m.rotary_dim)
+                         fail(gw, "qw / kvw / rot disagree with the heads and the layout rotary dim");
+                 }
++            } else if (g.kind == "lfm") {
++                g.mixer = get<std::string>(gj, "mixer", gw);
++                if (g.mixer != "conv" && g.mixer != "att") fail(gw, "mixer must be conv or att, is " + g.mixer);
++                if (g.program.size() != 2)
++                    fail(gw, "an lfm route has exactly 2 steps (the fused input projection, the output projection), has " +
++                                 std::to_string(g.program.size()));
++                g.cd_ln = get<int64_t>(gj, "cd_ln", gw);
++                g.cd_ffn = get<int64_t>(gj, "cd_ffn", gw);
++                if (g.mixer == "conv") {
++                    g.taps = get<uint64_t>(gj, "taps", gw);
++                    g.cd_conv = get<int64_t>(gj, "cd_conv", gw);
++                    if (g.taps != 3) fail(gw, "the host conv middle is the 3-tap window the LFM2-MoE kernel holds");
++                    if (t.state_kind != "linear") fail(gw, "a conv route on a layer type whose state is not linear");
++                } else {
++                    g.qw = get<uint64_t>(gj, "qw", gw);
++                    g.kvw = get<uint64_t>(gj, "kvw", gw);
++                    g.nh = get<uint64_t>(gj, "nh", gw);
++                    g.kvh = get<uint64_t>(gj, "kvh", gw);
++                    g.hd = get<uint64_t>(gj, "hd", gw);
++                    g.rot = get<uint64_t>(gj, "rot", gw);
++                    g.cd_qnorm = get<int64_t>(gj, "cd_qnorm", gw);
++                    g.cd_knorm = get<int64_t>(gj, "cd_knorm", gw);
++                    if (t.state_kind != "kv") fail(gw, "an att route on a layer type whose state is not kv");
++                    if (g.qw != g.nh * g.hd || g.kvw != g.kvh * g.hd || g.rot != g.hd || g.rot != m.rotary_dim)
++                        fail(gw, "qw / kvw / rot disagree with the heads and the layout rotary dim (the full-head rotation)");
++                }
++                if (gj.contains("ffn_program")) {
++                    g.ff = get<uint64_t>(gj, "ff", gw);
++                    g.ffn_program = parse_program(gj["ffn_program"], gw + ".ffn_program");
++                    if (g.ffn_program.size() != 2)
++                        fail(gw, "ffn_program has exactly 2 steps (up|gate, down), has " + std::to_string(g.ffn_program.size()));
++                    for (const auto& s : g.ffn_program) {
++                        check_step(m, s, gw, "gemm_block.ffn_program");
++                        if (s.op != "run" || s.args.size() != 3)
++                            fail(gw, "gemm_block.ffn_program step " + s.kernel + " must be a run with exactly 3 args");
++                    }
++                    parse_weights("ffn_weights", g.ffn_weights);
++                } else {
++                    if (!m.has_moe) fail(gw, "an lfm route without an ffn_program needs layout.moe");
++                    const json& rj = need(gj, "route", gw);
++                    g.route_router = get<std::string>(rj, "router", gw + ".route");
++                    g.route_bias = get<std::string>(rj, "bias", gw + ".route");
++                    g.route_experts = get<uint64_t>(rj, "experts", gw + ".route");
++                    g.route_topk = get<uint64_t>(rj, "topk", gw + ".route");
++                    g.route_scale = rj.value("scale", 1.0);
++                    const json& bj = need(gj, "moe_batch", gw);
++                    const std::string bw = gw + ".moe_batch";
++                    MoeBatch& b = g.moe_batch;
++                    b.nt = get<uint64_t>(bj, "nt", bw);
++                    b.y_layout = bj.value("y_layout", std::string());
++                    b.args = get<std::vector<std::string>>(bj, "args", bw);
++                    if (b.nt != 8 || b.args.size() != 4 || b.args[0] != "pool" || b.y_layout != "rbg_half_row")
++                        fail(bw, "wants nt 8, four args (pool, x, h, y) and y_layout rbg_half_row");
++                    for (const auto& [slots_s, kname] : need(bj, "kernels", bw).items()) {
++                        const size_t slots = static_cast<size_t>(std::stoull(slots_s));
++                        if (slots == 0 || slots % 8) fail(bw, "slot count " + slots_s + " is not a positive multiple of 8");
++                        auto it = m.kernels.find(kname.get<std::string>());
++                        if (it == m.kernels.end()) fail(bw, "names unknown kernel " + kname.get<std::string>());
++                        if (it->second.patch != "moebatch") fail(bw, "kernel " + it->first + " is not built with the moebatch patch table");
++                        b.kernels[slots] = it->first;
++                    }
++                    if (b.kernels.empty()) fail(bw, "names no streams");
++                    if (g.route_experts != m.moe.experts) fail(gw, "route.experts disagrees with layout.moe");
++                }
+             } else {
+-                fail(gw, "unknown kind " + g.kind + " (dense | linear | full)");
++                fail(gw, "unknown kind " + g.kind + " (dense | linear | full | lfm)");
+             }
+             // K2's grouped host norms (Stage 2.2): 1 -- also the default when the
+             // field is absent -- keeps the plain whole-row RMSNorm byte for byte.
+--- a/src/open_qwen36/core.hpp
++++ b/src/open_qwen36/core.hpp
+@@ -766,6 +766,11 @@
+     /// token-batched kernel over rows [0, t_real) of `rows`, or mx one token at a time.
+     /// `xres` (rows * hidden) is overwritten with the layer's output.
+     void block_layer_moe(int l, size_t rows, size_t t_real, float* xres);
++    /// kind "lfm" (LFM2-MoE): one whole layer over a block -- the mixer's GEMMs and host middle, the residual and
++    /// ffn_norm, then the dense MLP or the host router and the token-batched experts -- leaving the layer output in xres
++    void block_layer_lfm(int l, float* xres, size_t T, size_t t_real, size_t pos0);
++    /// hy_route's arithmetic over a block's rows of xm (rounded to bf16 as the kernels see them)
++    void lfm_route_rows(int l, const float* xm, size_t t_real, int32_t* idx, float* w);
+     /// The MoE block for one token on the sequential kernel (lx1 / ax1): xm, the router
+     /// record and the residual into `act`, route + run, the new residual out of `xres`.
+     void moe_token(int l, const float* xm, const float* res, const float* probs, const int32_t* idx, const float* w,
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -750,6 +750,29 @@
+                         throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": q_norm / k_norm is not [" +
+                                                  std::to_string(ab.hd) + "], the head dim the attention products were built for");
+                 }
++            } else if (lt.gemm_block.kind == "lfm") {
++                // LFM2-MoE: the host stages read the very bytes the kernels do, from the packed consts
++                const GemmBlockProgram& gb = lt.gemm_block;
++                HostConsts& h = hc_[l];
++                auto bf16_at = [&](int64_t off, size_t n, const char* what) {
++                    if (off < 0 || static_cast<uint64_t>(off) + n * 2 > lt.consts_bytes)
++                        throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": the " + what + " offset is outside the consts");
++                    std::vector<float> v(n);
++                    const uint16_t* b = reinterpret_cast<const uint16_t*>(c_host + off);
++                    for (size_t i = 0; i < n; ++i) v[i] = bf16_to_f32(b[i]);
++                    return v;
++                };
++                h.ln = bf16_at(gb.cd_ln, w_->hidden, "entry norm");
++                h.postln = bf16_at(gb.cd_ffn, w_->hidden, "ffn norm");
++                if (gb.mixer == "conv") {
++                    if (gb.cd_conv < 0 || static_cast<uint64_t>(gb.cd_conv) + gb.taps * w_->hidden * 4 > lt.consts_bytes)
++                        throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": the conv taps are outside the consts");
++                    h.convw.resize(gb.taps * w_->hidden);
++                    std::memcpy(h.convw.data(), c_host + gb.cd_conv, h.convw.size() * 4);
++                } else {
++                    h.qn = bf16_at(gb.cd_qnorm, gb.hd, "q norm");
++                    h.kn = bf16_at(gb.cd_knorm, gb.hd, "k norm");
++                }
+             } else {
+                 // the MoE kinds' host stages read their small tensors straight from the
+                 // file, by the names the consts plan carries (no consts layout knowledge here)
+@@ -2553,6 +2576,10 @@
+     const PackOp& op = ops[idx];
+     // the GEMM dequantises the q4_1 band law, which is what std_perm writes; a q8_perm
+     // projection has no route (the recipe does not emit one) and is refused here too
++    // (an fl_q4 op that is one contiguous tensor -- LFM2-MoE's projections -- writes the same law: 64-row bands of
++    // in_dim / 128 chunks)
++    if (op.op == "fl_q4" && op.experts <= 1 && op.stripe_bytes == 0)
++        return {static_cast<size_t>(op.dst), static_cast<size_t>(op.rows / 64 * (op.in_dim / 128)) * w_->chunk_bytes};
+     if (op.op != "std_perm" && op.op != "std_perm_gguf")
+         throw std::runtime_error("open_qwen36: op_region: " + from + " op " + std::to_string(idx) + " is a " + op.op +
+                                  ", not a band-law projection the GEMM reads");
+@@ -3391,6 +3418,10 @@
+     moe_stage_resize(T);
+     for (int l = 0; l < nl_; ++l) {
+         const std::string& kind = types_[l]->gemm_block.kind;
++        if (kind == "lfm") {
++            block_layer_lfm(l, xres.data(), T, t_real, static_cast<size_t>(pos_));
++            continue;
++        }
+         if (kind == "linear") block_layer_linear(l, xres.data(), T, t_real, 0, true, true);
+         else if (kind == "full") block_layer_full(l, xres.data(), T, t_real, static_cast<size_t>(pos_), 0, true);
+         else throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + " (" + types_[l]->name + ") has no block route");
+@@ -4835,6 +4866,33 @@
+         // belongs to exactly one token, so the un-interleave is the scatter -- read the tiles
+         // straight into the token's row rather than staging 20 MB a layer and reading it back.
+         const size_t NG = NT / 8;                      // mmul sub-tiles a slot holds
++        if (mb.y_layout == "rbg_half_row") {
++            // designs/lfm2moe_batch/layout.py: per slot [rbg][half][row r][2 groups][2 parities][NG][8 t][8 j] f32,
++            // output row = 64 band + 16 (2 half + group) + 2 j + parity, band = 4 rbg + r
++#pragma omp parallel for
++            for (long long t = 0; t < static_cast<long long>(t_real); ++t) {
++                float* o = out + t * hid;
++                for (const auto& [col, wt] : per_token[t]) {
++                    const size_t tt = col % NT;
++                    const float* sl = yh + (col / NT) * hid * NT;
++                    for (size_t band = 0; band < hid / 64; ++band) {
++                        const size_t rbg = band / 4, r = band % 4;
++                        for (size_t half = 0; half < 2; ++half) {
++                            const float* el = sl + ((rbg * 2 + half) * 4 + r) * 256;
++                            for (size_t gg = 0; gg < 2; ++gg)
++                                for (size_t p = 0; p < 2; ++p) {
++                                    const float* v = el + ((gg * 2 + p) * NG + tt / 8) * 64 + (tt % 8) * 8;
++                                    float* d = o + band * 64 + (2 * half + gg) * 16 + p;
++                                    for (size_t j = 0; j < 8; ++j) d[2 * j] += wt * v[j];
++                                }
++                        }
++                    }
++                }
++            }
++            timing_.moe_read_ms += ms_since(t2);
++            done += n;
++            continue;
++        }
+ #pragma omp parallel for
+         for (long long t = 0; t < static_cast<long long>(t_real); ++t) {
+             float* o = out + t * hid;
+@@ -4859,6 +4917,168 @@
+     timing_.route_ms += ms_since(tp);
+ }
+ 
++// ---- kind "lfm": LFM2-MoE's block layer (OPEN-FAMILY-LFM2MOE, recipes/lfm2moe.py gemm_route; the mixer's GEMMs on the
++// NPU, the conv / attention middle and the norms on the host, the leading dense layers' two MLP GEMMs or the host
++// router and the token-batched experts)
++void Core::lfm_route_rows(int l, const float* xm, size_t t_real, int32_t* idx, float* wout) {
++    const GemmBlockProgram& gb = types_[l]->gemm_block;
++    const size_t hid = w_->hidden, E = gb.route_experts, K = gb.route_topk;
++    auto it = hy_router_.find(l);
++    if (it == hy_router_.end()) {
++        auto name = [&](std::string n) {
++            for (size_t p = n.find("{l}"); p != std::string::npos; p = n.find("{l}")) n.replace(p, 3, std::to_string(l));
++            return n;
++        };
++        std::vector<float> w = file_->f32(name(gb.route_router)), b = file_->f32(name(gb.route_bias));
++        if (w.size() != E * hid || b.size() != E)
++            throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": the router is not [" + std::to_string(E) + ", " +
++                                     std::to_string(hid) + "] with a [" + std::to_string(E) + "] bias");
++        it = hy_router_.emplace(l, std::make_pair(std::move(w), std::move(b))).first;
++    }
++    const std::vector<float>& W = it->second.first;
++    const std::vector<float>& B = it->second.second;
++#pragma omp parallel for
++    for (long long tt = 0; tt < static_cast<long long>(t_real); ++tt) {
++        const size_t t = static_cast<size_t>(tt);
++        std::vector<double> x(hid), score(E), choice(E);
++        for (size_t i = 0; i < hid; ++i) x[i] = bf16_to_f32(f32_to_bf16(xm[t * hid + i]));
++        for (size_t e = 0; e < E; ++e) {
++            const float* wr = W.data() + e * hid;
++            double acc = 0.0;
++            for (size_t i = 0; i < hid; ++i) acc += static_cast<double>(wr[i]) * x[i];
++            score[e] = 1.0 / (1.0 + std::exp(-acc));
++            choice[e] = score[e] + static_cast<double>(B[e]);
++        }
++        std::vector<uint32_t> order(E);
++        for (size_t e = 0; e < E; ++e) order[e] = static_cast<uint32_t>(e);
++        std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return choice[a] > choice[b]; });
++        double sum = 0.0;
++        for (size_t j = 0; j < K; ++j) sum += score[order[j]];
++        for (size_t j = 0; j < K; ++j) {
++            idx[t * K + j] = static_cast<int32_t>(order[j]);
++            wout[t * K + j] = static_cast<float>(score[order[j]] / (sum + 1e-20) * gb.route_scale);
++        }
++    }
++}
++
++void Core::block_layer_lfm(int l, float* xres, size_t T, size_t t_real, size_t pos0) {
++    const LayerType& lt = *types_[l];
++    const GemmBlockProgram& gb = lt.gemm_block;
++    const HostConsts& hc = hc_[l];
++    const size_t hid = w_->hidden;
++    if (gb.has_dense_ffn() == gb.moe_batch.present())
++        throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": an lfm route has a dense MLP or the experts, not " +
++                                 (gb.has_dense_ffn() ? "both" : "neither"));
++    float* res = moe_.res.data();
++    float* xm = moe_.xm.data();
++    auto tn = std::chrono::steady_clock::now();
++    float* xn = BlockScratch::fit(bs_.xn, T * hid);
++    host::rmsnorm_rows(xres, T, hid, hc.ln.data(), gb.eps, xn);
++    timing_.part1_ms += ms_since(tn);
++    timing_.prenorm_ms += ms_since(tn);
++    xrt::bo& st = state_[l];
++    float* mid = nullptr;       // [T, K of the out projection]: the mixer's output rows
++    size_t mid_k = 0;
++    if (gb.mixer == "conv") {
++        const float* yq = gemm_run(gb.program[0], xn, T, hid, 3 * hid, l);
++        float* Bp = BlockScratch::fit(bs_.part[0], T * hid);
++        float* Cp = BlockScratch::fit(bs_.part[1], T * hid);
++        float* Up = BlockScratch::fit(bs_.part[2], T * hid);
++        {
++            auto tt = std::chrono::steady_clock::now();
++            const host::TransposePart parts[3] = {{Bp, 0, hid}, {Cp, hid, hid}, {Up, 2 * hid, hid}};
++            host::transpose_parts(yq, T, parts, 3);
++            timing_.part1_ms += ms_since(tt);
++            timing_.gemm_tr_ms += ms_since(tt);
++        }
++        // the two previous bx rows (oldest first) live in the state BO; the host slides them over the block
++        auto ts = std::chrono::steady_clock::now();
++        read_back(st, lt.state_bytes, 0);
++        timing_.state_ms += ms_since(ts);
++        float* s0 = reinterpret_cast<float*>(st.map<uint8_t*>());
++        float* s1 = s0 + hid;
++        float* y = BlockScratch::fit(bs_.og, T * hid);
++        auto t0 = std::chrono::steady_clock::now();
++        const float* w0 = hc.convw.data();
++        const float* w1 = w0 + hid;
++        const float* w2 = w1 + hid;
++#pragma omp parallel for
++        for (long long cc = 0; cc < static_cast<long long>(hid); ++cc) {
++            const size_t c = static_cast<size_t>(cc);
++            float p2 = s0[c], p1 = s1[c];
++            for (size_t t = 0; t < t_real; ++t) {
++                const float bx = Bp[t * hid + c] * Up[t * hid + c];
++                const float conv = p2 * w0[c] + p1 * w1[c] + bx * w2[c];
++                y[t * hid + c] = Cp[t * hid + c] * conv;
++                p2 = p1;
++                p1 = bx;
++            }
++            for (size_t t = t_real; t < T; ++t) y[t * hid + c] = 0.f;
++            s0[c] = p2;
++            s1[c] = p1;
++        }
++        timing_.part1_ms += ms_since(t0);
++        timing_.mid_ms += ms_since(t0);
++        ts = std::chrono::steady_clock::now();
++        st.sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
++        timing_.state_ms += ms_since(ts);
++        mid = y;
++        mid_k = hid;
++    } else {
++        const size_t qw = gb.qw, kvw = gb.kvw;
++        const float* yf = gemm_run(gb.program[0], xn, T, hid, qw + 2 * kvw, l);
++        float* q = BlockScratch::fit(bs_.part[0], T * qw);
++        float* k = BlockScratch::fit(bs_.part[1], T * kvw);
++        float* v = BlockScratch::fit(bs_.part[2], T * kvw);
++        {
++            auto tt = std::chrono::steady_clock::now();
++            const host::TransposePart parts[3] = {{q, 0, qw}, {k, qw, kvw}, {v, qw + kvw, kvw}};
++            host::transpose_parts(yf, T, parts, 3);
++            timing_.part1_ms += ms_since(tt);
++            timing_.gemm_tr_ms += ms_since(tt);
++        }
++        const size_t row = lt.state_row;
++        auto ts = std::chrono::steady_clock::now();
++        if (pos0 > 0) read_back(st, pos0 * row, 0);
++        timing_.state_ms += ms_since(ts);
++        host::AttnGeom g;
++        g.T = T; g.t_real = t_real; g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
++        g.pos0 = pos0; g.eps = gb.eps;
++        float* og = BlockScratch::fit(bs_.og, T * qw);
++        auto t0 = std::chrono::steady_clock::now();
++        host::attention_block(g, q, k, v, nullptr, hc.qn.data(), hc.kn.data(), w_->rope_inv_freq.data(),
++                              st.map<uint16_t*>(), row / 2, og);
++        timing_.part1_ms += ms_since(t0);
++        timing_.mid_ms += ms_since(t0);
++        timing_.attn_ms += ms_since(t0);
++        ts = std::chrono::steady_clock::now();
++        st.sync(XCL_BO_SYNC_BO_TO_DEVICE, t_real * row, pos0 * row);
++        timing_.state_ms += ms_since(ts);
++        mid = og;
++        mid_k = qw;
++    }
++    gemm(gb.program[1], mid, T, mid_k, hid, l, gout_);
++    auto t1 = std::chrono::steady_clock::now();
++    const std::vector<float>& out = gout_;
++#pragma omp parallel for
++    for (long long i = 0; i < static_cast<long long>(T * hid); ++i) res[i] = xres[i] + out[i];
++    host::rmsnorm_rows(res, T, hid, hc.postln.data(), gb.eps, xm);
++    timing_.part1_ms += ms_since(t1);
++    timing_.tail_ms += ms_since(t1);
++    if (gb.has_dense_ffn()) {
++        ffn_block(l, gb.ffn_program, gb.ff, xm, res, T, t_real, nullptr);
++        std::memcpy(xres, res, T * hid * 4);
++        return;
++    }
++    const size_t topk = w_->moe.topk;
++    if (gb.route_topk != topk) throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": route.topk is not layout.moe.topk");
++    auto tr = std::chrono::steady_clock::now();
++    lfm_route_rows(l, xm, t_real, moe_.idx.data(), moe_.w.data());
++    timing_.route_ms += ms_since(tr);
++    if (!moe_batch_on_) throw std::runtime_error("open_qwen36: the lfm route has no per-token expert fallback (OFLM_OPEN_MOE_BATCH=0)");
++    moe_block(l, xm, res, moe_.idx.data(), moe_.w.data(), T, t_real, xres);
++}
++
+ void Core::step_rows(const int* ids, int* argmax, bool want_logits, bool draft) {
+     const size_t L = man_.rows.l, hid = w_->hidden;
+     if (!L) throw std::runtime_error("open_qwen36: this kernel set has no L-row pass (manifest `rows`)");
+--- a/src/open_qwen36/block_host.cpp
++++ b/src/open_qwen36/block_host.cpp
+@@ -659,8 +659,12 @@
+             for (size_t j = 0; j < g.hd; ++j) o[j] += a * vr[j];
+         }
+         float* out = og + t * qw + h * g.hd;
+-        const float* gt = gate + t * qw + h * g.hd;
+-        for (size_t j = 0; j < g.hd; ++j) out[j] = o[j] * sigmoid(gt[j]);
++        if (gate) {
++            const float* gt = gate + t * qw + h * g.hd;
++            for (size_t j = 0; j < g.hd; ++j) out[j] = o[j] * sigmoid(gt[j]);
++        } else {                                  // no output gate (LFM2-MoE): the attention output as it is
++            for (size_t j = 0; j < g.hd; ++j) out[j] = o[j];
++        }
+     }
+ }
+ 

@@ -479,9 +479,11 @@ impl Tokenizer {
         if let Some(token) = &eos_token {
             env.add_global("eos_token", token.clone());
         }
-        // Mirror transformers' jinja2 Environment(trim_blocks=True, lstrip_blocks=True):
-        // minijinja's default whitespace handling already strips `{%- -%}` control
-        // markers; the template exclusively uses those, so no extra config needed.
+        // Mirror transformers' jinja2 Environment(trim_blocks=True, lstrip_blocks=True). Most
+        // templates use `{%- -%}` everywhere and render the same either way; HY V3's opens with
+        // a plain `{# ... #}` comment and `{% if %}` blocks, whose newlines transformers drops.
+        env.set_trim_blocks(true);
+        env.set_lstrip_blocks(true);
         env.add_function(
             "raise_exception",
             |msg: String| -> Result<String, minijinja::Error> {

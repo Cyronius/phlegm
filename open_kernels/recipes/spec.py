@@ -49,7 +49,7 @@ class SpecError(ValueError):
 
 @dataclass(frozen=True)
 class ModelSpec:
-    family: str                       # the recipe: "qwen36moe" | "qwen35" | "qwen3" | "llama3" | "gemma3" | "hunyuan" | "granite" | "phi3" | "qwen2" | "gptoss" (no recipe yet)
+    family: str                       # the recipe: "qwen36moe" | "qwen35" | "qwen3" | "llama3" | "gemma3" | "hunyuan" | "granite" | "phi3" | "qwen2" | "gptoss" | "flint"
     hidden: int
     num_layers: int
     layer_types: tuple[str, ...]      # per layer: LINEAR | FULL | DENSE
@@ -112,6 +112,10 @@ class ModelSpec:
     # rotated ternary weight itself (its input goes through the transform too; the recipe runs
     # it as t2) -- absent for a container whose head was un-rotated to q8 at conversion.
     hadamard: dict | None = None
+    # Flint (OPEN-FAMILY-FLINT): the leading layers whose FFN is a dense `intermediate`-wide MLP
+    # instead of the experts (`mlp_only_layers` [0, 1]). 0 on every other family and then absent
+    # from to_dict(), as norm_groups is, so no shipped spec_hash moves.
+    dense_lead: int = 0
 
     # ---- derived
     @property
@@ -269,6 +273,8 @@ class ModelSpec:
         for k in GEMMA4_FIELDS:
             if d[k] == _DEFAULTS[k]:
                 del d[k]           # the Gemma 4 fields, likewise: absent on every other family
+        if d["dense_lead"] == 0:
+            del d["dense_lead"]    # Flint's, likewise
         return d
 
     def to_json(self) -> str:
@@ -854,6 +860,131 @@ def _lfm2_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
 
 
 
+def _lfm2moe_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+    """LiquidAI LFM2-MoE (`lfm2_moe`, Lfm2MoeForCausalLM; transformers' modular_lfm2_moe.py over lfm2's
+    Lfm2ShortConv / Lfm2Attention, llama.cpp's src/models/lfm2.cpp + lfm-base.cpp for arch lfm2moe):
+    LFM2's hybrid -- short depthwise causal conv layers and GQA attention layers with per-head q / k
+    RMSNorm and a full-head NEOX RoPE -- with the FFN of every layer past the first `num_dense_layers`
+    replaced by routed SiLU experts (no shared expert). Routing: sigmoid scores, a per-expert selection
+    bias (the bias picks, the unbiased scores weigh), renormalised over the top k, times
+    `routed_scaling_factor` (OPEN-FAMILY-LFM2MOE). The router constants are host arithmetic, so they
+    ride in `extra`; a config that routes otherwise is refused, as is a conv with a bias or an untied
+    head. The layer types use lfm2's names (short_conv / full_attention)."""
+    n = _need(cfg, "num_hidden_layers")
+    hidden = _need(cfg, "hidden_size")
+    heads = _need(cfg, "num_attention_heads")
+    hd = cfg.get("head_dim") or (hidden // heads if hidden % heads == 0 else None)
+    if hd is None:
+        raise SpecError(f"lfm2_moe: no head_dim in config.json and hidden_size {hidden} is not a "
+                        f"multiple of num_attention_heads {heads}")
+    rope = cfg.get("rope_parameters") or {}
+    theta = rope.get("rope_theta", cfg.get("rope_theta"))
+    if theta is None:
+        raise SpecError("lfm2_moe: config.json lacks 'rope_theta' (top level or rope_parameters)")
+    kind = rope.get("rope_type", "default")
+    if cfg.get("rope_scaling") or kind != "default":
+        raise SpecError(f"lfm2_moe: rope scaling {cfg.get('rope_scaling') or kind!r} is not supported")
+    for key, want in (("conv_bias", False), ("use_expert_bias", True), ("norm_topk_prob", True),
+                      ("tie_word_embeddings", True)):
+        if bool(cfg.get(key, want)) != want:
+            raise SpecError(f"lfm2_moe: {key} = {cfg.get(key)!r} is not implemented (need {want!r})")
+    for key in ("conv_dim", "conv_dim_out"):
+        if cfg.get(key, hidden) != hidden:
+            raise SpecError(f"lfm2_moe: {key} {cfg.get(key)} is not hidden_size {hidden}")
+    lead = int(cfg.get("num_dense_layers", 0))
+    if not 0 <= lead < n:
+        raise SpecError(f"lfm2_moe: num_dense_layers {lead} of {n} layers")
+    vocab = _need(cfg, "vocab_size")
+    return ModelSpec(
+        family="lfm2moe",
+        hidden=hidden,
+        num_layers=n,
+        layer_types=_lfm2_layer_types(cfg, n),
+        vocab=vocab,
+        real_vocab=real_vocab if real_vocab is not None else vocab,
+        num_heads=heads,
+        num_kv_heads=_need(cfg, "num_key_value_heads"),
+        head_dim=hd,
+        rotary_dim=hd,
+        rope_theta=float(theta),
+        qk_norm=True,
+        attn_gate=False,
+        conv_kernel=int(cfg.get("conv_L_cache", 3)),
+        intermediate=int(_need(cfg, "intermediate_size")) if lead else 0,
+        activation="silu",
+        num_experts=_need(cfg, "num_experts"),
+        experts_per_tok=_need(cfg, "num_experts_per_tok"),
+        moe_intermediate=int(_need(cfg, "moe_intermediate_size")),
+        norm_eps=float(cfg.get("norm_eps", 1e-5)),
+        dense_lead=lead,
+        quant="q4_1",
+        extra={"model_type": cfg["model_type"], "source": "hf_config",
+               "router_scale": float(cfg.get("routed_scaling_factor", 1.0)),
+               "router": "sigmoid+bias, renormalised"},
+    )
+
+
+def _lfm3_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+    """LiquidAI LFM3 (`lfm3`, Lfm3ForCausalLM; the Hub's modeling_lfm3.py, llama.cpp arch lfm3): LFM2's hybrid
+    -- gated short depthwise causal convs (here 7 taps) and GQA attention layers with per-head q / k RMSNorm --
+    with four changes (OPEN-FAMILY-LFM3): a sandwich norm on every block output (post_operator_norm,
+    post_ffn_norm), two attention kinds (`full_attention`: theta 1e6 and the first half of the head rotated;
+    `sliding_attention`: theta 1e4, every pair, a 256-row window), a sigmoid output gate of one value a head
+    (projected from the layer input), and a dense SiLU FFN on every layer. The half-rotated head is the
+    zero-tail progression (HF Lfm3RotaryEmbedding): the first partial * hd / 2 pairs turn at theta^(-2i/hd),
+    pair i with i + hd / 2, the rest have frequency 0. Layer types: short_conv, full_attention (FULL) and
+    sliding_attention (DENSE_LOCAL)."""
+    n = _need(cfg, "num_hidden_layers")
+    hidden = _need(cfg, "hidden_size")
+    heads = _need(cfg, "num_attention_heads")
+    hd = cfg.get("head_dim") or (hidden // heads if hidden % heads == 0 else None)
+    if hd is None:
+        raise SpecError(f"lfm3: no head_dim in config.json and hidden_size {hidden} is not a "
+                        f"multiple of num_attention_heads {heads}")
+    rope = cfg.get("rope_parameters") or {}
+    full, slide = rope.get("full_attention") or {}, rope.get("sliding_attention") or {}
+    if not full or not slide:
+        raise SpecError("lfm3: config.json lacks rope_parameters for full_attention and sliding_attention")
+    for what, r in (("full_attention", full), ("sliding_attention", slide)):
+        if r.get("rope_type", "default") != "default":
+            raise SpecError(f"lfm3: {what} rope type {r.get('rope_type')!r} is not supported")
+    if float(slide.get("partial_rotary_factor", 1.0)) != 1.0:
+        raise SpecError("lfm3: a partial rotation on the sliding layers is not implemented")
+    for key, want in (("conv_bias", False), ("tie_word_embeddings", True), ("use_sandwich_norm", True)):
+        if bool(cfg.get(key, want)) != want:
+            raise SpecError(f"lfm3: {key} = {cfg.get(key)!r} is not implemented (need {want!r})")
+    names = {"conv": SHORT_CONV, "full_attention": FULL, "sliding_attention": DENSE_LOCAL}
+    lt = list(_need(cfg, "layer_types"))
+    if len(lt) != n or any(t not in names for t in lt):
+        raise SpecError(f"lfm3: layer_types {sorted(set(lt) - set(names))} / length {len(lt)} of {n}")
+    vocab = _need(cfg, "vocab_size")
+    return ModelSpec(
+        family="lfm3",
+        hidden=hidden,
+        num_layers=n,
+        layer_types=tuple(names[t] for t in lt),
+        vocab=vocab,
+        real_vocab=real_vocab if real_vocab is not None else vocab,
+        num_heads=heads,
+        num_kv_heads=_need(cfg, "num_key_value_heads"),
+        head_dim=hd,
+        rotary_dim=hd,
+        rope_theta=float(full["rope_theta"]),
+        rope_local_theta=float(slide["rope_theta"]),
+        sliding_window=int(_need(cfg, "sliding_window")),
+        qk_norm=True,
+        attn_gate=True,
+        conv_kernel=int(_need(cfg, "conv_L_cache")),
+        intermediate=int(_need(cfg, "intermediate_size")),
+        activation="silu",
+        sandwich_norms=True,
+        norm_eps=float(cfg.get("norm_eps", 1e-5)),
+        quant="q4_1",
+        extra={"model_type": cfg["model_type"], "source": "hf_config",
+               "partial_rotary_factor": float(full.get("partial_rotary_factor", 1.0))},
+    )
+
+
 # GPT-OSS's own layer-type names. `full_attention` here means a plain dense layer, NOT the
 # spec's FULL -- that one is the full-attention half of Qwen3.6's linear/full alternation.
 _GPTOSS_LAYER_TYPES = {"sliding_attention": DENSE_LOCAL, "full_attention": DENSE}
@@ -946,6 +1077,173 @@ def _gptoss_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
         norm_eps=float(cfg.get("rms_norm_eps", 1e-5)),
         quant="q4_1",
         extra={"model_type": cfg["model_type"], "source": "hf_config"},
+    )
+
+
+def _flint_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+    """Recursive Flint (`flint`, FlintForCausalLM; transformers' modular_flint.py, llama.cpp's
+    src/models/flint.cpp): GQA attention with Qwen3's per-head q / k RMSNorm and GPT-OSS's learned
+    per-head sink (`softmax_type` "learnable"), a sliding window on the `sliding_attention` layers
+    and NO positional encoding on the `full_attention` ones (RoPE on exactly the sliding layers;
+    `no_rope_layer_indices` must name the full ones), `mlp_only_layers` leading dense SiLU MLPs, then
+    routed SiLU experts with an UNGATED shared expert always added in full, routed by sigmoid scores
+    (no expert bias) renormalised over the top k.
+
+    The sink, the NoPE full layers, the sigmoid router and the ungated shared expert are family
+    properties: the derivation refuses a config that says otherwise rather than recording it, so a
+    differently-built Flint cannot silently run on these kernels (OPEN-FAMILY-FLINT)."""
+    n = _need(cfg, "num_hidden_layers")
+    heads = _need(cfg, "num_attention_heads")
+    hidden = _need(cfg, "hidden_size")
+    rope = cfg.get("rope_parameters") or {}
+    theta = rope.get("rope_theta", cfg.get("rope_theta"))
+    if theta is None:
+        raise SpecError("flint: config.json lacks 'rope_theta' (top level or rope_parameters)")
+    kind = rope.get("rope_type", "default")
+    if cfg.get("rope_scaling") or kind != "default":
+        raise SpecError(f"flint: rope scaling {cfg.get('rope_scaling') or kind!r} is not supported (default RoPE only)")
+    for key, want in (("softmax_type", "learnable"), ("router_score_function", "sigmoid"),
+                      ("hidden_act", "silu"), ("attention_bias", False), ("tie_word_embeddings", False)):
+        if cfg.get(key, want) != want:
+            raise SpecError(f"flint: {key} = {cfg.get(key)!r} is not implemented (need {want!r})")
+    if cfg.get("router_expert_bias"):
+        raise SpecError("flint: router_expert_bias is not implemented (the router has no bias)")
+    if not cfg.get("norm_topk_prob", True):
+        raise SpecError("flint: norm_topk_prob false is not implemented (the top-k weights are renormalised)")
+    if int(cfg.get("decoder_sparse_step", 1)) != 1:
+        raise SpecError("flint: decoder_sparse_step != 1 is not implemented")
+    hd = cfg.get("head_dim") or None
+    if hd is None:
+        if hidden % heads:
+            raise SpecError(f"flint: no head_dim in config.json and hidden_size {hidden} is not a multiple of "
+                            f"num_attention_heads {heads}")
+        hd = hidden // heads
+    raw = tuple(cfg.get("layer_types") or ())
+    if not raw:
+        # HF's own default (FlintConfig.__post_init__): full on the first two, every fourth from 1, the last
+        raw = tuple("full_attention" if i < 2 or i % 4 == 1 or i == n - 1 else "sliding_attention" for i in range(n))
+    if len(raw) != n:
+        raise SpecError(f"flint: layer_types has {len(raw)} entries, num_hidden_layers is {n}")
+    bad = sorted({t for t in raw if t not in _GPTOSS_LAYER_TYPES})
+    if bad:
+        raise SpecError(f"flint: layer_types: unknown layer type(s) {bad} (have {sorted(_GPTOSS_LAYER_TYPES)})")
+    layers = tuple(_GPTOSS_LAYER_TYPES[t] for t in raw)
+    full = [i for i, t in enumerate(raw) if t == "full_attention"]
+    if "no_rope_layer_indices" in cfg and sorted(cfg["no_rope_layer_indices"]) != full:
+        raise SpecError(f"flint: no_rope_layer_indices {sorted(cfg['no_rope_layer_indices'])} are not the full "
+                        f"attention layers {full} (only the sliding layers rotate)")
+    window = int(cfg.get("sliding_window") or 0)
+    if DENSE_LOCAL in layers and (window <= 0 or cfg.get("use_sliding_window") is False):
+        raise SpecError("flint: the sliding_attention layers need a positive 'sliding_window'")
+    dense = sorted(int(i) for i in cfg.get("mlp_only_layers", [0, 1]))
+    if dense != list(range(len(dense))):
+        raise SpecError(f"flint: mlp_only_layers {dense} must be the leading layers (as llama.cpp's converter requires)")
+    vocab = _need(cfg, "vocab_size")
+    return ModelSpec(
+        family="flint",
+        hidden=hidden,
+        num_layers=n,
+        layer_types=layers,
+        vocab=vocab,
+        real_vocab=real_vocab if real_vocab is not None else vocab,
+        num_heads=heads,
+        num_kv_heads=_need(cfg, "num_key_value_heads"),
+        head_dim=hd,
+        rotary_dim=hd,
+        rope_theta=float(theta),
+        sliding_window=window,
+        qk_norm=True,
+        attn_gate=False,
+        intermediate=int(_need(cfg, "intermediate_size")) if dense else 0,
+        activation="silu",
+        num_experts=_need(cfg, "num_experts"),
+        experts_per_tok=_need(cfg, "num_experts_per_tok"),
+        moe_intermediate=_need(cfg, "moe_intermediate_size"),
+        shared_expert_intermediate=int(cfg.get("shared_expert_intermediate_size") or 0),
+        norm_eps=float(cfg.get("rms_norm_eps", 1e-6)),
+        dense_lead=len(dense),
+        quant="q4_1",
+        extra={"model_type": cfg["model_type"], "source": "hf_config"},
+    )
+
+
+def _hyv3_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+    """Tencent HY V3 (`hy_v3`, HYV3ForCausalLM; transformers' modular_hy_v3.py, llama.cpp's
+    src/models/hy-v3.cpp): GQA attention with Qwen3's per-head q / k RMSNorm before a full-head NEOX
+    RoPE on every layer, leading dense SiLU MLPs (`mlp_layer_types` "dense"), then routed SiLU experts
+    beside an UNGATED shared expert, routed by sigmoid scores with a per-expert selection bias (the
+    bias picks, the unbiased scores weigh), renormalised over the top k and scaled by
+    `router_scaling_factor` (OPEN-FAMILY-HYV3).
+
+    The expert width is the STORED one. Hy-Memory-30B-A3B's config says moe_intermediate_size 1536
+    but every expert and shared-expert tensor is 768 wide (`expert_hidden_dim` 768; the safetensors
+    headers, 2026-10-31), so `expert_hidden_dim` wins when present; the published value is kept in
+    `extra`. The router's constants are host arithmetic (no kernel sees them), so they ride in `extra`
+    too, and a config that routes otherwise (softmax, no bias, no renormalisation) is refused."""
+    n = _need(cfg, "num_hidden_layers")
+    heads = _need(cfg, "num_attention_heads")
+    hidden = _need(cfg, "hidden_size")
+    rope = cfg.get("rope_parameters") or {}
+    theta = rope.get("rope_theta", cfg.get("rope_theta"))
+    if theta is None:
+        raise SpecError("hy_v3: config.json lacks 'rope_theta' (top level or rope_parameters)")
+    kind = rope.get("rope_type", "default")
+    if cfg.get("rope_scaling") or kind != "default":
+        raise SpecError(f"hy_v3: rope scaling {cfg.get('rope_scaling') or kind!r} is not supported (default RoPE only)")
+    for key, want in (("hidden_act", "silu"), ("attention_bias", False), ("mlp_bias", False),
+                      ("tie_word_embeddings", False), ("qk_norm", True), ("moe_router_use_sigmoid", True),
+                      ("moe_router_enable_expert_bias", True), ("route_norm", True)):
+        if cfg.get(key, want) != want:
+            raise SpecError(f"hy_v3: {key} = {cfg.get(key)!r} is not implemented (need {want!r})")
+    if int(cfg.get("num_nextn_predict_layers") or 0):
+        raise SpecError("hy_v3: MTP (num_nextn_predict_layers) is not implemented")
+    hd = cfg.get("head_dim") or None
+    if hd is None:
+        if hidden % heads:
+            raise SpecError(f"hy_v3: no head_dim in config.json and hidden_size {hidden} is not a multiple of "
+                            f"num_attention_heads {heads}")
+        hd = hidden // heads
+    mlp = list(cfg.get("mlp_layer_types") or ())
+    if not mlp:
+        k = int(cfg.get("first_k_dense_replace", 1))
+        mlp = ["dense"] * k + ["sparse"] * (n - k)       # HF's own default (HYV3Config.__post_init__)
+    if len(mlp) != n or set(mlp) - {"dense", "sparse"}:
+        raise SpecError(f"hy_v3: mlp_layer_types must be {n} entries of dense / sparse")
+    lead = mlp.index("sparse") if "sparse" in mlp else n
+    if "dense" in mlp[lead:]:
+        raise SpecError("hy_v3: the dense-MLP layers must be the leading layers")
+    published = int(_need(cfg, "moe_intermediate_size"))
+    width = int(cfg.get("expert_hidden_dim") or published)
+    if published not in (width, 2 * width):
+        raise SpecError(f"hy_v3: moe_intermediate_size {published} vs expert_hidden_dim {width}: not a known pairing")
+    shared = int(cfg.get("num_shared_experts", 1) or 0)
+    scale = float(cfg.get("router_scaling_factor", 1.0))
+    vocab = _need(cfg, "vocab_size")
+    return ModelSpec(
+        family="hyv3",
+        hidden=hidden,
+        num_layers=n,
+        layer_types=tuple([DENSE] * n),
+        vocab=vocab,
+        real_vocab=real_vocab if real_vocab is not None else vocab,
+        num_heads=heads,
+        num_kv_heads=_need(cfg, "num_key_value_heads"),
+        head_dim=hd,
+        rotary_dim=hd,
+        rope_theta=float(theta),
+        qk_norm=True,
+        attn_gate=False,
+        intermediate=int(_need(cfg, "intermediate_size")) if lead else 0,
+        activation="silu",
+        num_experts=_need(cfg, "num_experts"),
+        experts_per_tok=_need(cfg, "num_experts_per_tok"),
+        moe_intermediate=width,
+        shared_expert_intermediate=width * shared,
+        norm_eps=float(cfg.get("rms_norm_eps", 1e-5)),
+        dense_lead=lead,
+        quant="q4_1",
+        extra={"model_type": cfg["model_type"], "source": "hf_config", "router_scale": scale,
+               "router": "sigmoid+bias, renormalised", "published_moe_intermediate": published},
     )
 
 
@@ -1786,7 +2084,8 @@ HF_FAMILIES = {"qwen3_5_moe": _qwen36moe_hf, "qwen3_5_moe_text": _qwen36moe_hf,
                "granite": _granite_hf, "phi3": _phi3_hf, "lfm2": _lfm2_hf,
                "gpt_oss": _gptoss_hf, "k2_horizon": _k2_hf, "dflash2": _dflash2_hf,
                "gemma4_unified": _gemma4_hf, "gemma4_unified_text": _gemma4_hf,
-               "gemma4": _gemma4_unsupported, "gemma4_text": _gemma4_unsupported}
+               "gemma4": _gemma4_unsupported, "gemma4_text": _gemma4_unsupported,
+               "flint": _flint_hf, "hy_v3": _hyv3_hf, "lfm2_moe": _lfm2moe_hf, "lfm3": _lfm3_hf}
 GGUF_FAMILIES = {"qwen35moe": _qwen36moe_gguf, "qwen3next": _qwen36moe_gguf, "qwen35": _qwen35_gguf, "qwen3": _qwen3_gguf, "llama": _llama3_gguf,
                  "gemma3": _gemma3_gguf, "hunyuan-dense": _hunyuan_gguf, "granite": _granite_gguf}
 _FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen35_hf: "qwen35",
@@ -1797,7 +2096,8 @@ _FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen35_
               _hunyuan_hf: "hunyuan", _hunyuan_gguf: "hunyuan",
               _granite_hf: "granite", _granite_gguf: "granite", _phi3_hf: "phi3",
               _lfm2_hf: "lfm2", _gptoss_hf: "gptoss", _k2_hf: "k2", _dflash2_hf: "dflash2",
-              _gemma4_hf: "gemma4", _gemma4_unsupported: "gemma4"}
+              _gemma4_hf: "gemma4", _gemma4_unsupported: "gemma4", _flint_hf: "flint",
+              _hyv3_hf: "hyv3", _lfm2moe_hf: "lfm2moe", _lfm3_hf: "lfm3"}
 
 
 def hf_model_types(family: str) -> list[str]:
@@ -1845,6 +2145,22 @@ ROLE_TENSORS["dflash2"] = {}
 ROLE_TENSORS["gptoss"] = {**_ATTN_HF, "ffn_up_exps.weight": "experts",
                           "ffn_gate_exps.weight": "experts", "ffn_down_exps.weight": "experts",
                           "ffn_gate_up_down_exps.weight": "experts"}
+# Flint's GGUF names (the open recipe reads only the GGUF): every matrix one role per kind
+ROLE_TENSORS["flint"] = {**_ATTN_HF, **_FFN_HF, "ffn_up_exps.weight": "experts",
+                         "ffn_gate_exps.weight": "experts", "ffn_down_exps.weight": "experts",
+                         "ffn_up_shexp.weight": "shared", "ffn_gate_shexp.weight": "shared",
+                         "ffn_down_shexp.weight": "shared"}
+# HY V3's GGUF names likewise (the recipe reads only the GGUF)
+ROLE_TENSORS["hyv3"] = dict(ROLE_TENSORS["flint"])
+# LFM2-MoE's GGUF names (the recipe reads only the GGUF): lfm2's conv roles, the experts, the dense MLP
+ROLE_TENSORS["lfm2moe"] = {**ROLE_TENSORS["flint"], "shortconv.in_proj.weight": "linear",
+                           "shortconv.out_proj.weight": "linear_out"}
+# LFM3's GGUF names: the conv roles, the attention gate (a second q-width projection, its own role as the
+# DeltaNet z is) and the dense FFN
+ROLE_TENSORS["lfm3"] = {"attn_q.weight": "attn", "attn_k.weight": "attn", "attn_v.weight": "attn",
+                        "attn_output.weight": "attn", "attn_gate.weight": "attn",
+                        "ffn_up.weight": "ffn", "ffn_gate.weight": "ffn", "ffn_down.weight": "ffn",
+                        "shortconv.in_proj.weight": "linear", "shortconv.out_proj.weight": "linear_out"}
 
 _GGUF_BLOCK = re.compile(r"^blk\.\d+\.")
 _GGUF_ROLE = {"attn_q.weight": "attn", "attn_k.weight": "attn", "attn_v.weight": "attn",
