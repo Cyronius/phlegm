@@ -43,6 +43,23 @@ def stats(name, got, ref):
     return {"rel_l2": rel, "cos": cos, "max_rel": mx}
 
 
+def law(a: np.ndarray) -> np.ndarray:
+    """q4_1-law chunk bytes -> the pool's law: unchanged, or (LFM3_Q40) the Q4_0-native 4608-B chunks (the m plane,
+    -8 d, dropped; fl_q4's Q4_0-native output)."""
+    if not FR.q40_on():
+        return a
+    c = np.asarray(a).reshape(-1, 5120)
+    return np.concatenate([c[:, :512], c[:, 1024:]], axis=1).reshape(-1)
+
+
+def MAT(*a, **k):
+    return law(P.matrix(*a, **k))
+
+
+def UG(gate, up, hid):
+    return law(P.slot_ug(gate, up, hid))
+
+
 def q4(g, name: str) -> np.ndarray:
     t = g.tensors[name]
     cols = t["dims"][0]
@@ -128,9 +145,9 @@ def main():
     if mixer == FR.MIX_CONV:
         ip = q4(g, p + "shortconv.in_proj.weight")
         for dst, r0 in ((L.POOL_B, 0), (L.POOL_C, hid), (L.POOL_U, 2 * hid)):
-            t = P.matrix(ip, hid, hid, row0=r0)
+            t = MAT(ip, hid, hid, row0=r0)
             pool[dst:dst + t.size] = t
-        t = P.matrix(q4(g, p + "shortconv.out_proj.weight"), hid, hid)
+        t = MAT(q4(g, p + "shortconv.out_proj.weight"), hid, hid)
         pool[L.POOL_OUT:L.POOL_OUT + t.size] = t
         taps = np.ascontiguousarray(wc.T.astype(np.float32)).view(np.uint8).reshape(-1)   # [7][hid] f32
         consts[L.CD_CONV:L.CD_CONV + taps.size] = taps
@@ -141,7 +158,7 @@ def main():
         for role, dst, rows, K in (("attn_q", L.POOL_Q, G.QW, hid), ("attn_gate", L.POOL_GATE, G.QW, hid),
                                    ("attn_k", L.POOL_K, G.KVW, hid), ("attn_v", L.POOL_V, G.KVW, hid),
                                    ("attn_output", L.POOL_O, hid, G.QW)):
-            t = P.matrix(q4(g, p + role + ".weight"), rows, K)
+            t = MAT(q4(g, p + role + ".weight"), rows, K)
             pool[dst:dst + t.size] = t
         for vec, n, off in ((g.array(p + "attn_q_norm.weight"), hd, L.CD_META),
                             (g.array(p + "attn_k_norm.weight"), hd, L.CD_META + 2 * hd)):
@@ -178,9 +195,9 @@ def main():
     dw = {}
     for s_ in range(FF.SLOTS):
         r0 = s_ * ff
-        ug = P.slot_ug(P.matrix(blk["ffn_gate.weight"], ff, hid, row0=r0), P.matrix(blk["ffn_up.weight"], ff, hid, row0=r0), hid)
+        ug = UG(P.matrix(blk["ffn_gate.weight"], ff, hid, row0=r0), P.matrix(blk["ffn_up.weight"], ff, hid, row0=r0), hid)
         pool[s_ * FF.EXPERT_UG:s_ * FF.EXPERT_UG + ug.size] = ug
-        down = P.matrix(blk["ffn_down.weight"], hid, ff, col0=s_ * ff)
+        down = MAT(blk["ffn_down.weight"], hid, ff, col0=s_ * ff)
         o0 = FF.POOL_DOWN + s_ * FF.UP_BYTES
         pool[o0:o0 + down.size] = down
         dw[s_] = (g.array(p + "ffn_gate.weight")[r0:r0 + ff], g.array(p + "ffn_up.weight")[r0:r0 + ff],

@@ -95,3 +95,29 @@ def test_shared_with_block_prefill(monkeypatch):
     assert all(lt["gemm_block"]["kind"] == "lfm" for lt in p["layer_types"].values())
     for k in p["kernels"].values():
         assert k["build"] in b
+
+
+def test_q40_pools_and_the_bf16_head_are_opt_in(monkeypatch):
+    from recipes import lfm3 as R
+    for k in ("LFM3_Q40", "LFM3_HEAD", "LFM3_SHARED", "LFM3_FUSED", "LFM3_BLOCK"):
+        monkeypatch.delenv(k, raising=False)
+    s = spec()
+    off = json.dumps([R.programs(s), R.builds(s), R.pack_plan(s), R.manifest_layout(s, 4096)], sort_keys=True)
+    assert R.pack_plan(s)["chunk_bytes"] == 5120 and R.pack_plan(s)["lm_head"]["ops"][0]["op"] == "gx_lmhead"
+    monkeypatch.setenv("LFM3_Q40", "1")
+    monkeypatch.setenv("LFM3_HEAD", "bf16")
+    G, L, plan, b = R.geometry(s), R.layout(s), R.pack_plan(s), R.builds(s)
+    assert plan["chunk_bytes"] == 4608 and G.CALL_BYTES == 2 * 4608 and R.band_bytes(2048) == 16 * 4608
+    assert plan["lm_head"]["ops"][0]["op"] == "gx_lmhead_bf16" and R.manifest_layout(s, 4096)["lmhead_chunk_bytes"] == 8704
+    assert L.LMHEAD_BAND_BYTES == 4 * 8 * 8704
+    assert all(o["op"] == "fl_q4" for lt in plan["layer_types"].values() for o in lt["pool"])
+    assert "LMHEAD_SCALES_F32" not in b["lm_head_q8"]["env"] and "bf16s" in b["lm_head_q8"]["build_dir"]
+    for n, e in b.items():
+        if e["design"] == "lfm3/lg.py":
+            assert e["env"]["LFM3_Q40"] == "1" and e["build_dir"].endswith("_q40")
+    monkeypatch.setenv("LFM3_BLOCK", "1")
+    gemms = {n: e for n, e in R.builds(s).items() if e["design"].startswith("gemm_q4_prefill")}
+    assert gemms and all(e["env"]["GQP_FMT"] == "q4_0" for e in gemms.values())
+    for k in ("LFM3_Q40", "LFM3_HEAD", "LFM3_BLOCK"):
+        monkeypatch.delenv(k)
+    assert json.dumps([R.programs(s), R.builds(s), R.pack_plan(s), R.manifest_layout(s, 4096)], sort_keys=True) == off
