@@ -56,7 +56,7 @@ def main():
     size_tool = Path(os.environ['PEANO_INSTALL_DIR']) / ('bin/llvm-size.exe' if os.name == 'nt' else 'bin/llvm-size')
     sections = subprocess.check_output([str(size_tool), '-A', str(work / 'elfs_main_core_0_2/elfs_main_core_0_2.elf')], text=True)
     text_bytes = int(re.search(r'^\.text\s+(\d+)', sections, re.MULTILINE)[1])
-    report = {'tag': tag, 'stub': a.stub, 'broadcast_depth': a.bdepth, 'defs': [m for m in a.defs.split(',') if m], 'packets': PACKETS, 'element_bytes': ESZ, 'packet_format': 2, 'aiecc_opt': a.opt,
+    report = {'tag': tag, 'stub': a.stub, 'broadcast_depth': a.bdepth, 'defs': [m for m in a.defs.split(',') if m], 'packets': PACKETS, 'element_bytes': ESZ, 'streams': 2, 'slots': 2, 'packet_format': 3, 'aiecc_opt': a.opt,
               'cap': a.cap, 'texts_per_dispatch': 128 // a.cap, 'cores': 32, 'layers': a.layers,
               'scope': f'One dispatch, {a.layers} full encoder layers; host embedding lookup/input norm/output projection/pooling',
               'program_text_bytes': text_bytes, 'stack_bytes_per_core': 0x1400,

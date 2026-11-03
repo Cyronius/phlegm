@@ -170,12 +170,49 @@ These were tried without gain:
 Quantizer templates specialized for fp32 and bf16 input do not fit in program memory. IRON links kernels as
 bitcode before one whole-program code generation, so per-kernel flags do not change core code size.
 
+**Eight tokens a core, 2026-11-01 (branch `trit-npu-speed2`, uncommitted; build `r9`).** A dispatch now
+carries two 128-token slots, eight token rows on each of 32 cores (it was four rows and one slot per
+dispatch). Per core and dispatch, in cycles: about 720k at the start of the day, about 540k now. What
+moved it:
+
+- each slot has its own two broadcast streams (shim columns 0/1 and 4/5), and input states and K/V go
+  only to the cores that use them; the preamble is 25 pairs, a layer 110;
+- the projection MAC loop is 4 cycles a K block (it was 6 inside `project`: start both accumulators at
+  zero, add the patterns afterwards);
+- attention: four independent accumulator chains for the scores and the output, V exported transposed
+  as bfp16, an integer running maximum folded into `exp2_64`'s exponent, a 576-byte K/V head slot;
+- the mask bias is vectorized (it was 15% of a dispatch), the input states are written by the host in
+  the cores' own layout and copied contiguously;
+- LayerNorm: gamma pre-split into bf16 halves in the packet (`parameter_packet`), two chunks a pass,
+  vector row sums (6.3k to 3.4k cycles); quantization two chunks a pass (1643 to 1349);
+- K and V are computed before Q, so their exchange overlaps Q.
+
+Host: `TritNpu.encode` tokenizes in a thread (chunks of 128 texts, each four times the last) through the
+tokenizer backend, cutting texts over 1000 characters at the next space first (exact; checked on five
+corpora), embeds only the rows in use, and reads back only the cores whose rows it pools.
+
+Quality is unchanged (`ab/qgate.py`, vs CPU): STSB 82.88 (82.87), SciFact 60.48 (60.46), minimum vector
+cosine 0.998. Speed on a quiet machine, default power mode, full gate: 36,044 sentences/s, 4,820
+SciFact abstracts/s, 0.61 ms batch 1 (build `r3`; later builds are ~15% cheaper per core but were only
+measured while the machine was loaded). Not yet measured clean (`dibs run --measure`).
+
+Full evaluation of `r9` (2026-11-03, `npu_eval.py`, NPU in turbo mode, machine loaded: another session's
+GPU job): four-task nDCG@10 33.89 against CPU 33.85 (paired 95% CI −0.11 to +0.19), STSB 82.88 (82.87),
+minimum STSB vector cosine 0.998. Speed in that run: 14,668 sentences/s, 2,209 abstracts/s, 1.01 ms batch 1.
+With fixed inputs and two runs in flight the NPU alone takes 0.40 ms a dispatch (256 tokens); the host's
+embedding lookup and input LayerNorm take 0.27 ms a dispatch and a serial submit + wait 0.69 ms, so the
+end-to-end rate is now host-bound.
+
 **Open:**
 
-- the projection epilogue (most of a packet's 600 ticks);
-- bfp16 operands converted once per head instead of once per product;
-- host work per dispatch (0.53 against 0.48 ms);
-- two 128-token slots per dispatch;
+- a clean (`dibs run --measure`) `npu_eval.py` run of `r9`;
+- host work per dispatch (above); `bench.py` still assumes one slot a dispatch and fails on `r9`;
+- program memory is nearly full (15,968 of 16,384 bytes); the cycle-profiling builds no longer fit, so
+  further kernels must also shrink code;
+- the epilogue (about 40% of a projection packet), GELU (650 cycles a packet), attention (700 cycles a
+  block), the K/V exchange (about 36k cycles a dispatch);
+- splitting each column's output over both shim channels (in `r9`) measured within noise;
+- NPU turbo power mode (`sudo xrt-smi configure --pmode turbo`) needs root; numbers above are default mode;
 - a `phlegm serve` embeddings route;
 - Windows runs (untested here).
 
