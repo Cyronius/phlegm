@@ -4812,7 +4812,19 @@ whether it moves 9 or 28 MB (a fixed cost), so the 48 dispatches of 66-68 ms a t
 steps in sequence, one host sequence. Decode 49 ms a token; logits bit-identical to the unfused route over all 843 prompt positions
 (KL 0), greedy equal to llama.cpp (16 / 64 / 32), compatible with `LFM3_BLOCK=1` (chat prompt 40 / 40, prefill 23 ms a token). Off, programs,
 builds and pack plan are unchanged. Remaining cost: the conv <-> attention xclbin switch, ~0.9 ms x ~22 a token; one shared
-two-stream image (Gemma's dxm trick) would reach ~28 ms a token (not built).
+two-stream image (Gemma's dxm trick) would reach ~28 ms a token.
+
+**Shared image (2026-11-03, development; `LFM3_SHARED=1`, implies fused).** The conv and attention layers' fused dispatches are two
+instruction streams (`LG_STREAM=conv|att`) over one xclbin (`lg_shared`): identical core programs -- the main cores run the conv's band
+counts (12, 4, then the MLP), attention padded with 2 scratch bands drained into `t` (valid because QW = HID, O_PC = SC_PC and
+OG_ELEMS = XN_ELEMS, asserted); the conv core at Tile(6, 3) on shim columns 6 / 7, the attention cores at (2..5, 3); one buffer
+signature (pool, xres, consts, state, act, ptab; the state typed at the larger of the KV and conv sizes). Only the conv stream's
+xclbin is loaded; the export checks the two agree apart from build stamps (`xclbin_equivalent`: 71 bytes, all stamps). Budgets:
+main 11 504 B text, helper 7 424, attention unchanged (<= 15 808), conv 2 272. Decode never changes hardware context between layers.
+Result: logits bit-identical to the fused route over 843 positions; greedy equal to llama.cpp (16 / 64 / 32); with `LFM3_BLOCK=1`
+32 / 32 on the 843-token prompt. Timing (paired, alternating, load ~31, noisy): decode step 60.7 -> 36.7 ms (fused -> shared), the
+attention dispatch in the walk 2.3 -> 1.1 ms; CLI decode 32-38 ms a token at load ~30; ~29 ms estimated unloaded (not measured).
+What is left is bytes: the head (282 MB, 6-8 ms), the repeated-row gate, the q4_1 m plane (11 % over Q4_0).
 
 **Block prefill (2026-11-03, development; `LFM3_BLOCK=1`).** The LFM2.5 `lfm` gemm_block kind (OPEN-FAMILY-LFM2MOE), generalised: each
 layer is the mixer's fused input GEMM (conv in_proj B | C | u, or attention q | gate | k | v with the expanded gate), a host

@@ -54,3 +54,44 @@ def test_fused_and_block_together_make_a_consistent_manifest(monkeypatch):
     assert {"gemm_n6144_k2048", "lg_convmlp", "lg_attmlp"} <= set(b)
     for k in p["kernels"].values():
         assert k["build"] in b
+
+
+def test_shared_is_one_context_two_streams_and_off_is_unchanged(monkeypatch):
+    from recipes import lfm3 as R
+    s = spec()
+    monkeypatch.delenv("LFM3_SHARED", raising=False)
+    monkeypatch.setenv("LFM3_FUSED", "1")
+    fused = json.dumps([R.programs(s), R.builds(s)], sort_keys=True)
+    plan = json.dumps(R.pack_plan(s), sort_keys=True)
+    monkeypatch.delenv("LFM3_FUSED")
+    monkeypatch.setenv("LFM3_SHARED", "1")
+    p, b = R.programs(s), R.builds(s)
+    assert json.dumps(R.pack_plan(s), sort_keys=True) == plan
+    mixers = {k: v for k, v in p["kernels"].items() if k.startswith("lg_")}
+    assert {v["context"] for v in mixers.values()} == {"lg_shared"}
+    assert p["contexts"]["lg_shared"] == "lg_shared_conv/final.xclbin"
+    assert mixers["lg_convmlp"]["insts"] == "lg_shared_conv/insts.bin"
+    assert mixers["lg_attmlp"]["insts"] == mixers["lg_attmlp_local"]["insts"] == "lg_shared_att/insts.bin"
+    assert {n: b[n]["env"] for n in ("lg_shared_conv", "lg_shared_att")} == {
+        "lg_shared_conv": {"LG_PART": "shared", "LG_STREAM": "conv"},
+        "lg_shared_att": {"LG_PART": "shared", "LG_STREAM": "att"}}
+    assert "lg_convmlp" not in b and "lg_attmlp" not in b
+    # one buffer signature: the conv layer passes the ptab it never reads
+    assert p["layer_types"][SHORT_CONV]["program"][0]["args"] == ["pool", "xres", "consts", "state", "act", "ptab"]
+    assert len(p["layer_types"][FULL]["program"][0]["args"]) == 6
+    for k in p["kernels"].values():
+        assert k["context"] in p["contexts"] and k["build"] in b
+    monkeypatch.delenv("LFM3_SHARED")
+    monkeypatch.setenv("LFM3_FUSED", "1")
+    assert json.dumps([R.programs(s), R.builds(s)], sort_keys=True) == fused
+
+
+def test_shared_with_block_prefill(monkeypatch):
+    from recipes import lfm3 as R
+    monkeypatch.setenv("LFM3_SHARED", "1")
+    monkeypatch.setenv("LFM3_BLOCK", "1")
+    s = spec()
+    p, b = R.programs(s), R.builds(s)
+    assert all(lt["gemm_block"]["kind"] == "lfm" for lt in p["layer_types"].values())
+    for k in p["kernels"].values():
+        assert k["build"] in b

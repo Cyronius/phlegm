@@ -53,7 +53,7 @@ SPEC = current_spec()
 R = FR.recipe(SPEC)
 L, G = R.layout, R.geo
 PART = os.environ.get("LG_PART", "conv")
-assert PART in ("conv", "att", "mlp", "convmlp", "attmlp"), f"LG_PART={PART!r} (conv | att | mlp | convmlp | attmlp)"
+assert PART in ("conv", "att", "mlp", "convmlp", "attmlp", "shared"), f"LG_PART={PART!r} (conv | att | mlp | convmlp | attmlp | shared)"
 F = FR.ffn(SPEC)
 POOL_BYTES = L.POOL_BYTES
 HID, QW, KVW, HD = G.HID, G.QW, G.KVW, G.HD
@@ -236,8 +236,9 @@ def conv_main(win, xin, yout, tab, f_gy, f_prep):
 
 
 def conv_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
-             scin_p, scy_c, scn_c):
+             scin_p, scy_c, scn_c, st_bytes=None):
     # 1. layer-entry norm: xn -> act
+    STB = st_bytes or L.STATE_BYTES
     tg_ln = _entry_norm(lni, lno, c_xres, a_consts, a_act)
     # 2. B | C | u: weights now, xn after the norm
     pw, py = Pipeline(3), Pipeline(3)
@@ -255,12 +256,12 @@ def conv_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x
     py.finish(*y_conss)                                       # B, C, u are in DDR
     for i in range(G.SC_ELEMS):
         ps_in.fill(scin_p, a_consts, rows_tap(L.CD_BYTES, L.CD_CONV + i * SCB, TAPS, SCB, HID * 4))
-        ps_in.fill(scin_p, a_state, rows_tap(L.STATE_BYTES, i * SCB, TAPS - 1, SCB, HID * 4))
+        ps_in.fill(scin_p, a_state, rows_tap(STB, i * SCB, TAPS - 1, SCB, HID * 4))
         ps_in.fill(scin_p, a_act, bt(L.AD_BYTES, L.AD_B + i * SCB, SCB))
         ps_in.fill(scin_p, a_act, bt(L.AD_BYTES, L.AD_C + i * SCB, SCB))
         ps_in.fill(scin_p, a_act, bt(L.AD_BYTES, L.AD_U + i * SCB, SCB))
         ps_out.drain(scy_c, a_act, bt(L.AD_BYTES, L.AD_Y + i * SCYB, SCYB))
-        ps_out.drain(scn_c, a_state, rows_tap(L.STATE_BYTES, i * SCB, TAPS - 1, SCB, HID * 4))
+        ps_out.drain(scn_c, a_state, rows_tap(STB, i * SCB, TAPS - 1, SCB, HID * 4))
     ps_out.finish()                                           # y and the new state are in DDR
     ps_in.finish()
     # 4. out projection against y (bf16 hidden: one x element, like the norm's output)
@@ -290,8 +291,9 @@ def att_main(win, xin, yout, tab, f_gy, f_prep):
 
 
 def att_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss, ain_p, aout_c,
-             og_cs):
+             og_cs, pad=0, kv_bytes=None):
     # 1. layer-entry norm: xn -> act
+    KVB = kv_bytes or L.KV_BYTES
     tg_ln = _entry_norm(lni, lno, c_xres, a_consts, a_act)
     # 2. q | gate | k | v: weights now, xn after the norm. FOUR transfers a core and channel are issued
     #    before xn exists, so the throttle must allow four (a fourth awaiting the first would never return).
@@ -300,17 +302,26 @@ def att_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prod
         pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, L.POOL_Q + c * G.Q_PC * BB_H, G.Q_PC * BB_H))
         pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, L.POOL_GATE + c * G.Q_PC * BB_H, G.Q_PC * BB_H))
         pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, L.POOL_K + c * G.KV_PC * BB_H, G.KV_PC * BB_H))
-        pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, L.POOL_V + c * G.KV_PC * BB_H, G.KV_PC * BB_H))
-        py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_Q + c * G.Q_PC * YB, G.Q_PC * YB))
-        py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_GATE + c * G.Q_PC * YB, G.Q_PC * YB))
+        # pad: the shared image's main cores run the conv's band count, so v's fill carries `pad` more bands
+        # (whatever follows in the pool) and their results go to scratch (t, rewritten by the close)
+        pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, L.POOL_V + c * G.KV_PC * BB_H, (G.KV_PC + pad) * BB_H))
+        if pad:     # q and gate in one 2-row drain, so the four drains a core fit the throttle
+            assert L.AD_GATE - L.AD_Q == QW * 4
+            py.drain(y_conss[c], a_act, TensorAccessPattern((1, L.AD_BYTES), L.AD_Q + c * G.Q_PC * YB,
+                                                            [1, 1, 2, G.Q_PC * YB], [0, 0, QW * 4, 1]))
+        else:
+            py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_Q + c * G.Q_PC * YB, G.Q_PC * YB))
+            py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_GATE + c * G.Q_PC * YB, G.Q_PC * YB))
         py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_KVN + c * G.KV_PC * YB, G.KV_PC * YB))
         py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_KVN + KVW * 4 + c * G.KV_PC * YB, G.KV_PC * YB))
+        if pad:
+            py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_T + c * pad * YB, pad * YB))
     tg_ln.finish()                                            # xn is in DDR
     tg_x = TaskGroup()
     x_prod.fill(a_act, tap=bt(L.AD_BYTES, L.AD_XN, G.XN_ELEMS * ELEM), wait=True, group=tg_x)
     # 3. attention: meta + record now, q / k / v after the GEMVs, the window, the gate, the new row out
     pa_out, pa_in = Pipeline(3), Pipeline(3)
-    pa_out.drain(aout_c, a_kv, bt(L.KV_BYTES, L.KV_ROW, L.KV_ROW))           # [k' | v'] -> row pos (attnpos)
+    pa_out.drain(aout_c, a_kv, bt(KVB, L.KV_ROW, L.KV_ROW))           # [k' | v'] -> row pos (attnpos)
     for c in range(ACORES):
         pa_out.drain(og_cs[c], a_act, bt(L.AD_BYTES, L.AD_OG + c * NHL * HD * 2, NHL * HD * 2))
     pa_in.fill(ain_p, a_consts, bt(L.CD_BYTES, L.CD_META, E_A))              # [qn | kn]
@@ -319,7 +330,7 @@ def att_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prod
     pa_in.fill(ain_p, a_act, bt(L.AD_BYTES, L.AD_Q, QW * 4))
     pa_in.fill(ain_p, a_act, bt(L.AD_BYTES, L.AD_KVN, KVW * 4))
     pa_in.fill(ain_p, a_act, bt(L.AD_BYTES, L.AD_KVN + KVW * 4, KVW * 4))
-    pa_in.fill(ain_p, a_kv, bt(L.KV_BYTES, 0, L.KV_ROW))                     # the window: rows [0, nf) (attnpos)
+    pa_in.fill(ain_p, a_kv, bt(KVB, 0, L.KV_ROW))                     # the window: rows [0, nf) (attnpos)
     if not NOGATE:
         pa_in.fill(ain_p, a_act, bt(L.AD_BYTES, L.AD_GATE, QW * 4))          # the gate, after the window
     # 4. o projection against og
@@ -421,6 +432,105 @@ def mlp_sequence(a_pool, c_xres, a_consts, a_act, lni, lno, w_prods, x_prod, y_c
     px.finish()
 
 
+def sc_body(scin, scy, scn, wl, acc, f_cp, f_mac0, f_mac, f_fin):
+    """One token, element by element (a row at a time: a fifo has 16 buffer descriptors). Per element: the
+    taps (copied out), the state rows (acc = sum s_k w_k, the window sliding out as it goes), then B, C, u
+    in; the gated output (bf16) and the new state rows out."""
+    for _ in range_(G.SC_ELEMS):
+        for k in range(TAPS):
+            t = scin.acquire(1)
+            f_cp(t, wl, k)
+            scin.release(1)
+        s = scin.acquire(1)
+        f_mac0(s, wl, acc)
+        scin.release(1)
+        for k in range(1, TAPS - 1):
+            s = scin.acquire(1)
+            n = scn.acquire(1)
+            f_mac(s, wl, acc, n, k)
+            scn.release(1)
+            scin.release(1)
+        e = scin.acquire(3)
+        oy = scy.acquire(1)
+        n = scn.acquire(1)
+        f_fin(e[0], e[1], e[2], wl, acc, oy, n)
+        scn.release(1)
+        scy.release(1)
+        scin.release(3)
+
+
+def attn_core(ain, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pbuf, h0, c,
+         f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb):
+    e = ain.acquire(2)                                     # [qn | kn], the position record
+    f_meta(e[0], e[1], qn, kn, cs, pbuf)
+    ain.release(2)
+    for h in range_(G.Q_AIN_ELEMS):
+        e = ain.acquire(1)
+        f_q(e, qn, cs, qs, h)
+        ain.release(1)
+    for h in range_(G.K_AIN_ELEMS):
+        e = ain.acquire(1)
+        f_k(e, kn, cs, tmp, kout, h)
+        ain.release(1)
+    for h in range_(G.K_AIN_ELEMS):
+        e = ain.acquire(1)
+        f_v(e, vout, h)
+        ain.release(1)
+    if aout is not None:                                   # core 0 owns the cache row
+        o = aout.acquire(1)
+        for j in range_(KVW):
+            o[j] = kout[j]
+        aout.release(1)
+        o = aout.acquire(1)
+        for j in range_(KVW):
+            o[j] = vout[j]
+        aout.release(1)
+    f_init(oacc, ml)
+    for _ in range_(pbuf[4]):                              # whole blocks of RB cached rows
+        e = ain.acquire(2 * G.RB)
+        f_stepb(*[e[i] for i in range(2 * G.RB)], qs, oacc, ml, pbuf, h0)
+        ain.release(2 * G.RB)
+    for _ in range_(pbuf[5]):                              # what did not fill a block
+        e = ain.acquire(2)
+        f_step(e[0], e[1], qs, oacc, ml, pbuf, h0)
+        ain.release(2)
+    f_stepn(kout, vout, qs, oacc, ml, h0)
+    # The gate arrives for EVERY og element on the broadcast stream (two elements an og element, in head
+    # order): each core consumes all of them and finishes only its own N_OG (layer_x/xlayer.py's law).
+    if NOGATE:
+        for hp in range_(N_OG):
+            o = ogout.acquire(1)
+            f_fin(oacc, ml, o, hp)
+            ogout.release(1)
+        return
+    for _ in range(c * N_OG):
+        ain.acquire(2)
+        ain.release(2)
+    for hp in range_(N_OG):
+        g = ain.acquire(2)
+        o = ogout.acquire(1)
+        f_fin(oacc, ml, g[0], g[1], o, hp)
+        ogout.release(1)
+        ain.release(2)
+    for _ in range((ACORES - 1 - c) * N_OG):
+        ain.acquire(2)
+        ain.release(2)
+
+
+def attn0(ain, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pbuf,
+          f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb):
+    attn_core(ain, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pbuf, 0, 0,
+         f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb)
+
+
+def make_attn(c):
+    def body(ain, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pbuf,
+             f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb):
+        attn_core(ain, None, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pbuf, c * NHL, c,
+             f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb)
+    return body
+
+
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
 def lg_conv(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, srchash: CompileTime[int] = 0):
     T = _types()
@@ -451,31 +561,6 @@ def lg_conv(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, srch
     of_scn = ObjectFifo(fsc, name="scn", depth=2)               # the new state rows, a row at a time
 
 
-    def sc_body(scin, scy, scn, wl, acc, f_cp, f_mac0, f_mac, f_fin):
-        """One token, element by element (a row at a time: a fifo has 16 buffer descriptors). Per element: the
-        taps (copied out), the state rows (acc = sum s_k w_k, the window sliding out as it goes), then B, C, u
-        in; the gated output (bf16) and the new state rows out."""
-        for _ in range_(G.SC_ELEMS):
-            for k in range(TAPS):
-                t = scin.acquire(1)
-                f_cp(t, wl, k)
-                scin.release(1)
-            s = scin.acquire(1)
-            f_mac0(s, wl, acc)
-            scin.release(1)
-            for k in range(1, TAPS - 1):
-                s = scin.acquire(1)
-                n = scn.acquire(1)
-                f_mac(s, wl, acc, n, k)
-                scn.release(1)
-                scin.release(1)
-            e = scin.acquire(3)
-            oy = scy.acquire(1)
-            n = scn.acquire(1)
-            f_fin(e[0], e[1], e[2], wl, acc, oy, n)
-            scn.release(1)
-            scy.release(1)
-            scin.release(3)
 
     workers = [Worker(_ln_body, fn_args=[of_lni.cons(), of_lno.prod(), f_nr, f_nr32, f_lny, f_lnx], tile=Tile(0, 3),
                       stack_size=FR.STACK)]
@@ -547,74 +632,8 @@ def lg_att(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *
     of_og = [ObjectFifo(og_ty, name=f"og{c}", depth=2) for c in range(ACORES)]
 
 
-    def attn(ain, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pbuf, h0, c,
-             f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb):
-        e = ain.acquire(2)                                     # [qn | kn], the position record
-        f_meta(e[0], e[1], qn, kn, cs, pbuf)
-        ain.release(2)
-        for h in range_(G.Q_AIN_ELEMS):
-            e = ain.acquire(1)
-            f_q(e, qn, cs, qs, h)
-            ain.release(1)
-        for h in range_(G.K_AIN_ELEMS):
-            e = ain.acquire(1)
-            f_k(e, kn, cs, tmp, kout, h)
-            ain.release(1)
-        for h in range_(G.K_AIN_ELEMS):
-            e = ain.acquire(1)
-            f_v(e, vout, h)
-            ain.release(1)
-        if aout is not None:                                   # core 0 owns the cache row
-            o = aout.acquire(1)
-            for j in range_(KVW):
-                o[j] = kout[j]
-            aout.release(1)
-            o = aout.acquire(1)
-            for j in range_(KVW):
-                o[j] = vout[j]
-            aout.release(1)
-        f_init(oacc, ml)
-        for _ in range_(pbuf[4]):                              # whole blocks of RB cached rows
-            e = ain.acquire(2 * G.RB)
-            f_stepb(*[e[i] for i in range(2 * G.RB)], qs, oacc, ml, pbuf, h0)
-            ain.release(2 * G.RB)
-        for _ in range_(pbuf[5]):                              # what did not fill a block
-            e = ain.acquire(2)
-            f_step(e[0], e[1], qs, oacc, ml, pbuf, h0)
-            ain.release(2)
-        f_stepn(kout, vout, qs, oacc, ml, h0)
-        # The gate arrives for EVERY og element on the broadcast stream (two elements an og element, in head
-        # order): each core consumes all of them and finishes only its own N_OG (layer_x/xlayer.py's law).
-        if NOGATE:
-            for hp in range_(N_OG):
-                o = ogout.acquire(1)
-                f_fin(oacc, ml, o, hp)
-                ogout.release(1)
-            return
-        for _ in range(c * N_OG):
-            ain.acquire(2)
-            ain.release(2)
-        for hp in range_(N_OG):
-            g = ain.acquire(2)
-            o = ogout.acquire(1)
-            f_fin(oacc, ml, g[0], g[1], o, hp)
-            ogout.release(1)
-            ain.release(2)
-        for _ in range((ACORES - 1 - c) * N_OG):
-            ain.acquire(2)
-            ain.release(2)
 
-    def attn0(ain, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pbuf,
-              f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb):
-        attn(ain, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pbuf, 0, 0,
-             f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb)
 
-    def make_attn(c):
-        def body(ain, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pbuf,
-                 f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb):
-            attn(ain, None, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pbuf, c * NHL, c,
-                 f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb)
-        return body
 
     workers = [Worker(_ln_body, fn_args=[of_lni.cons(), of_lno.prod(), f_nr, f_nr32, f_lny, f_lnx], tile=Tile(0, 3),
                       stack_size=FR.STACK)]
@@ -912,6 +931,125 @@ def lg_attmlp(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 
+# ---- one image for both mixers (LG_PART=shared, LG_STREAM=conv | att): every core's program is the same in the two
+# builds, only the instruction stream differs, so conv and attention layers never change hardware context. The main
+# cores run the conv's band counts (12 then 4 a core); the attention stream pads its first GEMV phase with SHARED_PAD
+# scratch bands (q 4 + gate 4 + k 1 + v 1 + 2). The conv core sits at Tile(6, 3) (Tile(2, 3) is attention core 0) on
+# shim columns 6 / 7, which only the main cores' w / y use. Idle cores wait on their first fifo until a stream feeds
+# them (IRON workers loop until reconfiguration).
+STREAM = os.environ.get("LG_STREAM", "conv")
+SHARED_PAD = 3 * G.SC_PC - (2 * G.Q_PC + 2 * G.KV_PC)
+SHARED_ST_BYTES = max(L.KV_BYTES, L.STATE_BYTES)     # one signature: the state / kv argument typed at the larger
+
+
+@iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
+def lg_shared(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *, srchash: CompileTime[int] = 0):
+    assert PART == "shared" and STREAM in ("conv", "att")
+    assert SHARED_PAD >= 0 and G.O_PC == G.SC_PC and QW == HID and G.OG_ELEMS == G.XN_ELEMS, \
+        "lg_shared: the attention layer's GEMV phases must pad to the conv's"
+    T = _types()
+    elem, x_ty, y_ty, tab_ty, u8_ln = T["elem"], T["x_ty"], T["y_ty"], T["tab_ty"], T["u8_ln"]
+    st_ty = np.ndarray[(SHARED_ST_BYTES,), np.dtype[np.uint8]]
+    ptab_ty = np.ndarray[(L.PTAB_BYTES,), np.dtype[np.uint8]]
+    ms_ty = np.ndarray[(G.MS_FLOATS,), np.dtype[np.float32]]
+    acc_ty = np.ndarray[(G.DOWN_PC * BAND_ROWS,), np.dtype[np.float32]]
+    f_gy, f_prep = _kernels(("gy", "prep"), elem, x_ty, y_ty, tab_ty, None, None)
+    KF = _kernels(MLP_KN, elem, x_ty, y_ty, tab_ty, ms_ty, acc_ty)
+    f_nr, f_nr32, f_lny, f_lnx = _ln_fns(u8_ln)
+    inc = include_dirs()
+    # the conv core
+    fsc = np.ndarray[(SCW,), np.dtype[np.float32]]
+    bsc = np.ndarray[(SCW,), np.dtype[bfloat16]]
+    wloc = np.ndarray[(TAPS * SCW,), np.dtype[np.float32]]
+    f_cp = ExternalFunction("lg_cp", source_file=str(HERE / "lg_cp.cc"), arg_types=[fsc, wloc, np.int32],
+                            include_dirs=inc, compile_flags=OS)
+    f_mac0 = ExternalFunction("lg_scmac0", source_file=str(HERE / "lg_scmac0.cc"), arg_types=[fsc, wloc, fsc],
+                              include_dirs=inc, compile_flags=OS)
+    f_mac = ExternalFunction("lg_scmac", source_file=str(HERE / "lg_scmac.cc"),
+                             arg_types=[fsc, wloc, fsc, fsc, np.int32], include_dirs=inc, compile_flags=OS)
+    f_scf = ExternalFunction("lg_scfin", source_file=str(HERE / "lg_scfin.cc"),
+                             arg_types=[fsc, fsc, fsc, wloc, fsc, bsc, fsc], include_dirs=inc, compile_flags=OS)
+    # the attention cores
+    u8_a = np.ndarray[(E_A,), np.dtype[np.uint8]]
+    pb_ty = np.ndarray[(8,), np.dtype[np.int32]]
+    bhd = np.ndarray[(HD,), np.dtype[bfloat16]]
+    brow = np.ndarray[(KVW,), np.dtype[bfloat16]]
+    og_ty = np.ndarray[(OGH * HD,), np.dtype[bfloat16]]
+    fcs = np.ndarray[(G.ROT,), np.dtype[np.float32]]
+    fhd = np.ndarray[(HD,), np.dtype[np.float32]]
+    fq = np.ndarray[(2 * QW,), np.dtype[bfloat16]]
+    fml = np.ndarray[(2 * G.MLS,), np.dtype[np.float32]]
+    foacc = np.ndarray[(NHL * HD,), np.dtype[np.float32]]
+    i32 = np.int32
+    ainc = include_dirs() + [str(GEMV), str(ATTN), str(LN), str(LINL)]
+
+    def af(sym, args):
+        return ExternalFunction(sym, source_file=str(ATTN / f"{sym}.cc"), arg_types=args, include_dirs=ainc,
+                                compile_flags=ATTN_FLAGS)
+    afns = [af("attn_meta", [u8_a, u8_a, bhd, bhd, fcs, pb_ty]), af("attn_q", [u8_a, bhd, fcs, fq, i32]),
+            af("attn_k", [u8_a, bhd, fcs, fhd, brow, i32]), af("attn_v", [u8_a, brow, i32]),
+            af("attn_init", [foacc, fml]), af("attn_step", [u8_a, u8_a, fq, foacc, fml, pb_ty, i32]),
+            af("attn_step_new", [brow, brow, fq, foacc, fml, i32]),
+            af("attn_fin", [foacc, fml, u8_a, u8_a, og_ty, i32]),
+            af("attn_stepb", [u8_a] * (2 * G.RB) + [fq, foacc, fml, pb_ty, i32])]
+
+    of_w = [ObjectFifo(elem, name=f"w{c}", depth=2) for c in range(N_CORES)]
+    of_y = [ObjectFifo(y_ty, name=f"y{c}", depth=2) for c in range(N_CORES)]
+    of_x = ObjectFifo(x_ty, name="x", depth=2)
+    of_lni = ObjectFifo(u8_ln, name="lni", depth=5)
+    of_lno = ObjectFifo(u8_ln, name="lno", depth=1)
+    of_scin = ObjectFifo(fsc, name="scin", depth=4)
+    of_scy = ObjectFifo(bsc, name="scy", depth=2)
+    of_scn = ObjectFifo(fsc, name="scn", depth=2)
+    of_ain = ObjectFifo(u8_a, name="ain", depth=max(4, 2 * G.RB + 2))
+    of_aout = ObjectFifo(brow, name="aout", depth=2)
+    of_og = [ObjectFifo(og_ty, name=f"og{c}", depth=2) for c in range(ACORES)]
+
+    workers = [Worker(fused_ln_body, fn_args=[of_lni.cons(), of_lno.prod(), f_nr, f_nr32, f_lny, f_lnx],
+                      tile=Tile(0, 3), stack_size=FR.STACK)]
+    for c in range(N_CORES):
+        workers.append(Worker(conv_mlp_main, fn_args=[of_w[c].cons(), of_x.cons(), of_y[c].prod(),
+                                                       Buffer(tab_ty, name=f"tab{c}"), Buffer(ms_ty, name=f"ms{c}"),
+                                                       Buffer(acc_ty, name=f"acc{c}"), f_gy, f_prep] + KF,
+                              tile=Tile(c, 2), stack_size=FR.STACK))
+    workers.append(Worker(sc_body, fn_args=[of_scin.cons(), of_scy.prod(), of_scn.prod(),
+                                            Buffer(wloc, name="wloc"), Buffer(fsc, name="scacc"),
+                                            f_cp, f_mac0, f_mac, f_scf],
+                          tile=Tile(6, 3), stack_size=FR.STACK))
+
+    def abufs(c):
+        s_ = "" if c == 0 else str(c)
+        return [Buffer(bhd, name=f"qn{s_}"), Buffer(bhd, name=f"kn{s_}"), Buffer(fcs, name=f"cs{s_}"),
+                Buffer(fq, name=f"qs{s_}"), Buffer(fhd, name=f"tmp{s_}"), Buffer(brow, name=f"kout{s_}"),
+                Buffer(brow, name=f"vout{s_}"), Buffer(foacc, name=f"oacc{s_}"), Buffer(fml, name=f"ml{s_}"),
+                Buffer(pb_ty, name=f"pb{s_}")]
+    workers.append(Worker(attn0, fn_args=[of_ain.cons(), of_aout.prod(), of_og[0].prod()] + abufs(0) + afns,
+                          tile=Tile(2, 3), stack_size=FR.STACK))
+    for c in range(1, ACORES):
+        workers.append(Worker(make_attn(c), fn_args=[of_ain.cons(), of_og[c].prod()] + abufs(c) + afns,
+                              tile=Tile(2 + c, 3), stack_size=FR.STACK))
+
+    def sequence(a_pool, c_xres, a_consts, a_st, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
+                 scin_p, scy_c, scn_c, ain_p, aout_c, og_cs):
+        if STREAM == "conv":
+            conv_sequence(a_pool, c_xres, a_consts, a_st, a_act, lni, lno, w_prods, x_prod, y_conss,
+                          scin_p, scy_c, scn_c, st_bytes=SHARED_ST_BYTES)
+        else:
+            att_sequence(a_pool, c_xres, a_consts, a_st, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
+                         ain_p, aout_c, og_cs, pad=SHARED_PAD, kv_bytes=SHARED_ST_BYTES)
+        mlp_sequence(a_pool, c_xres, a_consts, a_act, lni, lno, w_prods, x_prod, y_conss)
+
+    rt = Runtime(sequence, [T["pool_ty"], T["xres_ty"], T["consts_ty"], st_ty, T["act_ty"], ptab_ty,
+                            of_lni.prod(tile=Tile(0, 0)), of_lno.cons(tile=Tile(0, 0)),
+                            [of_w[c].prod(tile=Tile(c, 0)) for c in range(N_CORES)],
+                            of_x.prod(tile=Tile(1, 0)),
+                            [of_y[c].cons(tile=Tile(c, 0)) for c in range(N_CORES)],
+                            of_scin.prod(tile=Tile(6, 0)), of_scy.cons(tile=Tile(6, 0)), of_scn.cons(tile=Tile(7, 0)),
+                            of_ain.prod(tile=Tile(2, 0)), of_aout.cons(tile=Tile(1, 0)),
+                            [of_og[c].cons(tile=Tile(2 + c, 0)) for c in range(ACORES)]])
+    return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
+
+
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
 def lg_mlp(pool: In, xres: InOut, consts: In, act: InOut, *, srchash: CompileTime[int] = 0):
     T = _types()
@@ -947,12 +1085,13 @@ def lg_mlp(pool: In, xres: InOut, consts: In, act: InOut, *, srchash: CompileTim
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 
-DESIGN = {"conv": lg_conv, "att": lg_att, "mlp": lg_mlp, "convmlp": lg_convmlp, "attmlp": lg_attmlp}[PART]
+DESIGN = {"conv": lg_conv, "att": lg_att, "mlp": lg_mlp, "convmlp": lg_convmlp, "attmlp": lg_attmlp, "shared": lg_shared}[PART]
 _src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + sorted(f.read_bytes() for f in HERE.glob("*.py"))
                 + sorted(f.read_bytes() for f in ATTN.glob("*.cc")) + sorted(f.read_bytes() for f in ATTN.glob("*.h"))
                 + [bytes([NOGATE]), (HERE.parent.parent / "recipes" / "lfm3.py").read_bytes(), (LN / "ln.h").read_bytes(),
                    (LN / "ln_y.cc").read_bytes(), (LN / "ln_xn.cc").read_bytes(), (LN / "ln_nr32.cc").read_bytes(),
                    (LINL / "ln_nr.cc").read_bytes(), (GEMV / "gemv_q4.h").read_bytes(),
                    (GEMV / "gemv_tab.h").read_bytes(), (HERE.parent.parent / "include" / "vecmath.h").read_bytes(),
-                   SPEC.spec_hash().encode(), repr(PROBES).encode(), PART.encode()])
+                   SPEC.spec_hash().encode(), repr(PROBES).encode(), PART.encode()]
+                + ([STREAM.encode()] if PART == "shared" else []))
 SPECIALIZE = {"srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

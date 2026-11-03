@@ -426,8 +426,19 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
 
 def fused_on() -> bool:
     """One dispatch a layer (designs/lfm3/lg.py LG_PART=convmlp | attmlp: the mixer's program then the MLP's over the
-    same fifos): opt-in (LFM3_FUSED=1). Off, programs() / builds() / pack_plan() are byte for byte what they were."""
-    return os.environ.get("LFM3_FUSED") == "1"
+    same fifos): opt-in (LFM3_FUSED=1, or LFM3_SHARED=1 which implies it). Off, programs() / builds() / pack_plan() are
+    byte for byte what they were."""
+    return os.environ.get("LFM3_FUSED") == "1" or shared_on()
+
+
+def shared_on() -> bool:
+    """The fused layers as ONE image for both mixers (LG_PART=shared, two instruction streams LG_STREAM=conv | att whose
+    xclbins agree apart from build stamps; only the conv build's is loaded): conv and attention layers never change
+    hardware context. Opt-in (LFM3_SHARED=1)."""
+    return os.environ.get("LFM3_SHARED") == "1"
+
+
+SHARED_BUILDS = {"conv": "lg_shared_conv", "att": "lg_shared_att"}
 
 
 def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
@@ -454,6 +465,21 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         step = dict(e["program"][0])
         step["kernel"] = ren[step["kernel"]]
         e["program"] = [step]
+    if not shared_on():
+        return out
+    # one image: the conv stream's xclbin is the context of every layer; both streams take the attention's six
+    # buffer arguments (a conv layer passes its state BO in the kv slot and the full layers' ptab, which it never reads)
+    for name in ("lg_convmlp", "lg_attmlp"):
+        out["contexts"].pop(name, None)
+    out["contexts"]["lg_shared"] = f"{SHARED_BUILDS['conv']}/final.xclbin"
+    for k, v in out["kernels"].items():
+        if v.get("build") in ("lg_convmlp", "lg_attmlp"):
+            b = SHARED_BUILDS["conv" if v["build"] == "lg_convmlp" else "att"]
+            v.update(context="lg_shared", insts=f"{b}/insts.bin", build=b)
+    if SHORT_CONV in out["layer_types"]:
+        if "ptab" not in out["globals"]:
+            raise OpRangeError("lfm3 shared image: a conv layer needs a ptab global for its sixth argument")
+        out["layer_types"][SHORT_CONV]["program"][0]["args"] = CONV_ARGS + ["ptab"]
     return out
 
 
@@ -521,6 +547,12 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
         out.pop("lg_att")
         out["lg_attmlp"] = {"design": "lfm3/lg.py", "build_dir": f"lfm3/build_attmlp_h{G.HID}_d{G.HD}",
                             "env": {"LG_PART": "attmlp"}}
+    if shared_on():
+        out.pop("lg_convmlp", None)
+        out.pop("lg_attmlp", None)
+        for stream, name in SHARED_BUILDS.items():
+            out[name] = {"design": "lfm3/lg.py", "build_dir": f"lfm3/build_shared_h{G.HID}_d{G.HD}_{stream}",
+                         "env": {"LG_PART": "shared", "LG_STREAM": stream}}
     return out
 
 

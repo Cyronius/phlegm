@@ -57,9 +57,13 @@ def main():
         ap.add_argument("--" + k, required=True)
     ap.add_argument("--mlp", default=None)
     ap.add_argument("--layer", type=int, default=0)
+    ap.add_argument("--shared", action="store_true",
+                    help="--conv / --att are the two streams of ONE image (lg_shared_conv / _att): the conv build's xclbin "
+                         "is loaded for both, every dispatch takes the 6-buffer signature (implies --fused)")
     ap.add_argument("--fused", action="store_true",
                     help="--conv / --att are the one-dispatch convmlp / attmlp builds (the MLP runs inside them)")
     a = ap.parse_args()
+    a.fused = a.fused or a.shared
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     mdir = Path(a.model_dir)
@@ -182,11 +186,14 @@ def main():
         dw[s_] = (g.array(p + "ffn_gate.weight")[r0:r0 + ff], g.array(p + "ffn_up.weight")[r0:r0 + ff],
                   g.array(p + "ffn_down.weight")[:, s_ * ff:(s_ + 1) * ff])
     pool_file()
-    head = ["device", f"xclbin A {mix_dir / 'final.xclbin'}", f"kernelx ka A {mix_dir / 'insts.bin'}",
+    img = Path(a.conv).resolve() if a.shared else mix_dir
+    head = ["device", f"xclbin A {img / 'final.xclbin'}", f"kernelx ka A {mix_dir / 'insts.bin'}",
             f"buf pool {POOL} pool.bin", f"buf xres {hid * 4} xres.bin", f"buf consts {L.CD_BYTES} consts.bin"]
     if mixer == FR.MIX_CONV:
-        drive("mix", head + [f"buf state {L.STATE_BYTES} state.bin", f"buf act {L.AD_BYTES}",
-                             "run ka pool xres consts state act", f"dump act act_mix.bin {L.AD_BYTES}", f"dump xres xres_mix.bin {hid * 4}",
+        (out / "ptab.bin").write_bytes(np.zeros(L.PTAB_BYTES, np.uint8).tobytes())
+        sig = (["buf ptab %d ptab.bin" % L.PTAB_BYTES, "run ka pool xres consts state act ptab"] if a.shared
+               else ["run ka pool xres consts state act"])
+        drive("mix", head + [f"buf state {L.STATE_BYTES} state.bin", f"buf act {L.AD_BYTES}"] + sig + [ f"dump act act_mix.bin {L.AD_BYTES}", f"dump xres xres_mix.bin {hid * 4}",
                              f"dump state state_mix.bin {L.STATE_BYTES}"])
     else:
         drive("mix", head + [f"buf kv {L.KV_BYTES} kv.bin", f"buf act {L.AD_BYTES}",
