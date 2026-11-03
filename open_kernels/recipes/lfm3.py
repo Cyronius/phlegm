@@ -424,7 +424,40 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
     return out
 
 
+def fused_on() -> bool:
+    """One dispatch a layer (designs/lfm3/lg.py LG_PART=convmlp | attmlp: the mixer's program then the MLP's over the
+    same fifos): opt-in (LFM3_FUSED=1). Off, programs() / builds() / pack_plan() are byte for byte what they were."""
+    return os.environ.get("LFM3_FUSED") == "1"
+
+
 def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
+    out = _programs(spec, max_ctx)
+    if not fused_on():
+        return out
+    # fold the MLP into the mixer's dispatch: the kernels / contexts are renamed, the layer program is one step
+    ren = {"lg_conv": "lg_convmlp", "lg_att": "lg_attmlp", "lg_att_local": "lg_attmlp_local"}
+    ctx_ren = {"lg_conv": "lg_convmlp", "lg_att": "lg_attmlp"}
+    out["contexts"] = {ctx_ren.get(k, k): v.replace(f"{k}/", f"{ctx_ren.get(k, k)}/") if k in ctx_ren else v
+                       for k, v in out["contexts"].items() if k != "lg_mlp"}
+    ks = {}
+    for k, v in out["kernels"].items():
+        if k == "lg_mlp":
+            continue
+        if k in ren:
+            v = dict(v)
+            v["context"] = ctx_ren.get(v["context"], v["context"])
+            v["insts"] = v["insts"].replace(v["build"] + "/", ctx_ren[v["build"]] + "/")
+            v["build"] = ctx_ren[v["build"]]
+        ks[ren.get(k, k)] = v
+    out["kernels"] = ks
+    for lt, e in out["layer_types"].items():
+        step = dict(e["program"][0])
+        step["kernel"] = ren[step["kernel"]]
+        e["program"] = [step]
+    return out
+
+
+def _programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     L, G = layout(spec, max_ctx), geometry(spec)
     check_buffer_args("lg_conv", CONV_ARGS)
     check_buffer_args("lg_att", ATT_ARGS + ["ptab"])
@@ -475,6 +508,23 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
 
 
 def builds(spec: ModelSpec) -> dict[str, dict]:
+    out = _builds(spec)
+    if not fused_on():
+        return out
+    G = geometry(spec)
+    out.pop("lg_mlp")
+    if "lg_conv" in out:
+        out.pop("lg_conv")
+        out["lg_convmlp"] = {"design": "lfm3/lg.py", "build_dir": f"lfm3/build_convmlp_h{G.HID}_t{G.TAPS}",
+                             "env": {"LG_PART": "convmlp"}}
+    if "lg_att" in out:
+        out.pop("lg_att")
+        out["lg_attmlp"] = {"design": "lfm3/lg.py", "build_dir": f"lfm3/build_attmlp_h{G.HID}_d{G.HD}",
+                            "env": {"LG_PART": "attmlp"}}
+    return out
+
+
+def _builds(spec: ModelSpec) -> dict[str, dict]:
     G, L = geometry(spec), layout(spec)
     out = {
         "lg_mlp": {"design": "lfm3/lg.py", "build_dir": f"lfm3/build_mlp_h{G.HID}_f{G.FF}_s{G.SLOTS}",

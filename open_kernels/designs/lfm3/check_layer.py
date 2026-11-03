@@ -53,9 +53,12 @@ def q4(g, name: str) -> np.ndarray:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    for k in ("conv", "att", "mlp", "model-dir", "ids-file", "out", "driver"):
+    for k in ("conv", "att", "model-dir", "ids-file", "out", "driver"):
         ap.add_argument("--" + k, required=True)
+    ap.add_argument("--mlp", default=None)
     ap.add_argument("--layer", type=int, default=0)
+    ap.add_argument("--fused", action="store_true",
+                    help="--conv / --att are the one-dispatch convmlp / attmlp builds (the MLP runs inside them)")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -105,7 +108,7 @@ def main():
 
     driver = Path(a.driver).resolve()
     mix_dir = Path(a.conv if mixer == FR.MIX_CONV else a.att).resolve()
-    mlp_dir = Path(a.mlp).resolve()
+    mlp_dir = Path(a.mlp).resolve() if a.mlp else None
 
     def bf(vec, n):
         o_ = np.zeros(n, bfloat16)
@@ -183,12 +186,12 @@ def main():
             f"buf pool {POOL} pool.bin", f"buf xres {hid * 4} xres.bin", f"buf consts {L.CD_BYTES} consts.bin"]
     if mixer == FR.MIX_CONV:
         drive("mix", head + [f"buf state {L.STATE_BYTES} state.bin", f"buf act {L.AD_BYTES}",
-                             "run ka pool xres consts state act", f"dump act act_mix.bin {L.AD_BYTES}",
+                             "run ka pool xres consts state act", f"dump act act_mix.bin {L.AD_BYTES}", f"dump xres xres_mix.bin {hid * 4}",
                              f"dump state state_mix.bin {L.STATE_BYTES}"])
     else:
         drive("mix", head + [f"buf kv {L.KV_BYTES} kv.bin", f"buf act {L.AD_BYTES}",
                              f"buf ptab {L.PTAB_BYTES} ptab.bin", "run ka pool xres consts kv act ptab",
-                             f"dump act act_mix.bin {L.AD_BYTES}", f"dump kv kv_mix.bin {2 * L.KV_ROW}"])
+                             f"dump act act_mix.bin {L.AD_BYTES}", f"dump xres xres_mix.bin {hid * 4}", f"dump kv kv_mix.bin {2 * L.KV_ROW}"])
     actb = np.fromfile(out / "act_mix.bin", np.uint8)
     res = actb[L.AD_RES:L.AD_RES + hid * 4].view(np.float32).copy()
     xm = actb[L.AD_XM:L.AD_XM + hid * 2].view(bfloat16).astype(np.float32)
@@ -215,7 +218,11 @@ def main():
     rep["xm"] = stats("xm", xm, xm_ref)
 
     actb.tofile(out / "act_route.bin")
-    drive("mlp", ["device", f"xclbin M {mlp_dir / 'final.xclbin'}", f"kernelx km M {mlp_dir / 'insts.bin'}",
+    if a.fused:        # the MLP ran inside the mixer's dispatch
+        (out / "xres_mlp.bin").write_bytes((out / "xres_mix.bin").read_bytes())
+        (out / "act_mlp.bin").write_bytes((out / "act_mix.bin").read_bytes())
+    else:
+      drive("mlp", ["device", f"xclbin M {mlp_dir / 'final.xclbin'}", f"kernelx km M {mlp_dir / 'insts.bin'}",
                   f"buf pool {POOL} pool.bin", f"buf xres {hid * 4} xres.bin", f"buf consts {L.CD_BYTES} consts.bin",
                   f"buf act {L.AD_BYTES} act_route.bin", "run km pool xres consts act",
                   f"dump xres xres_mlp.bin {hid * 4}", f"dump act act_mlp.bin {L.AD_BYTES}"])

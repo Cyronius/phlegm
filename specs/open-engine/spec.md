@@ -4806,6 +4806,14 @@ bf16 control vs fp32 837 / 843, 1.05e-4, 2.4e-4; no drift by position; the 256-r
 Timing (loaded): sequential prefill 60-102 ms a token (by load), decode 95-105 ms a token (48 dispatches). `phlegm run` and
 `phlegm serve` answer with the reasoning split. Open: fusing the two dispatches, the vision / audio siblings.
 
+**Decode fusion (2026-11-03, development; `LFM3_FUSED=1`).** Measured with `--bench-decode` (load ~1.5): every dispatch costs ~1.1-1.3 ms
+whether it moves 9 or 28 MB (a fixed cost), so the 48 dispatches of 66-68 ms a token (the earlier 100 ms was load) become 24: parts
+`convmlp` / `attmlp` of `designs/lfm3/lg.py` run the mixer's program and then the MLP's over the same fifos, the norm helper's close
+steps in sequence, one host sequence. Decode 49 ms a token; logits bit-identical to the unfused route over all 843 prompt positions
+(KL 0), greedy equal to llama.cpp (16 / 64 / 32), compatible with `LFM3_BLOCK=1` (chat prompt 40 / 40, prefill 23 ms a token). Off, programs,
+builds and pack plan are unchanged. Remaining cost: the conv <-> attention xclbin switch, ~0.9 ms x ~22 a token; one shared
+two-stream image (Gemma's dxm trick) would reach ~28 ms a token (not built).
+
 **Block prefill (2026-11-03, development; `LFM3_BLOCK=1`).** The LFM2.5 `lfm` gemm_block kind (OPEN-FAMILY-LFM2MOE), generalised: each
 layer is the mixer's fused input GEMM (conv in_proj B | C | u, or attention q | gate | k | v with the expanded gate), a host
 middle (the 7-tap conv with its 6-row f32 state slid over the block, or attention over the block with the layer type's zero-tail
