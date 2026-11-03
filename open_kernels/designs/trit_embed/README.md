@@ -246,18 +246,33 @@ Paired against the previous commit, alternating in one sitting with the machine 
 Vectors are unchanged against the Python loop (STSB minimum cosine 0.99934, as before). Absolute speed still needs
 a quiet machine. The NPU alone bounds the STSB set at about 59 ms (154 dispatches × 0.38 ms), 47k sentences/s.
 
+Quiet machine (`dibs run --measure`, CLEAN before and after, load average 3–9): nine rounds of this NPU path
+alternating with bge-micro-v2 fp16 on the iGPU (`bench_speed.py`, same workloads, tokenization included). The
+GPU's first run after idling is slower (passages about 5,200/s); the bge figures below are from runs after the GPU
+was already busy. Medians, with ranges:
+
+| | trit-embed-3l, NPU | bge-micro-v2, iGPU fp16 (warm) | ratio |
+|---|---:|---:|---:|
+| STSB sentences/s (2,758) | 51,537 (51,022–52,021) | 36,015 (33,837–36,460) | 1.43 |
+| SciFact abstracts/s (5,183) | 6,029 (5,990–6,104) | 6,065 (5,986–6,118) | 0.99 |
+| batch-1 latency, median | 0.42 ms (0.41–0.43) | 0.85 ms (0.84–0.86) | 0.50 |
+
+Quality from the release harness (`npu_eval.py`) on the same build: four-task nDCG@10 33.91 against the CPU's
+33.85 (paired 95% CI −0.07 to +0.21), STSB 82.88 against 82.87, minimum vector cosine to the CPU 0.998. Rounds:
+`npu-vs-bge-alternating-clean.txt`; harness results: `npu-result-f6db177-clean.json`, in the release bench folder.
+
 **Open:**
 
-- a clean (`dibs run --measure`) `npu_eval.py` run of `r9`;
 - `bench.py` still assumes one slot a dispatch and fails on `r9`; with the C++ host loop `TritNpu.dispatch_ms`
   stays empty (`npu_eval.py` now records no dispatch count or median);
-- sentences are still host-bound: tokenization, packing and per-text pooling;
+- with the host in C++, the quiet STSB run takes 53 ms for 154 dispatches (0.34 ms each), so the NPU kernels are
+  now the limit for both workloads;
 - program memory is nearly full (15,968 of 16,384 bytes); the cycle-profiling builds no longer fit, so
   further kernels must also shrink code;
 - the epilogue (about 40% of a projection packet), GELU (650 cycles a packet), attention (700 cycles a
   block), the K/V exchange (about 36k cycles a dispatch);
 - splitting each column's output over both shim channels (in `r9`) measured within noise;
-- NPU turbo power mode (`sudo xrt-smi configure --pmode turbo`) needs root; numbers above are default mode;
+- NPU turbo power mode (set by a systemd unit since 2026-11-03) measured no faster than default;
 - a `phlegm serve` embeddings route;
 - Windows runs (untested here).
 
