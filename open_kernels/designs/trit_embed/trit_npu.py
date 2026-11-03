@@ -35,7 +35,7 @@ SLOT = 128
 SLOTS = 2               # slots a dispatch
 TOKENS = SLOTS * SLOT
 OUT = 6912              # a core's output packet (trit_design.OSZ)
-SETS = 2
+SETS = int(os.environ.get('TRIT_NPU_SETS', '2'))   # buffer sets in flight
 PACKETS = 170
 ELEMENT = 8192   # broadcast element bytes
 CUT = 1000       # characters: tokenize cuts longer texts first (exact; see TritNpu.tokenize)
@@ -56,13 +56,19 @@ def load_runtime(library=LIBRARY):
     dll.tdn_wait.argtypes, dll.tdn_wait.restype = [ct.c_void_p, ct.c_int], ct.c_double
     dll.tdn_close.argtypes, dll.tdn_close.restype = [ct.c_void_p], None
     dll.tdn_last_error.argtypes, dll.tdn_last_error.restype = [], ct.c_char_p
+    vp, ip = ct.c_void_p, ct.POINTER(ct.c_int)
+    dll.tdn_host_init.argtypes = [vp, vp, vp, ct.c_int, vp, vp, ct.c_int, vp, vp, vp, ct.c_float,
+                                  ct.c_int, ip, ip, ip, ip, ct.c_int]
+    dll.tdn_host_init.restype = ct.c_int
+    dll.tdn_encode.argtypes = [vp, ct.c_int, vp, vp, vp, ct.c_int, vp, vp, vp, vp]
+    dll.tdn_encode.restype = ct.c_int
 
     def check(result, function, arguments):
         error = dll.tdn_last_error()
         if error:
             raise RuntimeError(f'{function.__name__}: {error.decode(errors="replace")}')
         return result
-    for name in ('tdn_open', 'tdn_buf', 'tdn_sync', 'tdn_bind', 'tdn_start', 'tdn_wait'):
+    for name in ('tdn_open', 'tdn_buf', 'tdn_sync', 'tdn_bind', 'tdn_start', 'tdn_wait', 'tdn_host_init', 'tdn_encode'):
         getattr(dll, name).errcheck = check
     return dll
 
@@ -178,8 +184,10 @@ def load_model(model_dir):
 
 
 class TritNpu:
-    def __init__(self, model_dir, build=BUILD, library=LIBRARY, profiling=False):
-        """profiling=True (bench.py) also accepts stub and variant builds, whose outputs are not vectors."""
+    def __init__(self, model_dir, build=BUILD, library=LIBRARY, profiling=False, native=True):
+        """profiling=True (bench.py) also accepts stub and variant builds, whose outputs are not vectors.
+        native=True runs each layout's dispatches in the host library (tdn_encode: embedding, input LayerNorm,
+        runs and pooling in C++); native=False keeps the Python loop below, with the model's own embed."""
         self.model = load_model(model_dir)
         self.backend = copy.deepcopy(self.model.tokenizer.backend_tokenizer)
         self.backend.enable_truncation(SLOT)
@@ -222,10 +230,42 @@ class TritNpu:
                     self.dll.tdn_sync(self.handle, i, 1, self.buffers[i].nbytes, 0)
                 run = self.dll.tdn_bind(self.handle, 5, (ct.c_int * 5)(0, *idx))
                 self.sets.append((run, idx))
+            self.native = native
+            if native:
+                self.init_native()
         except BaseException:
             self.close()
             raise
         self.dispatch_ms = []
+
+    def init_native(self):
+        """Hand the host library the embedding tables and the buffer sets (tdn_host_init)."""
+        m = self.model
+        self.tables = [np.ascontiguousarray(a) for a in (
+            m.word.qweight.numpy(), m.word.scale.float().numpy(), m.pos.qweight.numpy(), m.pos.scale.float().numpy(),
+            m.tok_type.weight[0].detach().float().numpy(), m.ln_e.weight.detach().float().numpy(),
+            m.ln_e.bias.detach().float().numpy())]
+        word, wscale, pos, pscale, tok, gamma, beta = self.tables
+        assert word.dtype == pos.dtype == np.int8 and word.shape[1] == pos.shape[1] == 384
+        col = lambda j: (ct.c_int * SETS)(*[idx[j] for _, idx in self.sets])
+        self.dll.tdn_host_init(self.handle, word.ctypes.data, wscale.ctypes.data, len(word), pos.ctypes.data,
+                               pscale.ctypes.data, len(pos), tok.ctypes.data, gamma.ctypes.data, beta.ctypes.data,
+                               float(m.ln_e.eps), SETS, (ct.c_int * SETS)(*[r for r, _ in self.sets]),
+                               col(0), col(1), col(3), OUT // 4)
+
+    def run_native(self, layout, pooled):
+        """One layout through tdn_encode; pooled rows base .. base + n - 1 are filled. Returns its dispatch count."""
+        base, runs, first, lengths, ids, pos, seg, _, _ = layout
+        n = len(first)
+        if not n:
+            return 0
+        first, lengths = np.ascontiguousarray(first, np.int64), np.ascontiguousarray(lengths, np.int64)
+        rows = np.arange(base, base + n, dtype=np.int64)
+        ids, pos, seg = (np.ascontiguousarray(a) for a in (ids, pos, seg))
+        assert ids.dtype == pos.dtype == np.int64 and seg.dtype == np.int32 and pooled.flags.c_contiguous
+        self.dll.tdn_encode(self.handle, runs, ids.ctypes.data, pos.ctypes.data, seg.ctypes.data, n,
+                            first.ctypes.data, lengths.ctypes.data, rows.ctypes.data, pooled.ctypes.data)
+        return runs
 
     def alloc(self, size):
         ptr = self.dll.tdn_buf(self.handle, size)
@@ -345,6 +385,10 @@ class TritNpu:
         m = self.model
         pooled = np.empty((n, 384), np.float32)
         runs, pending = 0, None
+        if self.native:
+            for layout in layouts:
+                runs += self.run_native(layout, pooled)
+            layouts = ()
 
         def pool(s, index, which, cuts, count, used):
             pooled[index] = np.add.reduceat(self.wait(s, used), cuts)[which] / count[:, None]

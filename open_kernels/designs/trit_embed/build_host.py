@@ -32,7 +32,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     source, target = ROOT / 'host/td_npu2.cpp', out / 'libtd_npu2.so'
     command = shlex.split(os.environ.get('CXX', 'g++')) + [
-        '-std=c++17', '-shared', '-fPIC', '-O2', str(source), '-I' + str(xrt / 'include'),
+        '-std=c++17', '-shared', '-fPIC', '-O3', '-march=x86-64-v3', '-ffp-contract=off', str(source), '-I' + str(xrt / 'include'),
         '-L' + str(lib), '-Wl,-rpath,' + str(lib), '-lxrt_coreutil', '-o', str(target)]
     subprocess.run(command, check=True)
     (out / 'build.json').write_text(json.dumps({'command': command, 'source_sha256': digest(source),

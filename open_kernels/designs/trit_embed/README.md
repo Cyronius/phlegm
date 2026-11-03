@@ -12,7 +12,7 @@ three layers run on the 32 cores (8 columns × 4 rows) of the XDNA2 NPU in **one
 | `fused2.h`, `f2_*.cc` | AIE kernels: mask, activation quantization, ternary projections, attention, LayerNorm, output; they use `open_kernels/include/vecmath.h` |
 | `gelu_lut.py`, `gelu_lut.h` | The GELU table and its generator (`--check` verifies the header) |
 | `build.py` | Compile to `build/` (`final.xclbin`, `insts.bin`, `build.json` with program size and hashes) |
-| `host/td_npu2.cpp`, `build_host.py` | Persistent XRT C ABI with two bound runs (`tdn_bind` / `tdn_start` / `tdn_wait`) |
+| `host/td_npu2.cpp`, `build_host.py` | Persistent XRT C ABI with bound runs (`tdn_bind` / `tdn_start` / `tdn_wait`), and the host loop `tdn_encode` |
 | `trit_npu.py` | Host: weight packing, text packing, `TritNpu(model_dir).encode(texts)` |
 | `check.py` | NPU vs CPU-reference cosine, and timing |
 | `bench.py` | Builds against each other: alternating rounds, ms per dispatch, output differences, cycle profiles |
@@ -203,10 +203,35 @@ With fixed inputs and two runs in flight the NPU alone takes 0.40 ms a dispatch 
 embedding lookup and input LayerNorm take 0.27 ms a dispatch and a serial submit + wait 0.69 ms, so the
 end-to-end rate is now host-bound.
 
+**C++ host loop, 2026-11-03.** The per-dispatch host work moved from Python into the host library:
+`tdn_encode` takes a whole layout (token ids, positions, segment IDs and each text's token range), embeds only
+the rows in use straight into the input buffer in the cores' layout (int8 word and position rows, fp32 scales,
+token type, input LayerNorm with 16-lane fp32 moments), syncs only the touched cores, keeps every buffer set in
+flight, and mean-pools each finished dispatch. Python tokenizes, packs and applies the output projection.
+`TritNpu(..., native=False)` keeps the Python loop for comparison. Built with `-O3 -march=x86-64-v3
+-ffp-contract=off`; `TDN_PROFILE=1` prints per-dispatch phase times.
+
+Per 256-token dispatch on 5,183 SciFact abstracts (`TDN_PROFILE=1`): embedding 0.13 ms, pooling 0.11, syncs
+0.04, and the loop now waits on the NPU. In the Python loop the model's embed alone took 0.27 ms.
+
+| 2026-11-03, machine loaded (another session's GPU job), turbo, `npu_eval.py` | Python loop (`r9`) | C++ loop |
+|---|---|---|
+| 2,758 STSB sentences/s | 14,668 | 26,961 |
+| 5,183 SciFact abstracts/s | 2,209 | 5,235 |
+| batch-1 latency | 1.01 ms | 0.65 ms |
+| four-task nDCG@10 (CPU 33.85) | 33.89 | 33.88 (paired 95% CI −0.12 to +0.18) |
+| STSB (CPU 82.87); min vector cosine to CPU | 82.88; 0.9981 | 82.88; 0.9981 |
+
+The C++ embedding differs from torch's LayerNorm by at most 1e-6 (half the values bit-identical); through the
+NPU's int8 rounding that leaves the native vectors within cosine 0.9993 of the Python loop's (STSB sentences).
+Three or four buffer sets measured the same as two. Not yet timed on a quiet machine.
+
 **Open:**
 
 - a clean (`dibs run --measure`) `npu_eval.py` run of `r9`;
-- host work per dispatch (above); `bench.py` still assumes one slot a dispatch and fails on `r9`;
+- `bench.py` still assumes one slot a dispatch and fails on `r9`; with the C++ host loop `TritNpu.dispatch_ms`
+  stays empty (`npu_eval.py` now records no dispatch count or median);
+- sentences are still host-bound: tokenization, packing and per-text pooling;
 - program memory is nearly full (15,968 of 16,384 bytes); the cycle-profiling builds no longer fit, so
   further kernels must also shrink code;
 - the epilogue (about 40% of a projection packet), GELU (650 cycles a packet), attention (700 cycles a
