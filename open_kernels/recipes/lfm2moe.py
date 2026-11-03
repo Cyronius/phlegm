@@ -37,7 +37,7 @@ import os
 from dataclasses import dataclass
 
 from .catalogue import OpRangeError, check_buffer_args
-from .qwen36moe import BAND_ROWS, ELEM, MB, roundup, tab_bytes
+from .qwen36moe import BAND_ROWS, ELEM, GEMM_T, MB, roundup, tab_bytes
 from .spec import FULL, SHORT_CONV, ModelSpec
 
 CH = 5120                 # a q4_1 chunk: 32 rows x 256 K, bf16 d | m planes (gemv_q4.h)
@@ -356,6 +356,8 @@ def _layer_plan(spec: ModelSpec, mixer: str, dense: bool) -> dict:
             {"op": "put", "tensor": b + "attn_q_norm.weight", "dst": L.CD_META, "cap": 2 * G.HD},
             {"op": "put", "tensor": b + "attn_k_norm.weight", "dst": L.CD_META + 2 * G.HD, "cap": 2 * G.HD},
         ]
+    if dense and block_on():
+        ffn_ops += _dense_gemm_ops(spec)
     return {"pool": ffn_ops + mix, "consts": consts}
 
 
@@ -381,6 +383,150 @@ def route_step(spec: ModelSpec) -> dict:
     return {"op": "hy_route", "kernel": "lm_moe", "a_xm": L.AD_XM, "a_w": L.AD_W, "hidden_real": G.HID,
             "slots": G.SLOTS, "router": "blk.{l}.ffn_gate_inp.weight", "bias": "blk.{l}.exp_probs_b.bias",
             "experts": spec.num_experts, "topk": spec.experts_per_tok, "scale": router_scale(spec), "shared": []}
+
+
+# ---- block prefill (the Gemma 4 route: commit 8c27569; .plans/lfm2moe-native.md "block prefill")
+def block_on() -> bool:
+    """The block prefill route's kernels and manifest keys: opt-in (LFM2MOE_BLOCK=1). Off, programs() / builds() /
+    pack_plan() are byte for byte what they were."""
+    return os.environ.get("LFM2MOE_BLOCK") == "1"
+
+
+MB_NT = 8             # designs/lfm2moe_batch/mbl.py token slots per expert visit (one 8-token MAC tile)
+
+
+def moe_batch_slots(spec: ModelSpec) -> list[int]:
+    """mbl's dispatch lengths: a binary ladder down from the expert count (an unused slot streams a real expert and
+    is wasted, so the rungs decide the padding)."""
+    return [s for s in (spec.num_experts >> i for i in range(30)) if s >= 8 and s % 8 == 0]
+
+
+def _dense_gemm_ops(spec: ModelSpec) -> list[dict]:
+    """The leading dense layers' MLP as three CONTIGUOUS GEMM operands (up, gate, down) in the free region of the
+    layer's pool between the 512-wide slots the sequential program reads and POOL_MIX. The slots interleave gate
+    and up bands, which is no GEMM operand; the extra 3 x 15 MB a dense layer is read once at load."""
+    G, L = geometry(spec), layout(spec)
+    F = ffn(spec, dense=True)
+    b = "blk.{l}."
+    ff, hid = spec.intermediate, G.HID
+    base = roundup(F.POOL_DOWN + F.POOL_SLOTS * F.UP_BYTES, MB)
+    ug = (ff // BAND_ROWS) * band_bytes(hid)
+    dn = (hid // BAND_ROWS) * band_bytes(ff)
+    if base + 2 * ug + dn > L.POOL_MIX:
+        raise OpRangeError("lfm2moe: the dense MLP's GEMM operands do not fit between its slots and the mixer")
+    return [_q4_op(b + "ffn_up.weight", base, ff, hid), _q4_op(b + "ffn_gate.weight", base + ug, ff, hid),
+            _q4_op(b + "ffn_down.weight", base + 2 * ug, hid, ff)]
+
+
+def moe_batch(spec: ModelSpec) -> dict:
+    """The token-batched expert kernel of the block route (designs/lfm2moe_batch/mbl.py): the `moe_batch` entry of a
+    layer type's gemm_block, plus the contexts / kernels / globals / builds it needs. One xclbin (context `mb`),
+    one instruction stream per dispatch length; the runtime patches the slots' expert offsets (`moebatch`,
+    moe_geometry's pool law: expert_stripes = 2 up_bytes is mbl's EXP_UG). y leaves [rbg][half][row][1024 B]
+    (designs/lfm2moe_batch/layout.py), not moe_batch's C-tile order."""
+    G, L, F = geometry(spec), layout(spec), ffn(spec, dense=False)
+    slots = moe_batch_slots(spec)
+    args = ["pool", "mb_x", "mb_h", "mb_y"]
+    check_buffer_args("moe_batch", args)
+    out: dict = {"contexts": {}, "kernels": {}, "globals": {}, "builds": {}}
+    for s in slots:
+        name = f"mb_s{s}"
+        out["contexts"].setdefault("mb", f"mb_s{slots[0]}/final.xclbin")
+        out["kernels"][name] = {"context": "mb", "insts": f"{name}/insts.bin", "patch": "moebatch", "build": name}
+        out["builds"][name] = {"design": "lfm2moe_batch/mbl.py",
+                               "build_dir": f"lfm2moe_batch/build_s{s}_h{G.HID}_f{G.FF}_e{spec.num_experts}",
+                               "env": {"MBL_SLOTS": str(s), "MBL_NT": str(MB_NT), "MBL_HID": str(G.HID),
+                                       "MBL_FF": str(G.FF), "MBL_EXPERTS": str(spec.num_experts),
+                                       "MBL_POOL_DOWN": str(F.POOL_DOWN), "MBL_POOL_BYTES": str(L.POOL_MIX)}}
+    out["globals"]["mb_x"] = slots[0] * G.HID * MB_NT * 2
+    out["globals"]["mb_h"] = slots[0] * G.FF * MB_NT * 2
+    out["globals"]["mb_y"] = slots[0] * G.HID * MB_NT * 4
+    out["moe_batch"] = {"kernels": {str(s): f"mb_s{s}" for s in slots}, "args": args, "nt": MB_NT,
+                        "y_layout": "rbg_half_row"}
+    return out
+
+
+def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
+    """Per layer type the `gemm_block` (kind `lfm`) the driver reads, plus the contexts / kernels / globals / builds
+    the route adds. None unless LFM2MOE_BLOCK=1. A layer is the mixer's fused input GEMM (conv in_proj B | C | u,
+    attention q | k | v), the host's middle (the conv, or attention over the block), the out GEMM, the host's
+    residual / ffn_norm, and then the leading dense layers' two MLP GEMMs or the routed experts (host router, the
+    token-batched mbl stream). The q4_1 GEMM reads the pool's bytes as they are: B | C | u and q | k | v are
+    contiguous pool ops."""
+    if not block_on():
+        return None
+    L, G, T = layout(spec, max_ctx), geometry(spec), GEMM_T
+    hid, qw, kvw = G.HID, G.QW, G.KVW
+    shapes: set[tuple[int, int]] = set()
+
+    def ctx(N: int, K: int) -> str:
+        if N % 256 or K % 256:
+            raise OpRangeError(f"lfm2moe gemm route: [{N}, {K}] is not a multiple of 256 in both dims")
+        shapes.add((N, K))
+        return f"gemm_n{N}_k{K}"
+
+    def run(N: int, K: int, w: str) -> dict:
+        return {"op": "run", "kernel": ctx(N, K), "args": [w, f"gemm_x_k{K}", f"gemm_y_n{N}"]}
+
+    def idx(pool: list[dict], suffix: str, dst: int | None = None) -> int:
+        hits = [i for i, o in enumerate(pool) if o["tensor"].endswith(suffix) and (dst is None or o["dst"] == dst)]
+        if len(hits) != 1:
+            raise OpRangeError(f"lfm2moe gemm route: {len(hits)} pack ops end in {suffix!r}, want one")
+        return hits[0]
+
+    def run_of(pool: list[dict], ids: list[int]) -> dict:
+        ops = [pool[i] for i in ids]
+        for a, b in zip(ops, ops[1:]):       # one byte-contiguous run, as the engine needs
+            if b["dst"] != a["dst"] + a["rows"] // BAND_ROWS * band_bytes(a["in_dim"]):
+                raise OpRangeError("lfm2moe gemm route: the pool ops of a GEMM weight are not contiguous")
+        return {"from": "pool", "ops": ids}
+
+    mbatch = moe_batch(spec)
+    out: dict = {"layer_types": {}, "contexts": {}, "kernels": {}, "globals": {}, "builds": {}}
+    for k in ("contexts", "kernels", "globals", "builds"):
+        out[k].update(mbatch[k])
+    seen: set[str] = set()
+    for nm, (mixer, dense) in zip(layer_type_names(spec), kinds(spec)):
+        if nm in seen:
+            continue
+        seen.add(nm)
+        pool = _layer_plan(spec, mixer, dense)["pool"]
+        gb: dict = {"kind": "lfm", "mixer": mixer, "t": T, "eps": spec.norm_eps,
+                    "cd_ln": L.CD_LNW, "cd_ffn": L.CD_POSTLN}
+        if mixer == MIX_CONV:
+            ip = "shortconv.in_proj.weight"
+            w = {"gin_w": run_of(pool, [idx(pool, ip, L.POOL_B), idx(pool, ip, L.POOL_C), idx(pool, ip, L.POOL_U)]),
+                 "gout_w": run_of(pool, [idx(pool, "shortconv.out_proj.weight")])}
+            gb.update(program=[run(3 * hid, hid, "gin_w"), run(hid, hid, "gout_w")], weights=w,
+                      taps=G.TAPS, cd_conv=L.CD_CONV)
+        else:
+            w = {"gqkv3_w": run_of(pool, [idx(pool, "attn_q.weight"), idx(pool, "attn_k.weight"),
+                                          idx(pool, "attn_v.weight")]),
+                 "go_w": run_of(pool, [idx(pool, "attn_output.weight")])}
+            gb.update(program=[run(qw + 2 * kvw, hid, "gqkv3_w"), run(hid, qw, "go_w")], weights=w,
+                      qw=qw, kvw=kvw, nh=G.NH, kvh=G.KVH, hd=G.HD, rot=spec.rotary_dim,
+                      cd_qnorm=L.CD_META, cd_knorm=L.CD_META + 2 * G.HD)
+        if dense:
+            ff = spec.intermediate
+            up, gate, down = _dense_gemm_ops(spec)
+            fw = {"gffn_ug_w": run_of(pool, [idx(pool, "ffn_up.weight", up["dst"]), idx(pool, "ffn_gate.weight", gate["dst"])]),
+                  "gffn_down_w": run_of(pool, [idx(pool, "ffn_down.weight", down["dst"])])}
+            gb.update(ff=ff, ffn_program=[run(2 * ff, hid, "gffn_ug_w"), run(hid, ff, "gffn_down_w")], ffn_weights=fw)
+        else:
+            r = route_step(spec)
+            gb.update(route={"router": r["router"], "bias": r["bias"], "experts": r["experts"], "topk": r["topk"],
+                             "scale": r["scale"]}, moe_batch=mbatch["moe_batch"])
+        out["layer_types"][nm] = gb
+    for N, K in sorted(shapes):
+        name = f"gemm_n{N}_k{K}"
+        out["contexts"].setdefault("gemm", f"{name}/final.xclbin")
+        out["kernels"][name] = {"context": "gemm", "insts": f"{name}/insts.bin", "build": name}
+        out["globals"][f"gemm_x_k{K}"] = K * T * 2
+        out["globals"][f"gemm_y_n{N}"] = max(out["globals"].get(f"gemm_y_n{N}", 0), N * T * 4)
+        out["builds"][name] = {"design": "gemm_q4_prefill/gemm_q4_prefill.py",
+                               "build_dir": f"gemm_q4_prefill/build_n{N}_k{K}_t{T}",
+                               "env": {"GQP_N": str(N), "GQP_K": str(K), "GQP_T": str(T)}}
+    return out
 
 
 CONV_ARGS = ["pool", "xres", "consts", "state", "act"]
@@ -429,6 +575,14 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
                      [route_step(spec), {"op": "run", "kernel": "lm_moe", "args": ["pool", "xres", "act"]}])
         out["layer_types"][nm] = {"buffers": {"consts": L.CD_BYTES, "act": L.AD_BYTES, "state": state},
                                   "program": [first] + ffn_steps}
+    gr = gemm_route(spec, max_ctx)
+    if gr:
+        for lt, gb in gr["layer_types"].items():
+            out["layer_types"][lt]["gemm_block"] = gb
+        for k in ("contexts", "kernels"):
+            out[k].update(gr[k])
+        for k, v in gr["globals"].items():
+            out["globals"][k] = max(out["globals"].get(k, 0), v)
     return out
 
 
@@ -455,6 +609,9 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
         out["lm_dense"] = {"design": "lfm2moe/lm.py",
                            "build_dir": f"lfm2moe/build_dense_h{G.HID}_f{DENSE_SLOT}_s{G.DENSE_SLOTS}",
                            "env": {"LM_PART": "dense"}}
+    gr = gemm_route(spec)
+    if gr:
+        out.update(gr["builds"])
     return out
 
 
@@ -487,7 +644,9 @@ def hf_config_check(spec: ModelSpec) -> dict:
 
 GEN_KERNELS = "designs/lfm2moe/gen_kernels.py"
 KERNEL_SOURCES = [
-    "designs/lfm2moe/*.py", "designs/gemv_q4/gemv_q4.h", "designs/gemv_q4/gemv_tab.h",
+    "designs/lfm2moe/*.py", "designs/lfm2moe_batch/*.py", "designs/lfm2moe_batch/*.cc", "designs/lfm2moe_batch/*.h",
+    "designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.h", "designs/gemm_q4_prefill/*.cc",
+    "designs/gemv_q4/gemv_q4.h", "designs/gemv_q4/gemv_tab.h",
     "designs/attn/*.cc", "designs/attn/*.h", "designs/ln/ln.h", "designs/ln/*.cc", "designs/ln/ln.py",
     "designs/lin_layer/ln_nr.cc", "designs/lm_head_q8/*.py", "designs/lm_head_q8/*.h", "designs/lm_head_q8/*.cc",
     "include/vecmath.h", "include/scalar_fp.h", "ironutil.py", "build_design.py",

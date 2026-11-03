@@ -324,6 +324,19 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   `target/npu-dev/hyv3-patch.sh` regenerates it and checks the chain reproduces the clone
   (`target/npu-dev/hyv3-runtime`).
 
+- `upstream-patches/lfm2moe-block-runtime.patch` (2026-11-03) is LFM2.5-24B-A2B's block prefill
+  (OPEN-FAMILY-LFM2MOE, `LFM2MOE_BLOCK=1`). A new `gemm_block` kind `lfm` (mixer `conv` | `att`):
+  `block_layer_lfm` runs the entry norm, the fused input GEMM, the conv's elementwise middle over the
+  block with the carried two-row f32 state (or `attention_block` with a null gate), the out GEMM, the
+  residual and `ffn_norm`; then a leading dense layer's up|gate and down GEMMs (`ffn_program`), or
+  hy_route's router arithmetic over the block (`lfm_route_rows`) and `moe_block` with mbl's
+  `[rbg][half][row]` y order (`moe_batch.y_layout`). `op_region` reads a one-tensor `fl_q4` op as the band
+  law. No new pack op. The diff applies over `beccd46`, the nine Gemma 4 patches, `gptoss-runtime.patch`,
+  `gptoss-prefill-runtime.patch`, `flint-runtime.patch` and `hyv3-runtime.patch`; it edits `moe_block`'s y
+  read like `gemma4-moe-block-runtime.patch` does, so the two are alternatives on one clone, not a stack.
+  `target/npu-dev/lfm2moe-block-patch.sh` regenerates it and checks the chain reproduces the clone
+  (`target/npu-dev/lfm2moe-runtime`).
+
 - `upstream-patches/gemma4-moe-runtime.patch` (2026-10-31) runs Gemma 4 26B-A4B from its QAT
   Q4_0 GGUF (OPEN-FAMILY-GEMMA4-MOE). Two pack ops: `g4_q40` (a Q4_0 tensor, 2-D or the
   experts' 3-D, into Q4_0-native chunks in `std_perm`'s band law, with rows and columns padded

@@ -567,5 +567,33 @@
     "note": "Tencent HY V3 / Hy-Memory-30B-A3B from our pure Q4_0 GGUF (OPEN-FAMILY-HYV3, recipes/hyv3.py): the hy_route program step (sigmoid router with the per-expert selection bias exp_probs_b, top-k of score + bias, the unbiased scores renormalised times router_scaling_factor, the shared expert's slot at weight 1, up to 16 slots in an f32[16] record; a dense mode pointing the slots at a dense MLP's slices at weight 1; moe2_apply on hy_moe's fills) and host_step dispatching it; the moe geometry's topk limit raised from 8 to 16 with the 8-slot device-router record checked in Core::route instead. The pack ops (fl_q4, gx_lmhead, put) are the chain's. A diff over base plus the nine Gemma 4 patches, gptoss-runtime.patch (8a5f808e), gptoss-prefill-runtime.patch (f28a389e) and flint-runtime.patch (323e4dc8); target/npu-dev/hyv3-patch.sh regenerates it and checks the chain",
     "patch": "hyv3-runtime.patch",
     "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "lfm2moe_block_20261103": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gptoss_runtime_20261031",
+      "gptoss_prefill_runtime_20261031",
+      "flint_runtime_20261031",
+      "hyv3_runtime_20261031"
+    ],
+    "files": [
+      "src/open_qwen36/block_host.cpp",
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp"
+    ],
+    "note": "LFM2.5-24B-A2B block prefill (OPEN-FAMILY-LFM2MOE, 2026-11-03, LFM2MOE_BLOCK=1): gemm_block kind `lfm` (mixer conv | att; the fused input GEMM, the out GEMM, a leading dense layer's up|gate + down GEMMs or `route` + `moe_batch`): block_layer_lfm runs the host entry norm, the 3-tap conv middle over the block with the carried 2-row f32 state (or attention_block without a gate), the residual and ffn_norm, hy_route's router math over the block (lfm_route_rows) and moe_block with mbl's [rbg][half][row] y order (moe_batch.y_layout); op_region reads a one-tensor fl_q4 op as the band law; attention_block takes a null gate. Independent of gemma4-moe-block-runtime.patch (both edit moe_block's y read: they conflict if stacked); no new pack op. sha256 f0d645712f14186cab05955a6223eae6f1571d69f6d6b6566b4c0989d328c3a6; chain-verified by target/npu-dev/lfm2moe-block-patch.sh; built in target/npu-dev/lfm2moe-runtime",
+    "patch": "lfm2moe-block-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
   }
 }
