@@ -1,4 +1,5 @@
 #define GEMV_PER_CALL 2
+#define GEMV_Q4_0_NATIVE 1      // LFM3_Q40: 4608-B chunks, m = -8 d
 #include "gemv_q4.h"
 // A q4_1 64-row band of a slot's gate or up into the scratch at ms + dst (up at 0, gate at 64).
 extern "C" {

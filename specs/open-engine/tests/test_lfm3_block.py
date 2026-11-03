@@ -1,6 +1,6 @@
 # Traces: OPEN-FAMILY-LFM3 (block prefill), OPEN-PREFILL-BATCH
 # (canonical spec: specs/open-engine/spec.md)
-"""LFM3-1.7B block prefill (LFM3_BLOCK=1): the recipe's emission, pure functions over the HF config fixture of test_lfm3.py -- no
+"""LFM3-1.7B block prefill (on by default; LFM3_BLOCK=0 drops it): the recipe's emission, pure functions over the HF config fixture of test_lfm3.py -- no
 model, no hardware (the route is validated on hardware: .plans/lfm3-native.md "block prefill")."""
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import pytest
 
 from recipes import lfm3 as F
 
-from test_lfm3 import spec
+from test_lfm3 import LEGACY, legacy, spec  # noqa: F401 (legacy: autouse, every other switch off)
 
 
 @pytest.fixture
@@ -16,8 +16,12 @@ def on(monkeypatch):
     monkeypatch.setenv("LFM3_BLOCK", "1")
 
 
-def test_off_by_default_leaves_decode_alone(monkeypatch):
-    monkeypatch.delenv("LFM3_BLOCK", raising=False)
+def test_on_by_default(monkeypatch):
+    monkeypatch.delenv("LFM3_BLOCK")
+    assert F.gemm_route(spec()) is not None
+
+
+def test_off_leaves_decode_alone():
     s = spec()
     assert F.gemm_route(s) is None
     assert all("gemm_block" not in lt for lt in F.programs(s)["layer_types"].values())
@@ -26,7 +30,6 @@ def test_off_by_default_leaves_decode_alone(monkeypatch):
 
 def test_the_pack_plan_and_decode_kernels_do_not_move(monkeypatch):
     s = spec()
-    monkeypatch.delenv("LFM3_BLOCK", raising=False)
     plan, progs, builds = F.pack_plan(s), F.programs(s), F.builds(s)
     monkeypatch.setenv("LFM3_BLOCK", "1")
     assert F.pack_plan(s) == plan                      # the route reads the decode pool's bytes as they are

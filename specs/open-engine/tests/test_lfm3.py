@@ -41,6 +41,18 @@ HF_LFM3 = {
 }
 
 
+
+# The fast paths are the default; these tests describe the original emission (two dispatches a layer, q4_1 pools, the
+# f32-scale head, sequential prefill), so they pin every switch off. test_lfm3_fused.py checks the defaults.
+LEGACY = {"LFM3_BLOCK": "0", "LFM3_FUSED": "0", "LFM3_SHARED": "0", "LFM3_Q40": "0", "LFM3_HEAD": "f32"}
+
+
+@pytest.fixture(autouse=True)
+def legacy(monkeypatch):
+    for k, v in LEGACY.items():
+        monkeypatch.setenv(k, v)
+
+
 def spec(**over):
     cfg = copy.deepcopy(HF_LFM3)
     cfg.update(over)

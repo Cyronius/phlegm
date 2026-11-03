@@ -368,9 +368,9 @@ def _moe_builds(spec: ModelSpec) -> dict[str, dict]:
 
 
 def moe_batch_on() -> bool:
-    """The block prefill route's token-batched expert streams in the 26B kernel set: opt-in (G4_MOE_BATCH=1)
-    until the route that uses them (runtime step_block_moe for gemma4) has passed its gate."""
-    return os.environ.get("G4_MOE_BATCH") == "1"
+    """The block prefill route's token-batched expert streams in the 26B kernel set: on by default (the route,
+    runtime step_block_moe for gemma4, passed its gate 2026-11-03; G4_MOE_BATCH=0 drops them: sequential prefill)."""
+    return os.environ.get("G4_MOE_BATCH") != "0"
 
 
 MB_NT = 8             # designs/gemma4_moe_batch/mb4.py token slots per expert visit (one 8-token MAC tile)
@@ -726,7 +726,7 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096, pool_quant: str | None = No
     view's), or q4_1's for the compact view (finalize_gguf_manifest)."""
     moe = is_moe(spec)
     if not gguf_direct(spec.quant) or not gemm_on() or (moe and not moe_batch_on()):
-        return None              # 26B-A4B: sequential prefill unless the token-batched experts are built (G4_MOE_BATCH=1)
+        return None              # 26B-A4B: sequential prefill when the token-batched experts are off (G4_MOE_BATCH=0)
     if moe and not attn_block_on():
         raise OpRangeError("gemma4 moe block route: attention is the block products only (no dxB build at hidden 2816); "
                            "G4_ATTN_BLOCK=0 has nothing to fall back to")

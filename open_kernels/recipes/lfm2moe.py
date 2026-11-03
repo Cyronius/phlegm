@@ -387,9 +387,9 @@ def route_step(spec: ModelSpec) -> dict:
 
 # ---- block prefill (the Gemma 4 route: commit 8c27569; .plans/lfm2moe-native.md "block prefill")
 def block_on() -> bool:
-    """The block prefill route's kernels and manifest keys: opt-in (LFM2MOE_BLOCK=1). Off, programs() / builds() /
-    pack_plan() are byte for byte what they were."""
-    return os.environ.get("LFM2MOE_BLOCK") == "1"
+    """The block prefill route's kernels and manifest keys: on by default (LFM2MOE_BLOCK=0 drops them: sequential
+    prefill, and programs() / builds() / pack_plan() are the decode set's alone)."""
+    return os.environ.get("LFM2MOE_BLOCK") != "0"
 
 
 MB_NT = 8             # designs/lfm2moe_batch/mbl.py token slots per expert visit (one 8-token MAC tile)
@@ -448,7 +448,7 @@ def moe_batch(spec: ModelSpec) -> dict:
 
 def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
     """Per layer type the `gemm_block` (kind `lfm`) the driver reads, plus the contexts / kernels / globals / builds
-    the route adds. None unless LFM2MOE_BLOCK=1. A layer is the mixer's fused input GEMM (conv in_proj B | C | u,
+    the route adds. None under LFM2MOE_BLOCK=0. A layer is the mixer's fused input GEMM (conv in_proj B | C | u,
     attention q | k | v), the host's middle (the conv, or attention over the block), the out GEMM, the host's
     residual / ffn_norm, and then the leading dense layers' two MLP GEMMs or the routed experts (host router, the
     token-batched mbl stream). The q4_1 GEMM reads the pool's bytes as they are: B | C | u and q | k | v are

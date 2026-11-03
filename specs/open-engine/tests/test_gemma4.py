@@ -503,9 +503,11 @@ def test_26b_pool_holds_the_experts_first(unvalidated):
     assert (g["pool_down"], g["share_up"], g["up_bytes"], g["topk"]) == (M.POOL_DOWN, M.POOL_END, M.UP_BYTES, 8)
 
 
-def test_26b_program_routes_and_combines_on_the_host(unvalidated):
+def test_26b_program_routes_and_combines_on_the_host(unvalidated, monkeypatch):
     """dxm (the default): the experts are each layer type's image's second stream, so a layer runs
-    in one context; its program still routes and combines on the host around the two dispatches"""
+    in one context; its program still routes and combines on the host around the two dispatches
+    (the decode set alone: G4_MOE_BATCH=0, no block prefill route)"""
+    monkeypatch.setenv("G4_MOE_BATCH", "0")
     s = spec_26b()
     m = manifest(s)
     for sec in (m, m["gguf"]):
@@ -534,6 +536,7 @@ def test_26b_expert_image_of_its_own(unvalidated, monkeypatch, design, parts):
     """G4_MOE_DESIGN=gm | gm8: the experts on a context of their own (the 2026-10-31 route, and the
     8-core image a routed slot a core); gm8 leaves one partial a slot for the combine to add"""
     monkeypatch.setattr(G4, "MOE_DESIGN", design)
+    monkeypatch.setenv("G4_MOE_BATCH", "0")
     s = spec_26b()
     m = manifest(s)
     for lt in ("dense_local", "dense"):

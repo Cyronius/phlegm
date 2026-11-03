@@ -36,13 +36,14 @@ from .qwen36moe import BAND_ROWS, ELEM, MB, roundup, tab_bytes
 from .spec import DENSE_LOCAL, FULL, SHORT_CONV, ModelSpec
 
 CH = 5120                 # a q4_1 chunk: 32 rows x 256 K, bf16 d | m planes (gemv_q4.h)
-CH_Q40 = 4608             # a Q4_0-native chunk: the bf16 d plane and the codes (m = -8 d on the core; LFM3_Q40=1)
+CH_Q40 = 4608             # a Q4_0-native chunk: the bf16 d plane and the codes (m = -8 d on the core; the default)
 
 
 def q40_on() -> bool:
-    """Q4_0-native pools (LFM3_Q40=1): the QAD Q4_0's scales are bf16 values, so 4608-B chunks (no m plane) hold every
-    matrix exactly in 10 % fewer bytes than the q4_1 law. Off, every emission is what it was."""
-    return os.environ.get("LFM3_Q40") == "1"
+    """Q4_0-native pools (the default; LFM3_Q40=0 for the q4_1 law): the QAD Q4_0's scales are bf16 values, so 4608-B
+    chunks (no m plane) hold every matrix exactly in 10 % fewer bytes than the q4_1 law. Off, every emission is the
+    q4_1 law's."""
+    return os.environ.get("LFM3_Q40") != "0"
 
 
 def chunk() -> int:
@@ -55,13 +56,14 @@ STACK = 0x1800
 LM_CORES = 8
 LM_BAND_ROWS = 128        # lm_head_q8: 128-row bands
 LM_TILE = 9216            # lm_head_q8.h's f32-scale chunk: 32 rows x 256 K
-LM_TILE_BF16 = 8704       # ... its bf16-scale chunk (LFM3_HEAD=bf16)
+LM_TILE_BF16 = 8704       # ... its bf16-scale chunk (the default; LFM3_HEAD=f32 for the other)
 
 
 def head_bf16() -> bool:
-    """The head's chunks with bf16 scales (LFM3_HEAD=bf16: gx_lmhead_bf16, lm_head_q8.h's default 8704-B law). The
-    f32-scale kernel rounds its scales to bf16 RNE on the core, so the logits are bit-identical in 5.6 % fewer bytes."""
-    return os.environ.get("LFM3_HEAD") == "bf16"
+    """The head's chunks with bf16 scales (the default: gx_lmhead_bf16, lm_head_q8.h's default 8704-B law; LFM3_HEAD=f32
+    for gx_lmhead's f32-scale 9216-B chunks). The f32-scale kernel rounds its scales to bf16 RNE on the core, so the
+    logits are bit-identical in 5.6 % fewer bytes."""
+    return os.environ.get("LFM3_HEAD") != "f32"
 
 
 def head_tile() -> int:
@@ -379,14 +381,14 @@ def rope_table(spec: ModelSpec, local: bool) -> list[float]:
 
 # ---- block prefill (the LFM2.5-24B-A2B route, recipes/lfm2moe.py gemm_route, kind `lfm`; .plans/lfm3-native.md "block prefill")
 def block_on() -> bool:
-    """The block prefill route's kernels and manifest keys: opt-in (LFM3_BLOCK=1). Off, programs() / builds() are byte
-    for byte what they were; pack_plan() is never touched (the route reads the decode pool's bytes as they are)."""
-    return os.environ.get("LFM3_BLOCK") == "1"
+    """The block prefill route's kernels and manifest keys: on by default (LFM3_BLOCK=0 drops them: sequential prefill).
+    pack_plan() is never touched (the route reads the decode pool's bytes as they are)."""
+    return os.environ.get("LFM3_BLOCK") != "0"
 
 
 def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
     """Per layer type the `gemm_block` (kind `lfm`) the driver reads, plus the contexts / kernels / globals / builds the
-    route adds. None unless LFM3_BLOCK=1. A layer is the mixer's fused input GEMM (conv in_proj B | C | u; attention
+    route adds. None under LFM3_BLOCK=0. A layer is the mixer's fused input GEMM (conv in_proj B | C | u; attention
     q | gate | k | v with the derived GGUF's expanded gate), the host's middle (the 7-tap conv with its 6-row state, or
     attention over the block with the layer type's RoPE table and window, the sigmoid gate on the output), the out GEMM, the
     sandwich norm and residual, then the dense MLP and its sandwich norm. The MLP reads the decode pool in place: slot e's
@@ -449,16 +451,16 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
 
 def fused_on() -> bool:
     """One dispatch a layer (designs/lfm3/lg.py LG_PART=convmlp | attmlp: the mixer's program then the MLP's over the
-    same fifos): opt-in (LFM3_FUSED=1, or LFM3_SHARED=1 which implies it). Off, programs() / builds() / pack_plan() are
-    byte for byte what they were."""
-    return os.environ.get("LFM3_FUSED") == "1" or shared_on()
+    same fifos): on by default (LFM3_FUSED=0 for the mixer and the MLP as two dispatches, which also turns the shared
+    image off)."""
+    return os.environ.get("LFM3_FUSED") != "0"
 
 
 def shared_on() -> bool:
     """The fused layers as ONE image for both mixers (LG_PART=shared, two instruction streams LG_STREAM=conv | att whose
     xclbins agree apart from build stamps; only the conv build's is loaded): conv and attention layers never change
-    hardware context. Opt-in (LFM3_SHARED=1)."""
-    return os.environ.get("LFM3_SHARED") == "1"
+    hardware context. On by default with fusion (LFM3_SHARED=0 for a fused image a mixer)."""
+    return os.environ.get("LFM3_SHARED") != "0" and fused_on()
 
 
 SHARED_BUILDS = {"conv": "lg_shared_conv", "att": "lg_shared_att"}

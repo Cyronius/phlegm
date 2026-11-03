@@ -2420,7 +2420,7 @@ and its down hold the same number of chunks, as `moeroute2`'s geometry requires.
 - the dense MLP pads to 2304 and the experts to 768; the 12B's recipe, pool plan and builds do not move.
 - the pool holds the experts from byte 0 (gate | up per expert, then the down slices), the attention and dense MLP after them, and every offset fits a 32-bit fill word.
 
-Block prefill (2026-11-03, `G4_MOE_BATCH=1` kernels, `gemma4-moe-block-runtime.patch`): a
+Block prefill (2026-11-03, on by default; `G4_MOE_BATCH=0` drops the kernels; `gemma4-moe-block-runtime.patch`): a
 `gemm_block` of kind `dense` per layer type: the five q4 GEMMs on the GGUF's Q4_0-native pool
 (qkv3, o, gate, up, down at the padded 2304; `gemm_q4_prefill`, T = 256), the attention as the
 `attn_block` products (no dxB build), then the layer's close on the host: `t1`, the router over
@@ -2428,6 +2428,11 @@ the f32 residual, the experts through `designs/gemma4_moe_batch/mb4.py` (each ex
 once per up to eight tokens, a transposed product, the weight codes dequantised to bf16 on the
 core; y leaves in its own [rbg][half][row] order), and the combine. Eight tokens share an
 expert visit, so the expert stream reads each expert's bytes once per eight tokens.
+Default since 2026-11-03: a default export's manifest equals the gated `dxm` + `mb` set's (build
+keys aside); that set is the model dir's `open_kernels/` (the 10-31 set kept as
+`open_kernels.1031`), and `phlegm run` (prefill route `auto`) takes the block route through a bridge
+built from the block runtime (`bridges/gemma4moe-blk`): a ~700-token prompt plus load 37 s against
+105 s with `--prefill-route sequential` (development, one run each).
 
 **Procedure (manual):** greedy tokens against llama.cpp on the same GGUF; every prefill
 position's log-KL against an independent fp32 reference and against a BF16-rounding
@@ -4740,7 +4745,7 @@ resident in ~25 s; sequential prefill 151 ms/token (843 tokens 127 s); decode 18
 route 3-5 ms, experts ~70 ms, head ~9 ms a token). `phlegm run` and `phlegm serve` (OpenAI chat, streamed and not)
 answer; the reasoning is not split from the reply.
 
-**Block prefill (2026-11-03, development; `LFM2MOE_BLOCK=1`).** The sequential prefill (151 ms a token) is replaced by
+**Block prefill (2026-11-03, development; the default since 2026-11-03, `LFM2MOE_BLOCK=0` drops it).** The sequential prefill (151 ms a token) is replaced by
 the Gemma 4 route (OPEN-FAMILY-GEMMA4-MOE): per layer a runtime kind `lfm` -- the entry norm, the conv middle (the 3-tap
 causal conv over the block, the 2-row f32 state carried across blocks) or the attention middle (q / k norm, RoPE, causal
 attention; on the host, `ag_*` products not wired), the residual / norm and the router (hy_route's arithmetic) on the host;
@@ -4755,8 +4760,11 @@ per-position KL(fp32 || x) over the 843 prompt positions: block 735 / 843 argmax
 prompt 8 / 8; a 1-token and a 257-token prompt differ from the sequential route on rounding-chaotic prompts (KL vs fp32 at
 position 256: 1.69 block / 1.47 sequential / 1.38 control). Development timing (load 2.6-4.1, alternating, 843 tokens, 1 decode
 token): block 7.8 s (9.2 ms a token), sequential 105-116 s (125-138 ms a token); no quiet-machine timing, no ArtLite
-comparison. Open: NPU attention products, hi / lo expert weights, bfp16 GEMMs, the model dir still runs the sequential route
-(`--kernels kernels/lfm2moe-blk --gemm-block` selects the block one; not wired through `phlegm run`).
+comparison. Open: NPU attention products, hi / lo expert weights, bfp16 GEMMs. Default since 2026-11-03: the recipe emits the
+route unless `LFM2MOE_BLOCK=0`, a default export's manifest equals `kernels/lfm2moe-blk`'s (build keys aside), the model dir's
+`open_kernels/` is that set (the sequential set kept as `open_kernels.seq`), and `phlegm run` (prefill route `auto`) takes it through
+a bridge built from the block runtime (`bridges/lfm2moe-blk`): a ~700-token prompt plus load 33 s against 133 s with
+`--prefill-route sequential`; the short chat prompt answers "The capital of France is Paris."
 
 ### OPEN-FAMILY-LFM3: LiquidAI LFM3 (LFM3-1.7B) derives its own spec and runs on its own recipe from the GGUF
 **Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_lfm3_hf`, `families.py`, `lfm3.py`,
@@ -4806,27 +4814,27 @@ bf16 control vs fp32 837 / 843, 1.05e-4, 2.4e-4; no drift by position; the 256-r
 Timing (loaded): sequential prefill 60-102 ms a token (by load), decode 95-105 ms a token (48 dispatches). `phlegm run` and
 `phlegm serve` answer with the reasoning split. Open: fusing the two dispatches, the vision / audio siblings.
 
-**Decode fusion (2026-11-03, development; `LFM3_FUSED=1`).** Measured with `--bench-decode` (load ~1.5): every dispatch costs ~1.1-1.3 ms
+**Decode fusion (2026-11-03, development; on by default, `LFM3_FUSED=0` for two dispatches a layer).** Measured with `--bench-decode` (load ~1.5): every dispatch costs ~1.1-1.3 ms
 whether it moves 9 or 28 MB (a fixed cost), so the 48 dispatches of 66-68 ms a token (the earlier 100 ms was load) become 24: parts
 `convmlp` / `attmlp` of `designs/lfm3/lg.py` run the mixer's program and then the MLP's over the same fifos, the norm helper's close
 steps in sequence, one host sequence. Decode 49 ms a token; logits bit-identical to the unfused route over all 843 prompt positions
-(KL 0), greedy equal to llama.cpp (16 / 64 / 32), compatible with `LFM3_BLOCK=1` (chat prompt 40 / 40, prefill 23 ms a token). Off, programs,
-builds and pack plan are unchanged. Remaining cost: the conv <-> attention xclbin switch, ~0.9 ms x ~22 a token; one shared
+(KL 0), greedy equal to llama.cpp (16 / 64 / 32), compatible with block prefill (chat prompt 40 / 40, prefill 23 ms a token). With `LFM3_FUSED=0` programs,
+builds and pack plan are the unfused set's. Remaining cost: the conv <-> attention xclbin switch, ~0.9 ms x ~22 a token; one shared
 two-stream image (Gemma's dxm trick) would reach ~28 ms a token.
 
-**Shared image (2026-11-03, development; `LFM3_SHARED=1`, implies fused).** The conv and attention layers' fused dispatches are two
+**Shared image (2026-11-03, development; on by default with fusion, `LFM3_SHARED=0` for a fused image a mixer).** The conv and attention layers' fused dispatches are two
 instruction streams (`LG_STREAM=conv|att`) over one xclbin (`lg_shared`): identical core programs -- the main cores run the conv's band
 counts (12, 4, then the MLP), attention padded with 2 scratch bands drained into `t` (valid because QW = HID, O_PC = SC_PC and
 OG_ELEMS = XN_ELEMS, asserted); the conv core at Tile(6, 3) on shim columns 6 / 7, the attention cores at (2..5, 3); one buffer
 signature (pool, xres, consts, state, act, ptab; the state typed at the larger of the KV and conv sizes). Only the conv stream's
 xclbin is loaded; the export checks the two agree apart from build stamps (`xclbin_equivalent`: 71 bytes, all stamps). Budgets:
 main 11 504 B text, helper 7 424, attention unchanged (<= 15 808), conv 2 272. Decode never changes hardware context between layers.
-Result: logits bit-identical to the fused route over 843 positions; greedy equal to llama.cpp (16 / 64 / 32); with `LFM3_BLOCK=1`
+Result: logits bit-identical to the fused route over 843 positions; greedy equal to llama.cpp (16 / 64 / 32); with block prefill
 32 / 32 on the 843-token prompt. Timing (paired, alternating, load ~31, noisy): decode step 60.7 -> 36.7 ms (fused -> shared), the
 attention dispatch in the walk 2.3 -> 1.1 ms; CLI decode 32-38 ms a token at load ~30; ~29 ms estimated unloaded (not measured).
 What is left is bytes: the head (282 MB, 6-8 ms), the repeated-row gate, the q4_1 m plane (11 % over Q4_0).
 
-**Decode bytes (2026-11-03, development; `LFM3_Q40=1`, `LFM3_HEAD=bf16`).** The pools in the Q4_0-native law (4608-B chunks, bf16 d,
+**Decode bytes (2026-11-03, development; on by default, `LFM3_Q40=0` for the q4_1 pools, `LFM3_HEAD=f32` for the f32-scale head).** The pools in the Q4_0-native law (4608-B chunks, bf16 d,
 m = -8 d on the core): exact, since every QAD scale is a bf16 value; the layer pool 40.9 -> 36.7 MB and the block route's GEMMs read
 q4_0 in place (`GQP_FMT=q4_0`). The tied head with bf16 per-32 scales (8704-B chunks, 282 -> 266 MB): bit-identical, because the
 f32-scale kernel already rounds its scales to bf16 on the core. Runtime `lfm3-q40-runtime.patch` (`fl_q4` at 4608, `gx_lmhead_bf16`).
@@ -4835,7 +4843,7 @@ Decode step ~37 -> 34.6 ms (paired, load ~16). Measured on the head: 7.3 ms of b
 xclbin a token; folding it into the shared image (a runtime-selected core mode) and a Q6_K-native head (exact to the published file,
 ~215 MB) are the remaining head options, neither built.
 
-**Block prefill (2026-11-03, development; `LFM3_BLOCK=1`).** The LFM2.5 `lfm` gemm_block kind (OPEN-FAMILY-LFM2MOE), generalised: each
+**Block prefill (2026-11-03, development; on by default, `LFM3_BLOCK=0` for sequential prefill).** The LFM2.5 `lfm` gemm_block kind (OPEN-FAMILY-LFM2MOE), generalised: each
 layer is the mixer's fused input GEMM (conv in_proj B | C | u, or attention q | gate | k | v with the expanded gate), a host
 middle (the 7-tap conv with its 6-row f32 state slid over the block, or attention over the block with the layer type's zero-tail
 RoPE table, the 256-row window and the sigmoid gate), the out GEMM, the sandwich norm and residual, then the dense MLP as five
@@ -4850,9 +4858,14 @@ positions: block 836 / 843 argmax-equal, median 1.21e-4, mean 2.46e-4; sequentia
 steps after the block prefill agree to relL2 <= 1.3e-2 (the conv state and the KV rows carry over). Development timing (load
 4.6-8.9, alternating, 843 tokens, 1 decode token): block 2.57 s (3.0 ms a token), sequential 50.2 s (60 ms a token), ~19.6x; a
 256-token block is ~670 ms (GEMMs 411, host 231 of which attention 153). No quiet-machine timing, no ArtLite comparison. Open:
-attention on the host (the head-dim-128 `ag_*` products exist, unwired), the MLP's 10 small dispatches a layer, hi / lo, bfp16,
-and `phlegm run` wiring (the model dir prefills sequentially unless `open_kernels/` is the `lfm3-blk` set and the engine's gemm
-route is on).
+attention on the host (the head-dim-128 `ag_*` products exist, unwired), the MLP's 10 small dispatches a layer, hi / lo, bfp16.
+
+**Defaults (2026-11-03).** Every route above is the recipe's default: unset, `LFM3_FUSED`, `LFM3_SHARED`, `LFM3_Q40`, `LFM3_BLOCK` are on
+and `LFM3_HEAD` is `bf16`; `0` (`f32` for the head) selects the slower route, which the unit tests pin explicitly. A default export
+reproduces `kernels/lfm3-q40h-blk` (manifest equal apart from build keys; every xclbin equal apart from build stamps;
+`insts.bin` byte-identical). The model dir's `open_kernels/` is that set (the original two-dispatch set kept as `open_kernels.seq`),
+and `phlegm run` takes block prefill (prefill route `auto`) through a bridge built from the `lfm3-q40-runtime.patch` chain
+(`bridges/lfm3`): a ~700-token prompt plus load 6.8 s against 24 s with `--prefill-route sequential` (development, one run each).
 
 ### OPEN-WIDTH-PAD: the padded width a recipe may derive, and what it does not settle
 **Applies to:** openflowlm-next (`open_kernels/recipes/qwen36moe.py`,

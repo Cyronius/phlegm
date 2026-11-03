@@ -187,9 +187,10 @@ prompt and all 32 after an 843-token prompt equal llama.cpp's; every prompt posi
 bf16 control's / llama.cpp's distance from the fp32 reference. Decode ~183 ms a token, sequential
 prefill ~151 ms a token (development, loaded machine). `phlegm run` / `serve` answer. Open: block
 prefill, the reasoning split, the QAD-Q4_0 checkpoint (a Q6_K head), a clean benchmark. Block prefill
-(`LFM2MOE_BLOCK=1`, 2026-11-03, token-batched `mbl` experts + q4 GEMMs, host elementwise middles and attention): the
+(2026-11-03, token-batched `mbl` experts + q4 GEMMs, host elementwise middles and attention): the
 843-token prompt in 7.8 s against 105-116 s sequential (development, loaded), 32/32 greedy identical, every position inside
-the bf16 control's spread; not yet the model dir's default. Plan:
+the bf16 control's spread. The default (`LFM2MOE_BLOCK=0` for sequential): the model dir's kernels and `phlegm run` use it
+(bridge `bridges/lfm2moe-blk`). Plan:
 [.plans/lfm2moe-native.md](.plans/lfm2moe-native.md); spec: OPEN-FAMILY-LFM2MOE.
 
 ## LiquidAI LFM3-1.7B (lfm3)
@@ -200,10 +201,12 @@ gated attention in two kinds -- full with a half-rotated head, sliding 256 -- an
 layer) on the existing LFM2.5 runtime, no patch of its own. 16/64/32 greedy tokens of a raw, a chat and an 843-token prompt
 equal llama.cpp's; every prompt position sits at the bf16 control's distance from the fp32 reference (835/843 argmax-equal,
 KL median 8.7e-5). `phlegm run` / `serve` answer. Decode ~100 ms a token (dispatch-bound: 48 dispatches and context
-switches; `LFM3_FUSED=1` runs one dispatch a layer: 49 ms a token, bit-identical logits, `LFM3_SHARED=1` puts conv and attention in one xclbin with two streams: ~32-38 ms a token at load ~30, bit-identical logits; `LFM3_Q40=1` + `LFM3_HEAD=bf16`: Q4_0-native pools and bf16 head scales, exact, ~37 -> 34.6 ms at load ~16), sequential prefill 60-102 ms a token. Block prefill (`LFM3_BLOCK=1`, 2026-11-03, the LFM2.5 `lfm` route generalised:
+switches; fusion runs one dispatch a layer: 49 ms a token, bit-identical logits; the shared image puts conv and attention in one xclbin with two streams: ~32-38 ms a token at load ~30, bit-identical logits; Q4_0-native pools and bf16 head scales, exact, ~37 -> 34.6 ms at load ~16), sequential prefill 60-102 ms a token. Block prefill (2026-11-03, the LFM2.5 `lfm` route generalised:
 q4 GEMMs on the decode pool's bytes in place, host conv / attention middles, sandwich norms): the 843-token prompt in 2.6 s against
 50 s sequential (development, loaded), 32/32 greedy equal to llama.cpp, mean KL 2.46e-4 against 2.43e-4 sequential and 2.42e-4 for the
-bf16 control; not yet the model dir's default. Open: the head's context switches (~2 ms a token) and a Q6_K-native head, the 16-row gate, a quiet-machine timing, attention products on the NPU for prefill,
+bf16 control. Every one of these is the default (2026-11-03; `LFM3_FUSED` / `LFM3_SHARED` / `LFM3_Q40` / `LFM3_BLOCK=0`,
+`LFM3_HEAD=f32` select the slower routes): the model dir's kernels are the `lfm3-q40h-blk` set and `phlegm run` uses block prefill
+through `bridges/lfm3`. Open: the head's context switches (~2 ms a token) and a Q6_K-native head, the 16-row gate, a quiet-machine timing, attention products on the NPU for prefill,
 a clean benchmark. Plan:
 [.plans/lfm3-native.md](.plans/lfm3-native.md); spec: OPEN-FAMILY-LFM3.
 
@@ -218,7 +221,7 @@ logit's KL against an fp32 reference matches a bf16-rounding control. `phlegm ru
 `serve` answer through the bridge. Development timing (2026-11-01, paired against the 10-31
 build): decode step 0.80x (106 against 132 ms median at load 8-20; 82 ms a token on a quieter
 run), sequential prefill 88 ms a token, logits byte-identical. Phlegm returns Gemma's thought
-channel as `reasoning_content` (SERVER-REASONING). Block prefill (2026-11-03, `G4_MOE_BATCH=1` kernels,
+channel as `reasoning_content` (SERVER-REASONING). Block prefill (2026-11-03, the default since then: the model dir's kernels and `phlegm run` through `bridges/gemma4moe-blk`; `G4_MOE_BATCH=0` drops it;
 `gemma4-moe-block-runtime.patch`, `designs/gemma4_moe_batch`): 1450 tokens in 13-15 ms a token against
 74-99 sequential (paired, alternating, load 20-30; development timing); short prompt 32/32 equal to
 llama.cpp, long prompt 17/32 then a 0.374 / 0.371 near-tie flip, prompt log-KL within the bf16

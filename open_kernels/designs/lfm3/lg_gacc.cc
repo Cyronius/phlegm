@@ -1,4 +1,5 @@
 #define GEMV_PER_CALL 2
+#define GEMV_Q4_0_NATIVE 1      // LFM3_Q40: 4608-B chunks, m = -8 d
 #include "gemv_q4.h"
 #include "vecmath.h"
 // A q4_1 down band of slot e into the scratch at ms + 128 and, after the band's last group, onto

@@ -58,8 +58,9 @@ def test_recipe_emits_the_expert_ladder(monkeypatch):
     assert int(b["env"]["MB_POOL_DOWN"]) == M.POOL_DOWN == 128 * 2433024
     assert M.UP_BYTES == 1216512 and M.EXPERT_UG == 2433024
     assert mb["globals"]["mb_y"] == 128 * 2816 * 8 * 4
-    # off by default: the shipped decode set is untouched; on, the streams join its builds
-    assert "mb_s128" not in G4.builds(spec)
-    monkeypatch.setenv("G4_MOE_BATCH", "1")
+    # on by default: the streams join the decode set's builds; G4_MOE_BATCH=0 leaves the decode set alone
     assert "mb_s128" in G4.builds(spec)
+    monkeypatch.setenv("G4_MOE_BATCH", "0")
+    assert "mb_s128" not in G4.builds(spec)
+    monkeypatch.delenv("G4_MOE_BATCH")
     assert G4.programs(spec)["kernels"]["mb_s64"]["patch"] == "moebatch"

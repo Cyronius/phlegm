@@ -1,6 +1,6 @@
 # Traces: OPEN-FAMILY-LFM2MOE (block prefill), OPEN-PREFILL-BATCH
 # (canonical spec: specs/open-engine/spec.md)
-"""LFM2.5-24B-A2B block prefill (LFM2MOE_BLOCK=1): the recipe's emission and the expert kernel's host layouts. Pure
+"""LFM2.5-24B-A2B block prefill (on by default; LFM2MOE_BLOCK=0 drops it): the recipe's emission and the expert kernel's host layouts. Pure
 functions over the HF config fixture of test_lfm2moe.py and synthetic arrays -- no model, no hardware (the kernel and the
 route are validated on hardware: designs/lfm2moe_batch/make_test.py + compare.py, the model gate in .plans/lfm2moe-native.md)."""
 from __future__ import annotations
@@ -33,8 +33,13 @@ def on(monkeypatch):
     monkeypatch.setenv("LFM2MOE_BLOCK", "1")
 
 
-def test_off_by_default_leaves_the_sequential_emission_alone(monkeypatch):
+def test_on_by_default(monkeypatch):
     monkeypatch.delenv("LFM2MOE_BLOCK", raising=False)
+    assert F.gemm_route(spec()) is not None
+
+
+def test_off_leaves_the_sequential_emission_alone(monkeypatch):
+    monkeypatch.setenv("LFM2MOE_BLOCK", "0")
     s = spec()
     assert F.gemm_route(s) is None
     assert all("gemm_block" not in lt for lt in F.programs(s)["layer_types"].values())

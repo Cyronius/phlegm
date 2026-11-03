@@ -326,7 +326,7 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   (`target/npu-dev/hyv3-runtime`).
 
 - `upstream-patches/lfm2moe-block-runtime.patch` (2026-11-03) is LFM2.5-24B-A2B's block prefill
-  (OPEN-FAMILY-LFM2MOE, `LFM2MOE_BLOCK=1`). A new `gemm_block` kind `lfm` (mixer `conv` | `att`):
+  (OPEN-FAMILY-LFM2MOE; the recipe's default, `LFM2MOE_BLOCK=0` drops it). A new `gemm_block` kind `lfm` (mixer `conv` | `att`):
   `block_layer_lfm` runs the entry norm, the fused input GEMM, the conv's elementwise middle over the
   block with the carried two-row f32 state (or `attention_block` with a null gate), the out GEMM, the
   residual and `ffn_norm`; then a leading dense layer's up|gate and down GEMMs (`ffn_program`), or
@@ -339,7 +339,7 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   (`target/npu-dev/lfm2moe-runtime`).
 
 - `upstream-patches/lfm3-block-runtime.patch` (2026-11-03) is LFM3-1.7B's block prefill (OPEN-FAMILY-LFM3,
-  `LFM3_BLOCK=1`), over `lfm2moe-block-runtime.patch`. A GEMM weight may be a byte `range` of the decode pool
+  on by default, `LFM3_BLOCK=0` drops it), over `lfm2moe-block-runtime.patch`. A GEMM weight may be a byte `range` of the decode pool
   as it is (the gate | up slots' alternating 64-row bands and the mixer projections), so the pack plan and
   every decode kernel stay as they were. The `lfm` kind gains sandwich norms (`cd_postop`, `cd_postffn`), the
   elementwise sigmoid gate (`gate`: q | gate | k | v), a sliding `window`, the layer type's own
@@ -348,7 +348,7 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   chain reproduces the clone (`target/npu-dev/lfm3-runtime`).
 
 - `upstream-patches/lfm3-q40-runtime.patch` (2026-11-03) is LFM3-1.7B's decode bytes (OPEN-FAMILY-LFM3,
-  `LFM3_Q40=1`, `LFM3_HEAD=bf16`), over `lfm3-block-runtime.patch`. `fl_q4` gains the Q4_0-native 4608-B chunk
+  on by default; `LFM3_Q40=0`, `LFM3_HEAD=f32` select the q4_1 pools and f32-scale head), over `lfm3-block-runtime.patch`. `fl_q4` gains the Q4_0-native 4608-B chunk
   law (bf16 d plane, m = -8 d on the core; byte-identical to `std_perm_gguf`'s Q4_0 pool, checked in
   `gguf_pack_test`) and a new pack op `gx_lmhead_bf16` packs the tied Q8_0 head with RNE bf16 per-32 scales
   (8704-B chunks). `target/npu-dev/lfm3-q40-patch.sh` regenerates it and checks the chain.
@@ -386,7 +386,7 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   (the 26B has no per-token dxB build); `step_gemm_block_layer` then closes the layer with
   `g4_moe_tail` (t1, the host router over the f32 residual, `moe_block` reading mb4's y order, the
   combine). The CLI gains `--force-ids-file` (teacher forcing in the decode loop). `op_region` accepts a contiguous `g4_q40` op, and the staged schedule is off for the
-  kind. Needs `G4_MOE_BATCH=1` kernels; without them the manifest has no block route and prefill
+  kind. Needs the token-batched expert kernels (built by default; `G4_MOE_BATCH=0` drops them); without them the manifest has no block route and prefill
   is sequential, as before. Applies over `beccd46`, the nine Gemma 4 patches,
   `gemma4-moe-runtime.patch` and `gemma4-moe-decode-runtime.patch`
   (`target/npu-dev/gemma4-moe-runtime`).
