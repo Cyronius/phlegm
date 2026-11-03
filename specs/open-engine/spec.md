@@ -4740,6 +4740,72 @@ resident in ~25 s; sequential prefill 151 ms/token (843 tokens 127 s); decode 18
 route 3-5 ms, experts ~70 ms, head ~9 ms a token). `phlegm run` and `phlegm serve` (OpenAI chat, streamed and not)
 answer; the reasoning is not split from the reply.
 
+**Block prefill (2026-11-03, development; `LFM2MOE_BLOCK=1`).** The sequential prefill (151 ms a token) is replaced by
+the Gemma 4 route (OPEN-FAMILY-GEMMA4-MOE): per layer a runtime kind `lfm` -- the entry norm, the conv middle (the 3-tap
+causal conv over the block, the 2-row f32 state carried across blocks) or the attention middle (q / k norm, RoPE, causal
+attention; on the host, `ag_*` products not wired), the residual / norm and the router (hy_route's arithmetic) on the host;
+the conv / attention projections and the 2 dense layers' MLP as q4 GEMMs (the dense MLP gets three contiguous extra pool
+ops, +45 MB a dense layer); the experts through `mbl` (`designs/lfm2moe_batch/`, mb4's token-batched design on LFM's q4_1
+pool law: each expert streamed once per up to 8 tokens, ladder 64 / 32 / 16 / 8 slots, bf16 MACs). Kernel set
+`kernels/lfm2moe-blk` (9 builds beside the decode streams, which are untouched); runtime `lfm2moe-block-runtime.patch`
+(an alternative to `gemma4-moe-block-runtime.patch` on one clone: both edit `moe_block`). Gate on hardware: 16 / 16 and
+32 / 32 greedy tokens (short chat; 843-token prompt in 4 blocks) identical to the sequential route and so to llama.cpp;
+per-position KL(fp32 || x) over the 843 prompt positions: block 735 / 843 argmax-equal, median 2.80e-2, mean .124; sequential
+737, 2.65e-2, .147; bf16 control 734, 2.04e-2, .134 -- the same class, no drift across the block boundaries; a 256-token
+prompt 8 / 8; a 1-token and a 257-token prompt differ from the sequential route on rounding-chaotic prompts (KL vs fp32 at
+position 256: 1.69 block / 1.47 sequential / 1.38 control). Development timing (load 2.6-4.1, alternating, 843 tokens, 1 decode
+token): block 7.8 s (9.2 ms a token), sequential 105-116 s (125-138 ms a token); no quiet-machine timing, no ArtLite
+comparison. Open: NPU attention products, hi / lo expert weights, bfp16 GEMMs, the model dir still runs the sequential route
+(`--kernels kernels/lfm2moe-blk --gemm-block` selects the block one; not wired through `phlegm run`).
+
+### OPEN-FAMILY-LFM3: LiquidAI LFM3 (LFM3-1.7B) derives its own spec and runs on its own recipe from the GGUF
+**Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_lfm3_hf`, `families.py`, `lfm3.py`,
+`designs/lfm3/{lg.py,gen_kernels.py,check_layer.py}`, `model/lfm3_gguf_reference.py`, `model/lfm3_gguf_make.py`; runtime: the
+LFM2.5 bridge / CLI (flint chain + `hyv3-runtime.patch`), no patch of its own)
+**Test category:** unit (`tests/test_lfm3.py`); manual (the procedure in `.plans/lfm3-native.md`, which needs the NPU and the GGUF)
+
+A config whose `model_type` is `lfm3` shall derive a `ModelSpec` with `family` `lfm3`. The architecture, read from the Hub's
+`modeling_lfm3.py` and llama.cpp build 12015's arch `lfm3` (which agree: 40 / 40 greedy tokens of a free generation):
+
+- layers: LFM2's hybrid, `layer_types` "conv" (`short_conv`), "full_attention" (`full_attention`) and "sliding_attention"
+  (`dense_local`); LFM3-1.7B has 24: attention at 2, 6, ..., 22 (full) and 4, 8, ..., 20 (sliding), 13 conv;
+- every layer, conv or attention, has a SiLU GLU MLP of 7680 and a SANDWICH norm: `x = x + rms(op(rms(x) w_op)) w_post_op`,
+  `x = x + rms(mlp(rms(x) w_ffn)) w_post_ffn` (RMSNorm without +1, eps 1e-5);
+- short conv: in_proj gives B | C | u by rows; bx = B u; a **7-tap** depthwise causal conv over bx with no bias, the LAST tap on
+  this token; y = C conv; out_proj. The state is the six previous bx rows;
+- attention: 16 q / 4 kv heads at head dim 128, per-head RMSNorm on q and k before a rotate_half RoPE, scale 1/sqrt(128), and a
+  sigmoid output gate of one value a head (a projection of the layer input) multiplied onto the attention output before
+  o_proj. Full layers: theta 1e6, the zero-tail partial rotation (the first 32 of 64 pairs turn at theta^(-2i/128), pair i with
+  i + 64, the rest have frequency 0). Sliding layers: theta 1e4, all 64 pairs, the newest 256 rows including the new one;
+- final norm HF `embedding_norm` (GGUF `output_norm`, after the layers) and a head tied to the embedding (vocab 128000).
+
+The conv without a bias, the tied head, sandwich norms and default (unscaled) RoPE on both kinds are family properties:
+the derivation refuses a config that says otherwise, by key. `families.family_module("lfm3")` is `recipes/lfm3.py`.
+
+**The recipe (2026-11-03), from a derived GGUF.** LiquidAI's `LFM3-1.7B-QAD-Q4_0.gguf` has every matrix Q4_0 with bf16-valued scales
+(all 45 820 928 blocks, checked) and bf16-exact conv taps, so the q4_1 pool law (5120-B chunks, m = -8 d; `fl_q4`) holds the
+matrices exactly. Its tied head is Q6_K and its `attn_gate` has 16 rows, so `model/lfm3_gguf_make.py` writes `model.gguf` with
+`token_embd` re-encoded Q8_0 and each `attn_gate` row repeated head_dim times ([2048, 2048], exact: Q4_0 rows are independent), so
+the gate is an ordinary q-width projection that attn.h's `ATTN_GATE` applies per element. A layer is two dispatches:
+
+- `lg_conv` / `lg_att` (`designs/lfm3/lg.py`; one build each, the sliding and full layers share `lg_att` and differ in the kernel
+  entry's window and the position table): entry norm; B | C | u or q | gate | k | v; the conv core (128-channel elements, one fifo
+  of rows, the 7 taps copied into core memory and the 6 state rows accumulated one at a time while the window slides) or the
+  attention cores (RB 4, 4 cores of 4 heads, the gate stream after the window); out / o; `ln_nr32` of the output, `res = x + t`,
+  `xm = ffn_norm(res)`;
+- `lg_mlp`: five unweighted slots of 1536 (3 bands a core), `ln_nr32` of the down, `xres = res + t`.
+Then `ln` (output_norm) and `lm_head_q8`. A fifo has at most 16 buffer descriptors (the first conv design, all 16 rows at once,
+failed placement), and four weight transfers a core are in flight before the norm output exists (the host-side `Pipeline` must
+allow four: three deadlocked with a state-8 timeout).
+
+**Result 2026-11-03 (Strix Halo, development runs on a machine shared with other sessions, not a clean benchmark):** single-layer
+checks vs fp32 at position 1: conv layers y 2.2-2.4e-3, out 4.7e-4 .. 1.6e-3; the full attention layer K / V 2e-3, og 3.7e-3, h vs the
+NPU-fed reference 3e-5. Full model: 16 / 64 / 32 greedy tokens (raw prompt, chat prompt, 843-token prompt) identical to llama.cpp.
+Every prompt position of the 843-token prompt: NPU vs fp32 835 / 843 argmax-equal, KL median 8.7e-5, mean 2.4e-4, max 2.95e-2; the
+bf16 control vs fp32 837 / 843, 1.05e-4, 2.4e-4; no drift by position; the 256-row window edge (positions 250-262) 3e-7 .. 1.8e-4.
+Timing (loaded): sequential prefill 102 ms a token, decode 95-105 ms a token (48 dispatches). `phlegm run` answers with the
+reasoning split. Open: block prefill (see below if built), fusing the two dispatches, the vision / audio siblings.
+
 ### OPEN-WIDTH-PAD: the padded width a recipe may derive, and what it does not settle
 **Applies to:** openflowlm-next (`open_kernels/recipes/qwen36moe.py`,
 `open_kernels/recipes/pack.py`)

@@ -186,8 +186,22 @@ HY V3's `hy_route` host step, unchanged (no runtime patch of its own). 51 greedy
 prompt and all 32 after an 843-token prompt equal llama.cpp's; every prompt position sits inside the
 bf16 control's / llama.cpp's distance from the fp32 reference. Decode ~183 ms a token, sequential
 prefill ~151 ms a token (development, loaded machine). `phlegm run` / `serve` answer. Open: block
-prefill, the reasoning split, the QAD-Q4_0 checkpoint (a Q6_K head), a clean benchmark. Plan:
+prefill, the reasoning split, the QAD-Q4_0 checkpoint (a Q6_K head), a clean benchmark. Block prefill
+(`LFM2MOE_BLOCK=1`, 2026-11-03, token-batched `mbl` experts + q4 GEMMs, host elementwise middles and attention): the
+843-token prompt in 7.8 s against 105-116 s sequential (development, loaded), 32/32 greedy identical, every position inside
+the bf16 control's spread; not yet the model dir's default. Plan:
 [.plans/lfm2moe-native.md](.plans/lfm2moe-native.md); spec: OPEN-FAMILY-LFM2MOE.
+
+## LiquidAI LFM3-1.7B (lfm3)
+
+Runs on the NPU from LiquidAI's QAD-Q4_0 GGUF (derived: Q8_0 head, per-head gate rows repeated to a q-width
+projection) through its own recipe `recipes/lfm3.py` (`designs/lfm3/lg.py`: the LFM2 hybrid with a 7-tap conv, sandwich norms,
+gated attention in two kinds -- full with a half-rotated head, sliding 256 -- and a dense MLP on every layer; two dispatches a
+layer) on the existing LFM2.5 runtime, no patch of its own. 16/64/32 greedy tokens of a raw, a chat and an 843-token prompt
+equal llama.cpp's; every prompt position sits at the bf16 control's distance from the fp32 reference (835/843 argmax-equal,
+KL median 8.7e-5). `phlegm run` answers. Decode ~100 ms a token (dispatch-bound), sequential prefill 102 ms a token
+(development, loaded machine). Open: block prefill, one dispatch a layer, a clean benchmark. Plan:
+[.plans/lfm3-native.md](.plans/lfm3-native.md); spec: OPEN-FAMILY-LFM3.
 
 ## Gemma 4 26B-A4B (MoE)
 

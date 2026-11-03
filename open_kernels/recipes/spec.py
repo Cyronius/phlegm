@@ -924,6 +924,67 @@ def _lfm2moe_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
     )
 
 
+def _lfm3_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+    """LiquidAI LFM3 (`lfm3`, Lfm3ForCausalLM; the Hub's modeling_lfm3.py, llama.cpp arch lfm3): LFM2's hybrid
+    -- gated short depthwise causal convs (here 7 taps) and GQA attention layers with per-head q / k RMSNorm --
+    with four changes (OPEN-FAMILY-LFM3): a sandwich norm on every block output (post_operator_norm,
+    post_ffn_norm), two attention kinds (`full_attention`: theta 1e6 and the first half of the head rotated;
+    `sliding_attention`: theta 1e4, every pair, a 256-row window), a sigmoid output gate of one value a head
+    (projected from the layer input), and a dense SiLU FFN on every layer. The half-rotated head is the
+    zero-tail progression (HF Lfm3RotaryEmbedding): the first partial * hd / 2 pairs turn at theta^(-2i/hd),
+    pair i with i + hd / 2, the rest have frequency 0. Layer types: short_conv, full_attention (FULL) and
+    sliding_attention (DENSE_LOCAL)."""
+    n = _need(cfg, "num_hidden_layers")
+    hidden = _need(cfg, "hidden_size")
+    heads = _need(cfg, "num_attention_heads")
+    hd = cfg.get("head_dim") or (hidden // heads if hidden % heads == 0 else None)
+    if hd is None:
+        raise SpecError(f"lfm3: no head_dim in config.json and hidden_size {hidden} is not a "
+                        f"multiple of num_attention_heads {heads}")
+    rope = cfg.get("rope_parameters") or {}
+    full, slide = rope.get("full_attention") or {}, rope.get("sliding_attention") or {}
+    if not full or not slide:
+        raise SpecError("lfm3: config.json lacks rope_parameters for full_attention and sliding_attention")
+    for what, r in (("full_attention", full), ("sliding_attention", slide)):
+        if r.get("rope_type", "default") != "default":
+            raise SpecError(f"lfm3: {what} rope type {r.get('rope_type')!r} is not supported")
+    if float(slide.get("partial_rotary_factor", 1.0)) != 1.0:
+        raise SpecError("lfm3: a partial rotation on the sliding layers is not implemented")
+    for key, want in (("conv_bias", False), ("tie_word_embeddings", True), ("use_sandwich_norm", True)):
+        if bool(cfg.get(key, want)) != want:
+            raise SpecError(f"lfm3: {key} = {cfg.get(key)!r} is not implemented (need {want!r})")
+    names = {"conv": SHORT_CONV, "full_attention": FULL, "sliding_attention": DENSE_LOCAL}
+    lt = list(_need(cfg, "layer_types"))
+    if len(lt) != n or any(t not in names for t in lt):
+        raise SpecError(f"lfm3: layer_types {sorted(set(lt) - set(names))} / length {len(lt)} of {n}")
+    vocab = _need(cfg, "vocab_size")
+    return ModelSpec(
+        family="lfm3",
+        hidden=hidden,
+        num_layers=n,
+        layer_types=tuple(names[t] for t in lt),
+        vocab=vocab,
+        real_vocab=real_vocab if real_vocab is not None else vocab,
+        num_heads=heads,
+        num_kv_heads=_need(cfg, "num_key_value_heads"),
+        head_dim=hd,
+        rotary_dim=hd,
+        rope_theta=float(full["rope_theta"]),
+        rope_local_theta=float(slide["rope_theta"]),
+        sliding_window=int(_need(cfg, "sliding_window")),
+        qk_norm=True,
+        attn_gate=True,
+        conv_kernel=int(_need(cfg, "conv_L_cache")),
+        intermediate=int(_need(cfg, "intermediate_size")),
+        activation="silu",
+        sandwich_norms=True,
+        norm_eps=float(cfg.get("norm_eps", 1e-5)),
+        quant="q4_1",
+        extra={"model_type": cfg["model_type"], "source": "hf_config",
+               "partial_rotary_factor": float(full.get("partial_rotary_factor", 1.0))},
+    )
+
+
 # GPT-OSS's own layer-type names. `full_attention` here means a plain dense layer, NOT the
 # spec's FULL -- that one is the full-attention half of Qwen3.6's linear/full alternation.
 _GPTOSS_LAYER_TYPES = {"sliding_attention": DENSE_LOCAL, "full_attention": DENSE}
@@ -2024,7 +2085,7 @@ HF_FAMILIES = {"qwen3_5_moe": _qwen36moe_hf, "qwen3_5_moe_text": _qwen36moe_hf,
                "gpt_oss": _gptoss_hf, "k2_horizon": _k2_hf, "dflash2": _dflash2_hf,
                "gemma4_unified": _gemma4_hf, "gemma4_unified_text": _gemma4_hf,
                "gemma4": _gemma4_unsupported, "gemma4_text": _gemma4_unsupported,
-               "flint": _flint_hf, "hy_v3": _hyv3_hf, "lfm2_moe": _lfm2moe_hf}
+               "flint": _flint_hf, "hy_v3": _hyv3_hf, "lfm2_moe": _lfm2moe_hf, "lfm3": _lfm3_hf}
 GGUF_FAMILIES = {"qwen35moe": _qwen36moe_gguf, "qwen3next": _qwen36moe_gguf, "qwen35": _qwen35_gguf, "qwen3": _qwen3_gguf, "llama": _llama3_gguf,
                  "gemma3": _gemma3_gguf, "hunyuan-dense": _hunyuan_gguf, "granite": _granite_gguf}
 _FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen35_hf: "qwen35",
@@ -2036,7 +2097,7 @@ _FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen35_
               _granite_hf: "granite", _granite_gguf: "granite", _phi3_hf: "phi3",
               _lfm2_hf: "lfm2", _gptoss_hf: "gptoss", _k2_hf: "k2", _dflash2_hf: "dflash2",
               _gemma4_hf: "gemma4", _gemma4_unsupported: "gemma4", _flint_hf: "flint",
-              _hyv3_hf: "hyv3", _lfm2moe_hf: "lfm2moe"}
+              _hyv3_hf: "hyv3", _lfm2moe_hf: "lfm2moe", _lfm3_hf: "lfm3"}
 
 
 def hf_model_types(family: str) -> list[str]:
@@ -2094,6 +2155,12 @@ ROLE_TENSORS["hyv3"] = dict(ROLE_TENSORS["flint"])
 # LFM2-MoE's GGUF names (the recipe reads only the GGUF): lfm2's conv roles, the experts, the dense MLP
 ROLE_TENSORS["lfm2moe"] = {**ROLE_TENSORS["flint"], "shortconv.in_proj.weight": "linear",
                            "shortconv.out_proj.weight": "linear_out"}
+# LFM3's GGUF names: the conv roles, the attention gate (a second q-width projection, its own role as the
+# DeltaNet z is) and the dense FFN
+ROLE_TENSORS["lfm3"] = {"attn_q.weight": "attn", "attn_k.weight": "attn", "attn_v.weight": "attn",
+                        "attn_output.weight": "attn", "attn_gate.weight": "attn",
+                        "ffn_up.weight": "ffn", "ffn_gate.weight": "ffn", "ffn_down.weight": "ffn",
+                        "shortconv.in_proj.weight": "linear", "shortconv.out_proj.weight": "linear_out"}
 
 _GGUF_BLOCK = re.compile(r"^blk\.\d+\.")
 _GGUF_ROLE = {"attn_q.weight": "attn", "attn_k.weight": "attn", "attn_v.weight": "attn",
