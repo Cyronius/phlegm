@@ -54,9 +54,9 @@ impl Sampler {
         assert!(temperature >= 0.0);
         assert!(top_p > 0.0 && top_p <= 1.0);
         assert!(repetition_penalty > 0.0);
-        // No seed given: mix in a nondeterministic-ish default (matches numpy's
-        // default_rng(None) in spirit, not in value).
-        let seed = seed.unwrap_or(0x2545F4914F6CDD1D);
+        // No seed given: a fresh random one, so repeated requests differ (OpenAI's and llama.cpp's
+        // servers behave the same way; numpy's default_rng(None) too). A seed reproduces a reply.
+        let seed = seed.unwrap_or_else(random_seed);
         Sampler { temperature, top_k, top_p, repetition_penalty, rng: Rng::new(seed) }
     }
 
@@ -151,6 +151,16 @@ impl Sampler {
     }
 }
 
+/// 64 random bits without a dependency: std's RandomState keys come from the OS's random source
+/// (once per thread, then stepped for every new state), hashed with the clock for good measure.
+fn random_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    h.write_u128(now.map_or(0, |d| d.as_nanos()));
+    h.finish()
+}
+
 fn argmax(x: &[f32]) -> usize {
     let mut best = 0usize;
     for i in 1..x.len() {
@@ -210,6 +220,20 @@ mod tests {
         let a = Sampler::new(1.0, 0, 1.0, 1.0, Some(7)).sample(&flat, &[]);
         let b = Sampler::new(1.0, 0, 1.0, 1.0, Some(7)).sample(&flat, &[]);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn no_seed_draws_differently_each_time() {
+        // 1000 near-flat tokens: two of eight unseeded samplers matching on all four draws by
+        // chance has probability about 28 x 1000^-4.
+        let flat = synthetic_logits(2, 1000, 0, -999.0);
+        let runs: std::collections::HashSet<Vec<usize>> = (0..8)
+            .map(|_| {
+                let mut s = Sampler::new(1.0, 0, 1.0, 1.0, None);
+                (0..4).map(|_| s.sample(&flat, &[])).collect()
+            })
+            .collect();
+        assert_eq!(runs.len(), 8);
     }
 
     #[test]

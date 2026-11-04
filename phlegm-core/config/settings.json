@@ -38,13 +38,13 @@
       "description": "Context window length in tokens (prompt plus output)",
       "type": "int",
       "min_value": 2,
-      "presets": [2048, 4096, 8192, 16384, 32768],
+      "presets": [4096, 8192, 16384, 32768, 65536, 131072],
       "scope": "per_model",
       "delivery": "direct",
       "category": "memory",
       "reload_required": true,
       "registry_key": "default_context_length",
-      "default_value": 4096
+      "default_value": 32768
     },
     {
       "key": "think",

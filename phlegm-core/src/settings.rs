@@ -723,7 +723,7 @@ mod tests {
         assert_eq!(base.values["temperature"], (json!(0.1), Source::Shipped));
         assert_eq!(base.values["top_p"], (json!(1.0), Source::GenerationConfig));
         assert_eq!(base.values["max_tokens"], (json!(0), Source::Shipped));
-        assert_eq!(base.values["ctx_len"], (json!(4096), Source::Shipped));
+        assert_eq!(base.values["ctx_len"], (json!(32768), Source::Shipped));
         // User defaults, then the user's per-model setting, then env, then the flag.
         cfg.set_user(None, "temperature", json!(0.5)).unwrap();
         assert_eq!(r(&cfg, &[], &no_env).values["temperature"], (json!(0.5), Source::User));

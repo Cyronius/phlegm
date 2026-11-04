@@ -190,9 +190,47 @@ outside the registry still samples the way its maker set it.
 
 The shipped entries copy each model's `generation_config.json` (2026-11-04): LFM3 temperature
 0.1, top_k 50, repetition_penalty 1.1; LFM2.5 0.1 / 50 / 1.05; Gemma 4 1.0 / 64 / top_p 0.95;
-Qwen3.5 MoE (KAT, Ornith) and Flint 1.0 / 20 / 0.95; gpt-oss 1.0 / 50. Hy-Memory and Nex ship no
-generation config and stay greedy. Before this every request without fields was greedy with no
-repetition penalty, whatever the model asked for.
+Qwen3.5 MoE (KAT, Ornith) and Flint 1.0 / 20 / 0.95; gpt-oss 1.0 / 50. Before this every request
+without fields was greedy with no repetition penalty, whatever the model asked for. Two models
+ship no generation config, so their entries take what the publisher says instead (no LM Studio
+catalogue entry exists for either, checked 2026-11-04):
+- **Nex-N2.5-mini:** temperature 0.7, top_p 0.95, top_k 40, the model card's "Our evaluations
+  use" values (nex-agi/Nex-N2.5-mini @ 87420286).
+- **Hy-Memory-30B-A3B:** temperature 0 (greedy). The card's only setting is its quickstart's
+  `temperature=0.0` (tencent/Hy-Memory-30B-A3B @ 64a460a9); neither the card, the GitHub repo nor
+  the report (arXiv 2610.22196) gives top-k, top-p or a sampled temperature.
+
+Both templates switch reasoning with `chat_template_kwargs.reasoning_effort`, not
+`enable_thinking`, so `think` does not reach them yet.
+
+**Seed:** a request (or `phlegm run`) without `seed` samples from a fresh random seed, as
+OpenAI's and llama.cpp's servers do; `seed` reproduces a reply. Until 2026-11-04 the missing seed
+was a fixed constant, so identical requests returned identical replies.
+
+**Context:** `ctx_len` defaults to 32768 (OpenFlowLM's usual `default_context_length`), and every
+registry entry states it; it was 4096, the kernel manifests' `max_ctx_default`. Capacity is a
+runtime allocation (no descriptor compiles it in: `specs/open-engine/spec.md`, `kvslice`): at most
+`kv_row` x attention layers a token from the manifests, 20-225 KB (at 32768: 0.6-0.7 GiB for the
+Qwen3.5 MoE and LFM models, 1.5 GiB gpt-oss, 3 GiB Flint and Hy-Memory, 6.9 GiB Gemma 4; an upper
+bound, counting sliding-window layers as full). Measured 2026-11-04 (`target/npu-dev/fastdefault/ctxcost.py`,
+`ctxcost.json`; `phlegm serve --max-ctx 4096` against `32768`, one load each, greedy, thinking
+off; development host, other sessions' jobs between models), 4096 -> 32768:
+
+| model | prefill ~2.9-3.6k tokens | short-prompt first token | decode ms/token | needle at ~4.6-5.7k tokens |
+|---|---|---|---|---|
+| LFM3 1.7B | 33.0 -> 32.0 s | 0.90 -> 0.97 s | 58 -> 55 | found (4642 tokens, 68 s) |
+| LFM2.5 24B | 46.6 -> 36.4 s | 1.06 -> 0.99 s | 144 -> 142 | found (4641, 164 s; 414 tokens, reasons first) |
+| Flint 40B | 620 -> 614 s | 2.0 -> 1.9 s | 204 -> 196 | found (4552, 1009 s) |
+| Gemma 4 26B | 54.1 -> 53.9 s | 2.07 -> 2.01 s | 165 -> 192 (4 steps) | found (5435, 88 s) |
+| gpt-oss 20B | 18.4 -> 19.5 s | 1.15 -> 1.11 s | 152 -> 159 | found (4620, 45 s) |
+| Hy-Memory 30B | 666 -> 657 s | 4.3 -> 3.8 s | 204 -> 233 (4 steps) | found (4621, 1211 s) |
+| KAT Q4K 35B | 31.1 -> 31.0 s | 1.58 -> 1.43 s | 116 -> 140 (4 steps) | found (5698, 53 s) |
+
+The larger capacity costs nothing measurable (the "4 steps" decode figures come from a 5-token
+reply and are noise), and positions past 4096 answer correctly. What does cost is long-prompt
+prefill, at either capacity: Flint and Hy-Memory prefill at ~4.5 tokens/s, and LFM3 falls from
+~230 tokens/s at 843 tokens to 89 at 2950 and 24 at 11688 (488 s, still correct). A first probe at
+11.7k tokens ran past the server's 600 s request timeout (HTTP 500) on LFM2.5 and Flint.
 
 `phlegm config show [--model-dir DIR | --config-model TAG] [--json]` prints the paths and every
 value with its source (shipped, generation_config, user, env); `set` / `unset` write the user
@@ -214,7 +252,9 @@ no shipped model uses it.
 - `requests_take_the_model_defaults_and_override_them` and
   `invalid_sampling_parameters_are_rejected_without_panicking` (`server.rs`).
 - `the_candidate_list_draws_what_the_full_vector_draws` (`sampler.rs`): the top-k candidate
-  sampler draws exactly the tokens the full-vector one does for the same seed.
+  sampler draws exactly the tokens the full-vector one does for the same seed;
+  `no_seed_draws_differently_each_time`, `seed_reproducible`.
+- Context: the table above; every registry entry carries `default_context_length` 32768.
 - Hardware (2026-11-04, LFM3, `phlegm serve` with no flags): "Name three primary colors" took
   268 / 210 / 199 tokens (seeds 1-3) at the model's settings against 1254 greedy without the
   penalty (that request's override reproduces the earlier greedy run token count exactly);

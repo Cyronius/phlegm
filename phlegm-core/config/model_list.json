@@ -9,6 +9,7 @@
     "flint": {
       "40b-a2.5b": {
         "name": "flint-NPU2",
+        "default_context_length": 32768,
         "details": {
           "family": "flint",
           "parameter_size": "40B-A2.5B"
@@ -23,6 +24,7 @@
     "gemma4-it": {
       "26b-a4b": {
         "name": "gemma-4-26B-A4B-it-NPU2",
+        "default_context_length": 32768,
         "details": {
           "family": "gemma4",
           "parameter_size": "26B-A4B",
@@ -39,6 +41,7 @@
     "gpt-oss": {
       "20b": {
         "name": "gpt-oss-20b-NPU2",
+        "default_context_length": 32768,
         "details": {
           "family": "gpt-oss",
           "parameter_size": "20B",
@@ -53,15 +56,20 @@
     "hy-memory": {
       "30b-a3b": {
         "name": "Hy-Memory-30B-A3B-NPU2",
+        "default_context_length": 32768,
         "details": {
           "family": "hy_v3",
           "parameter_size": "30B-A3B"
+        },
+        "sampling": {
+          "temperature": 0.0
         }
       }
     },
     "kat-coder-v2.5": {
       "dev": {
         "name": "KAT-Coder-V2.5-Dev-NPU2",
+        "default_context_length": 32768,
         "details": {
           "family": "qwen3.5-moe",
           "quantization_level": "Q4_0",
@@ -75,6 +83,7 @@
       },
       "dev-q4k": {
         "name": "KAT-Coder-V2.5-Dev-Q4K-NPU2",
+        "default_context_length": 32768,
         "details": {
           "family": "qwen3.5-moe",
           "quantization_level": "Q4_K",
@@ -88,6 +97,7 @@
       },
       "dev-q4pure": {
         "name": "KAT-Coder-V2.5-Dev-Q4pure-NPU2",
+        "default_context_length": 32768,
         "details": {
           "family": "qwen3.5-moe",
           "quantization_level": "Q4_0",
@@ -103,6 +113,7 @@
     "lfm2.5-moe": {
       "24b-a2b": {
         "name": "LFM2.5-24B-A2B-NPU2",
+        "default_context_length": 32768,
         "details": {
           "family": "lfm2-moe",
           "parameter_size": "24B-A2B"
@@ -117,6 +128,7 @@
     "lfm3": {
       "1.7b": {
         "name": "LFM3-1.7B-NPU2",
+        "default_context_length": 32768,
         "details": {
           "family": "lfm3",
           "parameter_size": "1.7B",
@@ -132,22 +144,35 @@
     "nex-n2.5": {
       "mini-q4k": {
         "name": "Nex-N2.5-mini-Q4K-NPU2",
+        "default_context_length": 32768,
         "details": {
           "family": "qwen3.5-moe",
           "quantization_level": "Q4_K"
+        },
+        "sampling": {
+          "temperature": 0.7,
+          "top_k": 40,
+          "top_p": 0.95
         }
       },
       "mini-q4pure": {
         "name": "Nex-N2.5-mini-Q4pure-NPU2",
+        "default_context_length": 32768,
         "details": {
           "family": "qwen3.5-moe",
           "quantization_level": "Q4_0"
+        },
+        "sampling": {
+          "temperature": 0.7,
+          "top_k": 40,
+          "top_p": 0.95
         }
       }
     },
     "ornith1.5": {
       "35b-a3b-q4k": {
         "name": "Ornith-1.5-35B-A3B-Q4K-NPU2",
+        "default_context_length": 32768,
         "details": {
           "family": "qwen3.5-moe",
           "parameter_size": "35B-A3B",
@@ -162,6 +187,7 @@
       },
       "35b-a3b-q4pure": {
         "name": "Ornith-1.5-35B-A3B-Q4pure-NPU2",
+        "default_context_length": 32768,
         "details": {
           "family": "qwen3.5-moe",
           "parameter_size": "35B-A3B",

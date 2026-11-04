@@ -374,7 +374,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(npu_options(&map, &resolve(&map)).unwrap().prefill_route, "auto");
-        assert_eq!(npu_options(&map, &resolve(&map)).unwrap().context_capacity, 4096);
+        assert_eq!(npu_options(&map, &resolve(&map)).unwrap().context_capacity, 32768);
         map.insert("--prefill-route".into(), "block".into());
         map.insert("--max-ctx".into(), "8192".into());
         assert_eq!(npu_options(&map, &resolve(&map)).unwrap().prefill_route, "block");
