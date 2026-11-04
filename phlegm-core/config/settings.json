@@ -1,0 +1,134 @@
+{
+  "version": 1,
+  "settings": [
+    {
+      "key": "prefill_mode",
+      "cli_flag": "--prefill-mode",
+      "description": "Memory/speed trade-off for prefill",
+      "type": "enum",
+      "options": [
+        {"value": "fast", "description": "Default prefill, higher memory"},
+        {"value": "lean", "description": "Lower memory, slower"}
+      ],
+      "scope": "per_model",
+      "delivery": "direct",
+      "category": "performance",
+      "reload_required": true,
+      "default_value": "fast"
+    },
+    {
+      "key": "prefill_route",
+      "cli_flag": "--prefill-route",
+      "description": "How the prompt is prefilled",
+      "type": "enum",
+      "options": [
+        {"value": "auto", "description": "The fastest route the kernel set has (layer-major, then block, then sequential)"},
+        {"value": "block", "description": "Batched GEMM blocks"},
+        {"value": "sequential", "description": "One token at a time through the decode kernels"}
+      ],
+      "scope": "per_model",
+      "delivery": "direct",
+      "category": "performance",
+      "reload_required": true,
+      "default_value": "auto"
+    },
+    {
+      "key": "ctx_len",
+      "cli_flag": "--max-ctx",
+      "description": "Context window length in tokens (prompt plus output)",
+      "type": "int",
+      "min_value": 2,
+      "presets": [2048, 4096, 8192, 16384, 32768],
+      "scope": "per_model",
+      "delivery": "direct",
+      "category": "memory",
+      "reload_required": true,
+      "registry_key": "default_context_length",
+      "default_value": 4096
+    },
+    {
+      "key": "think",
+      "cli_flag": "--think",
+      "description": "Enable reasoning/thinking mode by default (the chat template's enable_thinking)",
+      "type": "bool",
+      "scope": "per_model",
+      "delivery": "api_field",
+      "category": "generation",
+      "reload_required": false,
+      "registry_key": "details.think",
+      "default_value": true
+    },
+    {
+      "key": "temperature",
+      "cli_flag": "--temperature",
+      "description": "Sampling temperature; 0 is greedy",
+      "type": "float",
+      "min_value": 0,
+      "scope": "per_model",
+      "delivery": "api_field",
+      "category": "generation",
+      "reload_required": false,
+      "registry_key": "sampling.temperature",
+      "generation_config": "temperature",
+      "default_value": 0
+    },
+    {
+      "key": "top_k",
+      "cli_flag": "--top-k",
+      "description": "Sample from the k most likely tokens; 0 is off",
+      "type": "int",
+      "min_value": 0,
+      "scope": "per_model",
+      "delivery": "api_field",
+      "category": "generation",
+      "reload_required": false,
+      "registry_key": "sampling.top_k",
+      "generation_config": "top_k",
+      "default_value": 0
+    },
+    {
+      "key": "top_p",
+      "cli_flag": "--top-p",
+      "description": "Nucleus sampling: the smallest set of tokens whose probability reaches p; 1 is off",
+      "type": "float",
+      "min_value": 0,
+      "min_exclusive": true,
+      "max_value": 1,
+      "scope": "per_model",
+      "delivery": "api_field",
+      "category": "generation",
+      "reload_required": false,
+      "registry_key": "sampling.top_p",
+      "generation_config": "top_p",
+      "default_value": 1.0
+    },
+    {
+      "key": "repetition_penalty",
+      "cli_flag": "--repetition-penalty",
+      "description": "Divides the logits of tokens already in the context (HF convention); 1 is off",
+      "type": "float",
+      "min_value": 0,
+      "min_exclusive": true,
+      "scope": "per_model",
+      "delivery": "api_field",
+      "category": "generation",
+      "reload_required": false,
+      "registry_key": "sampling.repetition_penalty",
+      "generation_config": "repetition_penalty",
+      "default_value": 1.0
+    },
+    {
+      "key": "max_tokens",
+      "cli_flag": "--max-tokens",
+      "env_var": "PHLEGM_MAX_TOKENS",
+      "description": "Output tokens for a request that does not set max_tokens; 0 is until a stop token or the end of the context",
+      "type": "int",
+      "min_value": 0,
+      "scope": "per_model",
+      "delivery": "api_field",
+      "category": "generation",
+      "reload_required": false,
+      "default_value": 0
+    }
+  ]
+}

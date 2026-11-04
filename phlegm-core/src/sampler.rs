@@ -81,31 +81,21 @@ impl Sampler {
         }
     }
 
-    fn apply_top_k(&self, logits: &mut [f32]) {
-        let k = self.top_k;
-        if k == 0 || k >= logits.len() {
-            return;
-        }
-        let mut sorted = logits.to_vec();
-        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        let kth = sorted[k - 1];
-        for v in logits.iter_mut() {
-            if *v < kth {
-                *v = NEG_INF;
-            }
-        }
-    }
-
     fn apply_top_p(&self, logits: &mut [f32]) {
         if self.top_p >= 1.0 {
             return;
         }
-        let mut order: Vec<usize> = (0..logits.len()).collect();
+        // Only the tokens still in play: top-k's masked ones carry no probability, so leaving them
+        // out of the sort changes nothing but its length.
+        let mut order: Vec<usize> = (0..logits.len()).filter(|&i| logits[i] > NEG_INF).collect();
+        if order.is_empty() {
+            return;
+        }
         order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap()); // descending
         let sorted: Vec<f32> = order.iter().map(|&i| logits[i]).collect();
         let probs = softmax(&sorted);
         let mut cumsum = 0f32;
-        let mut keep = vec![false; logits.len()];
+        let mut keep = vec![false; order.len()];
         for (rank, &p) in probs.iter().enumerate() {
             keep[rank] = cumsum < self.top_p;
             cumsum += p;
@@ -133,18 +123,31 @@ impl Sampler {
         for v in lg.iter_mut() {
             *v /= self.temperature;
         }
-        self.apply_top_k(&mut lg);
-        self.apply_top_p(&mut lg);
-        let probs = softmax(&lg);
+        // Top-k as the candidate list (in vocabulary order; ties at the k-th kept), so top-p, the
+        // softmax and the draw see k tokens instead of the vocabulary (262k vocabulary, top-k 64,
+        // top-p 0.95: 1.1 ms a token instead of 4.2, release build, loaded host, 2026-11-04). The
+        // draws are those of masking the full vector: masked tokens have probability exactly 0
+        // and add nothing to the running sum. Top-p alone still sorts the whole vocabulary.
+        let idx: Vec<usize> = match self.top_k {
+            k if k > 0 && k < lg.len() => {
+                let mut scratch = lg.clone();
+                let kth = *scratch.select_nth_unstable_by(k - 1, |a, b| b.partial_cmp(a).unwrap()).1;
+                (0..lg.len()).filter(|&i| lg[i] >= kth).collect()
+            }
+            _ => (0..lg.len()).collect(),
+        };
+        let mut cand: Vec<f32> = idx.iter().map(|&i| lg[i]).collect();
+        self.apply_top_p(&mut cand);
+        let probs = softmax(&cand);
         let draw = self.rng.next_f64() as f32;
         let mut cumsum = 0f32;
         for (i, &p) in probs.iter().enumerate() {
             cumsum += p;
             if draw < cumsum {
-                return i;
+                return idx[i];
             }
         }
-        probs.len() - 1
+        idx[probs.len() - 1]
     }
 }
 
@@ -233,6 +236,52 @@ mod tests {
         let mut s = Sampler::new(1.0, 0, 0.9, 1.0, Some(3));
         for _ in 0..500 {
             assert_eq!(s.sample(&peaked, &[]), 10);
+        }
+    }
+
+    /// The sampler as it was before the candidate list: every transform on the full vector.
+    fn full_vector_sample(s: &Sampler, rng: &mut Rng, logits: &[f32]) -> usize {
+        let mut lg: Vec<f32> = logits.iter().map(|v| v / s.temperature).collect();
+        if s.top_k > 0 && s.top_k < lg.len() {
+            let mut sorted = lg.clone();
+            sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            let kth = sorted[s.top_k - 1];
+            lg.iter_mut().filter(|v| **v < kth).for_each(|v| *v = NEG_INF);
+        }
+        if s.top_p < 1.0 {
+            let mut order: Vec<usize> = (0..lg.len()).collect();
+            order.sort_by(|&a, &b| lg[b].partial_cmp(&lg[a]).unwrap());
+            let probs = softmax(&order.iter().map(|&i| lg[i]).collect::<Vec<_>>());
+            let mut cum = 0f32;
+            for (rank, &i) in order.iter().enumerate() {
+                if rank > 0 && cum >= s.top_p {
+                    lg[i] = NEG_INF;
+                }
+                cum += probs[rank];
+            }
+        }
+        let probs = softmax(&lg);
+        let draw = rng.next_f64() as f32;
+        let mut cum = 0f32;
+        for (i, &p) in probs.iter().enumerate() {
+            cum += p;
+            if draw < cum {
+                return i;
+            }
+        }
+        probs.len() - 1
+    }
+
+    #[test]
+    fn the_candidate_list_draws_what_the_full_vector_draws() {
+        for (seed, t, k, p) in [(1u64, 1.0f32, 20usize, 0.95f32), (2, 0.7, 64, 0.8), (3, 1.0, 0, 0.9),
+                                (4, 0.1, 50, 1.0), (5, 2.0, 5, 1.0)] {
+            let lg = synthetic_logits(seed, 4096, 7, 3.0);
+            let mut s = Sampler::new(t, k, p, 1.0, Some(seed));
+            let mut rng = Rng::new(seed);
+            for _ in 0..300 {
+                assert_eq!(s.sample(&lg, &[]), full_vector_sample(&s, &mut rng, &lg), "seed {seed}");
+            }
         }
     }
 

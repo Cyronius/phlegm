@@ -1,0 +1,179 @@
+{
+  "version": 1,
+  "defaults_version": "c179d7e897fe987e",
+  "defaults": {
+    "prefill_mode": "fast",
+    "prefill_route": "auto"
+  },
+  "models": {
+    "flint": {
+      "40b-a2.5b": {
+        "name": "flint-NPU2",
+        "details": {
+          "family": "flint",
+          "parameter_size": "40B-A2.5B"
+        },
+        "sampling": {
+          "temperature": 1.0,
+          "top_k": 20,
+          "top_p": 0.95
+        }
+      }
+    },
+    "gemma4-it": {
+      "26b-a4b": {
+        "name": "gemma-4-26B-A4B-it-NPU2",
+        "details": {
+          "family": "gemma4",
+          "parameter_size": "26B-A4B",
+          "quantization_level": "Q4_0",
+          "think": true
+        },
+        "sampling": {
+          "temperature": 1.0,
+          "top_k": 64,
+          "top_p": 0.95
+        }
+      }
+    },
+    "gpt-oss": {
+      "20b": {
+        "name": "gpt-oss-20b-NPU2",
+        "details": {
+          "family": "gpt-oss",
+          "parameter_size": "20B",
+          "quantization_level": "MXFP4"
+        },
+        "sampling": {
+          "temperature": 1.0,
+          "top_k": 50
+        }
+      }
+    },
+    "hy-memory": {
+      "30b-a3b": {
+        "name": "Hy-Memory-30B-A3B-NPU2",
+        "details": {
+          "family": "hy_v3",
+          "parameter_size": "30B-A3B"
+        }
+      }
+    },
+    "kat-coder-v2.5": {
+      "dev": {
+        "name": "KAT-Coder-V2.5-Dev-NPU2",
+        "details": {
+          "family": "qwen3.5-moe",
+          "quantization_level": "Q4_0",
+          "think": true
+        },
+        "sampling": {
+          "temperature": 1.0,
+          "top_k": 20,
+          "top_p": 0.95
+        }
+      },
+      "dev-q4k": {
+        "name": "KAT-Coder-V2.5-Dev-Q4K-NPU2",
+        "details": {
+          "family": "qwen3.5-moe",
+          "quantization_level": "Q4_K",
+          "think": true
+        },
+        "sampling": {
+          "temperature": 1.0,
+          "top_k": 20,
+          "top_p": 0.95
+        }
+      },
+      "dev-q4pure": {
+        "name": "KAT-Coder-V2.5-Dev-Q4pure-NPU2",
+        "details": {
+          "family": "qwen3.5-moe",
+          "quantization_level": "Q4_0",
+          "think": true
+        },
+        "sampling": {
+          "temperature": 1.0,
+          "top_k": 20,
+          "top_p": 0.95
+        }
+      }
+    },
+    "lfm2.5-moe": {
+      "24b-a2b": {
+        "name": "LFM2.5-24B-A2B-NPU2",
+        "details": {
+          "family": "lfm2-moe",
+          "parameter_size": "24B-A2B"
+        },
+        "sampling": {
+          "temperature": 0.1,
+          "top_k": 50,
+          "repetition_penalty": 1.05
+        }
+      }
+    },
+    "lfm3": {
+      "1.7b": {
+        "name": "LFM3-1.7B-NPU2",
+        "details": {
+          "family": "lfm3",
+          "parameter_size": "1.7B",
+          "think": true
+        },
+        "sampling": {
+          "temperature": 0.1,
+          "top_k": 50,
+          "repetition_penalty": 1.1
+        }
+      }
+    },
+    "nex-n2.5": {
+      "mini-q4k": {
+        "name": "Nex-N2.5-mini-Q4K-NPU2",
+        "details": {
+          "family": "qwen3.5-moe",
+          "quantization_level": "Q4_K"
+        }
+      },
+      "mini-q4pure": {
+        "name": "Nex-N2.5-mini-Q4pure-NPU2",
+        "details": {
+          "family": "qwen3.5-moe",
+          "quantization_level": "Q4_0"
+        }
+      }
+    },
+    "ornith1.5": {
+      "35b-a3b-q4k": {
+        "name": "Ornith-1.5-35B-A3B-Q4K-NPU2",
+        "details": {
+          "family": "qwen3.5-moe",
+          "parameter_size": "35B-A3B",
+          "quantization_level": "Q4_K",
+          "think": true
+        },
+        "sampling": {
+          "temperature": 1.0,
+          "top_k": 20,
+          "top_p": 0.95
+        }
+      },
+      "35b-a3b-q4pure": {
+        "name": "Ornith-1.5-35B-A3B-Q4pure-NPU2",
+        "details": {
+          "family": "qwen3.5-moe",
+          "parameter_size": "35B-A3B",
+          "quantization_level": "Q4_0",
+          "think": true
+        },
+        "sampling": {
+          "temperature": 1.0,
+          "top_k": 20,
+          "top_p": 0.95
+        }
+      }
+    }
+  }
+}

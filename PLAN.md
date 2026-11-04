@@ -41,6 +41,8 @@ that they all block CLI/server integration.
 
 - [x] Extend the resident process adapter with prefill/decode logits for normal generation.
 - [x] Connect `phlegm run` and `phlegm serve` to that adapter.
+- [x] Per-model runtime defaults (sampling, thinking, context, prefill) in OpenFlowLM's
+  `model_list.json` + user `settings.json` format, with `phlegm config` (SERVER-SETTINGS).
 - [x] Sample in Rust, load external/inline model chat templates, and derive EOS IDs.
 - [x] Stream server output, reset for each request, and bound generation by context capacity.
 - [x] Surface load/worker errors without silently using a placeholder tokenizer.

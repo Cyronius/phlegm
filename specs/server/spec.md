@@ -103,8 +103,8 @@ in `specs/server/tests/` once the server's request/response layer is implemented
 
 ## SERVER-REASONING: Reasoning apart from the answer
 
-Chat templates render with `enable_thinking=true`, so a reasoning model writes its thinking
-before the answer. `/v1/chat/completions` returns that thinking in `message.reasoning_content`
+Chat templates render with `enable_thinking` from the model's `think` setting (default true;
+SERVER-SETTINGS), so a reasoning model writes its thinking before the answer. `/v1/chat/completions` returns that thinking in `message.reasoning_content`
 (streamed: `delta.reasoning_content`) and only the answer in `content`, the field llama.cpp's
 and vLLM's OpenAI servers use. `phlegm run` prints the reasoning on stderr between
 `[reasoning]` / `[/reasoning]` and the answer alone on stdout.
@@ -127,8 +127,9 @@ its reasoning has an empty `content` and `finish_reason: "length"`.
   decoded marker is held back until it resolves (`tagged_reasoning_streams_monotonically_and_splits`,
   `harmony_progress_grows_reasoning_then_answer`).
 - A model whose files mark no reasoning block returns `content` only, unchanged.
-- `phlegm run` defaults to `--max-tokens -1`, as llama.cpp does: until a stop token or the end
-  of `--max-ctx` (a positive value is clamped to the room left). With 128, thinking models'
+- `phlegm run` defaults to the `max_tokens` setting, 0, as llama.cpp's `-n -1` does (`-1` is
+  accepted for 0): until a stop token or the end of `--max-ctx` (a positive value is clamped to
+  the room left). With 128, thinking models'
   answers were cut off behind the reasoning (KAT needed 256 for a one-line question).
 
 ## SERVER-OUTPUT-BUDGET: Output tokens per request
@@ -136,7 +137,8 @@ its reasoning has an empty `content` and `finish_reason: "length"`.
 `/v1/chat/completions` sets a request's output budget the way llama.cpp's server does
 (`n_predict = -1` by default): generate until a stop token or the end of the context.
 
-- **Without `max_tokens`:** `PHLEGM_MAX_TOKENS` (default 0 = open-ended).
+- **Without `max_tokens`:** the model's `max_tokens` setting (SERVER-SETTINGS; its env var is
+  `PHLEGM_MAX_TOKENS`; default 0 = open-ended).
 - **Cap:** `PHLEGM_MAX_TOKENS_CAP` (default 0 = no cap beyond the context).
 - **Context:** the budget never runs past the backend's context (`Backend::context_capacity`:
   prompt + max_tokens - 1 <= `--max-ctx`). A request that reaches it finishes with
@@ -151,3 +153,69 @@ The old defaults (64, capped at 512) cut thinking models off inside their reason
 
 - `output_budget_follows_llama_cpp_server` (`phlegm-core` `server.rs`) covers the open-ended
   default, clamping to the context, the exact-fit prompt, the too-long prompt and the env overrides.
+
+## SERVER-SETTINGS: Per-model runtime defaults
+
+`phlegm run` and `phlegm serve` take their sampling, template, context and prefill defaults from
+the model's settings, in OpenFlowLM's two-file format (openflowlm-next #214, its
+`docs/config.md`; `phlegm-core` `settings.rs`):
+
+- **Definitions:** `phlegm-core/config/settings.json` (OpenFlowLM's `src/config/settings.json`
+  shape: key, cli_flag, env_var, type, options / min / max, scope, delivery, category,
+  reload_required, registry_key, default_value). Phlegm adds the type `float`, `min_exclusive`,
+  and `generation_config` (the `generation_config.json` field a model directory supplies).
+- **Shipped registry:** `phlegm-core/config/model_list.json`, built into the binary
+  (`PHLEGM_CONFIG_PATH` reads another): `version`, `defaults_version` (the first 16 hex digits
+  of sha256 of the sorted, compact JSON of `defaults`), `defaults`, and
+  `models.<family>.<size>` entries (`name` = the model directory's name, `details`,
+  `default_context_length`, `sampling`). A `--model-dir` finds its entry by that name,
+  case-insensitively; `--config-model family:size` names one directly.
+- **User overlay:** `PHLEGM_SETTINGS_PATH`, else `$XDG_CONFIG_HOME/phlegm/settings.json`, else
+  `~/.config/phlegm/settings.json` (`%USERPROFILE%\.phlegm\settings.json` on Windows). Sparse:
+  `defaults` (every model), `settings.<family>.<size>` (one model), `models` (entries added or
+  changed, deep-merged into the registry), `version`, `defaults_version`. Phlegm never writes it
+  except through `phlegm config set` / `unset`. A bad value or an unknown key in it is reported
+  and ignored, not fatal; a changed `defaults_version` is reported with the overridden keys.
+
+Settings: `prefill_mode`, `prefill_route`, `ctx_len` (`--max-ctx`), `think`, `temperature`,
+`top_k`, `top_p`, `repetition_penalty`, `max_tokens` (`PHLEGM_MAX_TOKENS`). Precedence, lowest
+to highest: the built-in default; the model directory's `generation_config.json` (HF semantics:
+without `do_sample: true` it is greedy and only `repetition_penalty` applies; with it a field
+left out takes HF's default, temperature 1, top_k 50, top_p 1); the registry entry; the shipped
+`defaults`; the user's `defaults`; the user's per-model settings; the env var; the flag; and in
+the server the request's own fields (`temperature`, `top_p`, `top_k`, `repetition_penalty` or
+llama.cpp's `repeat_penalty`, `seed`, `chat_template_kwargs.enable_thinking` or `think`). This is
+OpenFlowLM's order with `generation_config.json` added under the registry, so a model directory
+outside the registry still samples the way its maker set it.
+
+The shipped entries copy each model's `generation_config.json` (2026-11-04): LFM3 temperature
+0.1, top_k 50, repetition_penalty 1.1; LFM2.5 0.1 / 50 / 1.05; Gemma 4 1.0 / 64 / top_p 0.95;
+Qwen3.5 MoE (KAT, Ornith) and Flint 1.0 / 20 / 0.95; gpt-oss 1.0 / 50. Hy-Memory and Nex ship no
+generation config and stay greedy. Before this every request without fields was greedy with no
+repetition penalty, whatever the model asked for.
+
+`phlegm config show [--model-dir DIR | --config-model TAG] [--json]` prints the paths and every
+value with its source (shipped, generation_config, user, env); `set` / `unset` write the user
+file atomically; `list` prints the registry. (OpenFlowLM's guided flow, full-screen browser,
+`review` and legacy migration are not ported.)
+
+Sampling cost: with top-k, top-p, the softmax and the draw run over the k candidates, not the
+vocabulary (262k vocabulary, top-k 64, top-p 0.95: 1.1 ms a token instead of 4.2; release build,
+loaded host, 2026-11-04). Top-p without top-k still sorts the vocabulary (~18 ms a token there);
+no shipped model uses it.
+
+### Acceptance criteria
+
+- `the_shipped_files_are_consistent` (`settings.rs`): every built-in default and registry value
+  passes its setting's checks, flags and names are unique, `defaults_version` is current.
+- `precedence_runs_from_built_in_to_the_command_line`,
+  `a_model_outside_the_registry_takes_its_generation_config_with_hf_semantics`,
+  `the_user_file_overlays_models_and_bad_entries_are_reported_not_fatal`.
+- `requests_take_the_model_defaults_and_override_them` and
+  `invalid_sampling_parameters_are_rejected_without_panicking` (`server.rs`).
+- `the_candidate_list_draws_what_the_full_vector_draws` (`sampler.rs`): the top-k candidate
+  sampler draws exactly the tokens the full-vector one does for the same seed.
+- Hardware (2026-11-04, LFM3, `phlegm serve` with no flags): "Name three primary colors" took
+  268 / 210 / 199 tokens (seeds 1-3) at the model's settings against 1254 greedy without the
+  penalty (that request's override reproduces the earlier greedy run token count exactly);
+  `enable_thinking: false` answered in 5 tokens.

@@ -45,6 +45,12 @@ phlegm serve --model-dir C:/models/my-model --kernels C:/kernels/my-model `
   --bridge target/reference-bench/phlegm-reference-bench.exe
 ```
 
+Both take the model's runtime defaults (sampling, thinking, context, prefill route) from the
+shipped registry `phlegm-core/config/model_list.json` under your `~/.config/phlegm/settings.json`;
+`phlegm config show --model-dir DIR` prints them and where each comes from, `phlegm config set`
+overrides one, and every flag and request field still wins (SERVER-SETTINGS in
+[specs/server/spec.md](specs/server/spec.md)).
+
 `phlegm serve --mock` explicitly selects the hardware-free demo. The model needs
 `tokenizer.json`, `tokenizer_config.json`, and a chat template (external
 `chat_template.jinja` or inline in the config). The bridge and its `.build.json`

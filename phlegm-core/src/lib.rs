@@ -6,6 +6,7 @@ pub mod mock_backend;
 pub mod placeholder_tokenizer;
 pub mod sampler;
 pub mod server;
+pub mod settings;
 pub mod tokenizer;
 pub mod npu_lock;
 #[cfg(feature = "npu")]

@@ -52,6 +52,39 @@ pub struct ServerConfig {
     pub model_dir: Option<PathBuf>,
     /// Reported verbatim in `GET /health`; selected by the CLI after load.
     pub backend_name: String,
+    /// Sampling and template defaults for a request that does not set them (the model's
+    /// resolved settings, SERVER-SETTINGS).
+    pub defaults: GenDefaults,
+}
+
+/// What a request leaves out: the model's resolved `temperature`, `top_k`, `top_p`,
+/// `repetition_penalty` and `think` settings.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GenDefaults {
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub repetition_penalty: f32,
+    pub think: bool,
+}
+
+impl Default for GenDefaults {
+    /// The settings' built-in defaults: greedy, the template's thinking on.
+    fn default() -> Self {
+        GenDefaults { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, think: true }
+    }
+}
+
+impl GenDefaults {
+    pub fn from_settings(r: &crate::settings::Resolved) -> GenDefaults {
+        GenDefaults {
+            temperature: r.f32("temperature"),
+            top_k: r.usize("top_k"),
+            top_p: r.f32("top_p"),
+            repetition_penalty: r.f32("repetition_penalty"),
+            think: r.bool("think"),
+        }
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -68,6 +101,7 @@ impl ServerConfig {
             max_tokens_cap: env_or("PHLEGM_MAX_TOKENS_CAP", "0").parse().unwrap_or(0),
             model_dir: std::env::var("PHLEGM_MODEL_DIR").ok().map(PathBuf::from),
             backend_name: env_or("PHLEGM_BACKEND", "mock"),
+            defaults: GenDefaults::default(),
         }
     }
 }
@@ -145,12 +179,12 @@ impl ServerTokenizer {
         }
     }
 
-    fn apply_chat_template(&self, messages: &[ChatMessage]) -> String {
+    fn apply_chat_template(&self, messages: &[ChatMessage], think: bool) -> String {
         match self {
             // add_generation_prompt=true (we always want a completion to
-            // follow); enable_thinking=true (Qwen3.6's own default).
+            // follow); enable_thinking from the request or the model's `think` setting.
             ServerTokenizer::Real(t) => {
-                t.apply_chat_template(messages, true, true)
+                t.apply_chat_template(messages, true, think)
                     .unwrap_or_else(|e| {
                         eprintln!("server: chat template render error: {e}");
                         String::new()
@@ -383,19 +417,37 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
         .and_then(Value::as_f64)
         .map(|v| v as f32);
     let seed = req_json.get("seed").and_then(Value::as_u64);
+    // llama.cpp's names: top_k, repeat_penalty (HF's repetition_penalty is accepted too).
+    let top_k_field = req_json.get("top_k").filter(|v| !v.is_null());
+    let top_k = top_k_field.and_then(Value::as_u64).map(|v| v as usize);
+    let penalty_field = ["repetition_penalty", "repeat_penalty"]
+        .iter()
+        .find_map(|k| req_json.get(*k).filter(|v| !v.is_null()));
+    let repetition_penalty = penalty_field.and_then(Value::as_f64).map(|v| v as f32);
+    // enable_thinking as vLLM and llama.cpp take it (chat_template_kwargs), or OpenFlowLM's `think`.
+    let think = req_json
+        .pointer("/chat_template_kwargs/enable_thinking")
+        .or_else(|| req_json.get("think"))
+        .and_then(Value::as_bool);
 
     if temperature.is_some_and(|v| !v.is_finite() || v < 0.0)
         || top_p.is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 1.0)
+        || (top_k_field.is_some() && top_k.is_none())
+        || (penalty_field.is_some()
+            && !repetition_penalty.is_some_and(|v| v.is_finite() && v > 0.0))
     {
         respond_json(
             request,
             400,
-            &json!({"error": {"message": "temperature must be nonnegative and top_p must be in (0, 1]", "type": "invalid_request_error"}}),
+            &json!({"error": {"message": "temperature must be nonnegative, top_p in (0, 1], top_k a nonnegative integer and repetition_penalty positive", "type": "invalid_request_error"}}),
         );
         return;
     }
 
-    let prompt = state.tokenizer.apply_chat_template(&messages);
+    let d = &state.cfg.defaults;
+    let prompt = state
+        .tokenizer
+        .apply_chat_template(&messages, think.unwrap_or(d.think));
     let prompt_ids = state.tokenizer.encode(&prompt);
     let max_tokens = match output_budget(
         requested_max_tokens,
@@ -417,10 +469,10 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
     let reasoning = state.tokenizer.reasoning_for(&prompt);
 
     let sampler = Sampler::new(
-        temperature.unwrap_or(0.0),
-        0,
-        top_p.unwrap_or(1.0),
-        1.0,
+        temperature.unwrap_or(d.temperature),
+        top_k.unwrap_or(d.top_k),
+        top_p.unwrap_or(d.top_p),
+        repetition_penalty.unwrap_or(d.repetition_penalty),
         seed,
     );
     let params = GenParams {
@@ -794,6 +846,7 @@ mod tests {
                 max_tokens_cap: 16,
                 model_dir: None,
                 backend_name: "fixture".into(),
+                defaults: GenDefaults::default(),
             };
             let server = bind(&cfg).unwrap();
             let addr = server.server_addr().to_ip().unwrap().to_string();
@@ -850,6 +903,7 @@ mod tests {
             max_tokens_cap: 512,
             model_dir: None,
             backend_name: "mock".to_string(),
+            defaults: GenDefaults::default(),
         };
         cfg_mut(&mut cfg);
         let server = bind(&cfg).expect("bind");
@@ -981,12 +1035,43 @@ mod tests {
     #[test]
     fn invalid_sampling_parameters_are_rejected_without_panicking() {
         let addr = spawn_test_server(|_| {});
-        for extra in [r#""top_p":0"#, r#""temperature":-1"#] {
+        for extra in [r#""top_p":0"#, r#""temperature":-1"#, r#""top_k":-1"#, r#""top_k":1.5"#,
+                      r#""repeat_penalty":0"#, r#""repetition_penalty":"x""#] {
             let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],{extra}}}"#);
             let (status, _, response) =
                 http_request(&addr, "POST", "/v1/chat/completions", Some(&body));
             assert_eq!(status, 400, "{response}");
         }
+    }
+
+    #[test]
+    fn requests_take_the_model_defaults_and_override_them() {
+        struct Record(Arc<Mutex<Vec<(f32, usize, f32, f32)>>>);
+        impl Backend for Record {
+            fn generate(&mut self, _: &[u32], p: &mut GenParams, emit: &mut dyn FnMut(u32))
+                -> Result<(), String> {
+                let s = &p.sampler;
+                self.0.lock().unwrap().push((s.temperature, s.top_k, s.top_p, s.repetition_penalty));
+                emit(1);
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut cfg = ServerConfig::from_env();
+        cfg.port = 0;
+        cfg.backend_name = "mock".into();
+        cfg.defaults = GenDefaults { temperature: 0.1, top_k: 50, top_p: 0.9, repetition_penalty: 1.1, think: true };
+        let server = bind(&cfg).unwrap();
+        let addr = server.server_addr().to_ip().unwrap().to_string();
+        let backend = Box::new(Record(seen.clone()));
+        std::thread::spawn(move || run(server, backend, cfg));
+        for extra in ["", r#","temperature":0.7,"top_k":5,"top_p":0.5,"repeat_penalty":1.3"#,
+                      r#","repetition_penalty":1.2"#] {
+            let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{extra}}}"#);
+            let (status, _, response) = http_request(&addr, "POST", "/v1/chat/completions", Some(&body));
+            assert_eq!(status, 200, "{response}");
+        }
+        assert_eq!(*seen.lock().unwrap(), vec![(0.1, 50, 0.9, 1.1), (0.7, 5, 0.5, 1.3), (0.1, 50, 0.9, 1.2)]);
     }
 
     #[test]
