@@ -16,6 +16,7 @@ three layers run on the 32 cores (8 columns × 4 rows) of the XDNA2 NPU in **one
 | `trit_npu.py` | Host: weight packing, text packing, `TritNpu(model_dir).encode(texts)` |
 | `check.py` | NPU vs CPU-reference cosine, and timing |
 | `bench.py` | Builds against each other: alternating rounds, ms per dispatch, output differences, cycle profiles |
+| `bundle.py` | Puts the prebuilt graph, host library and `trit_npu.py` into a model folder (`npu/`), for running without a toolchain |
 
 ## Build and run (Linux)
 
@@ -43,6 +44,37 @@ LayerNorm, pooling, the output projection and normalization.
 
 When running from a Claude Code session, raise `ulimit -l` first: the user systemd manager caps
 locked memory at 8 MiB. On a shared machine, hold the NPU (`dibs run npu -- ...`).
+
+`TritNpu` and `check_npu()` check the runtime prerequisites first and raise `NpuUnavailable` naming the
+missing one: Linux on x86-64, an XDNA2 NPU (PCI 1022:17f0) bound to amdxdna, access to its `/dev/accel`
+node, XRT's `libxrt_coreutil.so.2` (`$XILINX_XRT`, `/opt/xilinx/xrt`, then the loader's path), and the
+locked-memory limit (XRT maps a 64 MiB device heap at open: with XRT 2.27.0, 48 MiB fails and 64 MiB works;
+the soft limit is raised towards 128 MiB when the hard limit allows). `python trit_npu.py
+MODEL_DIR` prints what it found and compares a few vectors with the CPU reference.
+
+## Prebuilt bundle (no toolchain)
+
+`bundle.py MODEL_DIR` makes a model folder run on the NPU with only XRT and the amdxdna driver: it copies
+`build/final.xclbin` and `build/insts.bin` into `MODEL_DIR/npu/`, compiles the host library there with the
+system `g++` against a packaged XRT (`--xrt /usr`) and without an rpath, audits it, and copies `trit_npu.py`
+next to `trit_embed.py`. `npu/build.json` is `build/build.json` plus a `bundle` record: the phlegm commit,
+mlir-aie and Peano versions, xclbinutil, compiler and command, the XRT headers' version, the library's
+`NEEDED` entries, newest imported symbol versions and the 22 XRT symbols it imports; `artifact_sha256`
+then also covers `libtd_npu2.so`, and `TritNpu` checks those hashes (not the sources) for a bundle. In a
+phlegm checkout without `build/`, `TritNpu(model_dir)` uses the model folder's `npu/` too.
+
+```sh
+source target/npu-dev/env.sh
+python open_kernels/designs/trit_embed/build.py
+python open_kernels/designs/trit_embed/bundle.py path/to/trit-embed-3l --cxx /usr/bin/g++
+```
+
+The audit fails the bundle on an rpath or on symbol versions newer than GLIBC_2.32, GLIBCXX_3.4.30 and
+CXXABI_1.3.13. Two things it caught: the conda compiler in `target/npu-dev` adds an rpath to its own
+`lib/`, and `std::sqrt` with errno semantics calls `sqrtf@GLIBC_2.43` on Fedora 44, so the host library
+is now compiled with `-fno-math-errno` (sqrt is exact either way; the call only handled negative inputs).
+The xclbin is not byte-reproducible: two builds of the same sources differ in its timestamp and UUIDs
+(about 80 bytes); its PDI, the core programs and `insts.bin` are identical.
 
 ## Arithmetic
 

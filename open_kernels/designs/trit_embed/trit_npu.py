@@ -10,17 +10,26 @@ short texts share a slot (best-fit packing; per-token segment IDs keep their att
 folder's 2-bit codes and bf16 row scales into the NPU's packets (weight_stream). Per dispatch it tokenizes,
 does the int8 embedding lookup and input LayerNorm, mean-pools, and applies the output projection, all with
 the model folder's own reference code, and keeps two buffer sets in flight so it prepares one dispatch while
-the NPU runs the previous one. Build the graph (build.py) and the XRT host library (build_host.py) first.
-An instance owns mutable device buffers: use it from one thread.
+the NPU runs the previous one. An instance owns mutable device buffers: use it from one thread.
+
+In a phlegm checkout, build the graph (build.py) and the XRT host library (build_host.py) first. A model
+folder can instead ship them prebuilt in npu/ (bundle.py), next to a copy of this file: then the runtime
+needs only Linux, an XDNA2 NPU on the amdxdna driver, XRT and the Python packages of trit_embed.py.
+check_npu() names a missing prerequisite (NpuUnavailable) before anything touches the device; run
+`python trit_npu.py MODEL_DIR` to check them and compare a few vectors with the CPU reference.
 """
 import copy
 import ctypes as ct
+import glob
 import hashlib
 import importlib.util
 import itertools
 import json
 import os
+import platform
 import queue
+import resource
+import sys
 import threading
 from pathlib import Path
 
@@ -28,9 +37,25 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-ROOT = Path(__file__).resolve().parent
-BUILD = ROOT / 'build'
-LIBRARY = Path(os.environ.get('TRIT_NPU_LIBRARY', str(BUILD / 'host/libtd_npu2.so')))
+# Not resolve(): a Hugging Face snapshot links each file to a blob of its own, so the folder is the link's.
+ROOT = Path(os.path.abspath(__file__)).parent
+# A phlegm checkout builds into build/; a model folder ships the prebuilt files in npu/ (bundle.py).
+BUILD = ROOT / 'build' if (ROOT / 'trit_design.py').exists() else ROOT / 'npu'
+LIBRARY_NAME = 'libtd_npu2.so'
+
+
+def default_library(build):
+    """TRIT_NPU_LIBRARY, else the host library of a build: <build>/libtd_npu2.so (bundle) or <build>/host/ (phlegm);
+    variant builds (build_<tag>/, bench.py) have none of their own and share build/host/'s."""
+    if 'TRIT_NPU_LIBRARY' in os.environ:
+        return Path(os.environ['TRIT_NPU_LIBRARY'])
+    for path in (Path(build) / LIBRARY_NAME, Path(build) / 'host' / LIBRARY_NAME):
+        if path.exists():
+            return path
+    return ROOT / 'build/host' / LIBRARY_NAME
+
+
+LIBRARY = default_library(BUILD)
 SLOT = 128
 SLOTS = 2               # slots a dispatch
 TOKENS = SLOTS * SLOT
@@ -46,8 +71,142 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def load_runtime(library=LIBRARY):
-    dll = ct.CDLL(str(library))
+class NpuUnavailable(RuntimeError):
+    """A runtime prerequisite of the NPU path is missing; the message names it and the fix."""
+
+
+XDNA2 = {'0x17f0'}          # PCI device IDs (vendor 0x1022) of XDNA2 NPUs; 0x1502 is XDNA1 (Phoenix, Hawk Point)
+# Locked memory: XRT maps a 64 MiB device heap when it opens the device. Measured 2026-11-04 (XRT 2.27.0): 48 MiB
+# fails (mmap EAGAIN), 64 MiB works. check_npu asks for MEMLOCK_WANT and fails below MEMLOCK_NEED.
+MEMLOCK_NEED = 64 << 20
+MEMLOCK_WANT = 128 << 20
+XRT_DIRS = ('lib', 'lib64')
+
+
+def find_npu():
+    """(accel node, PCI device ID) of the first device on the amdxdna driver."""
+    seen = []
+    for dev in sorted(glob.glob('/sys/class/accel/accel*')):
+        driver = os.path.basename(os.path.realpath(os.path.join(dev, 'device/driver')))
+        if driver != 'amdxdna':
+            continue
+        with open(os.path.join(dev, 'device/device')) as f:
+            pci = f.read().strip()
+        seen.append(('/dev/accel/' + os.path.basename(dev), pci))
+    if not seen:
+        if not os.path.isdir('/sys/module/amdxdna'):
+            raise NpuUnavailable('The amdxdna kernel driver is not loaded (no /sys/module/amdxdna). It is in mainline '
+                                 'Linux from 6.14 (CONFIG_DRM_ACCEL_AMDXDNA); try `sudo modprobe amdxdna`, or install '
+                                 "AMD's xdna-driver for older kernels.")
+        raise NpuUnavailable('amdxdna is loaded but no NPU is bound to it (no /sys/class/accel/accel* with driver '
+                             'amdxdna). Check `dmesg | grep -i amdxdna` for firmware or probe errors.')
+    for node, pci in seen:
+        if pci in XDNA2:
+            if not os.access(node, os.R_OK | os.W_OK):
+                raise NpuUnavailable(f'No read/write access to {node}; add your user to its group '
+                                     f'(`ls -l {node}`, usually render) and log in again.')
+            return node, pci
+    raise NpuUnavailable(f'The NPU (PCI 1022:{seen[0][1][2:]}) is not XDNA2: these kernels need an XDNA2 NPU '
+                         '(PCI 1022:17f0: Ryzen AI 300 / Strix Point, Strix Halo, Krackan Point); 1022:1502 is the '
+                         'XDNA1 NPU of Phoenix and Hawk Point.')
+
+
+def raise_memlock(need=MEMLOCK_WANT):
+    """Raise the soft RLIMIT_MEMLOCK towards need (up to the hard limit); returns the soft limit in force.
+    XRT pins its command and buffer memory when it opens the device; with the 8 MiB that systemd gives
+    desktop sessions by default, opening the device fails."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    inf = resource.RLIM_INFINITY
+    if soft != inf and soft < need:
+        target = need if hard == inf else min(need, hard)
+        if target > soft:
+            resource.setrlimit(resource.RLIMIT_MEMLOCK, (target, hard))
+            soft = target
+    return soft
+
+
+def memlock_hint(soft):
+    if soft == resource.RLIM_INFINITY:
+        return ''
+    return (f' The locked-memory limit is {soft >> 20} MiB (`ulimit -l`); XRT needs {MEMLOCK_NEED >> 20} MiB. Raise it, for example with '
+            '`* - memlock unlimited` in /etc/security/limits.d/99-npu.conf (and DefaultLimitMEMLOCK=infinity in '
+            '/etc/systemd/user.conf and system.conf for desktop sessions), then log in again; or run one command as '
+            '`systemd-run --user --pipe --wait -p LimitMEMLOCK=infinity python ...`.')
+
+
+def load_xrt():
+    """Load XRT's libxrt_coreutil.so.2 globally, so the host library binds to it; returns (handle, path, version).
+    Search order: $XILINX_XRT/lib[64], /opt/xilinx/xrt/lib[64] (AMD's packages), then the loader's default path."""
+    roots = [os.environ['XILINX_XRT']] if os.environ.get('XILINX_XRT') else []
+    candidates = [os.path.join(r, d, 'libxrt_coreutil.so.2') for r in roots + ['/opt/xilinx/xrt'] for d in XRT_DIRS]
+    errors = []
+    for path in [c for c in candidates if os.path.exists(c)] + ['libxrt_coreutil.so.2']:
+        try:
+            lib = ct.CDLL(path, mode=ct.RTLD_GLOBAL)
+        except OSError as e:
+            errors.append(str(e))
+            continue
+        real = loaded_path('libxrt_coreutil.so') or path
+        version = os.path.basename(os.path.realpath(real)).partition('.so.')[2] or 'unknown'
+        return lib, os.path.realpath(real), version
+    raise NpuUnavailable('XRT is not installed (cannot load libxrt_coreutil.so.2: ' + '; '.join(errors[-2:]) + '). '
+                         'Install XRT 2.27 or newer with its amdxdna plugin (Fedora: xrt-npu and xrt-plugin-amdxdna; '
+                         "otherwise AMD's xdna-driver packages, under /opt/xilinx/xrt), or set XILINX_XRT.")
+
+
+def loaded_path(name):
+    """Path of a loaded shared object whose file name starts with name, from /proc/self/maps."""
+    try:
+        with open('/proc/self/maps') as f:
+            for line in f:
+                path = line.rstrip('\n').split(maxsplit=5)[-1]
+                if os.path.basename(path).startswith(name):
+                    return path
+    except OSError:
+        pass
+    return None
+
+
+def check_npu(library=None):
+    """Check the runtime prerequisites without opening the device; returns what was found. Raises
+    NpuUnavailable naming the first one missing: Linux on x86-64, an XDNA2 NPU on amdxdna, device access,
+    XRT, the locked-memory limit (raised here when the hard limit allows), and the host library loading."""
+    if sys.platform != 'linux' or platform.machine() not in ('x86_64', 'AMD64'):
+        raise NpuUnavailable(f'The prebuilt NPU host library is for Linux on x86-64; this is {sys.platform} '
+                             f'{platform.machine()}. Use TritEmbed (CPU/GPU) here.')
+    node, pci = find_npu()
+    _, xrt_path, xrt_version = load_xrt()
+    plugin = glob.glob(os.path.join(os.path.dirname(xrt_path), 'libxrt_driver_xdna.so*'))
+    memlock = raise_memlock()
+    info = {'device': node, 'pci_id': '1022:' + pci[2:], 'xrt': xrt_path, 'xrt_version': xrt_version,
+            'xdna_plugin': plugin[0] if plugin else None,
+            'memlock_mib': 'unlimited' if memlock == resource.RLIM_INFINITY else memlock >> 20}
+    if memlock != resource.RLIM_INFINITY and memlock < MEMLOCK_NEED:
+        raise NpuUnavailable('Too little lockable memory for XRT.' + memlock_hint(memlock))
+    if library is not None:
+        load_runtime(library, info)
+    return info
+
+
+def load_runtime(library=LIBRARY, info=None):
+    library = Path(library)
+    if not library.exists():
+        raise NpuUnavailable(f'No NPU host library at {library}: in phlegm, run build_host.py; a model folder ships '
+                             f'it as npu/{LIBRARY_NAME}.')
+    try:
+        dll = ct.CDLL(str(library))
+    except OSError as e:
+        message = str(e)
+        if 'GLIBC' in message or 'CXXABI' in message:
+            hint = ('The prebuilt library needs glibc 2.32 and libstdc++ from GCC 12 (GLIBCXX_3.4.30) or newer; a '
+                    'Python environment that loads an older libstdc++ first (some conda environments) hides the '
+                    "system's. Rebuild it with phlegm's bundle.py, or use a newer libstdc++.")
+        elif 'undefined symbol' in message:
+            hint = (f'Your XRT ({(info or {}).get("xrt_version", "unknown version")}) lacks an XRT symbol the library '
+                    'was linked against (XRT 2.27.0); update XRT, or rebuild the library against yours.')
+        else:
+            hint = 'Check that XRT is installed (check_npu()).'
+        raise NpuUnavailable(f'Cannot load {library}: {message}. {hint}') from e
     dll.tdn_open.argtypes, dll.tdn_open.restype = [ct.c_char_p, ct.c_char_p], ct.c_void_p
     dll.tdn_buf.argtypes, dll.tdn_buf.restype = [ct.c_void_p, ct.c_size_t], ct.c_void_p
     dll.tdn_sync.argtypes, dll.tdn_sync.restype = [ct.c_void_p, ct.c_int, ct.c_int, ct.c_size_t, ct.c_size_t], None
@@ -184,11 +343,22 @@ def load_model(model_dir):
 
 
 class TritNpu:
-    def __init__(self, model_dir, build=BUILD, library=LIBRARY, profiling=False, native=True):
-        """profiling=True (bench.py) also accepts stub and variant builds, whose outputs are not vectors.
+    def __init__(self, model_dir, build=None, library=None, profiling=False, native=True):
+        """build: the folder with build.json, final.xclbin and insts.bin; by default this checkout's build/, or
+        else the model folder's prebuilt npu/. library: the host library, by default the build's (default_library).
+        profiling=True (bench.py) also accepts stub and variant builds, whose outputs are not vectors.
         native=True leaves everything after tokenization to the host library (tdn_encode: packing, embedding and
         input LayerNorm, the runs, pooling, output projection and normalization in C++); native=False keeps the
-        Python loop below, with the model's own embed and output head."""
+        Python loop below, with the model's own embed and output head.
+        Raises NpuUnavailable when a runtime prerequisite is missing (check_npu)."""
+        if build is None:
+            build = BUILD if (BUILD / 'build.json').exists() else Path(model_dir) / 'npu'
+        build = Path(build)
+        if not (build / 'build.json').exists():
+            raise NpuUnavailable(f'No NPU build at {build} (build.json): in phlegm, run build.py and build_host.py; '
+                                 'a model folder ships it prebuilt in npu/.')
+        library = Path(library) if library is not None else default_library(build)
+        self.runtime = check_npu()
         self.model = load_model(model_dir)
         self.backend = copy.deepcopy(self.model.tokenizer.backend_tokenizer)
         self.backend.enable_truncation(SLOT)
@@ -204,14 +374,24 @@ class TritNpu:
                 or self.manifest.get('packets') != PACKETS or self.manifest.get('packet_format') != 3
                 or self.manifest.get('element_bytes') != ELEMENT or (self.manifest.get('stub') and not profiling)):
             raise ValueError('Compiled encoder shape differs from the model (or is a profiling stub)')
-        for name, sha in self.manifest['source_sha256'].items():
-            if not profiling and digest(ROOT / name) != sha:
-                raise ValueError(f'Source {name} changed since the build; rebuild')
+        if not self.manifest.get('bundle'):   # a bundle's sources stay in phlegm; its artifact hashes still hold
+            for name, sha in self.manifest['source_sha256'].items():
+                if not profiling and digest(ROOT / name) != sha:
+                    raise ValueError(f'Source {name} changed since the build; rebuild')
         for name, sha in self.manifest['artifact_sha256'].items():
-            if digest(Path(build) / name) != sha:
+            if digest(build / name) != sha:
                 raise ValueError(f'Changed build artifact {name}')
-        self.dll = load_runtime(library)
-        self.handle = self.dll.tdn_open(os.fsencode(Path(build) / 'final.xclbin'), os.fsencode(Path(build) / 'insts.bin'))
+        self.dll = load_runtime(library, self.runtime)
+        try:
+            self.handle = self.dll.tdn_open(os.fsencode(build / 'final.xclbin'), os.fsencode(build / 'insts.bin'))
+        except RuntimeError as e:
+            soft = resource.getrlimit(resource.RLIMIT_MEMLOCK)[0]
+            if 'mmap' in str(e) and soft != resource.RLIM_INFINITY:
+                cause = 'XRT could not lock its device heap.' + memlock_hint(soft)
+            else:
+                cause = ('Another program may hold the NPU columns this full-array design needs (`xrt-smi examine -r '
+                         f'aie-partitions`), or the XRT amdxdna plugin is missing (found: {self.runtime["xdna_plugin"]}).')
+            raise NpuUnavailable(f'XRT could not open the NPU or load the encoder ({e}). {cause}') from e
         try:
             weights = weight_stream(self.model)
             for _, m in self.model.ternary_layers():   # the layers now live on the NPU; free the host copies
@@ -467,3 +647,50 @@ class TritNpu:
         if getattr(self, 'handle', None):
             self.dll.tdn_close(self.handle)
             self.handle = None
+
+
+SELFTEST = [
+    "A man is playing a guitar on the street.",
+    "how do index funds work",
+    "Index funds track a market index, so their holdings change only when the index does.",
+    "The mitochondria produce most of the chemical energy needed to power the cell's biochemical reactions.",
+    "Who wrote the novel Pride and Prejudice?",
+    "Jane Austen published Pride and Prejudice in 1813; it follows Elizabeth Bennet and her sisters. " * 4,
+]
+
+
+def main(argv=None):
+    """python trit_npu.py [MODEL_DIR]: check the NPU prerequisites; with a model folder, also encode a few texts
+    on the NPU, compare them with the CPU reference (minimum cosine about 0.998; below 0.995 fails) and time them."""
+    import argparse
+    import time
+    p = argparse.ArgumentParser(description=main.__doc__)
+    p.add_argument('model_dir', nargs='?', type=Path)
+    a = p.parse_args(argv)
+    try:
+        print(json.dumps(check_npu(), indent=2), flush=True)
+        if a.model_dir is None:
+            return
+        npu = TritNpu(a.model_dir)
+    except NpuUnavailable as e:
+        sys.exit(f'NPU unavailable: {e}')
+    try:
+        texts = SELFTEST * 64
+        vectors = npu.encode(texts)
+        cosine = (vectors * load_model(a.model_dir).encode(texts)).sum(-1)
+        seconds = []
+        for _ in range(3):
+            t = time.perf_counter()
+            npu.encode(texts)
+            seconds.append(time.perf_counter() - t)
+        print(json.dumps({'texts': len(texts), 'cosine_to_cpu': {'min': float(cosine.min()), 'mean': float(cosine.mean())},
+                          'texts_per_second': len(texts) / sorted(seconds)[1]}, indent=2))
+    finally:
+        npu.close()
+    if not np.isfinite(vectors).all() or cosine.min() < 0.995:
+        sys.exit('FAIL: NPU vectors differ from the CPU reference')
+    print('OK')
+
+
+if __name__ == '__main__':
+    main()

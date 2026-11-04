@@ -53,7 +53,9 @@ def main():
             seconds.append(time.perf_counter() - t)
         report = {'texts': len(texts), 'cosine_to_cpu': {'min': float(cos.min()), 'mean': float(cos.mean())},
                   'texts_per_second': len(texts) / statistics.median(seconds),
-                  'median_dispatch_ms': statistics.median(npu.dispatch_ms), 'dispatches': len(npu.dispatch_ms),
+                  # the C++ host loop (native, the default) records no per-dispatch times
+                  'median_dispatch_ms': statistics.median(npu.dispatch_ms) if npu.dispatch_ms else None,
+                  'dispatches': len(npu.dispatch_ms),
                   'build': npu.manifest['artifact_sha256']}
     finally:
         npu.close()

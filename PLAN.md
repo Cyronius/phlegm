@@ -480,6 +480,8 @@ Sources: [speculative decoding](specs/open-engine/plans/spec-decode.md),
   stubbed): the projection epilogue, and attention's repeated bfp16 operand conversions.
 - [ ] Hide the remaining host work per dispatch (0.53 ms an abstract, against 0.48 ms back to back).
 - [ ] Add an embeddings route to `phlegm serve`, and run the encoder on Windows.
+- [x] Ship the built graph and host library in the model folder (`bundle.py` -> `npu/`), so XDNA2 owners
+  run it with only XRT and amdxdna (2026-11-04; staged, not yet uploaded to Hugging Face).
 
 `open_kernels/designs/trit_embed/` runs all three ternary layers (2-bit weights, int8
 activations) in one dispatch per 128-token slot. On a quiet machine (2026-11-01) it encodes 1,888
