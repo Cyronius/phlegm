@@ -73,8 +73,46 @@ The audit fails the bundle on an rpath or on symbol versions newer than GLIBC_2.
 CXXABI_1.3.13. Two things it caught: the conda compiler in `target/npu-dev` adds an rpath to its own
 `lib/`, and `std::sqrt` with errno semantics calls `sqrtf@GLIBC_2.43` on Fedora 44, so the host library
 is now compiled with `-fno-math-errno` (sqrt is exact either way; the call only handled negative inputs).
-The xclbin is not byte-reproducible: two builds of the same sources differ in its timestamp and UUIDs
-(about 80 bytes); its PDI, the core programs and `insts.bin` are identical.
+The xclbin is not byte-reproducible: two builds of the same sources differ only in its timestamp, unique
+ID and UUIDs (73 to 80 bytes, against the measured `f6db177` build too); everything else, `insts.bin`
+included, is identical.
+
+**Bundle of `c236878`, 2026-11-04** (staged for the Hugging Face repo; not uploaded). Artifacts, sha256:
+
+| File | Bytes | sha256 |
+|---|---:|---|
+| `npu/final.xclbin` | 697,797 | `2c0863192f697f390b6bc523a3229ca46f2b351e058409cc8af603daa837d79c` |
+| `npu/insts.bin` | 20,352 | `caba86f1a32658fc3a8648e87857992a920a87812ee676f68e6e54ba1d4f9b33` |
+| `npu/libtd_npu2.so` | 77,728 | `692822bfd465c98d13cfeb5c91a68c48f72e2f3f9ad20e81a4a94e9d30a0b6ce` |
+| `npu/build.json` | 5,427 | `a6245ec9a7dd8ce47157f16c9893a4c5068ff4a886f6c9fcd73233df81c6d5d7` |
+| `trit_npu.py` | 36,922 | `03ba7ba25414f7d5efa10c7b476569e8b2e70dd9ce25cc083ab70fe134bd504c` |
+
+Built on Fedora 44: mlir-aie 1.4.2, llvm-aie 21.0.0.2026080301+c9c5ecb7, xclbinutil from XRT 2.27.0 (a29919c);
+host library with GCC 16.2.1 against the `xrt-base-devel` 2.27.0 headers (rebuilding gave the same hash). It
+needs `libxrt_coreutil.so.2`, `libstdc++.so.6`, `libgcc_s.so.1` and `libc.so.6`; newest symbol versions
+GLIBC_2.32, GLIBCXX_3.4.30, CXXABI_1.3.13.
+
+Checked from a Hugging Face cache layout (blobs and symlinks) in a fresh Python 3.14 venv (torch 2.15.0+cpu,
+transformers 5.22.1, tokenizers 0.23.3), with no phlegm env: `PATH=/usr/bin:/bin`, no `LD_LIBRARY_PATH` or
+`XILINX_XRT`; XRT from the Fedora packages (`/usr/lib64`), Linux 7.2.13 in-tree amdxdna, NPU firmware 1.1.2.65,
+machine loaded (another session's GPU job, load average 6 to 8), default dibs hold (not `--measure`):
+
+- release harness (`npu_eval.py` pointed at the snapshot): four-task nDCG@10 33.91 against CPU 33.85 (paired
+  95% CI −0.07 to +0.21), STSB 82.88 against 82.87, minimum STSB vector cosine to CPU 0.9981. Identical to the
+  `f6db177` result (SciFact 60.603 in both);
+- three alternating rounds, bundle against this checkout's development build (conda-compiled, rpath): STSB
+  29.6k/32.4k/22.3k against 32.8k/30.6k/32.2k sentences/s, SciFact 4.88k/4.67k/4.84k against 4.83k/4.70k/4.68k
+  abstracts/s, batch 1 0.53/0.56/0.57 against 0.54/0.56/0.55 ms. Equal within noise; absolute rates are below
+  the quiet figures above because the machine was loaded;
+- locked memory: 8 to 48 MiB fail at device open (XRT's 64 MiB heap `mmap` returns EAGAIN), 64 MiB works; with
+  soft 8 MiB and hard unlimited, `trit_npu` raises the soft limit and runs. An 8 MiB hard limit stops with
+  `NpuUnavailable` before the device is touched;
+- each other missing prerequisite (simulated: platform, driver, device, PCI ID, XRT, libstdc++, XRT symbol,
+  `npu/`, library) raises `NpuUnavailable` naming it.
+
+Evidence, with the scripts: `~/Documents/ChatGPT/model work/trit-release/bench/npu-bundle-c236878/`
+(`bundle-full.json` sha256 `52af5f70…35f7`, `verify_all.log` `eb22f591…a8a`, `probe_all.log` `227296b9…635`).
+Not covered: other XRT versions, other distributions and glibc versions, Strix Point and Krackan Point, Windows.
 
 ## Arithmetic
 
