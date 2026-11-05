@@ -347,6 +347,19 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   count with a (taps - 1)-row f32 state. `target/npu-dev/lfm3-block-patch.sh` regenerates it and checks the
   chain reproduces the clone (`target/npu-dev/lfm3-runtime`).
 
+- `upstream-patches/block-host-attention-runtime.patch` (2026-11-04, sha256 `7a633bf0...`) replaces
+  `host::attention_block` (the block routes' host attention: the `lfm` kind, LFM3 and LFM2.5) with a
+  vectorised, tiled version of the same arithmetic in the same order: bit-identical output and cache rows,
+  10-20x faster per block past a few thousand cached rows. Over `lfm3-q40-runtime.patch`; the
+  `lfm3-runtime` clone now carries it, so regenerate `lfm3-block-runtime.patch` against a clone without it
+  (`target/npu-dev/attn-bench/block_host.lfm3-runtime.orig.cpp` is the file before). The
+  `lfm2moe-runtime` clone carries the same body; `block-host-attention-lfm2moe-runtime.patch` is that
+  variant (the lfm2moe-block point of the chain; it also reproduces the `hyv3-runtime` clone over
+  `hyv3-block-runtime.patch`, so `hyv3-block-patch.sh`'s round trip needs it appended). Flint's
+  `flint-block-runtime.patch` was regenerated with the same body plus its `sinks` argument (bit-identical to
+  Flint's scalar sink version in the CPU harness: windows 513, NoPE, partial blocks). Evidence:
+  `.plans/long-prefill.md`.
+
 - `upstream-patches/lfm3-q40-runtime.patch` (2026-11-03) is LFM3-1.7B's decode bytes (OPEN-FAMILY-LFM3,
   on by default; `LFM3_Q40=0`, `LFM3_HEAD=f32` select the q4_1 pools and f32-scale head), over `lfm3-block-runtime.patch`. `fl_q4` gains the Q4_0-native 4608-B chunk
   law (bf16 d plane, m = -8 d on the core; byte-identical to `std_perm_gguf`'s Q4_0 pool, checked in

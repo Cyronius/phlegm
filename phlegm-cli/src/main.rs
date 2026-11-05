@@ -76,6 +76,14 @@ fn model_settings(map: &HashMap<String, String>) -> Result<Resolved, String> {
     cfg.resolve(tag.as_deref(), dir.as_deref(), map)
 }
 
+/// The bridge's host threads (OpenMP) when `--threads` is not given: half the logical CPUs, 4 to 16.
+/// The block routes' host stages (attention, transposes, norms) scale with them; decode does not
+/// care. 2026-11-04, LFM3, 8192-token prompt: 55.6 / 57.0 s at 4 threads, 36.3 / 33.4 s at 16,
+/// bit-identical logits (`target/npu-dev/prefill-prof/thr-lfm3.json`).
+fn default_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(4, 16))
+}
+
 fn npu_options(map: &HashMap<String, String>, settings: &Resolved) -> Result<NpuOptions, String> {
     let number = |key: &str, default: usize| -> Result<usize, String> {
         map.get(key)
@@ -88,7 +96,7 @@ fn npu_options(map: &HashMap<String, String>, settings: &Resolved) -> Result<Npu
         turbo: map.contains_key("--turbo"),
         bridge: PathBuf::from(required(map, "--bridge")?),
         context_capacity: settings.usize("ctx_len"),
-        threads: number("--threads", 4)?,
+        threads: number("--threads", default_threads())?,
         prefill_route: settings.str("prefill_route"),
         prefill_mode: settings.str("prefill_mode"),
         request_timeout: Duration::from_secs(number("--timeout", 600)? as u64),

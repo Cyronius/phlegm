@@ -1,0 +1,250 @@
+--- a/src/open_qwen36/block_host.cpp
++++ b/src/open_qwen36/block_host.cpp
+@@ -38,6 +38,14 @@
+     return _mm256_castsi256_ps(_mm256_and_si256(r, _mm256_set1_epi32(static_cast<int>(0xFFFF0000u))));
+ }
+ 
++// eight bf16 values as floats (exact: the bf16 bits in the high half)
++inline __m256 bf16x8(const uint16_t* p) {
++    const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
++    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
++}
++constexpr size_t ATT_TR = 64;   // attention_block: cache rows a K / V tile
++constexpr size_t ATT_TQ = 8;    // attention_block: block tokens a work unit (times the group's heads)
++
+ // x[d] / sqrt(mean(x^2) + eps) * w[d]
+ void rms_vec(const float* x, size_t d, const float* w, double eps, float* out) {
+     double ss = 0;
+@@ -591,79 +599,174 @@
+     }
+ }
+ 
++// The block's attention, vectorised and tiled with the reference's arithmetic in the reference's order
++// (bit-identical output and cache rows; attn-bench, 2026-11-04): each score is the same j-ordered
++// sum of separate multiplies and adds, computed eight cache rows a lane group from a transposed K
++// tile that stays in L1 while every query of a (kv head, TQ tokens) unit uses it; each query's
++// softmax and V sum then run row by row in order. The old per-(head, token) scalar dot read the
++// whole cache once per pair, so a long prompt was bound by memory and by the dot's add latency.
+ void attention_block(const AttnGeom& g, const float* q, const float* k, const float* v, const float* gate,
+-                     const float* qn, const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems,
+-                     float* og) {
++                          const float* qn, const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems,
++                          float* og) {
+     const size_t qw = g.nh * g.hd, kvw = g.kvh * g.hd, half = g.rot / 2, rows = g.pos0 + g.t_real;
+     if (g.nh % g.kvh || g.t_real > g.T || g.rot > g.hd || kv_row_elems < 2 * kvw)
+         throw std::runtime_error("open_qwen36: attention_block: inconsistent geometry");
+-    const size_t grp = g.nh / g.kvh, R = g.t_real;
+-    const float scale = 1.0f / std::sqrt(static_cast<float>(g.hd));
++    const size_t grp = g.nh / g.kvh, R = g.t_real, hd = g.hd;
++    if (kvw > 2048) throw std::runtime_error("open_qwen36: attention_block: kv width past 2048");
++    if (hd > 256 || hd % 8) throw std::runtime_error("open_qwen36: attention_block: head dim past 256 or not whole lanes");
++    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+     std::fill(og, og + g.T * qw, 0.f);
++    if (!R) return;
+ 
+-    // ---- phase 1: the cache window as floats (old rows from the cache, the block's rows
+-    // normed, roped, written to the cache in bf16), the block's queries normed and roped
+-    std::vector<float> K(rows * kvw), V(rows * kvw), Q(R * qw);
+-    for (size_t r = 0; r < g.pos0; ++r)
+-        for (size_t j = 0; j < kvw; ++j) {
+-            K[r * kvw + j] = bf16_to_f32(kv[r * kv_row_elems + j]);
+-            V[r * kvw + j] = bf16_to_f32(kv[r * kv_row_elems + kvw + j]);
+-        }
+-    for (size_t t = 0; t < R; ++t) {
+-        const size_t p = g.pos0 + t;
++    // ---- phase 1: the block's queries and its K | V rows (normed, roped, rounded into the cache)
++    std::vector<float> Q(R * qw);
++#pragma omp parallel for schedule(static)
++    for (long long tt = 0; tt < static_cast<long long>(R); ++tt) {
++        const size_t t = static_cast<size_t>(tt), p = g.pos0 + t;
+         for (size_t h = 0; h < g.nh; ++h) {
+-            float* dst = Q.data() + t * qw + h * g.hd;
+-            rms_vec(q + t * qw + h * g.hd, g.hd, qn, g.eps, dst);
++            float* dst = Q.data() + t * qw + h * hd;
++            rms_vec(q + t * qw + h * hd, hd, qn, g.eps, dst);
+             rope(dst, half, inv_freq, static_cast<double>(p));
+         }
+-        std::vector<float> kh(kvw);
++        float kh[2048];
+         for (size_t h = 0; h < g.kvh; ++h) {
+-            rms_vec(k + t * kvw + h * g.hd, g.hd, kn, g.eps, kh.data() + h * g.hd);
+-            rope(kh.data() + h * g.hd, half, inv_freq, static_cast<double>(p));
++            rms_vec(k + t * kvw + h * hd, hd, kn, g.eps, kh + h * hd);
++            rope(kh + h * hd, half, inv_freq, static_cast<double>(p));
+         }
+         for (size_t j = 0; j < kvw; ++j) {
+-            const uint16_t kb = f32_to_bf16(kh[j]), vb = f32_to_bf16(v[t * kvw + j]);
+-            kv[p * kv_row_elems + j] = kb;
+-            kv[p * kv_row_elems + kvw + j] = vb;
+-            K[p * kvw + j] = bf16_to_f32(kb);
+-            V[p * kvw + j] = bf16_to_f32(vb);
++            kv[p * kv_row_elems + j] = f32_to_bf16(kh[j]);
++            kv[p * kv_row_elems + kvw + j] = f32_to_bf16(v[t * kvw + j]);
+         }
+     }
+ 
+-    // ---- phase 2: every (head, token) pair attends over the causal window
+-    const long long pairs = static_cast<long long>(g.nh * R);
+-#pragma omp parallel for schedule(dynamic, 8)
+-    for (long long pr = 0; pr < pairs; ++pr) {
+-        const size_t h = static_cast<size_t>(pr) / R, t = static_cast<size_t>(pr) % R, p = g.pos0 + t;
+-        const float* qv = Q.data() + t * qw + h * g.hd;
+-        const size_t kh_off = (h / grp) * g.hd;
+-        std::vector<float> s(p + 1);
+-        float mx = -1e30f;
+-        for (size_t r = 0; r <= p; ++r) {
+-            const float* kr = K.data() + r * kvw + kh_off;
+-            float acc = 0;
+-            for (size_t j = 0; j < g.hd; ++j) acc += kr[j] * qv[j];
+-            s[r] = acc * scale;
+-            mx = std::max(mx, s[r]);
+-        }
+-        double denom = 0;
+-        for (size_t r = 0; r <= p; ++r) {
+-            s[r] = std::exp(s[r] - mx);
+-            denom += s[r];
+-        }
+-        const float inv = static_cast<float>(1.0 / denom);
+-        std::vector<float> o(g.hd, 0.f);
+-        for (size_t r = 0; r <= p; ++r) {
+-            const float* vr = V.data() + r * kvw + kh_off;
+-            const float a = s[r] * inv;
+-            for (size_t j = 0; j < g.hd; ++j) o[j] += a * vr[j];
+-        }
+-        float* out = og + t * qw + h * g.hd;
+-        if (gate) {
+-            const float* gt = gate + t * qw + h * g.hd;
+-            for (size_t j = 0; j < g.hd; ++j) out[j] = o[j] * sigmoid(gt[j]);
+-        } else {                                  // no output gate (LFM2-MoE): the attention output as it is
+-            for (size_t j = 0; j < g.hd; ++j) out[j] = o[j];
++    // ---- the rows any query reads, as floats in tiles of ATT_TR rows from `base`: K transposed
++    // ([kvh][tile][hd][ATT_TR], padding zero), V as rows ([kvh][row][hd])
++    const size_t r_lo = g.window && g.pos0 + 1 > g.window ? g.pos0 + 1 - g.window : 0;
++    const size_t base = r_lo / ATT_TR * ATT_TR, tiles = (rows - base + ATT_TR - 1) / ATT_TR, span = tiles * ATT_TR;
++    std::vector<float> Kt(g.kvh * span * hd), V(g.kvh * span * hd);
++#pragma omp parallel for schedule(static)
++    for (long long cc = 0; cc < static_cast<long long>(g.kvh * tiles); ++cc) {
++        const size_t kh = static_cast<size_t>(cc) / tiles, c = static_cast<size_t>(cc) % tiles;
++        float* kt = Kt.data() + (kh * tiles + c) * hd * ATT_TR;
++        float* vt = V.data() + (kh * span + c * ATT_TR) * hd;
++        alignas(32) float blk[8][8];
++        for (size_t i0 = 0; i0 < ATT_TR; i0 += 8)
++            for (size_t j0 = 0; j0 < hd; j0 += 8) {
++                for (size_t i = 0; i < 8; ++i) {
++                    const size_t r = base + c * ATT_TR + i0 + i;
++                    _mm256_store_ps(blk[i], r < rows ? bf16x8(kv + r * kv_row_elems + kh * hd + j0) : _mm256_setzero_ps());
++                }
++                for (size_t jj = 0; jj < 8; ++jj)
++                    for (size_t i = 0; i < 8; ++i) kt[(j0 + jj) * ATT_TR + i0 + i] = blk[i][jj];
++            }
++        for (size_t i = 0; i < ATT_TR; ++i) {
++            const size_t r = base + c * ATT_TR + i;
++            for (size_t j0 = 0; j0 < hd; j0 += 8)
++                _mm256_storeu_ps(vt + i * hd + j0,
++                                 r < rows ? bf16x8(kv + r * kv_row_elems + kvw + kh * hd + j0) : _mm256_setzero_ps());
++        }
++    }
++
++    // ---- phase 2: per (kv head, ATT_TQ tokens) unit, the group's heads x tokens as queries. Scores for
++    // every tile the unit reads, then each query's softmax and its V sum in row order.
++    const size_t qtiles = (R + ATT_TQ - 1) / ATT_TQ, units = g.kvh * qtiles;
++    const __m256 sc = _mm256_set1_ps(scale);
++#pragma omp parallel
++    {
++        std::vector<float> S, O(grp * ATT_TQ * hd);
++#pragma omp for schedule(dynamic, 1)
++        for (long long uu = 0; uu < static_cast<long long>(units); ++uu) {
++            // the longest units first: the last token tile of each head reads the most rows
++            const size_t u = units - 1 - static_cast<size_t>(uu);
++            const size_t kh = u % g.kvh, t0 = u / g.kvh * ATT_TQ, t1 = std::min(R, t0 + ATT_TQ);
++            const size_t nq = grp * (t1 - t0);
++            const size_t p_hi = g.pos0 + t1 - 1;
++            const size_t lo0 = g.window && g.pos0 + t0 + 1 > g.window ? g.pos0 + t0 + 1 - g.window : 0;
++            const size_t c_lo = (lo0 - base) / ATT_TR, c_hi = (p_hi - base) / ATT_TR + 1, w = (c_hi - c_lo) * ATT_TR;
++            S.resize(nq * w);
++            // scores: query (t, hh) at S[((t - t0) * grp + hh) * w + (r - base - c_lo * ATT_TR)]
++            for (size_t c = c_lo; c < c_hi; ++c) {
++                const float* kt = Kt.data() + (kh * tiles + c) * hd * ATT_TR;
++                for (size_t qi = 0; qi < nq; ++qi) {
++                    const size_t t = t0 + qi / grp, h = kh * grp + qi % grp;
++                    const float* qv = Q.data() + t * qw + h * hd;
++                    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
++                    for (size_t j = 0; j < hd; ++j) {
++                        const __m256 qj = _mm256_set1_ps(qv[j]);
++                        const float* kr = kt + j * ATT_TR;
++                        a0 = _mm256_add_ps(a0, _mm256_mul_ps(_mm256_loadu_ps(kr), qj));
++                        a1 = _mm256_add_ps(a1, _mm256_mul_ps(_mm256_loadu_ps(kr + 8), qj));
++                        a2 = _mm256_add_ps(a2, _mm256_mul_ps(_mm256_loadu_ps(kr + 16), qj));
++                        a3 = _mm256_add_ps(a3, _mm256_mul_ps(_mm256_loadu_ps(kr + 24), qj));
++                        a4 = _mm256_add_ps(a4, _mm256_mul_ps(_mm256_loadu_ps(kr + 32), qj));
++                        a5 = _mm256_add_ps(a5, _mm256_mul_ps(_mm256_loadu_ps(kr + 40), qj));
++                        a6 = _mm256_add_ps(a6, _mm256_mul_ps(_mm256_loadu_ps(kr + 48), qj));
++                        a7 = _mm256_add_ps(a7, _mm256_mul_ps(_mm256_loadu_ps(kr + 56), qj));
++                    }
++                    float* sr = S.data() + qi * w + (c - c_lo) * ATT_TR;
++                    _mm256_storeu_ps(sr, _mm256_mul_ps(a0, sc));
++                    _mm256_storeu_ps(sr + 8, _mm256_mul_ps(a1, sc));
++                    _mm256_storeu_ps(sr + 16, _mm256_mul_ps(a2, sc));
++                    _mm256_storeu_ps(sr + 24, _mm256_mul_ps(a3, sc));
++                    _mm256_storeu_ps(sr + 32, _mm256_mul_ps(a4, sc));
++                    _mm256_storeu_ps(sr + 40, _mm256_mul_ps(a5, sc));
++                    _mm256_storeu_ps(sr + 48, _mm256_mul_ps(a6, sc));
++                    _mm256_storeu_ps(sr + 56, _mm256_mul_ps(a7, sc));
++                }
++            }
++            // softmax per query over its own window (r0, p], the reference's order; S keeps exp
++            std::vector<float> invs(nq);
++            for (size_t qi = 0; qi < nq; ++qi) {
++                const size_t p = g.pos0 + t0 + qi / grp;
++                const size_t r0 = g.window && p + 1 > g.window ? p + 1 - g.window : 0;
++                float* sw = S.data() + qi * w - (base + c_lo * ATT_TR);   // indexed by cache row
++                float mx = -1e30f;
++                for (size_t r = r0; r <= p; ++r) mx = std::max(mx, sw[r]);
++                double denom = 0;
++                for (size_t r = r0; r <= p; ++r) {
++                    sw[r] = std::exp(sw[r] - mx);
++                    denom += sw[r];
++                }
++                invs[qi] = static_cast<float>(1.0 / denom);
++            }
++            // o += (s * inv) * v, row by row in order, a V tile at a time
++            std::fill(O.begin(), O.begin() + nq * hd, 0.f);
++            for (size_t c = c_lo; c < c_hi; ++c) {
++                const size_t rt = base + c * ATT_TR;
++                const float* vt = V.data() + (kh * span + c * ATT_TR) * hd;
++                for (size_t qi = 0; qi < nq; ++qi) {
++                    const size_t p = g.pos0 + t0 + qi / grp;
++                    const size_t r0 = g.window && p + 1 > g.window ? p + 1 - g.window : 0;
++                    const size_t a_lo = std::max(r0, rt), a_hi = std::min(p + 1, rt + ATT_TR);
++                    if (a_lo >= a_hi) continue;
++                    const float* sw = S.data() + qi * w - (base + c_lo * ATT_TR);
++                    const float inv = invs[qi];
++                    float* o = O.data() + qi * hd;
++                    for (size_t j0 = 0; j0 < hd; j0 += 64) {
++                        const size_t n8 = std::min<size_t>(8, (hd - j0) / 8);
++                        __m256 acc[8];
++                        for (size_t x = 0; x < n8; ++x) acc[x] = _mm256_loadu_ps(o + j0 + 8 * x);
++                        for (size_t r = a_lo; r < a_hi; ++r) {
++                            const __m256 a = _mm256_set1_ps(sw[r] * inv);
++                            const float* vr = vt + (r - rt) * hd + j0;
++                            for (size_t x = 0; x < n8; ++x)
++                                acc[x] = _mm256_add_ps(acc[x], _mm256_mul_ps(a, _mm256_loadu_ps(vr + 8 * x)));
++                        }
++                        for (size_t x = 0; x < n8; ++x) _mm256_storeu_ps(o + j0 + 8 * x, acc[x]);
++                    }
++                }
++            }
++            for (size_t qi = 0; qi < nq; ++qi) {
++                const size_t t = t0 + qi / grp, h = kh * grp + qi % grp;
++                const float* o = O.data() + qi * hd;
++                float* out = og + t * qw + h * hd;
++                if (gate) {
++                    const float* gt = gate + t * qw + h * hd;
++                    for (size_t j = 0; j < hd; ++j) out[j] = o[j] * sigmoid(gt[j]);
++                } else {
++                    for (size_t j = 0; j < hd; ++j) out[j] = o[j];
++                }
++            }
+         }
+     }
+ }

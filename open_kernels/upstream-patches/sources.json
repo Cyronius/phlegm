@@ -652,5 +652,57 @@
     "note": "LFM3-1.7B decode bytes (OPEN-FAMILY-LFM3, 2026-11-03, LFM3_Q40=1 / LFM3_HEAD=bf16) on top of lfm3-block-runtime.patch: fl_q4 under the Q4_0-native 4608-B chunk law (bf16 d plane, m = -8 d on the core; byte-identical to std_perm_gguf's Q4_0 pool, checked in gguf_pack_test) and the pack op gx_lmhead_bf16 (the tied Q8_0 head with RNE bf16 per-32 scales, 8704-B chunks; equal to gx_lmhead with its scales rounded).",
     "patch": "lfm3-q40-runtime.patch",
     "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "block_host_attention_20261104": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gptoss_runtime_20261031",
+      "gptoss_prefill_runtime_20261031",
+      "flint_runtime_20261031",
+      "hyv3_runtime_20261031",
+      "lfm2moe_block_20261103",
+      "lfm3_block_20261103",
+      "lfm3_q40_20261103"
+    ],
+    "files": [
+      "src/open_qwen36/block_host.cpp"
+    ],
+    "note": "host::attention_block vectorised and tiled (the block routes' host attention: the lfm kind, LFM3 and LFM2.5), bit-identical output and cache rows: K transposed into 64-row L1 tiles, each (kv head, 8 tokens) unit's queries dotted eight rows a lane group with the same j-ordered separate multiplies and adds, softmax and the V sum per query in row order. 2026-11-04: CPU harness target/npu-dev/attn-bench (27 edge cases identical; 8192 / 16384 cached rows 15-20x at 4 threads); NPU A/B target/npu-dev/prefill-prof/ab-lfm3.json, ab-lfm25.json (last-position and 8 greedy decode logits identical; LFM3 8192 tokens 221 -> 52-56 s at 4 threads). The lfm2moe-runtime clone (bridges/lfm2moe-blk) carries the same function body over its pre-window version.",
+    "patch": "block-host-attention-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "block_host_attention_lfm2moe_20261104": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gptoss_runtime_20261031",
+      "gptoss_prefill_runtime_20261031",
+      "flint_runtime_20261031",
+      "hyv3_runtime_20261031",
+      "lfm2moe_block_20261103"
+    ],
+    "files": [
+      "src/open_qwen36/block_host.cpp"
+    ],
+    "note": "The same attention_block replacement as block-host-attention-runtime.patch, against the lfm2moe-block point of the chain (attention_block before lfm3's window): the lfm2moe-runtime clone (bridges/lfm2moe-blk) and the hyv3-runtime clone (bridges/hyv3-blk, over hyv3-block-runtime.patch, which does not touch block_host.cpp). Flint's flint-block-runtime.patch carries the same body with its sinks argument folded in (regenerated 2026-11-04). NPU A/B: target/npu-dev/prefill-prof/ab-lfm25.json, ab-hy.json.",
+    "patch": "block-host-attention-lfm2moe-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
   }
 }

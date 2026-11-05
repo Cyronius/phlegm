@@ -80,7 +80,9 @@ cargo run -p phlegm-cli -- serve --model-dir C:/models/my-model `
 
 `--max-ctx`, `--threads`, `--prefill-route auto|block|sequential`,
 `--prefill-mode fast|lean`, `--timeout`, and `--dispatch-timeout-ms` select runtime
-settings. The bridge sends logits as base64 little-endian float32 bytes to
+settings. `--threads` (the bridge's OpenMP threads) defaults to half the logical
+CPUs, 4 to 16: the block routes' host stages scale with it (LFM3, 8192-token
+prompt: 56 s at 4 threads, 33-36 s at 16, the same logits) and decode does not. The bridge sends logits as base64 little-endian float32 bytes to
 avoid the overhead of a large JSON number array. `serve --mock` runs the
 explicit test backend. No release tag is needed for run/serve; the strict
 release and power-mode rules below still govern published benchmark reports.
