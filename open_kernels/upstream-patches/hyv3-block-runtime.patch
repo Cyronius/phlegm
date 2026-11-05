@@ -1,0 +1,106 @@
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -226,6 +226,11 @@
+     std::string route_router, route_bias;
+     uint64_t route_experts = 0, route_topk = 0;
+     double route_scale = 1.0;
++    // HY V3 (OPEN-FAMILY-HYV3 block prefill): pool experts every token also takes at weight 1 after the router's
++    // top k (the ungated shared expert), and a dense layer's route: slots 0..route_dense-1 = pool experts 0..n-1 at
++    // weight 1 for every token, no router (the dense MLP's expert-wide slices). Both absent for LFM2-MoE.
++    std::vector<uint64_t> route_shared;
++    uint64_t route_dense = 0;
+ };
+ 
+ struct LayerType {
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -664,11 +664,25 @@
+                 } else {
+                     if (!m.has_moe) fail(gw, "an lfm route without an ffn_program needs layout.moe");
+                     const json& rj = need(gj, "route", gw);
+-                    g.route_router = get<std::string>(rj, "router", gw + ".route");
+-                    g.route_bias = get<std::string>(rj, "bias", gw + ".route");
+-                    g.route_experts = get<uint64_t>(rj, "experts", gw + ".route");
+-                    g.route_topk = get<uint64_t>(rj, "topk", gw + ".route");
+-                    g.route_scale = rj.value("scale", 1.0);
++                    if (rj.contains("dense")) {
++                        // HY V3's dense layer: its MLP's slices are pool experts 0..n-1, every token takes all n at weight 1
++                        g.route_dense = get<uint64_t>(rj, "dense", gw + ".route");
++                        if (g.route_dense == 0 || g.route_dense != m.moe.topk || g.route_dense > m.moe.experts)
++                            fail(gw, "route.dense must be layout.moe.topk slices, within layout.moe.experts");
++                    } else {
++                        g.route_router = get<std::string>(rj, "router", gw + ".route");
++                        g.route_bias = get<std::string>(rj, "bias", gw + ".route");
++                        g.route_experts = get<uint64_t>(rj, "experts", gw + ".route");
++                        g.route_topk = get<uint64_t>(rj, "topk", gw + ".route");
++                        g.route_scale = rj.value("scale", 1.0);
++                        g.route_shared = rj.value("shared", std::vector<uint64_t>());
++                        // the shared experts sit after the routed ones in the pool (HY V3: pool expert 128)
++                        for (uint64_t s : g.route_shared)
++                            if (s < g.route_experts || s >= m.moe.experts)
++                                fail(gw, "route.shared expert " + std::to_string(s) + " is not a pool expert past the routed ones");
++                        if (g.route_topk + g.route_shared.size() != m.moe.topk)
++                            fail(gw, "route.topk plus the shared experts is not layout.moe.topk");
++                    }
+                     const json& bj = need(gj, "moe_batch", gw);
+                     const std::string bw = gw + ".moe_batch";
+                     MoeBatch& b = g.moe_batch;
+@@ -686,7 +700,8 @@
+                         b.kernels[slots] = it->first;
+                     }
+                     if (b.kernels.empty()) fail(bw, "names no streams");
+-                    if (g.route_experts != m.moe.experts) fail(gw, "route.experts disagrees with layout.moe");
++                    if (!g.route_dense && g.route_experts + g.route_shared.size() != m.moe.experts)
++                        fail(gw, "route.experts (plus the shared experts) disagrees with layout.moe");
+                 }
+             } else {
+                 fail(gw, "unknown kind " + g.kind + " (dense | linear | full | lfm)");
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -5071,12 +5071,43 @@
+         return;
+     }
+     const size_t topk = w_->moe.topk;
+-    if (gb.route_topk != topk) throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": route.topk is not layout.moe.topk");
+     auto tr = std::chrono::steady_clock::now();
+-    lfm_route_rows(l, xm, t_real, moe_.idx.data(), moe_.w.data());
++    int32_t* idx = moe_.idx.data();
++    float* wt = moe_.w.data();
++    if (gb.route_dense) {
++        // HY V3's dense layer: the MLP's slices (pool experts 0..n-1) at weight 1, every token
++        if (gb.route_dense != topk) throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": route.dense is not layout.moe.topk");
++        for (size_t t = 0; t < t_real; ++t)
++            for (size_t j = 0; j < topk; ++j) {
++                idx[t * topk + j] = static_cast<int32_t>(j);
++                wt[t * topk + j] = 1.0f;
++            }
++    } else {
++        const size_t K = gb.route_topk, S = gb.route_shared.size();
++        if (K + S != topk)
++            throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": route.topk plus the shared experts is not layout.moe.topk");
++        if (!S) {
++            lfm_route_rows(l, xm, t_real, idx, wt);
++        } else {
++            // HY V3: the router's top K, then the ungated shared expert(s) at weight 1 (hy_route's slot order)
++            std::vector<int32_t> ri(t_real * K);
++            std::vector<float> rw(t_real * K);
++            lfm_route_rows(l, xm, t_real, ri.data(), rw.data());
++            for (size_t t = 0; t < t_real; ++t) {
++                for (size_t j = 0; j < K; ++j) {
++                    idx[t * topk + j] = ri[t * K + j];
++                    wt[t * topk + j] = rw[t * K + j];
++                }
++                for (size_t j = 0; j < S; ++j) {
++                    idx[t * topk + K + j] = static_cast<int32_t>(gb.route_shared[j]);
++                    wt[t * topk + K + j] = 1.0f;
++                }
++            }
++        }
++    }
+     timing_.route_ms += ms_since(tr);
+     if (!moe_batch_on_) throw std::runtime_error("open_qwen36: the lfm route has no per-token expert fallback (OFLM_OPEN_MOE_BATCH=0)");
+-    moe_block(l, xm, res, moe_.idx.data(), moe_.w.data(), T, t_real, xres);
++    moe_block(l, xm, res, idx, wt, T, t_real, xres);
+ }
+ 
+ void Core::step_rows(const int* ids, int* argmax, bool want_logits, bool draft) {

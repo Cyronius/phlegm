@@ -45,6 +45,10 @@ that they all block CLI/server integration.
   `model_list.json` + user `settings.json` format, with `phlegm config` (SERVER-SETTINGS).
 - [x] OpenAI `reasoning_effort` translated to each template's own switch (SERVER-REASONING-EFFORT); the
   bridge dies with phlegm (PR_SET_PDEATHSIG).
+- [x] Long prompts (2026-11-04, `.plans/long-prefill.md`): the block routes' host attention vectorised and
+  tiled (bit-identical), 16 bridge threads by default, block prefill for Hy-Memory and Flint. Through
+  `phlegm serve` an ~11.5k-token prompt now answers on LFM3 (48 s), LFM2.5 (231 s), Flint (236 s) and
+  Hy-Memory (204 s); a ~2.9k-token prompt takes 10-50 s instead of 32-657 s.
 - [x] Sample in Rust, load external/inline model chat templates, and derive EOS IDs.
 - [x] Stream server output, reset for each request, and bound generation by context capacity.
 - [x] Surface load/worker errors without silently using a placeholder tokenizer.
@@ -159,10 +163,16 @@ and an 8-slot expert dispatch: 6 sigmoid-routed experts plus the ungated shared 
 slots) and `upstream-patches/flint-runtime.patch` (`fl_q4` pack op, `flint_route` host step). The
 GGUF's Q4_1 scales are bf16 values, so the pools are exact. `phlegm run` / `serve` answer (the
 `<think>` split, SERVER-REASONING, is not checked live on this model). Greedy tokens equal llama.cpp's; an 815-token prompt
-sits at the bf16 rounding control's distance from the fp32 reference at every position. Sequential
-prefill only (~215 ms a token on a loaded machine), decode ~190-210 ms a token. Open: block prefill,
-one context per layer, a live check of the reasoning split, a clean benchmark. Plan:
-[.plans/flint-native.md](.plans/flint-native.md); spec: OPEN-FAMILY-FLINT.
+sits at the bf16 rounding control's distance from the fp32 reference at every position. Decode
+~190-230 ms a token. Block prefill (2026-11-04, the default; `FLINT_BLOCK=0` for sequential): LFM2.5's route --
+q4 GEMMs, host attention with the sink, the window and NoPE (runtime kind `flint`,
+`upstream-patches/flint-block-runtime.patch`), the experts and the shared expert through LFM2.5's `mbl` reading
+the pools in place -- prefills the 815-token prompt in ~14 s against ~163-178 s sequential (development, loaded
+host); through `phlegm serve` (bridge `bridges/flint-blk`) a 2,891-token prompt in 70 s against 620 s. Quality
+is the sequential route's class (per-position KL median 9.5e-3 vs 9.1e-3 sequential, 8.0e-3 bf16 control) with a
+heavier tail; 29 / 32 greedy tokens of the long prompt equal llama.cpp's (a near-tie flip). Open: the host
+attention past a few thousand tokens, the tail error, one context per layer, a live check of the reasoning
+split, a clean benchmark. Plan: [.plans/flint-native.md](.plans/flint-native.md); spec: OPEN-FAMILY-FLINT.
 
 ## Tencent Hy-Memory-30B-A3B (hy_v3 MoE)
 
@@ -176,8 +186,15 @@ renormalised x 2.826, the ungated shared expert at weight 1). Every Q4_0 scale i
 pools are exact. A chat prompt's greedy tokens equal llama.cpp's up to the EOS both rank first; an
 836-token prompt sits at the bf16 control's distance from the fp32 reference at every position, and 32/33
 teacher-forced continuation positions agree with llama.cpp. Sequential prefill ~226 ms a token, decode
-~220-240 ms a token (development, loaded machine). `phlegm run` / `serve` answer. Open: block prefill,
-one context per layer, a clean benchmark. Plan: [.plans/hymemory-native.md](.plans/hymemory-native.md);
+~220-240 ms a token (development, loaded machine). `phlegm run` / `serve` answer. Block prefill
+(2026-11-04, the default; `HYV3_BLOCK=0` for sequential): LFM2.5's route over the same pool -- q | k | v and o
+as q4 GEMMs, host attention and norms, every FFN (routed, the shared expert at weight 1, the dense layer's
+slices) through LFM2.5's `mbl` expert kernel unchanged, since Hy's pool already has its byte law; runtime
+`hyv3-block-runtime.patch` (route `shared` / `dense`). The 836-token prompt in 17.6-17.9 s against 145-186 s
+sequential (development, loaded), every position inside the bf16 control's spread, short-prompt and
+256 / 257 / 300-token greedy tokens equal to sequential. The model dir's kernels and `phlegm` use it (bridge
+`bridges/hyv3-blk`). Open: NPU attention for the block (host attention dominates long prompts), one context
+per layer, a clean benchmark. Plan: [.plans/hymemory-native.md](.plans/hymemory-native.md);
 spec: OPEN-FAMILY-HYV3.
 
 ## LiquidAI LFM2.5-24B-A2B (lfm2_moe)

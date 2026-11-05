@@ -34,7 +34,7 @@ import os
 from dataclasses import dataclass
 
 from .catalogue import OpRangeError, check_buffer_args
-from .qwen36moe import BAND_ROWS, ELEM, MB, roundup, tab_bytes
+from .qwen36moe import BAND_ROWS, ELEM, GEMM_T, MB, roundup, tab_bytes
 from .spec import DENSE, DENSE_LOCAL, ModelSpec
 
 CH = 5120                 # a q4_1 chunk: 32 rows x 256 K, bf16 d | m planes (gemv_q4.h)
@@ -323,6 +323,8 @@ def _layer_plan(spec: ModelSpec, dense: bool) -> dict:
         ]
     attn = [_q4_op(b + "attn_q.weight", P.POOL_Q, G.QW, hid), _q4_op(b + "attn_k.weight", P.POOL_K, G.KVW, hid),
             _q4_op(b + "attn_v.weight", P.POOL_V, G.KVW, hid), _q4_op(b + "attn_output.weight", P.POOL_O, hid, G.QW)]
+    if dense and block_on():
+        attn += _dense_gemm_ops(spec)
     consts = [
         {"op": "put", "tensor": b + "attn_norm.weight", "dst": L.CD_LNW, "cap": L.ELN},
         {"op": "put", "tensor": b + "ffn_norm.weight", "dst": L.CD_POSTLN, "cap": L.ELN},
@@ -355,6 +357,152 @@ def route_step(spec: ModelSpec) -> dict:
     return {"op": "flint_route", "kernel": "fl_moe", "a_xm": L.AD_XM, "a_w": L.AD_W, "hidden_real": G.HID,
             "router": "blk.{l}.ffn_gate_inp.weight", "experts": spec.num_experts, "topk": spec.experts_per_tok,
             "shared": [spec.num_experts + i for i in range(SHARED_SLOTS)]}
+
+
+# ---- block prefill (LFM2.5's route, .plans/lfm2moe-native.md "block prefill"; .plans/flint-native.md 2026-11-04)
+def block_on() -> bool:
+    """The block prefill route's kernels and manifest keys: on by default (FLINT_BLOCK=0 drops them: sequential
+    prefill, and programs() / builds() / pack_plan() are the decode set's alone)."""
+    return os.environ.get("FLINT_BLOCK") != "0"
+
+
+MB_NT = 8             # designs/lfm2moe_batch/mbl.py token slots per expert visit (one 8-token MAC tile)
+
+
+def moe_batch_slots(spec: ModelSpec) -> list[int]:
+    """mbl's dispatch lengths: a binary ladder down from the routed expert count (an unused slot streams a real
+    expert and is wasted, so the rungs decide the padding)."""
+    return [s for s in (spec.num_experts >> i for i in range(30)) if s >= 8 and s % 8 == 0]
+
+
+def _dense_gemm_ops(spec: ModelSpec) -> list[dict]:
+    """The leading dense layers' MLP as three CONTIGUOUS GEMM operands (up, gate, down) after the dense pool's
+    attention. The twelve 512-wide slots the sequential program reads interleave gate and up bands, which is no GEMM
+    operand. Every layer's pool BO is the MoE layers' size, so the dense layers' free tail holds the copies at no
+    extra device memory; the 3 x 7.9 MB a dense layer are read once at load."""
+    G = geometry(spec)
+    P = pool(spec, dense=True)
+    b = "blk.{l}."
+    ff, hid = spec.intermediate, G.HID
+    base = roundup(P.POOL_O + (hid // BAND_ROWS) * band_bytes(G.QW), MB)
+    ug = (ff // BAND_ROWS) * band_bytes(hid)
+    dn = (hid // BAND_ROWS) * band_bytes(ff)
+    if base + 2 * ug + dn > pool_bytes(spec):
+        raise OpRangeError("flint: the dense MLP's GEMM operands do not fit in the dense layers' pool")
+    return [_q4_op(b + "ffn_up.weight", base, ff, hid), _q4_op(b + "ffn_gate.weight", base + ug, ff, hid),
+            _q4_op(b + "ffn_down.weight", base + 2 * ug, hid, ff)]
+
+
+def moe_batch(spec: ModelSpec) -> dict:
+    """The token-batched expert kernel of the block route: LFM2.5's mbl (designs/lfm2moe_batch/mbl.py) at Flint's
+    widths. Flint's pool law IS mbl's (fl_q4: per pool expert [gate band b | up band b] for the 8 bands, then from
+    POOL_DOWN each expert's 32 down bands), so the experts are read in place -- no second copy. The shared expert's
+    two 512-row halves are pool experts 256 and 257: the router lists them in every token's slots 6 and 7 at weight
+    1 (flint_route's record), so mbl visits them like routed experts (NT tokens a visit). One xclbin (context `mb`),
+    one instruction stream per dispatch length; the runtime patches the slots' expert offsets (`moebatch` over
+    moe_geometry's pool law). y leaves [rbg][half][row][1024 B] (designs/lfm2moe_batch/layout.py)."""
+    G, L, P = geometry(spec), layout(spec), pool(spec, dense=False)
+    slots = moe_batch_slots(spec)
+    args = ["pool", "mb_x", "mb_h", "mb_y"]
+    check_buffer_args("moe_batch", args)
+    out: dict = {"contexts": {}, "kernels": {}, "globals": {}, "builds": {}}
+    for s in slots:
+        name = f"mb_s{s}"
+        out["contexts"].setdefault("mb", f"mb_s{slots[0]}/final.xclbin")
+        out["kernels"][name] = {"context": "mb", "insts": f"{name}/insts.bin", "patch": "moebatch", "build": name}
+        out["builds"][name] = {"design": "lfm2moe_batch/mbl.py",
+                               "build_dir": f"lfm2moe_batch/build_s{s}_h{G.HID}_f{G.FF}_e{P.SLOTS}",
+                               "env": {"MBL_SLOTS": str(s), "MBL_NT": str(MB_NT), "MBL_HID": str(G.HID),
+                                       "MBL_FF": str(G.FF), "MBL_EXPERTS": str(P.SLOTS),
+                                       "MBL_POOL_DOWN": str(P.POOL_DOWN), "MBL_POOL_BYTES": str(P.POOL_ATTN)}}
+    if P.POOL_DOWN != P.SLOTS * L.EXPERT_UG or L.EXPERT_UG != 2 * L.UP_BYTES:
+        raise OpRangeError("flint: the pool is not mbl's law (gate | up per expert, then the down slices)")
+    out["globals"]["mb_x"] = slots[0] * G.HID * MB_NT * 2
+    out["globals"]["mb_h"] = slots[0] * G.FF * MB_NT * 2
+    out["globals"]["mb_y"] = slots[0] * G.HID * MB_NT * 4
+    out["moe_batch"] = {"kernels": {str(s): f"mb_s{s}" for s in slots}, "args": args, "nt": MB_NT,
+                        "y_layout": "rbg_half_row"}
+    return out
+
+
+def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
+    """Per layer type the `gemm_block` (kind `flint`: the runtime's kind `lfm` attention route plus the sink, the
+    window, NoPE and the shared slots) the driver reads, plus the contexts / kernels / globals / builds the route adds.
+    None under FLINT_BLOCK=0. A layer is the entry norm (host), the q | k | v GEMM, the host's attention over the block
+    (per-head q / k RMSNorm, RoPE on the sliding layers and none on the full ones, the 513-row window, the learned sink,
+    writing the K | V rows), the o GEMM, the host's residual / ffn_norm, and then the dense layers' two MLP GEMMs or
+    the routed experts (host router: flint_route's arithmetic, the shared halves in slots 6 and 7; the token-batched
+    mbl stream). The q4_1 GEMM reads the pool's bytes as they are: q | k | v is three contiguous pool ops."""
+    if not block_on():
+        return None
+    L, G, T = layout(spec, max_ctx), geometry(spec), GEMM_T
+    hid, qw, kvw = G.HID, G.QW, G.KVW
+    shapes: set[tuple[int, int]] = set()
+
+    def ctx(N: int, K: int) -> str:
+        if N % 256 or K % 256:
+            raise OpRangeError(f"flint gemm route: [{N}, {K}] is not a multiple of 256 in both dims")
+        shapes.add((N, K))
+        return f"gemm_n{N}_k{K}"
+
+    def run(N: int, K: int, w: str) -> dict:
+        return {"op": "run", "kernel": ctx(N, K), "args": [w, f"gemm_x_k{K}", f"gemm_y_n{N}"]}
+
+    def idx(ops: list[dict], suffix: str, dst: int | None = None) -> int:
+        hits = [i for i, o in enumerate(ops) if o["tensor"].endswith(suffix) and (dst is None or o["dst"] == dst)]
+        if len(hits) != 1:
+            raise OpRangeError(f"flint gemm route: {len(hits)} pack ops end in {suffix!r}, want one")
+        return hits[0]
+
+    def run_of(ops: list[dict], ids: list[int]) -> dict:
+        sel = [ops[i] for i in ids]
+        for a, b in zip(sel, sel[1:]):       # one byte-contiguous run, as the engine needs
+            if b["dst"] != a["dst"] + a["rows"] // BAND_ROWS * band_bytes(a["in_dim"]):
+                raise OpRangeError("flint gemm route: the pool ops of a GEMM weight are not contiguous")
+        for o in sel:                        # the engine's op_region: one contiguous fl_q4 tensor
+            if o["experts"] != 1 or o["stripe_bytes"]:
+                raise OpRangeError(f"flint gemm route: {o['tensor']} is not one contiguous band run")
+        return {"from": "pool", "ops": ids}
+
+    mbatch = moe_batch(spec)
+    r = route_step(spec)
+    out: dict = {"layer_types": {}, "contexts": {}, "kernels": {}, "globals": {}, "builds": {}}
+    for k in ("contexts", "kernels", "globals", "builds"):
+        out[k].update(mbatch[k])
+    for nm, kd in zip(layer_type_names(spec), kinds(spec)):
+        if nm in out["layer_types"]:
+            continue
+        dense = kd == KIND_DENSE
+        ops = _layer_plan(spec, dense)["pool"]
+        w = {"gqkv3_w": run_of(ops, [idx(ops, "attn_q.weight"), idx(ops, "attn_k.weight"), idx(ops, "attn_v.weight")]),
+             "go_w": run_of(ops, [idx(ops, "attn_output.weight")])}
+        gb: dict = {"kind": "flint", "mixer": "att", "t": T, "eps": spec.norm_eps,
+                    "cd_ln": L.CD_LNW, "cd_ffn": L.CD_POSTLN,
+                    "program": [run(qw + 2 * kvw, hid, "gqkv3_w"), run(hid, qw, "go_w")], "weights": w,
+                    "qw": qw, "kvw": kvw, "nh": G.NH, "kvh": G.KVH, "hd": G.HD, "rot": spec.rotary_dim,
+                    "cd_qnorm": L.CD_META, "cd_knorm": L.CD_META + 2 * G.HD, "cd_sinks": L.CD_SINK,
+                    # the sliding layers' 513 rows (query t reads (t - 513, t]); the full layers rotate nothing
+                    "window": spec.sliding_window if kd == KIND_LOCAL else 0, "nope": kd != KIND_LOCAL}
+        if dense:
+            ff = spec.intermediate
+            up, gate, down = _dense_gemm_ops(spec)
+            fw = {"gffn_ug_w": run_of(ops, [idx(ops, "ffn_up.weight", up["dst"]), idx(ops, "ffn_gate.weight", gate["dst"])]),
+                  "gffn_down_w": run_of(ops, [idx(ops, "ffn_down.weight", down["dst"])])}
+            gb.update(ff=ff, ffn_program=[run(2 * ff, hid, "gffn_ug_w"), run(hid, ff, "gffn_down_w")], ffn_weights=fw)
+        else:
+            gb.update(route={"router": r["router"], "experts": r["experts"], "topk": r["topk"], "scale": 1.0,
+                             "shared": r["shared"]}, moe_batch=mbatch["moe_batch"])
+        out["layer_types"][nm] = gb
+    for N, K in sorted(shapes):
+        name = f"gemm_n{N}_k{K}"
+        out["contexts"].setdefault("gemm", f"{name}/final.xclbin")
+        out["kernels"][name] = {"context": "gemm", "insts": f"{name}/insts.bin", "build": name}
+        out["globals"][f"gemm_x_k{K}"] = K * T * 2
+        out["globals"][f"gemm_y_n{N}"] = max(out["globals"].get(f"gemm_y_n{N}", 0), N * T * 4)
+        out["builds"][name] = {"design": "gemm_q4_prefill/gemm_q4_prefill.py",
+                               "build_dir": f"gemm_q4_prefill/build_n{N}_k{K}_t{T}",
+                               "env": {"GQP_N": str(N), "GQP_K": str(K), "GQP_T": str(T)}}
+    return out
 
 
 def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
@@ -402,6 +550,14 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             "buffers": {"consts": L.CD_BYTES, "act": L.AD_BYTES, "state": {"kind": "kv", "row": L.KV_ROW}},
             "program": prog,
         }
+    gr = gemm_route(spec, max_ctx)
+    if gr:
+        for lt, gb in gr["layer_types"].items():
+            out["layer_types"][lt]["gemm_block"] = gb
+        for k in ("contexts", "kernels"):
+            out[k].update(gr[k])
+        for k, v in gr["globals"].items():
+            out["globals"][k] = max(out["globals"].get(k, 0), v)
     return out
 
 
@@ -422,6 +578,9 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
                            "env": {"FL_PART": "att", "FL_POOL": "dense"}}
         out["fl_dense"] = {"design": "flint/fl.py", "build_dir": f"flint/build_moe_h{G.HID}_s{G.DENSE_SLOTS}_dense",
                            "env": {"FL_PART": "moe", "FL_POOL": "dense"}}
+    gr = gemm_route(spec)
+    if gr:
+        out.update(gr["builds"])
     return out
 
 
@@ -460,3 +619,17 @@ KERNEL_SOURCES = [
     "designs/lin_layer/ln_nr.cc", "designs/lm_head_q4/*.py", "designs/lm_head_q4/*.cc", "designs/gemv_q4/gemv_q4_prep_rt.cc",
     "include/vecmath.h", "include/scalar_fp.h", "ironutil.py", "build_design.py",
 ]
+# the block route's designs: in the build key only while the route is emitted (FLINT_BLOCK=0 keeps the sequential set's
+# key, so its manifest is the pre-block one byte for byte)
+BLOCK_SOURCES = [
+    "designs/lfm2moe_batch/*.py", "designs/lfm2moe_batch/*.cc", "designs/lfm2moe_batch/*.h",
+    "designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.h", "designs/gemm_q4_prefill/*.cc",
+]
+
+
+def __getattr__(name: str):
+    """recipes/cache.py reads KERNEL_SOURCES_MOE for a family with experts; Flint's is the block route's designs, and
+    only when block_on() (PEP 562: evaluated at each read, so the switch is honoured per export)."""
+    if name == "KERNEL_SOURCES_MOE":
+        return list(BLOCK_SOURCES) if block_on() else []
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

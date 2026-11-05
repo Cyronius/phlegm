@@ -284,6 +284,19 @@ prefill, at either capacity: Flint and Hy-Memory prefill at ~4.5 tokens/s, and L
 ~230 tokens/s at 843 tokens to 89 at 2950 and 24 at 11688 (488 s, still correct). A first probe at
 11.7k tokens ran past the server's 600 s request timeout (HTTP 500) on LFM2.5 and Flint.
 
+Later the same day the LFM routes' host attention became a vectorised, tiled version of the same
+arithmetic (bit-identical logits; `open_kernels/upstream-patches/block-host-attention-runtime.patch`,
+`.plans/long-prefill.md`) and phlegm's bridge got 16 host threads instead of 4 (`--threads`
+defaults to half the logical CPUs, 4 to 16). The same probes through `phlegm serve` at 32768
+(`ctxcost-fa.json`, `ctx32k-fa.json`; host shared with two other sessions' builds and NPU jobs):
+LFM3 2950 tokens 32.0 -> 9.6 s, needle at 4642 68 -> 16.5 s, 11688 tokens 488 -> 48 s (correct);
+LFM2.5 2949 tokens 36.4 -> 22.7 s, 11687 tokens now answers correctly in 231 s (477 reply tokens)
+where it timed out. Flint and Hy-Memory then got block prefill routes (OPEN-FAMILY-FLINT,
+OPEN-FAMILY-HYV3; bridges `flint-blk`, `hyv3-blk`) with the same attention (`ctxcost-blk.json`,
+`ctx32k-blk.json`): Flint 2891 tokens 614 -> 41.6 s, needle at 4552 1009 -> 77.8 s, 11482 tokens
+correct in 236 s (was HTTP 500); Hy-Memory 2938 tokens 657 -> 50.1 s, needle at 4621 1211 -> 92.6 s,
+11633 tokens correct in 204 s.
+
 `phlegm config show [--model-dir DIR | --config-model TAG] [--json]` prints the paths and every
 value with its source (shipped, generation_config, user, env); `set` / `unset` write the user
 file atomically; `list` prints the registry. (OpenFlowLM's guided flow, full-screen browser,

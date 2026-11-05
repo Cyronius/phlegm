@@ -4502,8 +4502,9 @@ explicitly excludes.
 ### OPEN-FAMILY-FLINT: Recursive Flint derives its own spec and runs on its own recipe from the GGUF
 **Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_flint_hf`, `families.py`, `flint.py`,
 `flint_pack.py`, `designs/flint/{fl.py,gen_kernels.py,check_layer.py}`, `model/flint_gguf_reference.py`;
-runtime `upstream-patches/flint-runtime.patch`)
-**Test category:** unit (`tests/test_flint.py`); manual (the procedure below, which needs the NPU and the GGUF)
+runtime `upstream-patches/flint-runtime.patch`; block prefill `designs/lfm2moe_batch/mbl.py`, `designs/gemm_q4_prefill/`,
+`upstream-patches/flint-block-runtime.patch`)
+**Test category:** unit (`tests/test_flint.py`, `tests/test_flint_block.py`); manual (the procedure below, which needs the NPU and the GGUF)
 
 A config whose `model_type` is `flint` shall derive a `ModelSpec` with `family` `flint`. The architecture,
 read from transformers' `modular_flint.py` and llama.cpp's `src/models/flint.cpp` (build 12015), which agree:
@@ -4573,13 +4574,38 @@ llama.cpp's. (4) `phlegm run` and `serve` answer (non-streamed and streamed); th
 reasoning_content by SERVER-REASONING (not checked live on this model). Load 53 s; sequential prefill 215-241 ms a token; decode 187-210 ms a token
 (fl_att ~100, route 15-18, fl_moe ~80, head 7 ms).
 
-Not established: block prefill, a clean benchmark, contexts past 4096 rows, one context per layer.
+Not established: a clean benchmark, one context per layer.
+
+**Block prefill (2026-11-04, development; on by default, `FLINT_BLOCK=0` for the sequential set).** LFM2.5's route
+(OPEN-FAMILY-LFM2MOE) at Flint's widths: per layer a runtime gemm_block kind `flint` (`upstream-patches/flint-block-runtime.patch`
+over the chain through `lfm2moe-block-runtime.patch`) -- kind `lfm`'s attention route plus the learned sink, the 513-row window
+and NoPE, under its own name so that an engine without them refuses a Flint set rather than dropping them. The entry norm,
+attention (q / k norm, RoPE on the sliding layers and none on the full ones, the window, the sink: `host::attention_block`'s
+new `sinks` argument, which puts the sink in the max and exp(sink - max) in the denominator, and its honouring of
+`AttnGeom::window`), the residual / ffn_norm and the router (flint_route's arithmetic; slots 6, 7 = the shared halves at
+weight 1) run on the host. q | k | v [5120, 2048], o [2048, 4096] and the dense layers' MLP ([12288, 2048] up | gate, [2048, 6144]
+down; three contiguous fl_q4 copies in the dense pools' free tail, no device memory added) run as q4 GEMMs. The experts run on
+`designs/lfm2moe_batch/mbl.py` UNCHANGED at FF 512 / 258 pool experts: Flint's fl_q4 pool law is mbl's, so the experts are
+read in place, and the shared expert is two always-routed pool experts (ladder 256 / 128 / 64 / 32 / 16 / 8 slots). Kernel
+set `kernels/flint-blk` (10 builds beside the byte-identical decode streams; program memory: GEMMs 4784, mbl 13616 of 16384 B);
+mbl at FF 512 on the harness: y rel_fro 4.65e-4. `FLINT_BLOCK=0`: the manifest equals the 10-31 set's in every key but the
+build key. Gate on hardware (development): the short chat prompt's 64 greedy tokens equal the sequential route's; the
+815-token prompt (3 blocks and a 47-token tail, 302 positions past the window): per position KL(fp32 || x) block 738 / 815
+argmax-equal, median 9.47e-3, mean .066, p95 .206; the sequential route 745, 9.09e-3, .054, .144; the bf16 control 745, 7.97e-3,
+.061, .169 -- the same class, no step at the window or the block boundaries, a heavier tail; 29 / 32 greedy tokens equal
+llama.cpp's and the sequential route's, then a near-tie flip (block logit gap .067) where the fp32 reference sides with the
+sequential route. Edge prompts of 1, 256 and 257 tokens split from the sequential route only at near-ties (top-2 gaps .03-.09).
+Timing (loaded host, load 6-11; development): see `.plans/flint-native.md`; through `phlegm serve` (bridge
+`bridges/flint-blk`) a 2,891-token prompt prefills in 70 s (sequential: 614-620 s) and a 4,552-token needle prompt plus 40
+tokens takes 132 s (sequential: 1009 s), passphrase found. Open: the host attention (scalar reference; the dominant host cost
+past ~1k tokens), NPU attention products, the shared expert as GEMMs instead of mbl visits, the tail error.
 
 ### OPEN-FAMILY-HYV3: Tencent HY V3 (Hy-Memory-30B-A3B) derives its own spec and runs on its own recipe from the GGUF
 **Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_hyv3_hf`, `families.py`, `hyv3.py`,
 `designs/hyv3/{hy.py,gen_kernels.py,check_layer.py}`, `model/hyv3_gguf_reference.py`; runtime
-`upstream-patches/hyv3-runtime.patch`)
-**Test category:** unit (`tests/test_hyv3.py`); manual (the procedure below, which needs the NPU and the GGUF)
+`upstream-patches/hyv3-runtime.patch`; block prefill: `hyv3.py` `gemm_route` / `moe_batch`,
+`designs/lfm2moe_batch/mbl.py` unchanged, `upstream-patches/hyv3-block-runtime.patch`)
+**Test category:** unit (`tests/test_hyv3.py`, `tests/test_hyv3_block.py`); manual (the procedure below, which needs the NPU and the GGUF)
 
 A config whose `model_type` is `hy_v3` shall derive a `ModelSpec` with `family` `hyv3`. The architecture,
 read from transformers 5.21's `modular_hy_v3.py` and llama.cpp's `src/models/hy-v3.cpp` /
@@ -4655,7 +4681,37 @@ environment now sets trim_blocks / lstrip_blocks as transformers does (HY V3's t
 with two newlines); the other installed templates render unchanged. Sequential prefill 226 ms a token;
 decode 217-242 ms a token (hy_att ~90-100, route 9-11, hy_moe ~80-98, head 8-11 ms).
 
-Not established: block prefill, a clean benchmark, contexts past 4096 rows, one context per layer.
+**Block prefill (2026-11-04; the recipe's default, `HYV3_BLOCK=0` emits the sequential set unchanged).** LFM2.5's
+route (OPEN-FAMILY-LFM2MOE, runtime kind `lfm`, mixer `att`) over the SAME pool: the host entry norm; q | k | v as one
+q4_1 GEMM (`gemm_n5120_k2048`, the three contiguous pool ops) and o (`gemm_n2048_k4096`); host `attention_block` (q / k
+RMSNorm, NEOX RoPE, causal, no gate) writing the K | V rows; the host residual and ffn_norm; then every FFN through
+LFM2.5's token-batched expert kernel `mbl`. The pair law above is only hy_moe's core mapping: the pool bytes are mbl's law
+(per pool expert, [gate band b | up band b] x 12, then the down slices), so mbl runs unchanged at MBL_FF 768 / 129 pool
+experts (MBL_POOL_BYTES = the attention offset): no second copy of the experts, no pack op, the pack plan is the
+sequential one. MoE layers: the host router (hy_route's arithmetic over bf16 xm) and the shared expert (pool expert 128)
+at weight 1; the dense layer: its nine slices at weight 1, no router. `hyv3-block-runtime.patch` adds exactly those two
+optional route fields (`shared`, `dense`) to kind `lfm`. mbl streams of 8..64 slots in steps of 8 (one xclbin).
+`HYV3_BLOCK=0`'s manifest equals the 10-31 set's apart from build keys; the decode kernels are byte-identical.
+
+**Result 2026-11-04 (development, load 6-14 from other sessions; not a benchmark):** the short chat prompt's 64 greedy
+tokens equal the sequential route's; its positions vs fp32 27/27, KL median 1.6e-4 (the bf16 control 26/27, 2.1e-4). The
+836-token prompt, every position vs fp32: block 813/836, KL median 2.21e-3, p95 1.6e-2; sequential (same day) 815/836,
+2.13e-3, 1.3e-2; control 812/836, 2.03e-3, 1.4e-2; per-block medians fall 2.6e-3 -> 1.7e-3 as the sequential route's and the
+control's do; block-boundary positions are not worse than their neighbours except 255, which is as high in the
+sequential run and the control. Its free-run greedy parts from the sequential route's at token 2, the near tie recorded
+on 10-31 (four candidates within .64 nats); teacher-forced over llama.cpp's 32 greedy tokens (prefilled as blocks)
+32/33 positions agree, partial KL median 2.4e-5 (sequential: 32/33, 1.4e-5). Prefixes of 256 / 257 / 300 tokens (one
+block, one block + 1, a tail): 8/8 greedy equal to sequential. Kept open: a token's block-route logits depend at rounding
+level on the other real tokens of its block (the same 68 positions prefilled in a block of 68 and of 100 real tokens
+differ; both sit at the control's distance from fp32); the host stages are per token, so mbl or the GEMM is suspected. Paired timing, 836 tokens: block 17.6 / 17.9 s (21 ms a token), sequential 186 / 145 s; a
+full block is ~2.3 s of experts, ~0.5 s of GEMMs and host attention growing with position (1.0 / 1.8 / 3.4 s at blocks
+0 / 256 / 512).
+Through `phlegm serve` (bridge `bridges/hyv3-blk`, the model dir's default kernels) at a 32768-token capacity: a
+2938-token prompt 93.6 s (the sequential set: 656.7 s) and a 4621-token needle prompt answered correctly in 183 s
+(sequential: 1211 s).
+
+Not established: a clean benchmark, NPU attention products for the block (host attention dominates past ~1k tokens), one
+context per layer.
 
 ### OPEN-FAMILY-LFM2MOE: LiquidAI LFM2-MoE (LFM2.5-24B-A2B) derives its own spec and runs on its own recipe from the GGUF
 **Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_lfm2moe_hf`, `families.py`, `lfm2moe.py`,

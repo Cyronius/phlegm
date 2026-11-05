@@ -338,6 +338,33 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   `target/npu-dev/lfm2moe-block-patch.sh` regenerates it and checks the chain reproduces the clone
   (`target/npu-dev/lfm2moe-runtime`).
 
+- `upstream-patches/hyv3-block-runtime.patch` (2026-11-04) is Hy-Memory-30B-A3B's block prefill (OPEN-FAMILY-HYV3;
+  the recipe's default, `HYV3_BLOCK=0` drops it), over `lfm2moe-block-runtime.patch`: kind `lfm` with mixer `att`
+  as it is, plus two optional route fields that LFM2-MoE's manifests do not carry -- `shared` (pool experts every
+  token also takes at weight 1 after the router's top k: the ungated shared expert, pool expert 128) and `dense`
+  (n slots = pool experts 0..n-1 at weight 1, no router: the dense layer's nine 768-wide slices). The experts run
+  on LFM2.5's `mbl` stream unchanged (Hy's pool already has its byte law). `block_host.cpp` is not touched. No new
+  pack op. The diff applies over `beccd46`, the nine Gemma 4 patches, `gptoss-runtime.patch`,
+  `gptoss-prefill-runtime.patch`, `flint-runtime.patch`, `hyv3-runtime.patch` and `lfm2moe-block-runtime.patch`;
+  `target/npu-dev/hyv3-block-patch.sh` regenerates it and checks the chain reproduces the clone
+  (`target/npu-dev/hyv3-runtime`, which now carries both block patches; `hyv3-patch.sh` diffs the 10-31 tree,
+  kept as `lfm2moe-runtime-base`).
+
+- `upstream-patches/flint-block-runtime.patch` (2026-11-04) is Recursive Flint's block prefill (OPEN-FAMILY-FLINT;
+  the recipe's default, `FLINT_BLOCK=0` drops it), over `lfm2moe-block-runtime.patch`: a gemm_block kind `flint` that
+  runs through `block_layer_lfm` as kind `lfm` mixer `att`, plus `cd_sinks` (the learned per-head sinks, bf16 in the
+  consts), `window` (513 on the sliding layers; only the KV rows the window reaches are read back), `nope` (the full
+  layers rotate nothing) and `route.shared` (the shared expert's halves, pool experts 256 and 257, after every token's
+  sigmoid top 6 at weight 1; no selection bias). Its own kind name, so an engine without these fields refuses a Flint
+  set by name. `host::attention_block` gains `const float* sinks = nullptr` and honours `AttnGeom::window` -- small
+  edits to the REFERENCE body; `block-host-attention-runtime.patch`'s vectorised body already has the window and needs
+  the sink (max includes it, denominator gains exp(sink - max)) folded in before the two can stack. The experts run on
+  LFM2.5's `mbl` stream unchanged. No new pack op. The diff applies over `beccd46`, the nine Gemma 4 patches,
+  `gptoss-runtime.patch`, `gptoss-prefill-runtime.patch`, `flint-runtime.patch`, `hyv3-runtime.patch` and
+  `lfm2moe-block-runtime.patch`; it is an alternative to the Hy and LFM3 block patches on one clone.
+  `target/npu-dev/flint-block-patch.sh` regenerates it and checks the chain reproduces the clone
+  (`target/npu-dev/flint-blk-runtime`; base snapshot `flint-blk-runtime-base`; the sequential `flint-runtime` clone is untouched).
+
 - `upstream-patches/lfm3-block-runtime.patch` (2026-11-03) is LFM3-1.7B's block prefill (OPEN-FAMILY-LFM3,
   on by default, `LFM3_BLOCK=0` drops it), over `lfm2moe-block-runtime.patch`. A GEMM weight may be a byte `range` of the decode pool
   as it is (the gate | up slots' alternating 64-row bands and the mixer projections), so the pack plan and

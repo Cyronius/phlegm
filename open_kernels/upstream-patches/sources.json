@@ -653,6 +653,33 @@
     "patch": "lfm3-q40-runtime.patch",
     "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
   },
+  "hyv3_block_20261104": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gptoss_runtime_20261031",
+      "gptoss_prefill_runtime_20261031",
+      "flint_runtime_20261031",
+      "hyv3_runtime_20261031",
+      "lfm2moe_block_20261103"
+    ],
+    "files": [
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp"
+    ],
+    "note": "Hy-Memory-30B-A3B block prefill (OPEN-FAMILY-HYV3, 2026-11-04, the recipe's default; HYV3_BLOCK=0 drops it): gemm_block kind `lfm` (lfm2moe-block-runtime.patch, mixer att) gains two optional route fields, both absent for LFM2-MoE: `shared` (pool experts every token also takes at weight 1 after the router's top k: HY V3's ungated shared expert, pool expert 128) and `dense` (n slots = pool experts 0..n-1 at weight 1, no router: the dense layer's 768-wide MLP slices). The manifest checks topk + shared = layout.moe.topk and experts + shared = layout.moe.experts; block_layer_lfm fills the route record accordingly and runs moe_block (mbl). attention_block and block_host.cpp are untouched; no new pack op. sha256 1668b6c4724520a1e4738dd4f238c614eba4e807a303daee3b179e79d06e7b13; chain-verified by target/npu-dev/hyv3-block-patch.sh; built in target/npu-dev/hyv3-runtime",
+    "patch": "hyv3-block-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
   "block_host_attention_20261104": {
     "base": "beccd4699d812642b63741255322d19a0c1dd738",
     "applies_after": [
@@ -678,6 +705,37 @@
     ],
     "note": "host::attention_block vectorised and tiled (the block routes' host attention: the lfm kind, LFM3 and LFM2.5), bit-identical output and cache rows: K transposed into 64-row L1 tiles, each (kv head, 8 tokens) unit's queries dotted eight rows a lane group with the same j-ordered separate multiplies and adds, softmax and the V sum per query in row order. 2026-11-04: CPU harness target/npu-dev/attn-bench (27 edge cases identical; 8192 / 16384 cached rows 15-20x at 4 threads); NPU A/B target/npu-dev/prefill-prof/ab-lfm3.json, ab-lfm25.json (last-position and 8 greedy decode logits identical; LFM3 8192 tokens 221 -> 52-56 s at 4 threads). The lfm2moe-runtime clone (bridges/lfm2moe-blk) carries the same function body over its pre-window version.",
     "patch": "block-host-attention-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "flint_block_20261104": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gptoss_runtime_20261031",
+      "gptoss_prefill_runtime_20261031",
+      "flint_runtime_20261031",
+      "hyv3_runtime_20261031",
+      "lfm2moe_block_20261103"
+    ],
+    "files": [
+      "src/open_qwen36/block_host.cpp",
+      "src/open_qwen36/block_host.hpp",
+      "src/open_qwen36/block_host_test.cpp",
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp"
+    ],
+    "note": "Recursive Flint block prefill (OPEN-FAMILY-FLINT, 2026-11-04, the recipe's default, FLINT_BLOCK=0 drops it): gemm_block kind `flint` = kind `lfm` mixer `att` through block_layer_lfm plus cd_sinks (bf16 [nh] learned sinks), window (rows (p - window, p]; only the reached KV rows are read back), nope (rot 0: no rotation) and route.shared (pool experts appended to every token's routed slots at weight 1; no selection bias). host::attention_block gains `const float* sinks = nullptr` (the max includes the sink, the denominator gains exp(sink - max)) and honours AttnGeom::window, edits to the REFERENCE (scalar) body; block-host-attention-runtime.patch's vectorised body has the window but not the sink, so stacking the two needs the sink folded in. block_host_test gains the sink / window / NoPE checks. No new pack op. Alternative to hyv3-block-runtime.patch and lfm3-block-runtime.patch on one clone (all three extend kind lfm). sha256 55607ff8d34ce6b5eba5ca7b826fc4e7b77a8fc905c974e5dec2a6f3c2ec4239; chain-verified by target/npu-dev/flint-block-patch.sh; built in target/npu-dev/flint-blk-runtime",
+    "patch": "flint-block-runtime.patch",
     "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
   },
   "block_host_attention_lfm2moe_20261104": {
