@@ -155,6 +155,7 @@ fn run(args: &[String]) -> Result<(), String> {
             seed,
         ),
         stop_ids: tokenizer.stop_ids(),
+        reuse_mark: None,
     };
     backend.generate(&ids, &mut params, &mut |id| output.push(id))?;
     let reply = tokenizer.decode(&output)?;

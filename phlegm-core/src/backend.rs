@@ -10,6 +10,10 @@ pub struct GenParams {
     pub max_tokens: usize,
     pub sampler: Sampler,
     pub stop_ids: HashSet<u32>,
+    /// Where the conversation's messages end in the prompt and the generation prompt begins
+    /// (SERVER-PROMPT-REUSE): the next turn's prompt shares the tokens before it, so a backend
+    /// that keeps its context saves its recurrent state there. None: the prompt's end.
+    pub reuse_mark: Option<usize>,
 }
 
 pub trait Backend {
@@ -35,5 +39,11 @@ pub trait Backend {
     /// server bounds an open-ended request by it, as llama.cpp's server does.
     fn context_capacity(&self) -> Option<usize> {
         None
+    }
+
+    /// Prompt tokens the last `generate` took from the previous requests' context instead of
+    /// prefilling them (OpenAI's `usage.prompt_tokens_details.cached_tokens`).
+    fn cached_tokens(&self) -> usize {
+        0
     }
 }

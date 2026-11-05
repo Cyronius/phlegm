@@ -683,6 +683,42 @@ pub struct NpuBackend {
     context_capacity: usize,
     real_vocab: usize,
     _lock: NpuLock,
+    /// SERVER-PROMPT-REUSE: whether the model has recurrent layers (None: reuse is off, or the
+    /// bridge predates it), the tokens at the bridge's positions [0, len), its mark, and the
+    /// last request's reused prompt tokens.
+    recurrent: Option<bool>,
+    context: Vec<u32>,
+    mark: Option<usize>,
+    reused: usize,
+}
+
+/// How a request's prompt starts on the bridge (SERVER-PROMPT-REUSE).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Start {
+    Reset,
+    /// The prompt extends everything the bridge holds.
+    Append,
+    /// Back to a position: the mark, or anywhere on a model without recurrent layers.
+    Rewind(usize),
+}
+
+/// The longest reuse of `context` (the bridge's tokens) for `prompt`, leaving at least one token
+/// to prefill (the logits come from it). Returns the start and how to get there.
+fn reuse_start(context: &[u32], mark: Option<usize>, recurrent: Option<bool>, prompt: &[u32]) -> (usize, Start) {
+    let Some(recurrent) = recurrent else { return (0, Start::Reset) };
+    let shared = context.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+    let limit = shared.min(prompt.len().saturating_sub(1));
+    let mut best = (0, Start::Reset);
+    if shared == context.len() && shared == limit && shared > 0 {
+        best = (shared, Start::Append);
+    }
+    if let Some(m) = mark.filter(|&m| m <= limit && m > best.0) {
+        best = (m, Start::Rewind(m));
+    }
+    if !recurrent && limit > best.0 {
+        best = (limit, Start::Rewind(limit));
+    }
+    best
 }
 
 pub struct NpuOptions {
@@ -740,16 +776,30 @@ impl NpuBackend {
         if context_capacity != options.context_capacity || real_vocab == 0 {
             return Err("NPU engine loaded unexpected capacity or vocabulary".into());
         }
+        let reuse = std::env::var("PHLEGM_PROMPT_REUSE").map_or(true, |v| v != "0");
+        let recurrent = hello
+            .get("recurrent_layers")
+            .and_then(Value::as_u64)
+            .filter(|_| reuse)
+            .map(|n| n > 0);
         Ok(Self {
             process,
             context_capacity,
             real_vocab,
             _lock: lock,
+            recurrent,
+            context: Vec::new(),
+            mark: None,
+            reused: 0,
         })
     }
 
     fn logits(&mut self, command: Value) -> Result<Vec<f32>, String> {
         let reply = self.process.request(command)?;
+        self.logits_of(&reply)
+    }
+
+    fn logits_of(&self, reply: &Value) -> Result<Vec<f32>, String> {
         let encoded = reply
             .get("logits_f32_le_base64")
             .and_then(Value::as_str)
@@ -793,9 +843,51 @@ impl Backend for NpuBackend {
         {
             return Err("prompt or output count exceeds the NPU model's context/vocabulary".into());
         }
-        self.process.request(json!({"command":"reset"}))?;
+        // Until this request's prefill succeeds the bridge's context is unknown: a failed
+        // request leaves nothing to reuse.
+        let context = std::mem::take(&mut self.context);
+        let old_mark = self.mark.take();
+        self.reused = 0;
+        let (start, how) = reuse_start(&context, old_mark, self.recurrent, prompt_ids);
+        let kept_mark = match how {
+            Start::Reset => {
+                self.process.request(json!({"command":"reset"}))?;
+                None
+            }
+            Start::Append => old_mark,
+            Start::Rewind(pos) => {
+                self.process.request(json!({"command":"rewind", "pos":pos}))?;
+                old_mark.filter(|&m| m <= pos)
+            }
+        };
+        let mut prefill = json!({"command":"prefill_logits", "prompt":&prompt_ids[start..]});
+        // A model with recurrent layers saves their state at the conversation's end (or the
+        // prompt's), where the next turn's prompt will part from this one.
+        let want_mark = (self.recurrent == Some(true)).then(|| {
+            params.reuse_mark.filter(|&k| k > start && k <= prompt_ids.len()).unwrap_or(prompt_ids.len())
+        });
+        if let Some(k) = want_mark {
+            prefill["mark"] = json!(k);
+        }
+        let reply = self.process.request(prefill)?;
+        let mut logits = self.logits_of(&reply)?;
+        self.mark = match want_mark {
+            Some(_) => Some(
+                reply
+                    .get("mark")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| usize::try_from(v).ok())
+                    .filter(|&m| m >= start && m <= prompt_ids.len())
+                    .ok_or("NPU engine returned no mark")?,
+            ),
+            None => kept_mark,
+        };
+        self.context = prompt_ids.to_vec();
+        self.reused = start;
+        if self.recurrent.is_some() {
+            eprintln!("phlegm: prompt {} tokens, {} reused", prompt_ids.len(), start);
+        }
         let mut history: Vec<i64> = prompt_ids.iter().map(|&id| i64::from(id)).collect();
-        let mut logits = self.logits(json!({"command":"prefill_logits", "prompt":prompt_ids}))?;
         for index in 0..params.max_tokens {
             let next = params.sampler.sample(&logits, &history) as u32;
             if params.stop_ids.contains(&next) {
@@ -804,7 +896,10 @@ impl Backend for NpuBackend {
             on_token(next);
             history.push(i64::from(next));
             if index + 1 < params.max_tokens {
+                let context = std::mem::take(&mut self.context);
                 logits = self.logits(json!({"command":"decode_logits", "token":next}))?;
+                self.context = context;
+                self.context.push(next);
             }
         }
         Ok(())
@@ -812,6 +907,10 @@ impl Backend for NpuBackend {
 
     fn context_capacity(&self) -> Option<usize> {
         Some(self.context_capacity)
+    }
+
+    fn cached_tokens(&self) -> usize {
+        self.reused
     }
 }
 
@@ -885,6 +984,7 @@ for line in sys.stdin:
                 max_tokens: 4,
                 sampler: crate::sampler::Sampler::new(0.0, 0, 1.0, 1.0, None),
                 stop_ids: [4u32].into_iter().collect(),
+                reuse_mark: None,
             };
             let mut output = Vec::new();
             backend
@@ -894,5 +994,142 @@ for line in sys.stdin:
         }
         drop(backend);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A fake bridge with a recurrent layer: it tracks its position and mark the way bridge.cpp
+    /// does and logs every command, so the test sees what phlegm asks of it across turns.
+    #[test]
+    fn resident_bridge_reuses_the_shared_prompt() {
+        let dir = std::env::temp_dir().join(format!("phlegm-reuse-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bridge = dir.join("fake-bridge");
+        let log = dir.join("log.jsonl");
+        fs::write(
+            &bridge,
+            format!(
+                r#"#!/usr/bin/env python3
+import base64, json, struct, sys
+print(json.dumps({{'ok': True, 'protocol': 1, 'engine': 'openflowlm-cpp-reference'}}), flush=True)
+log = open({log:?}, 'a')
+pos, mark, T = 0, None, 4
+def logits(): return base64.b64encode(struct.pack('<6f', 0, 0, 0, 0, 0, 10)).decode()
+for line in sys.stdin:
+    r = json.loads(line)
+    cmd = r['command']
+    log.write(json.dumps({{k: v for k, v in r.items() if k != 'model_dir' and k != 'kernel_dir'}}) + '\n'); log.flush()
+    if cmd == 'init':
+        out = {{'context_capacity': r['max_ctx'], 'real_vocab': 6, 'recurrent_layers': 1}}
+    elif cmd == 'reset':
+        pos, mark, out = 0, None, {{}}
+    elif cmd == 'rewind':
+        assert r['pos'] == mark, (r, mark)
+        pos, out = mark, {{'position': mark}}
+    elif cmd == 'prefill_logits':
+        at = r['mark'] - pos
+        at -= at % T
+        mark = pos + at
+        pos += len(r['prompt'])
+        out = {{'logits_f32_le_base64': logits(), 'mark': mark}}
+    elif cmd == 'decode_logits':
+        pos += 1
+        out = {{'logits_f32_le_base64': logits()}}
+    else:
+        raise RuntimeError(cmd)
+    out['ok'] = True
+    print(json.dumps(out), flush=True)
+"#
+            ),
+        )
+        .unwrap();
+        let mut mode = fs::metadata(&bridge).unwrap().permissions();
+        mode.set_mode(0o700);
+        fs::set_permissions(&bridge, mode).unwrap();
+        let adapter_sha = format!("{:x}", Sha256::digest(BRIDGE_SOURCE));
+        let files = BTreeMap::from([("bridge/bridge.cpp".into(), adapter_sha.clone())]);
+        let sidecar = json!({"protocol":1, "engine":BACKEND_NAME, "source_commit":"0".repeat(40),
+            "source_dirty":false, "source_tree_sha256":manifest_hash(&files),
+            "adapter_sha256":adapter_sha, "binary_sha256":hash_file(&bridge).unwrap(),
+            "compiler_flags":"fake test bridge", "source_files":files});
+        fs::write(bridge.with_extension("build.json"), sidecar.to_string()).unwrap();
+        let opts = NpuOptions {
+            bridge,
+            model_dir: dir.clone(),
+            kernel_dir: dir.clone(),
+            turbo: false,
+            context_capacity: 64,
+            prefill_route: "auto".into(),
+            prefill_mode: "fast".into(),
+            threads: 1,
+            request_timeout: Duration::from_secs(5),
+            dispatch_timeout_ms: 1000,
+        };
+        let mut backend = NpuBackend::load(opts).unwrap();
+        let mut turn = |prompt: &[u32], mark: usize| {
+            let mut params = GenParams {
+                max_tokens: 3,
+                sampler: crate::sampler::Sampler::new(0.0, 0, 1.0, 1.0, None),
+                stop_ids: std::collections::HashSet::new(),
+                reuse_mark: Some(mark),
+            };
+            let mut output = Vec::new();
+            backend.generate(prompt, &mut params, &mut |id| output.push(id)).unwrap();
+            assert_eq!(output, vec![5, 5, 5]);
+            backend.cached_tokens()
+        };
+        // Turn 1: 10 messages tokens + a 2-token generation prompt; mark asked at 10, lands on 8.
+        let first: Vec<u32> = [vec![1; 10], vec![2, 3]].concat();
+        assert_eq!(turn(&first, 10), 0);
+        // Turn 2 re-renders turn 1's reply differently after token 11: back to the mark at 8.
+        let second: Vec<u32> = [vec![1; 10], vec![2, 4, 4], vec![1; 7], vec![2, 3]].concat();
+        assert_eq!(turn(&second, 20), 8);
+        // Turn 3 extends everything the bridge holds (turn 2's prompt and its two fed tokens).
+        let third: Vec<u32> = [second.clone(), vec![5, 5, 1, 2, 3]].concat();
+        assert_eq!(turn(&third, third.len() - 2), second.len() + 2);
+        // A different conversation starts over.
+        assert_eq!(turn(&[3, 3, 3], 2), 0);
+        let commands: Vec<Value> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|v| v["command"] != "decode_logits" && v["command"] != "init")
+            .map(|mut v| {
+                if let Some(p) = v.get("prompt") {
+                    v["prompt"] = json!(p.as_array().unwrap().len());
+                }
+                v
+            })
+            .collect();
+        assert_eq!(
+            commands,
+            vec![
+                json!({"command":"reset"}),
+                json!({"command":"prefill_logits", "prompt":12, "mark":10}),
+                json!({"command":"rewind", "pos":8}),
+                json!({"command":"prefill_logits", "prompt":14, "mark":20}),
+                json!({"command":"prefill_logits", "prompt":3, "mark":third.len() - 2}),
+                json!({"command":"reset"}),
+                json!({"command":"prefill_logits", "prompt":3, "mark":2}),
+            ]
+        );
+        drop(backend);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reuse_start_takes_the_longest_valid_start() {
+        let ctx = [1, 2, 3, 4, 5, 6];
+        // without reuse, always a reset
+        assert_eq!(reuse_start(&ctx, Some(4), None, &[1, 2, 3, 4, 5, 6, 7]), (0, Start::Reset));
+        // extends the context: append, even past the mark
+        assert_eq!(reuse_start(&ctx, Some(4), Some(true), &[1, 2, 3, 4, 5, 6, 7]), (6, Start::Append));
+        // parts after the mark: back to it; before it: nothing to reuse on a recurrent model
+        assert_eq!(reuse_start(&ctx, Some(4), Some(true), &[1, 2, 3, 4, 5, 9]), (4, Start::Rewind(4)));
+        assert_eq!(reuse_start(&ctx, Some(4), Some(true), &[1, 2, 3, 9]), (0, Start::Reset));
+        // attention only: back to wherever the prompts part
+        assert_eq!(reuse_start(&ctx, None, Some(false), &[1, 2, 3, 9]), (3, Start::Rewind(3)));
+        // the same prompt again keeps one token to prefill
+        assert_eq!(reuse_start(&ctx, None, Some(false), &ctx), (5, Start::Rewind(5)));
+        assert_eq!(reuse_start(&ctx, Some(6), Some(true), &ctx), (0, Start::Reset));
+        assert_eq!(reuse_start(&ctx, Some(4), Some(true), &ctx), (4, Start::Rewind(4)));
     }
 }

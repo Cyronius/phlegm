@@ -64,9 +64,13 @@ coverage are recorded in
 ## Run and serve through the NPU bridge
 
 The same resident bridge now handles normal generation. `phlegm run` and
-`phlegm serve` reset the C++ Core for each request, prefill the prompt with the
-selected open-kernel route, and decode on the NPU. Rust samples the returned
-binary32 logits and applies the model's chat template and stop tokens.
+`phlegm serve` prefill the prompt with the selected open-kernel route and decode
+on the NPU. Rust samples the returned binary32 logits and applies the model's
+chat template and stop tokens. Between requests the bridge keeps its context:
+a request prefills only what its prompt adds (`rewind` to an earlier position,
+`prefill_logits` with a `mark` that saves recurrent layers' state;
+SERVER-PROMPT-REUSE), and resets when nothing is shared.
+`PHLEGM_PROMPT_REUSE=0` resets for every request as before.
 
 ```powershell
 cargo run -p phlegm-cli -- run --model-dir C:/models/my-model `

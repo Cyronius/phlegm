@@ -42,11 +42,12 @@ static std::vector<int> prompt_ids(const json& request, const Core& core) {
         throw std::runtime_error("prompt token outside the model vocabulary");
     return ids;
 }
-static void run_prefill(Core& core, const std::vector<int>& ids, const std::string& route) {
+static void run_prefill(Core& core, const std::vector<int>& ids, const std::string& route, bool want_logits = true) {
     if (static_cast<size_t>(core.position()) + ids.size() > core.max_ctx())
         throw std::runtime_error("prefill exceeds context capacity");
+    if (ids.empty()) return;
     if (route == "layer-major") {
-        core.step_gemm_prompt(ids, true);
+        core.step_gemm_prompt(ids, want_logits);
     } else if (route == "gemm-block") {
         const size_t block_size = core.gemm_block_t();
         if (!block_size) throw std::runtime_error("kernel set has no block prefill route");
@@ -54,12 +55,50 @@ static void run_prefill(Core& core, const std::vector<int>& ids, const std::stri
             const size_t real = std::min(block_size, ids.size() - at);
             std::vector<int> block(ids.begin() + at, ids.begin() + at + real);
             block.resize(block_size, block.back());
-            core.step_gemm_block(block, real, at + real == ids.size());
+            core.step_gemm_block(block, real, want_logits && at + real == ids.size());
             at += real;
         }
     } else {
-        for (size_t i = 0; i < ids.size(); ++i) core.step(ids[i], i + 1 == ids.size());
+        for (size_t i = 0; i < ids.size(); ++i) core.step(ids[i], want_logits && i + 1 == ids.size());
     }
+}
+
+// Prompt reuse (SERVER-PROMPT-REUSE). Phlegm keeps the bridge's context between requests and
+// prefills only what a new prompt adds. The KV rows sit at absolute positions, so moving the
+// position back is enough for attention layers; recurrent layers (DeltaNet, short conv) cannot
+// be run backwards, so their state is saved at a mark inside a prefill and restored from it.
+struct Mark {
+    bool valid = false;
+    open_qwen36::Snapshot snap;  // the recurrent states and the position; no KV rows
+};
+static size_t recurrent_layers(const Core& core) {
+    size_t n = 0;
+    for (int l = 0; l < core.num_layers(); ++l) n += !core.is_attention_layer(l);
+    return n;
+}
+static void set_mark(Core& core, Mark& mark) {
+    mark.snap = core.checkpoint();
+    for (auto& rows : mark.snap.kv) std::vector<uint8_t>().swap(rows);  // the rows stay in the cache
+    mark.valid = true;
+}
+// Prefill `ids` from the current position, saving the state at the mark asked for: on the block
+// routes the last block boundary at or before it (so the split adds no block), else the position
+// itself. Returns the mark's position.
+static size_t prefill_marked(Core& core, const std::vector<int>& ids, const std::string& route,
+                             size_t want, Mark& mark) {
+    const size_t pos0 = static_cast<size_t>(core.position());
+    if (want < pos0 || want > pos0 + ids.size()) throw std::runtime_error("mark outside the prefill");
+    size_t at = want - pos0;
+    if (route != "sequential" && core.gemm_block_t()) at -= at % core.gemm_block_t();
+    if (at == ids.size()) {
+        run_prefill(core, ids, route);
+        set_mark(core, mark);
+    } else {
+        run_prefill(core, std::vector<int>(ids.begin(), ids.begin() + at), route, false);
+        set_mark(core, mark);
+        run_prefill(core, std::vector<int>(ids.begin() + at, ids.end()), route);
+    }
+    return pos0 + at;
 }
 static int prefill(Core& core, const std::vector<int>& ids, const std::string& route) {
     run_prefill(core, ids, route);
@@ -98,6 +137,7 @@ int main() {
     std::unique_ptr<xrt::device> device;
     std::unique_ptr<Core> core;
     std::string route;
+    Mark mark;
     reply({{"protocol", 1}, {"engine", "openflowlm-cpp-reference"}});
     try {
         std::string line;
@@ -134,12 +174,24 @@ int main() {
                 reply({{"device", device->get_info<xrt::info::device::name>()},
                     {"context_capacity", core->max_ctx()}, {"layers", core->num_layers()},
                     {"real_vocab", core->real_vocab()}, {"prefill_route", route},
-                    {"weights_file", core->is_gguf() ? "model.gguf" : "model.q4nx"}});
+                    {"weights_file", core->is_gguf() ? "model.gguf" : "model.q4nx"},
+                    {"recurrent_layers", recurrent_layers(*core)}});
                 continue;
             }
             if (!core) throw std::runtime_error("init is required before inference");
-            if (command == "reset") { core->reset(); reply({}); }
-            else if (command == "prefill") {
+            if (command == "reset") { core->reset(); mark.valid = false; reply({}); }
+            else if (command == "rewind") {
+                // Back to `pos` <= the position: the mark's own position (its states restored), or
+                // anywhere on a model without recurrent layers. Rows past `pos` are rewritten later.
+                const size_t pos = request.at("pos").get<size_t>();
+                if (pos > static_cast<size_t>(core->position())) throw std::runtime_error("rewind past the position");
+                if (mark.valid && pos == static_cast<size_t>(mark.snap.pos)) core->restore(mark.snap);
+                else if (recurrent_layers(*core)) throw std::runtime_error("rewind to a position without a mark");
+                else if (pos == 0) core->reset();
+                else core->seek(static_cast<int>(pos));
+                if (mark.valid && pos < static_cast<size_t>(mark.snap.pos)) mark.valid = false;
+                reply({{"position", core->position()}});
+            } else if (command == "prefill") {
                 const auto ids = prompt_ids(request, *core);
                 reply({{"token", prefill(*core, ids, route)}});
             } else if (command == "decode") {
@@ -148,9 +200,20 @@ int main() {
                 core->step(token, true);
                 reply({{"token", greedy(*core)}});
             } else if (command == "prefill_logits") {
+                // Continues from the current position (a fresh request resets first). With `mark`,
+                // also saves the recurrent state there (prefill_marked) and replies with its position.
                 const auto ids = prompt_ids(request, *core);
-                run_prefill(*core, ids, route);
-                reply(logits_reply(*core));
+                if (mark.valid && static_cast<size_t>(core->position()) < static_cast<size_t>(mark.snap.pos))
+                    mark.valid = false;
+                if (request.contains("mark")) {
+                    const size_t at = prefill_marked(*core, ids, route, request.at("mark").get<size_t>(), mark);
+                    json out = logits_reply(*core);
+                    out["mark"] = at;
+                    reply(std::move(out));
+                } else {
+                    run_prefill(*core, ids, route);
+                    reply(logits_reply(*core));
+                }
             } else if (command == "decode_logits") {
                 const int token = request.at("token").get<int>();
                 if (token < 0 || static_cast<size_t>(token) >= core->real_vocab()) throw std::runtime_error("invalid decode token");
@@ -170,7 +233,8 @@ int main() {
                 latencies.reserve(outputs - 1);
                 std::vector<int> greedy_tokens;
                 if (survey) greedy_tokens.reserve(outputs);
-                core->reset();                 // excluded; no prefix caching in Core
+                core->reset();                 // excluded; a trial never reuses a prompt
+                mark.valid = false;
                 const auto start = Clock::now();
                 int previous = prefill(*core, ids, route);
                 const double prefill_ms = elapsed(start);

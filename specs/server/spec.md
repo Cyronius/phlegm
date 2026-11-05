@@ -206,6 +206,70 @@ The old defaults (64, capped at 512) cut thinking models off inside their reason
 - `output_budget_follows_llama_cpp_server` (`phlegm-core` `server.rs`) covers the open-ended
   default, clamping to the context, the exact-fit prompt, the too-long prompt and the env overrides.
 
+## SERVER-PROMPT-REUSE: Earlier turns are not prefilled again
+
+The NPU bridge keeps its context between requests, and a request prefills only what its prompt adds
+to it (llama.cpp's server does the same with its slot cache; `phlegm-core` `bench/reference.rs`
+`reuse_start`, `benchmarks/reference/bridge.cpp`).
+
+- **Attention rows** sit at absolute positions in the cache (sliding windows included), so going back
+  to any earlier position only moves the position (`rewind`); rows past it are rewritten later.
+- **Recurrent layers** (DeltaNet, LFM's short conv) cannot be run backwards. A prefill saves their
+  state at a **mark** (`prefill_logits` with `mark`): the server asks for it where the conversation's
+  messages end and the generation prompt begins (`GenParams::reuse_mark`, from the template rendered
+  without the generation prompt), since templates rewrite the last turn there (Qwen's and LFM's drop
+  the reasoning of earlier replies). On the block routes the mark lands on the last block boundary at
+  or before it, so the split adds no block and the blocks are the ones a single prefill would run;
+  the mark keeps no KV rows.
+- **A request** starts at the longest of: the end of the bridge's context when the prompt extends it
+  (the earlier prompt plus every reply token fed back); the mark, when the prompts agree up to it; on
+  a model without recurrent layers, wherever the prompts part. At least one token is always
+  prefilled, for the logits. Otherwise it resets.
+- **Usage:** `usage.prompt_tokens_details.cached_tokens` (OpenAI's field) reports the reused tokens;
+  `phlegm` logs `prompt N tokens, R reused` per request. `PHLEGM_PROMPT_REUSE=0` turns reuse off.
+- A failed request leaves nothing to reuse (the bridge exits on any error).
+
+### Acceptance criteria
+
+- `reuse_start_takes_the_longest_valid_start` and `resident_bridge_reuses_the_shared_prompt` (a fake
+  bridge that keeps a position and a mark) in `bench/reference.rs`.
+- Hardware, per model (`target/npu-dev/reuse/check.py`): the reuse paths' logits and 8 greedy decode
+  steps are bit-identical to the same prefills from a reset (rewind to the mark; appending after fed
+  decode tokens; on attention-only models a rewind to an unaligned position).
+
+Results (2026-11-05, development, host load 3-10, 16 threads, default bridges; the first turn is
+1506 tokens with the mark asked at 1500, the second 1800 tokens sharing the first 1500, the third
+appends 48 tokens after 8 fed decode tokens; `reuse/*.json`):
+
+| model (route, recurrent layers) | mark | rewind / append / seek bit-identical | 2nd turn, reset -> reuse | 3rd turn, reset -> append |
+|---|---|---|---|---|
+| LFM3 (block, 13) | 1280 | yes / yes / - | 6.4 -> 2.4 s | 6.4 -> 0.8 s |
+| LFM2.5 (block, 30) | 1280 | yes / yes / - | 16.3 -> 5.5 s | 16.8 -> 1.3 s |
+| Flint (block, 0) | 1280 | yes / yes / yes | 22.8 -> 7.6 s | 23.6 -> 1.5 s |
+| Hy-Memory (block, 0) | 1280 | yes / yes / yes | 25.8 -> 8.7 s | 26.7 -> 1.6 s |
+| KAT Coder Q4pure (layer-major, 30) | 1280 | yes / yes / - | 8.0 -> 4.1 s | 8.3 -> 1.3 s |
+| gpt-oss (its own prefill, 0) | 1500 | yes / yes / yes | 6.9 -> 2.3 s | 7.2 -> 1.1 s |
+| Gemma 4 (layer-major, 0) | 1280 | yes / yes / yes | 24.2 -> 9.3 s | 24.9 -> 2.8 s |
+
+Against a reset and one prefill of the whole prompt (what phlegm did before), the reuse paths are
+the route's own arithmetic in other pieces, not a new approximation:
+- **Block routes:** the mark is block-aligned, so the rewind path runs the very blocks a single
+  prefill runs: bit-identical (LFM3, LFM2.5, Flint, Hy-Memory, Gemma 4, KAT on `--prefill-route block`).
+- **Layer-major routes** (KAT, gpt-oss): the MoE runs once over each call's tokens, so a prefill in two
+  calls differs from one call at rounding level (max |logit difference| 0.91 KAT, 0.29 gpt-oss; argmax
+  and 8 greedy tokens equal).
+- **Appending** reads the reply's KV rows as the NPU decode kernels wrote them, where a single
+  prefill recomputes them on the prefill route: max |logit difference| 0.04-0.97, argmax equal; the
+  8 greedy tokens after it equal on 6 of 8 models (LFM2.5 and Gemma 4 part at a later step).
+- **An unaligned rewind** on an attention-only model keeps rows that came from blocks composed
+  differently from a single prefill's (block-composition rounding, already open on these routes).
+
+Through `phlegm serve` (LFM3, `reuse/turns.py`, a ~2950-token log question then two short
+follow-ups, greedy, 400 reply tokens): turns 2 and 3 reuse 2816 tokens and take 21 s instead of
+29-30 s (two alternating rounds; the replies' reasoning has the same length with and without reuse,
+1117 / 1103 / 1188 characters, the text itself was not recorded). KAT Coder: 3328 and 3584 of
+3600 / 3624 tokens reused (its no-reuse round was cut short to free the machine).
+
 ## SERVER-SETTINGS: Per-model runtime defaults
 
 `phlegm run` and `phlegm serve` take their sampling, template, context and prefill defaults from

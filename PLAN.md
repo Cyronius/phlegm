@@ -49,6 +49,10 @@ that they all block CLI/server integration.
   tiled (bit-identical), 16 bridge threads by default, block prefill for Hy-Memory and Flint. Through
   `phlegm serve` an ~11.5k-token prompt now answers on LFM3 (48 s), LFM2.5 (231 s), Flint (236 s) and
   Hy-Memory (204 s); a ~2.9k-token prompt takes 10-50 s instead of 32-657 s.
+- [x] Prompt reuse (2026-11-05, SERVER-PROMPT-REUSE): the bridge keeps its context between requests and a
+  turn prefills only what it adds (recurrent state saved at a block-aligned mark where the conversation ends);
+  bit-identical to the same prefills from a reset on all seven model families; a 1800-token second turn
+  sharing 1500 tokens prefills in 2.3-9.3 s instead of 6.4-26 s.
 - [x] Sample in Rust, load external/inline model chat templates, and derive EOS IDs.
 - [x] Stream server output, reset for each request, and bound generation by context capacity.
 - [x] Surface load/worker errors without silently using a placeholder tokenizer.

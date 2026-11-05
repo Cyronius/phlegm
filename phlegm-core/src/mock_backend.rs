@@ -65,6 +65,7 @@ mod tests {
             max_tokens: 5,
             sampler: Sampler::new(0.0, 0, 1.0, 1.0, Some(1)),
             stop_ids: HashSet::new(),
+            reuse_mark: None,
         };
         let mut out = Vec::new();
         backend
@@ -86,6 +87,7 @@ mod tests {
             max_tokens: 100,
             sampler: Sampler::new(0.0, 0, 1.0, 1.0, Some(1)),
             stop_ids,
+            reuse_mark: None,
         };
         let mut out = Vec::new();
         backend

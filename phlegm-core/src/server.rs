@@ -202,6 +202,21 @@ impl ServerTokenizer {
         }
     }
 
+    /// The prompt position where the conversation's messages end and the generation prompt
+    /// begins: how far the prompt with the generation prompt and the one without agree
+    /// (SERVER-PROMPT-REUSE). None when the template does not render without it.
+    fn conversation_end(
+        &self,
+        messages: &[ChatMessage],
+        kwargs: &serde_json::Map<String, Value>,
+        prompt_ids: &[u32],
+    ) -> Option<usize> {
+        let ServerTokenizer::Real(t) = self else { return None };
+        let text = t.render_chat(messages, false, kwargs).ok()?;
+        let ids = t.encode(&text).ok()?;
+        Some(ids.iter().zip(prompt_ids).take_while(|(a, b)| a == b).count())
+    }
+
     fn template_vars(&self) -> TemplateVars {
         match self {
             ServerTokenizer::Real(t) => t.template_vars(),
@@ -530,6 +545,7 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
         max_tokens,
         sampler,
         stop_ids,
+        reuse_mark: state.tokenizer.conversation_end(&messages, &kwargs, &prompt_ids),
     };
 
     if stream {
@@ -567,10 +583,11 @@ fn full_response(
 ) {
     let max_tokens = params.max_tokens;
     let mut out_ids: Vec<u32> = Vec::new();
-    let gen_result = {
+    let (gen_result, cached_tokens) = {
         let mut backend = state.backend.lock().unwrap();
         let mut on_token = |tid: u32| out_ids.push(tid);
-        backend.generate(&prompt_ids, &mut params, &mut on_token)
+        let result = backend.generate(&prompt_ids, &mut params, &mut on_token);
+        (result, backend.cached_tokens())
     };
     if let Err(e) = gen_result {
         let msg = format!("generation error: {e}");
@@ -612,6 +629,7 @@ fn full_response(
             "prompt_tokens": prompt_ids.len(),
             "completion_tokens": out_ids.len(),
             "total_tokens": prompt_ids.len() + out_ids.len(),
+            "prompt_tokens_details": {"cached_tokens": cached_tokens},
         },
     });
     respond_json(request, 200, &resp);
