@@ -675,6 +675,15 @@ impl Tokenizer {
         self.eos_ids.clone()
     }
 
+    /// The token that closes a tagged reasoning block (`</think>`), when the marker is one token:
+    /// what `think_end_bias` raises (SERVER-SETTINGS).
+    pub fn think_end_id(&self) -> Option<u32> {
+        match &self.reasoning {
+            Some(ReasoningFormat::Tagged { close, .. }) => self.tk.token_to_id(close),
+            _ => None,
+        }
+    }
+
     /// The chat template speaks OpenAI's harmony format (GPT-OSS): replies arrive as an analysis
     /// channel then a final one, which the CLI and server separate (`harmony_split`).
     pub fn is_harmony(&self) -> bool {

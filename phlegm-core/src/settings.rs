@@ -312,12 +312,15 @@ fn pointer<'a>(v: &'a Value, dotted: &str) -> Option<&'a Value> {
 /// What a model directory's generation_config.json says for a setting, with HF
 /// `GenerationConfig` semantics: without `do_sample: true` it decodes greedily (temperature 0,
 /// top-k and top-p unused) and applies only `repetition_penalty`; with it, a field it leaves out
-/// takes HF's default (temperature 1, top_k 50, top_p 1).
+/// takes HF's default (temperature 1, top_k 50, top_p 1). The penalties and Clover's `dllm_*`
+/// ramps apply under greedy decoding too (Clover's `sampling_clover_moe.py`), so they are taken as
+/// given.
 fn generation_config_value(gc: &Value, field: &str) -> Option<Value> {
     let sampling = gc.get("do_sample").and_then(Value::as_bool).unwrap_or(false);
     let given = gc.get(field).filter(|v| !v.is_null()).cloned();
     match field {
-        "repetition_penalty" => given,
+        "repetition_penalty" | "presence_penalty" | "frequency_penalty" => given,
+        _ if field.starts_with("dllm_") => given,
         _ if !sampling => (field == "temperature").then(|| json!(0.0)),
         "temperature" => Some(given.unwrap_or(json!(1.0))),
         "top_k" => Some(given.unwrap_or(json!(50))),

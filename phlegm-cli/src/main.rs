@@ -4,7 +4,7 @@ use phlegm_core::image::{self, ImageConfig, ImageRequest};
 use phlegm_core::mock_backend::MockBackend;
 use phlegm_core::reasoning_effort::template_kwargs;
 use phlegm_core::sampler::Sampler;
-use phlegm_core::server::{self, GenDefaults, ServerConfig};
+use phlegm_core::server::{self, penalties_for, penalties_from_settings, GenDefaults, ServerConfig};
 use phlegm_core::settings::{Config, Resolved};
 use phlegm_core::tokenizer::{ChatMessage, Tokenizer};
 use std::collections::HashMap;
@@ -32,6 +32,8 @@ run and serve take the model's settings (phlegm config show --model-dir DIR), ea
   --max-ctx N  --prefill-route auto|block|sequential  --prefill-mode fast|lean  --think true|false
   --reasoning-effort default|none|minimal|low|medium|high|xhigh
   --temperature T  --top-k K  --top-p P  --repetition-penalty R  --max-tokens N
+  --presence-penalty P  --frequency-penalty F  --repetition-penalty-scope context|response
+  --length-bias B --length-bias-start N --length-bias-window N  --think-end-bias B --think-end-start N --think-end-window N
 --turbo selects experimental lower-precision kernels from DIR/turbo; requires a matching bundle.
 Build the resident NPU bridge with benchmarks/reference/build.ps1 first.";
 
@@ -153,7 +155,12 @@ fn run(args: &[String]) -> Result<(), String> {
             settings.f32("top_p"),
             settings.f32("repetition_penalty"),
             seed,
-        ),
+        )
+        .with_penalties(penalties_for(
+            penalties_from_settings(&settings),
+            &tokenizer.stop_ids(),
+            tokenizer.think_end_id(),
+        )),
         stop_ids: tokenizer.stop_ids(),
         reuse_mark: None,
     };

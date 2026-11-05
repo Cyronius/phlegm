@@ -41,11 +41,39 @@ impl Rng {
     }
 }
 
+/// A logit bias that grows with the reply: 0 through `start` reply tokens, then rising linearly to
+/// `strength` over `window` more (Clover's `dllm_length_penalty` on the stop tokens and
+/// `dllm_think_end_bias` on `</think>`, `sampling_clover_moe.py`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ramp {
+    pub ids: Vec<u32>,
+    pub strength: f32,
+    pub start: usize,
+    pub window: usize,
+    /// Off once the reply holds one of `ids` (the reasoning block closed).
+    pub until_seen: bool,
+}
+
+/// Penalties on the reply so far (not the prompt), as OpenAI's API and vLLM define presence and
+/// frequency: each token already in the reply loses `presence`, plus `frequency` per occurrence.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Penalties {
+    pub presence: f32,
+    pub frequency: f32,
+    /// The repetition penalty counts only the reply's tokens (Clover), not the whole context.
+    pub repetition_reply_only: bool,
+    pub ramps: Vec<Ramp>,
+}
+
 pub struct Sampler {
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
     pub repetition_penalty: f32,
+    pub penalties: Penalties,
+    /// The reply so far: every token this sampler returned, by id, and their number.
+    counts: std::collections::HashMap<u32, u32>,
+    produced: usize,
     rng: Rng,
 }
 
@@ -57,18 +85,71 @@ impl Sampler {
         // No seed given: a fresh random one, so repeated requests differ (OpenAI's and llama.cpp's
         // servers behave the same way; numpy's default_rng(None) too). A seed reproduces a reply.
         let seed = seed.unwrap_or_else(random_seed);
-        Sampler { temperature, top_k, top_p, repetition_penalty, rng: Rng::new(seed) }
+        Sampler {
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty,
+            penalties: Penalties::default(),
+            counts: Default::default(),
+            produced: 0,
+            rng: Rng::new(seed),
+        }
+    }
+
+    pub fn with_penalties(mut self, penalties: Penalties) -> Sampler {
+        self.penalties = penalties;
+        self
     }
 
     pub fn greedy(&self) -> bool {
         self.temperature == 0.0
     }
 
+    /// Presence, frequency and the length ramps, in Clover's order (before the repetition penalty).
+    fn apply_reply_penalties(&self, logits: &mut [f32]) {
+        let p = &self.penalties;
+        if p.presence != 0.0 || p.frequency != 0.0 {
+            for (&id, &n) in &self.counts {
+                if let Some(v) = logits.get_mut(id as usize) {
+                    *v -= n as f32 * p.frequency;
+                    *v -= p.presence;
+                }
+            }
+        }
+    }
+
+    fn apply_ramps(&self, logits: &mut [f32]) {
+        // The token being chosen is reply position produced + 1.
+        let at = (self.produced + 1) as f32;
+        for r in &self.penalties.ramps {
+            if r.strength == 0.0 || (r.until_seen && r.ids.iter().any(|id| self.counts.contains_key(id))) {
+                continue;
+            }
+            let bias = ((at - r.start as f32) / r.window.max(1) as f32).clamp(0.0, 1.0) * r.strength;
+            if bias == 0.0 {
+                continue;
+            }
+            for &id in &r.ids {
+                if let Some(v) = logits.get_mut(id as usize) {
+                    *v += bias;
+                }
+            }
+        }
+    }
+
     fn apply_repetition_penalty(&self, logits: &mut [f32], history: &[i64]) {
-        if self.repetition_penalty == 1.0 || history.is_empty() {
+        if self.repetition_penalty == 1.0 {
             return;
         }
-        let mut seen: Vec<i64> = history.to_vec();
+        let mut seen: Vec<i64> = if self.penalties.repetition_reply_only {
+            self.counts.keys().map(|&id| i64::from(id)).collect()
+        } else {
+            history.to_vec()
+        };
+        if seen.is_empty() {
+            return;
+        }
         seen.sort_unstable();
         seen.dedup();
         for id in seen {
@@ -109,12 +190,21 @@ impl Sampler {
     }
 
     /// `logits`: `[VOCAB]` f32. `history`: prior token ids (for repetition
-    /// penalty). Returns the next token id.
+    /// penalty). Returns the next token id, which the sampler counts as the reply's next token.
     pub fn sample(&mut self, logits: &[f32], history: &[i64]) -> usize {
+        let id = self.choose(logits, history);
+        *self.counts.entry(id as u32).or_default() += 1;
+        self.produced += 1;
+        id
+    }
+
+    fn choose(&mut self, logits: &[f32], history: &[i64]) -> usize {
         let mut lg = logits.to_vec();
         assert!(lg.iter().all(|v| v.is_finite()), "non-finite logits (interval-3 blowup?)");
 
+        self.apply_reply_penalties(&mut lg);
         self.apply_repetition_penalty(&mut lg, history);
+        self.apply_ramps(&mut lg);
 
         if self.greedy() {
             return argmax(&lg);
@@ -315,5 +405,49 @@ mod tests {
         two[5] = 2.0;
         two[6] = 2.0; // tie between 5 and 6
         assert_eq!(Sampler::new(0.0, 0, 1.0, 1.5, None).sample(&two, &[5]), 6);
+    }
+
+    #[test]
+    fn presence_and_frequency_count_the_reply_only() {
+        // Token 5 is in the prompt (history) but not the reply: no presence penalty for it.
+        let mut lg = vec![0f32; 10];
+        lg[5] = 1.0;
+        lg[6] = 0.95;
+        let mut s = Sampler::new(0.0, 0, 1.0, 1.0, None)
+            .with_penalties(Penalties { presence: 0.9, ..Default::default() });
+        assert_eq!(s.sample(&lg, &[5, 5, 5]), 5);
+        // Now 5 is in the reply: 1.0 - 0.9 < 0.95.
+        assert_eq!(s.sample(&lg, &[5, 5, 5, 5]), 6);
+        // Frequency: 6 once (-0.2), 5 once (-0.2); 7 at 0.85 wins over 0.8 / 0.75.
+        lg[7] = 0.85;
+        let mut f = Sampler::new(0.0, 0, 1.0, 1.0, None)
+            .with_penalties(Penalties { frequency: 0.2, ..Default::default() });
+        f.sample(&[0., 0., 0., 0., 0., 1., 0., 0., 0., 0.], &[]);
+        f.sample(&[0., 0., 0., 0., 0., 0., 1., 0., 0., 0.], &[]);
+        assert_eq!(f.sample(&lg, &[]), 7);
+    }
+
+    #[test]
+    fn repetition_can_count_the_reply_only() {
+        let mut two = vec![0f32; 100];
+        two[5] = 2.0;
+        two[6] = 1.9;
+        let mut s = Sampler::new(0.0, 0, 1.0, 1.5, None)
+            .with_penalties(Penalties { repetition_reply_only: true, ..Default::default() });
+        assert_eq!(s.sample(&two, &[5]), 5); // the prompt's 5 does not count
+        assert_eq!(s.sample(&two, &[5, 5]), 6); // the reply's does
+    }
+
+    #[test]
+    fn ramps_grow_with_the_reply_and_stop_once_seen() {
+        // Bias on token 9 from reply position 2, full (+1) at position 4; off once 9 is produced.
+        let ramp = Ramp { ids: vec![9], strength: 1.0, start: 2, window: 2, until_seen: true };
+        let mut s = Sampler::new(0.0, 0, 1.0, 1.0, None)
+            .with_penalties(Penalties { ramps: vec![ramp], ..Default::default() });
+        let mut lg = vec![0f32; 10];
+        lg[1] = 0.6;
+        let picks: Vec<usize> = (0..5).map(|_| s.sample(&lg, &[])).collect();
+        // positions 1, 2: bias 0, 0; position 3: +0.5 < 0.6; position 4: +1 > 0.6; then 9 is seen.
+        assert_eq!(picks, vec![1, 1, 1, 9, 1]);
     }
 }

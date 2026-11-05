@@ -22,7 +22,7 @@
 use crate::backend::{Backend, GenParams};
 use crate::placeholder_tokenizer::PlaceholderTokenizer;
 use crate::reasoning_effort::{template_kwargs, Levels, TemplateVars, Thinking};
-use crate::sampler::Sampler;
+use crate::sampler::{Penalties, Ramp, Sampler};
 use crate::tokenizer::{ChatMessage, Reasoning, Tokenizer};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -69,6 +69,9 @@ pub struct GenDefaults {
     pub repetition_penalty: f32,
     pub thinking: Thinking,
     pub effort_levels: Option<Levels>,
+    /// presence / frequency (a request may set them), the repetition penalty's scope and the
+    /// length / think-end ramps (`ids` filled per request: the stop tokens, `</think>`).
+    pub penalties: Penalties,
 }
 
 impl Default for GenDefaults {
@@ -81,6 +84,7 @@ impl Default for GenDefaults {
             repetition_penalty: 1.0,
             thinking: Thinking::On,
             effort_levels: None,
+            penalties: Penalties::default(),
         }
     }
 }
@@ -94,8 +98,41 @@ impl GenDefaults {
             repetition_penalty: r.f32("repetition_penalty"),
             thinking: Thinking::from_settings(&r.str("reasoning_effort"), r.bool("think"))?,
             effort_levels: Levels::from_entry(r.entry.as_ref())?,
+            penalties: penalties_from_settings(r),
         })
     }
+}
+
+/// The settings' penalties, with the ramps' token ids left empty.
+pub fn penalties_from_settings(r: &crate::settings::Resolved) -> Penalties {
+    let ramp = |strength: &str, start: &str, window: &str, until_seen: bool| Ramp {
+        ids: Vec::new(),
+        strength: r.f32(strength),
+        start: r.usize(start),
+        window: r.usize(window),
+        until_seen,
+    };
+    Penalties {
+        presence: r.f32("presence_penalty"),
+        frequency: r.f32("frequency_penalty"),
+        repetition_reply_only: r.str("repetition_penalty_scope") == "response",
+        ramps: vec![
+            ramp("length_bias", "length_bias_start", "length_bias_window", false),
+            ramp("think_end_bias", "think_end_start", "think_end_window", true),
+        ],
+    }
+}
+
+/// The penalties for one request: the ramps get their tokens (the length ramp the stop tokens, the
+/// think-end ramp the reasoning block's closing token; without one it stays off).
+pub fn penalties_for(mut p: Penalties, stop_ids: &HashSet<u32>, think_end: Option<u32>) -> Penalties {
+    if let [length, think, ..] = p.ramps.as_mut_slice() {
+        length.ids = stop_ids.iter().copied().collect();
+        length.ids.sort_unstable();
+        think.ids = think_end.into_iter().collect();
+    }
+    p.ramps.retain(|r| r.strength != 0.0 && !r.ids.is_empty());
+    p
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -215,6 +252,13 @@ impl ServerTokenizer {
         let text = t.render_chat(messages, false, kwargs).ok()?;
         let ids = t.encode(&text).ok()?;
         Some(ids.iter().zip(prompt_ids).take_while(|(a, b)| a == b).count())
+    }
+
+    fn think_end_id(&self) -> Option<u32> {
+        match self {
+            ServerTokenizer::Real(t) => t.think_end_id(),
+            ServerTokenizer::Placeholder(_) => None,
+        }
     }
 
     fn template_vars(&self) -> TemplateVars {
@@ -454,6 +498,14 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
         .iter()
         .find_map(|k| req_json.get(*k).filter(|v| !v.is_null()));
     let repetition_penalty = penalty_field.and_then(Value::as_f64).map(|v| v as f32);
+    // OpenAI's presence_penalty / frequency_penalty, in [-2, 2], on the reply's tokens.
+    let reply_penalty = |key: &str| {
+        let field = req_json.get(key).filter(|v| !v.is_null());
+        (field.is_some(), field.and_then(Value::as_f64).map(|v| v as f32))
+    };
+    let (presence_given, presence_penalty) = reply_penalty("presence_penalty");
+    let (frequency_given, frequency_penalty) = reply_penalty("frequency_penalty");
+    let bad_reply_penalty = |given: bool, v: Option<f32>| given && !v.is_some_and(|v| v.is_finite() && (-2.0..=2.0).contains(&v));
     // Thinking (SERVER-REASONING-EFFORT): OpenAI's reasoning_effort; else enable_thinking as vLLM
     // and llama.cpp take it (chat_template_kwargs), or OpenFlowLM's `think`.
     let kwargs_field = req_json.get("chat_template_kwargs").filter(|v| !v.is_null());
@@ -488,11 +540,13 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
         || (top_k_field.is_some() && top_k.is_none())
         || (penalty_field.is_some()
             && !repetition_penalty.is_some_and(|v| v.is_finite() && v > 0.0))
+        || bad_reply_penalty(presence_given, presence_penalty)
+        || bad_reply_penalty(frequency_given, frequency_penalty)
     {
         respond_json(
             request,
             400,
-            &json!({"error": {"message": "temperature must be nonnegative, top_p in (0, 1], top_k a nonnegative integer and repetition_penalty positive", "type": "invalid_request_error"}}),
+            &json!({"error": {"message": "temperature must be nonnegative, top_p in (0, 1], top_k a nonnegative integer, repetition_penalty positive and presence_penalty / frequency_penalty in [-2, 2]", "type": "invalid_request_error"}}),
         );
         return;
     }
@@ -540,7 +594,16 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
         top_p.unwrap_or(d.top_p),
         repetition_penalty.unwrap_or(d.repetition_penalty),
         seed,
-    );
+    )
+    .with_penalties(penalties_for(
+        Penalties {
+            presence: presence_penalty.unwrap_or(d.penalties.presence),
+            frequency: frequency_penalty.unwrap_or(d.penalties.frequency),
+            ..d.penalties.clone()
+        },
+        &stop_ids,
+        state.tokenizer.think_end_id(),
+    ));
     let params = GenParams {
         max_tokens,
         sampler,
@@ -1106,7 +1169,7 @@ mod tests {
         let addr = spawn_test_server(|_| {});
         for extra in [r#""top_p":0"#, r#""temperature":-1"#, r#""top_k":-1"#, r#""top_k":1.5"#,
                       r#""repeat_penalty":0"#, r#""repetition_penalty":"x""#,
-                      r#""reasoning_effort":"max""#, r#""reasoning_effort":2"#,
+                      r#""reasoning_effort":"max""#, r#""presence_penalty":2.5"#, r#""frequency_penalty":"x""#, r#""reasoning_effort":2"#,
                       r#""chat_template_kwargs":[1]"#] {
             let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],{extra}}}"#);
             let (status, _, response) =

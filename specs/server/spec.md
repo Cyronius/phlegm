@@ -294,15 +294,30 @@ the model's settings, in OpenFlowLM's two-file format (openflowlm-next #214, its
   and ignored, not fatal; a changed `defaults_version` is reported with the overridden keys.
 
 Settings: `prefill_mode`, `prefill_route`, `ctx_len` (`--max-ctx`), `think`, `reasoning_effort`, `temperature`,
-`top_k`, `top_p`, `repetition_penalty`, `max_tokens` (`PHLEGM_MAX_TOKENS`). Precedence, lowest
+`top_k`, `top_p`, `repetition_penalty`, `repetition_penalty_scope`, `presence_penalty`,
+`frequency_penalty`, `length_bias` (+ `_start`, `_window`), `think_end_bias` (+ `_start`,
+`_window`), `max_tokens` (`PHLEGM_MAX_TOKENS`). Precedence, lowest
 to highest: the built-in default; the model directory's `generation_config.json` (HF semantics:
 without `do_sample: true` it is greedy and only `repetition_penalty` applies; with it a field
 left out takes HF's default, temperature 1, top_k 50, top_p 1); the registry entry; the shipped
 `defaults`; the user's `defaults`; the user's per-model settings; the env var; the flag; and in
 the server the request's own fields (`temperature`, `top_p`, `top_k`, `repetition_penalty` or
-llama.cpp's `repeat_penalty`, `seed`, `reasoning_effort`, `chat_template_kwargs` or `think`). This is
+llama.cpp's `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `reasoning_effort`,
+`chat_template_kwargs` or `think`). This is
 OpenFlowLM's order with `generation_config.json` added under the registry, so a model directory
 outside the registry still samples the way its maker set it.
+
+**Penalties on the reply** (2026-11-05, `sampler.rs` `Penalties`, Clover's `sampling_clover_moe.py`):
+`presence_penalty` and `frequency_penalty` count the reply's tokens only, as OpenAI and vLLM define
+them (in [-2, 2]; a request may set them). `repetition_penalty_scope` picks what the repetition
+penalty counts: `context` (prompt and reply, as HF, llama.cpp and vLLM do; the default) or
+`response` (Clover). `length_bias` is added to the stop tokens' logits and `think_end_bias` to the
+reasoning block's closing token until the reply closes it, each 0 through `_start` reply tokens and
+rising linearly to full over `_window` more. Order: frequency, presence, repetition, the ramps
+(Clover's), then temperature / top-k / top-p. They apply under greedy decoding too, and
+`generation_config.json`'s `presence_penalty`, `frequency_penalty` and `dllm_*` fields count
+whatever `do_sample` says. Tests: `presence_and_frequency_count_the_reply_only`,
+`repetition_can_count_the_reply_only`, `ramps_grow_with_the_reply_and_stop_once_seen`.
 
 The shipped entries copy each model's `generation_config.json` (2026-11-04): LFM3 temperature
 0.1, top_k 50, repetition_penalty 1.1; LFM2.5 0.1 / 50 / 1.05; Gemma 4 1.0 / 64 / top_p 0.95;
