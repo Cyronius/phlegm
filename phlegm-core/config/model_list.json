@@ -45,7 +45,8 @@
         "details": {
           "family": "gpt-oss",
           "parameter_size": "20B",
-          "quantization_level": "MXFP4"
+          "quantization_level": "MXFP4",
+          "reasoning_efforts": {"low": "low", "medium": "medium", "high": "high"}
         },
         "sampling": {
           "temperature": 1.0,
@@ -59,7 +60,9 @@
         "default_context_length": 32768,
         "details": {
           "family": "hy_v3",
-          "parameter_size": "30B-A3B"
+          "parameter_size": "30B-A3B",
+          "think": false,
+          "reasoning_efforts": {"none": "no_think", "low": "low", "high": "high"}
         },
         "sampling": {
           "temperature": 0.0
@@ -147,7 +150,8 @@
         "default_context_length": 32768,
         "details": {
           "family": "qwen3.5-moe",
-          "quantization_level": "Q4_K"
+          "quantization_level": "Q4_K",
+          "reasoning_efforts": {"none": "none", "medium": "medium", "high": "high"}
         },
         "sampling": {
           "temperature": 0.7,
@@ -160,7 +164,8 @@
         "default_context_length": 32768,
         "details": {
           "family": "qwen3.5-moe",
-          "quantization_level": "Q4_0"
+          "quantization_level": "Q4_0",
+          "reasoning_efforts": {"none": "none", "medium": "medium", "high": "high"}
         },
         "sampling": {
           "temperature": 0.7,

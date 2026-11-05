@@ -21,6 +21,7 @@
 
 use crate::backend::{Backend, GenParams};
 use crate::placeholder_tokenizer::PlaceholderTokenizer;
+use crate::reasoning_effort::{template_kwargs, Levels, TemplateVars, Thinking};
 use crate::sampler::Sampler;
 use crate::tokenizer::{ChatMessage, Reasoning, Tokenizer};
 use serde_json::{json, Value};
@@ -58,32 +59,42 @@ pub struct ServerConfig {
 }
 
 /// What a request leaves out: the model's resolved `temperature`, `top_k`, `top_p`,
-/// `repetition_penalty` and `think` settings.
+/// `repetition_penalty`, `think` and `reasoning_effort` settings, and the registry entry's
+/// table of the template's effort values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenDefaults {
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
     pub repetition_penalty: f32,
-    pub think: bool,
+    pub thinking: Thinking,
+    pub effort_levels: Option<Levels>,
 }
 
 impl Default for GenDefaults {
     /// The settings' built-in defaults: greedy, the template's thinking on.
     fn default() -> Self {
-        GenDefaults { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, think: true }
+        GenDefaults {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            thinking: Thinking::On,
+            effort_levels: None,
+        }
     }
 }
 
 impl GenDefaults {
-    pub fn from_settings(r: &crate::settings::Resolved) -> GenDefaults {
-        GenDefaults {
+    pub fn from_settings(r: &crate::settings::Resolved) -> Result<GenDefaults, String> {
+        Ok(GenDefaults {
             temperature: r.f32("temperature"),
             top_k: r.usize("top_k"),
             top_p: r.f32("top_p"),
             repetition_penalty: r.f32("repetition_penalty"),
-            think: r.bool("think"),
-        }
+            thinking: Thinking::from_settings(&r.str("reasoning_effort"), r.bool("think"))?,
+            effort_levels: Levels::from_entry(r.entry.as_ref())?,
+        })
     }
 }
 
@@ -179,18 +190,22 @@ impl ServerTokenizer {
         }
     }
 
-    fn apply_chat_template(&self, messages: &[ChatMessage], think: bool) -> String {
+    /// add_generation_prompt=true (a completion always follows), with the template variables.
+    fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        kwargs: &serde_json::Map<String, Value>,
+    ) -> Result<String, String> {
         match self {
-            // add_generation_prompt=true (we always want a completion to
-            // follow); enable_thinking from the request or the model's `think` setting.
-            ServerTokenizer::Real(t) => {
-                t.apply_chat_template(messages, true, think)
-                    .unwrap_or_else(|e| {
-                        eprintln!("server: chat template render error: {e}");
-                        String::new()
-                    })
-            }
-            ServerTokenizer::Placeholder(t) => t.apply_chat_template(messages),
+            ServerTokenizer::Real(t) => t.render_chat(messages, true, kwargs),
+            ServerTokenizer::Placeholder(t) => Ok(t.apply_chat_template(messages)),
+        }
+    }
+
+    fn template_vars(&self) -> TemplateVars {
+        match self {
+            ServerTokenizer::Real(t) => t.template_vars(),
+            ServerTokenizer::Placeholder(_) => TemplateVars::default(),
         }
     }
 
@@ -424,11 +439,34 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
         .iter()
         .find_map(|k| req_json.get(*k).filter(|v| !v.is_null()));
     let repetition_penalty = penalty_field.and_then(Value::as_f64).map(|v| v as f32);
-    // enable_thinking as vLLM and llama.cpp take it (chat_template_kwargs), or OpenFlowLM's `think`.
-    let think = req_json
-        .pointer("/chat_template_kwargs/enable_thinking")
+    // Thinking (SERVER-REASONING-EFFORT): OpenAI's reasoning_effort; else enable_thinking as vLLM
+    // and llama.cpp take it (chat_template_kwargs), or OpenFlowLM's `think`.
+    let kwargs_field = req_json.get("chat_template_kwargs").filter(|v| !v.is_null());
+    let effort_field = req_json.get("reasoning_effort").filter(|v| !v.is_null());
+    let think = kwargs_field
+        .and_then(|k| k.get("enable_thinking"))
         .or_else(|| req_json.get("think"))
         .and_then(Value::as_bool);
+    let thinking = match (effort_field, kwargs_field) {
+        (Some(e), _) if !e.is_string() => Err("reasoning_effort must be a string".to_string()),
+        (_, Some(k)) if !k.is_object() => Err("chat_template_kwargs must be an object".to_string()),
+        _ => state
+            .cfg
+            .defaults
+            .thinking
+            .for_request(effort_field.and_then(Value::as_str), think),
+    };
+    let thinking = match thinking {
+        Ok(t) => t,
+        Err(msg) => {
+            respond_json(
+                request,
+                400,
+                &json!({"error": {"message": msg, "type": "invalid_request_error"}}),
+            );
+            return;
+        }
+    };
 
     if temperature.is_some_and(|v| !v.is_finite() || v < 0.0)
         || top_p.is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 1.0)
@@ -445,9 +483,22 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
     }
 
     let d = &state.cfg.defaults;
-    let prompt = state
-        .tokenizer
-        .apply_chat_template(&messages, think.unwrap_or(d.think));
+    // The translated switches, then the request's own template variables as written.
+    let mut kwargs = template_kwargs(&thinking, state.tokenizer.template_vars(), d.effort_levels.as_ref());
+    if let Some(Value::Object(extra)) = kwargs_field {
+        kwargs.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    let prompt = match state.tokenizer.apply_chat_template(&messages, &kwargs) {
+        Ok(p) => p,
+        Err(e) => {
+            respond_json(
+                request,
+                400,
+                &json!({"error": {"message": e, "type": "invalid_request_error"}}),
+            );
+            return;
+        }
+    };
     let prompt_ids = state.tokenizer.encode(&prompt);
     let max_tokens = match output_budget(
         requested_max_tokens,
@@ -1036,7 +1087,9 @@ mod tests {
     fn invalid_sampling_parameters_are_rejected_without_panicking() {
         let addr = spawn_test_server(|_| {});
         for extra in [r#""top_p":0"#, r#""temperature":-1"#, r#""top_k":-1"#, r#""top_k":1.5"#,
-                      r#""repeat_penalty":0"#, r#""repetition_penalty":"x""#] {
+                      r#""repeat_penalty":0"#, r#""repetition_penalty":"x""#,
+                      r#""reasoning_effort":"max""#, r#""reasoning_effort":2"#,
+                      r#""chat_template_kwargs":[1]"#] {
             let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],{extra}}}"#);
             let (status, _, response) =
                 http_request(&addr, "POST", "/v1/chat/completions", Some(&body));
@@ -1060,7 +1113,7 @@ mod tests {
         let mut cfg = ServerConfig::from_env();
         cfg.port = 0;
         cfg.backend_name = "mock".into();
-        cfg.defaults = GenDefaults { temperature: 0.1, top_k: 50, top_p: 0.9, repetition_penalty: 1.1, think: true };
+        cfg.defaults = GenDefaults { temperature: 0.1, top_k: 50, top_p: 0.9, repetition_penalty: 1.1, ..GenDefaults::default() };
         let server = bind(&cfg).unwrap();
         let addr = server.server_addr().to_ip().unwrap().to_string();
         let backend = Box::new(Record(seen.clone()));

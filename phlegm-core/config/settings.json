@@ -49,7 +49,7 @@
     {
       "key": "think",
       "cli_flag": "--think",
-      "description": "Enable reasoning/thinking mode by default (the chat template's enable_thinking)",
+      "description": "Think before answering by default (the chat template's enable_thinking, or its reasoning_effort off value)",
       "type": "bool",
       "scope": "per_model",
       "delivery": "api_field",
@@ -57,6 +57,27 @@
       "reload_required": false,
       "registry_key": "details.think",
       "default_value": true
+    },
+    {
+      "key": "reasoning_effort",
+      "cli_flag": "--reasoning-effort",
+      "description": "How much a reasoning model thinks (OpenAI's reasoning_effort), translated to the chat template's own values; default follows think",
+      "type": "enum",
+      "options": [
+        {"value": "default", "description": "Follow think: the model's usual thinking, or none"},
+        {"value": "none", "description": "No thinking where the model can skip it, else its least"},
+        {"value": "minimal", "description": "The model's nearest level to minimal"},
+        {"value": "low", "description": "The model's nearest level to low"},
+        {"value": "medium", "description": "The model's nearest level to medium"},
+        {"value": "high", "description": "The model's nearest level to high"},
+        {"value": "xhigh", "description": "The model's nearest level to xhigh"}
+      ],
+      "scope": "per_model",
+      "delivery": "api_field",
+      "category": "generation",
+      "reload_required": false,
+      "registry_key": "details.reasoning_effort",
+      "default_value": "default"
     },
     {
       "key": "temperature",

@@ -4,6 +4,7 @@ pub mod gguf;
 pub mod image;
 pub mod mock_backend;
 pub mod placeholder_tokenizer;
+pub mod reasoning_effort;
 pub mod sampler;
 pub mod server;
 pub mod settings;

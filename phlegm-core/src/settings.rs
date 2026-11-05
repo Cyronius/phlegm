@@ -195,6 +195,8 @@ impl Source {
 pub struct Resolved {
     pub tag: Option<String>,
     pub values: BTreeMap<String, (Value, Source)>,
+    /// The model's registry entry, with the user's changes (`details.reasoning_efforts`).
+    pub entry: Option<Value>,
 }
 
 impl Resolved {
@@ -545,7 +547,7 @@ impl Config {
             let found = found.ok_or_else(|| format!("setting {key} has no value and no default"))?;
             values.insert(key.to_string(), found);
         }
-        Ok(Resolved { tag: tag.map(str::to_string), values })
+        Ok(Resolved { tag: tag.map(str::to_string), values, entry })
     }
 
     /// `resolve_with` reading the process environment.

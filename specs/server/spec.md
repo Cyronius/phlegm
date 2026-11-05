@@ -103,8 +103,9 @@ in `specs/server/tests/` once the server's request/response layer is implemented
 
 ## SERVER-REASONING: Reasoning apart from the answer
 
-Chat templates render with `enable_thinking` from the model's `think` setting (default true;
-SERVER-SETTINGS), so a reasoning model writes its thinking before the answer. `/v1/chat/completions` returns that thinking in `message.reasoning_content`
+Chat templates render with the model's thinking switch on by default (`think` and
+`reasoning_effort`, SERVER-SETTINGS and SERVER-REASONING-EFFORT), so a reasoning model writes its
+thinking before the answer. `/v1/chat/completions` returns that thinking in `message.reasoning_content`
 (streamed: `delta.reasoning_content`) and only the answer in `content`, the field llama.cpp's
 and vLLM's OpenAI servers use. `phlegm run` prints the reasoning on stderr between
 `[reasoning]` / `[/reasoning]` and the answer alone on stdout.
@@ -131,6 +132,57 @@ its reasoning has an empty `content` and `finish_reason: "length"`.
   accepted for 0): until a stop token or the end of `--max-ctx` (a positive value is clamped to
   the room left). With 128, thinking models'
   answers were cut off behind the reasoning (KAT needed 256 for a one-line question).
+
+## SERVER-REASONING-EFFORT: How much a model thinks
+
+Requests and settings choose thinking in OpenAI's terms, and phlegm translates the choice into
+whatever the model's chat template reads (`phlegm-core` `reasoning_effort.rs`):
+
+- **Request:** `reasoning_effort` (OpenAI's Chat Completions field: `none`, `minimal`, `low`,
+  `medium`, `high`, `xhigh`; anything else is HTTP 400), else the on/off switch
+  `chat_template_kwargs.enable_thinking` (vLLM, llama.cpp) or `think` (OpenFlowLM), else the
+  model's settings. Switching on keeps an effort the settings name.
+- **Settings:** `reasoning_effort` (`--reasoning-effort`, registry `details.reasoning_effort`):
+  `default` follows `think`; any OpenAI name sets the effort.
+- **Template:** a template that reads `enable_thinking` gets it (false only for `none`). A
+  template that reads `reasoning_effort` gets the value its registry entry maps the effort to
+  (`details.reasoning_efforts`, OpenAI name -> template value; the nearest name, the higher of two
+  equally near). Without a table an explicit effort passes through as written. "On" is `medium`.
+- **Passthrough:** every other `chat_template_kwargs` key reaches the template as written (vLLM's
+  behavior), after the translated ones, so a client can still send a template's own value. A
+  template that fails to render (one that raises on a value it does not know) is HTTP 400, where
+  it used to send the model an empty prompt.
+
+Tables shipped (2026-11-04, from each template's source):
+
+| model | template values | none | minimal | low | medium (on) | high | xhigh |
+|---|---|---|---|---|---|---|---|
+| Hy-Memory 30B | no_think / low / high; anything else is no_think | no_think | low | low | high | high | high |
+| Nex-N2.5-mini | none / medium (also the default) / high | none | none | medium | medium | high | high |
+| gpt-oss 20B | low / medium / high; cannot turn off | low | low | low | medium | high | high |
+
+Qwen3.5 (KAT, Ornith), LFM3 and Gemma 4 read `enable_thinking` only, so every effort above `none`
+is plain "on". Hy-Memory's entry sets `think: false`: its template's default is `no_think`, so
+"on" by default would have changed what the model does unasked. Before this, `think` and
+`enable_thinking` never reached Hy-Memory or Nex, and no request could set gpt-oss's effort.
+
+### Acceptance criteria
+
+- `reasoning_effort.rs`: `hy_memory_and_nex_get_their_own_values`,
+  `a_model_that_cannot_stop_thinking_gets_its_lowest_effort`,
+  `switch_templates_and_templates_without_a_table`, `requests_override_settings`,
+  `bad_tables_are_errors`; `effort_templates_get_their_own_values` (`tokenizer.rs`) renders a
+  reduced Hy-Memory template; `invalid_sampling_parameters_are_rejected_without_panicking` covers
+  a bad `reasoning_effort` and a non-object `chat_template_kwargs`.
+- Hardware (2026-11-04, `phlegm serve` with no flags, seed 1, "A farmer has 17 sheep. All but 9
+  run away..."; `target/npu-dev/effort/check.py`, `check.json`):
+  - Hy-Memory: default, `none` and `enable_thinking: false` answer at once ("8", 1 token, no
+    reasoning); `low` thinks (123 tokens) and `high` / `think: true` think (85) and answer "9".
+  - Nex Q4K: `none` and `enable_thinking: false` answer in 1 token; default / `low` / `think: true`
+    (template value medium) close the block themselves (4 tokens); `high` (`<think>\n`) reasons
+    for 49 tokens. All answer "9".
+  - gpt-oss: `none` / `low` / `enable_thinking: false` reason for 32 tokens, default (medium) and
+    `think: true` 373, `high` 143. All answer "9".
 
 ## SERVER-OUTPUT-BUDGET: Output tokens per request
 
@@ -177,14 +229,14 @@ the model's settings, in OpenFlowLM's two-file format (openflowlm-next #214, its
   except through `phlegm config set` / `unset`. A bad value or an unknown key in it is reported
   and ignored, not fatal; a changed `defaults_version` is reported with the overridden keys.
 
-Settings: `prefill_mode`, `prefill_route`, `ctx_len` (`--max-ctx`), `think`, `temperature`,
+Settings: `prefill_mode`, `prefill_route`, `ctx_len` (`--max-ctx`), `think`, `reasoning_effort`, `temperature`,
 `top_k`, `top_p`, `repetition_penalty`, `max_tokens` (`PHLEGM_MAX_TOKENS`). Precedence, lowest
 to highest: the built-in default; the model directory's `generation_config.json` (HF semantics:
 without `do_sample: true` it is greedy and only `repetition_penalty` applies; with it a field
 left out takes HF's default, temperature 1, top_k 50, top_p 1); the registry entry; the shipped
 `defaults`; the user's `defaults`; the user's per-model settings; the env var; the flag; and in
 the server the request's own fields (`temperature`, `top_p`, `top_k`, `repetition_penalty` or
-llama.cpp's `repeat_penalty`, `seed`, `chat_template_kwargs.enable_thinking` or `think`). This is
+llama.cpp's `repeat_penalty`, `seed`, `reasoning_effort`, `chat_template_kwargs` or `think`). This is
 OpenFlowLM's order with `generation_config.json` added under the registry, so a model directory
 outside the registry still samples the way its maker set it.
 
@@ -200,8 +252,8 @@ catalogue entry exists for either, checked 2026-11-04):
   `temperature=0.0` (tencent/Hy-Memory-30B-A3B @ 64a460a9); neither the card, the GitHub repo nor
   the report (arXiv 2610.22196) gives top-k, top-p or a sampled temperature.
 
-Both templates switch reasoning with `chat_template_kwargs.reasoning_effort`, not
-`enable_thinking`, so `think` does not reach them yet.
+Both templates switch reasoning with `reasoning_effort`, not `enable_thinking`; their registry
+entries map OpenAI's effort names to their values (SERVER-REASONING-EFFORT).
 
 **Seed:** a request (or `phlegm run`) without `seed` samples from a fresh random seed, as
 OpenAI's and llama.cpp's servers do; `seed` reproduces a reply. Until 2026-11-04 the missing seed

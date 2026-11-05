@@ -224,6 +224,39 @@ fn parse_power_mode(report: &str) -> Result<String, String> {
         .ok_or_else(|| "xrt-smi platform report has no power mode".into())
 }
 
+/// The bridge must not outlive phlegm. `Drop` kills it on a normal exit, but a SIGTERM or
+/// SIGKILL ends phlegm without running it, and the bridge would hold the NPU until its current
+/// request finished. On Linux the kernel sends it SIGKILL when the thread that spawned it ends
+/// (PR_SET_PDEATHSIG), so spawn it from a thread that lives as long as the backend (`load` runs
+/// on the caller's thread: main, for `run` and `serve`).
+#[cfg(target_os = "linux")]
+fn die_with_parent(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    extern "C" {
+        fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
+        fn getppid() -> std::ffi::c_int;
+    }
+    const PR_SET_PDEATHSIG: std::ffi::c_int = 1;
+    const SIGKILL: std::ffi::c_ulong = 9;
+    let parent = std::process::id() as std::ffi::c_int;
+    // SAFETY: between fork and exec; prctl and getppid are async-signal-safe and allocate nothing.
+    unsafe {
+        command.pre_exec(move || {
+            if prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent may have died before prctl took effect.
+            if getppid() != parent {
+                return Err(std::io::Error::other("phlegm exited while starting the bridge"));
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent(_: &mut Command) {}
+
 struct Process {
     child: Child,
     input: ChildStdin,
@@ -248,6 +281,7 @@ impl Process {
         command
             .env("OMP_WAIT_POLICY", "PASSIVE")
             .env("OMP_NUM_THREADS", threads.to_string());
+        die_with_parent(&mut command);
         let mut child = command
             .spawn()
             .map_err(|e| format!("starting reference bridge: {e}"))?;

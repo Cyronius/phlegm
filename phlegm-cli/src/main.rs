@@ -2,6 +2,7 @@ use phlegm_core::backend::{Backend, GenParams};
 use phlegm_core::bench::reference::{NpuBackend, NpuOptions};
 use phlegm_core::image::{self, ImageConfig, ImageRequest};
 use phlegm_core::mock_backend::MockBackend;
+use phlegm_core::reasoning_effort::template_kwargs;
 use phlegm_core::sampler::Sampler;
 use phlegm_core::server::{self, GenDefaults, ServerConfig};
 use phlegm_core::settings::{Config, Resolved};
@@ -29,6 +30,7 @@ commands:
 
 run and serve take the model's settings (phlegm config show --model-dir DIR), each overridable by its flag:
   --max-ctx N  --prefill-route auto|block|sequential  --prefill-mode fast|lean  --think true|false
+  --reasoning-effort default|none|minimal|low|medium|high|xhigh
   --temperature T  --top-k K  --top-p P  --repetition-penalty R  --max-tokens N
 --turbo selects experimental lower-precision kernels from DIR/turbo; requires a matching bundle.
 Build the resident NPU bridge with benchmarks/reference/build.ps1 first.";
@@ -112,13 +114,15 @@ fn run(args: &[String]) -> Result<(), String> {
         .map(|v| v.parse::<u64>().map_err(|_| "invalid --seed".to_string()))
         .transpose()?;
     let tokenizer = Tokenizer::load(&npu.model_dir)?;
-    let text = tokenizer.apply_chat_template(
+    let defaults = GenDefaults::from_settings(&settings)?;
+    let kwargs = template_kwargs(&defaults.thinking, tokenizer.template_vars(), defaults.effort_levels.as_ref());
+    let text = tokenizer.render_chat(
         &[ChatMessage {
             role: "user".into(),
             content: prompt,
         }],
         true,
-        settings.bool("think"),
+        &kwargs,
     )?;
     let ids = tokenizer.encode(&text)?;
     // The backend holds prompt + max_tokens - 1 tokens (the last one is never fed back).
@@ -173,7 +177,7 @@ fn serve(args: &[String]) -> Result<(), String> {
     let mut cfg = ServerConfig::from_env();
     let settings = model_settings(&opts)?;
     cfg.default_max_tokens = settings.usize("max_tokens");
-    cfg.defaults = GenDefaults::from_settings(&settings);
+    cfg.defaults = GenDefaults::from_settings(&settings)?;
     if opts.contains_key("--mock") {
         if opts.contains_key("--turbo") {
             return Err("--turbo requires the NPU backend; cannot combine with --mock".into());

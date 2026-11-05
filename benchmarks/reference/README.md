@@ -85,6 +85,16 @@ avoid the overhead of a large JSON number array. `serve --mock` runs the
 explicit test backend. No release tag is needed for run/serve; the strict
 release and power-mode rules below still govern published benchmark reports.
 
+The bridge never outlives phlegm. A normal exit kills it from `Drop`; on Linux it
+is also started with `PR_SET_PDEATHSIG` = SIGKILL, so a SIGTERM or SIGKILL to
+phlegm stops it at once instead of leaving it on the NPU until its current
+request ends (2026-11-04: `phlegm serve` sent SIGTERM 8 s into a request; its
+bridge was gone 2 s later, `target/npu-dev/effort/check.json`). The bridge must
+be spawned from a thread that lives as long as the backend: the kernel sends the
+signal when the spawning thread exits. `run` and `serve` spawn it on the main
+thread. A left-over `/tmp/phlegm-npu.lock` naming a dead process is removed by
+the next phlegm that wants the NPU.
+
 ## Run from a tagged Phlegm release
 
 The Phlegm source must be clean, its Cargo version must match an exact `v<version>`

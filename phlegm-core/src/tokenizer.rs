@@ -2,8 +2,9 @@
 //! The token IDs and end tokens are read from the model's tokenizer files;
 //! templates may be an external Jinja file or embedded in tokenizer_config.json.
 
+use crate::reasoning_effort::TemplateVars;
 use minijinja::{context, Environment};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::path::Path;
 use tokenizers::Tokenizer as HfTokenizer;
 
@@ -306,6 +307,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn effort_templates_get_their_own_values() {
+        use crate::reasoning_effort::{template_kwargs, Levels, TemplateVars, Thinking};
+        let (dir, _) = fixture(false, false);
+        // Hy-Memory's generation prompt, reduced: no_think closes the block, low/high open it,
+        // and anything else falls back to no_think.
+        std::fs::write(
+            dir.join("chat_template.jinja"),
+            "{%- if reasoning_effort is not defined or reasoning_effort not in ['high', 'low', 'no_think'] %}\
+             {%- set reasoning_effort = 'no_think' %}{%- endif %}\
+             {{ messages[0].content }}|{{ reasoning_effort }}{{ '|' ~ preserve_thinking if preserve_thinking is defined }}",
+        )
+        .unwrap();
+        let tokenizer = Tokenizer::load(&dir).unwrap();
+        assert_eq!(tokenizer.template_vars(), TemplateVars { enable_thinking: false, reasoning_effort: true });
+        let levels = Levels::from_entry(Some(&serde_json::json!(
+            {"details": {"reasoning_efforts": {"none": "no_think", "low": "low", "high": "high"}}}
+        )))
+        .unwrap();
+        let msg = [ChatMessage { role: "user".into(), content: "A".into() }];
+        let render = |t: Thinking| {
+            let kwargs = template_kwargs(&t, tokenizer.template_vars(), levels.as_ref());
+            tokenizer.render_chat(&msg, true, &kwargs).unwrap()
+        };
+        assert_eq!(render(Thinking::Off), "A|no_think");
+        assert_eq!(render(Thinking::On), "A|high");
+        assert_eq!(render(Thinking::effort("minimal").unwrap()), "A|low");
+        // Without the table the OpenAI name goes through, and this template ignores "medium".
+        let kwargs = template_kwargs(&Thinking::effort("medium").unwrap(), tokenizer.template_vars(), None);
+        assert_eq!(tokenizer.render_chat(&msg, true, &kwargs).unwrap(), "A|no_think");
+        // Other template variables pass through.
+        let mut kwargs = Map::new();
+        kwargs.insert("preserve_thinking".into(), Value::Bool(true));
+        assert_eq!(tokenizer.render_chat(&msg, true, &kwargs).unwrap(), "A|no_think|True"); // as Python prints it
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn harmony_split_takes_the_final_channel() {
         let t = "<|channel|>analysis<|message|>Think.<|end|><|start|>assistant<|channel|>final<|message|>Paris.<|return|>";
         assert_eq!(harmony_split(t), Some(("Think.".into(), "Paris.".into())));
@@ -419,6 +457,7 @@ pub(crate) mod tests {
 
 pub struct Tokenizer {
     reasoning: Option<ReasoningFormat>,
+    template_vars: TemplateVars,
     tk: HfTokenizer,
     env: Environment<'static>,
     add_bos_token: bool,
@@ -523,6 +562,7 @@ impl Tokenizer {
         } else {
             None
         };
+        let template_vars = TemplateVars::of(&template_src);
         env.add_template_owned("chat", template_src)
             .map_err(|e| format!("compiling chat_template.jinja: {e}"))?;
 
@@ -580,6 +620,7 @@ impl Tokenizer {
             tk,
             env,
             reasoning,
+            template_vars,
             add_bos_token,
             bos_token,
             eos_ids,
@@ -647,28 +688,45 @@ impl Tokenizer {
     }
 
     // ---- chat template ----------------------------------------------------
-    /// Render messages through the packaged chat_template.jinja. With
-    /// `add_generation_prompt=true` the render ends at
-    /// `<|im_start|>assistant\n` plus a `<think>\n` opener (Qwen3.6 is a
-    /// thinking model); pass `enable_thinking=false` to emit an empty
-    /// `<think>\n\n</think>` block.
+    /// The thinking switches the chat template reads (`enable_thinking`, `reasoning_effort`).
+    pub fn template_vars(&self) -> TemplateVars {
+        self.template_vars
+    }
+
+    /// Render messages through the model's chat template with only `enable_thinking` set.
     pub fn apply_chat_template(
         &self,
         messages: &[ChatMessage],
         add_generation_prompt: bool,
         enable_thinking: bool,
     ) -> Result<String, String> {
+        let mut kwargs = Map::new();
+        kwargs.insert("enable_thinking".into(), Value::Bool(enable_thinking));
+        self.render_chat(messages, add_generation_prompt, &kwargs)
+    }
+
+    /// Render messages through the model's chat template with extra template variables, the way
+    /// transformers and vLLM pass `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`,
+    /// `preserve_thinking`, ...). They cannot replace `messages`, `add_generation_prompt` or `tools`.
+    pub fn render_chat(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        kwargs: &Map<String, Value>,
+    ) -> Result<String, String> {
         let tmpl = self.env.get_template("chat").map_err(|e| e.to_string())?;
         let msgs: Vec<_> = messages
             .iter()
             .map(|m| context! { role => m.role.clone(), content => m.content.clone() })
             .collect();
-        tmpl.render(context! {
-            messages => msgs,
-            add_generation_prompt => add_generation_prompt,
-            enable_thinking => enable_thinking,
-            tools => Option::<Value>::None,
-        })
-        .map_err(|e| format!("rendering chat template: {e:#}"))
+        let mut ctx: std::collections::BTreeMap<String, minijinja::Value> = kwargs
+            .iter()
+            .map(|(k, v)| (k.clone(), minijinja::Value::from_serialize(v)))
+            .collect();
+        ctx.insert("messages".into(), minijinja::Value::from(msgs));
+        ctx.insert("add_generation_prompt".into(), add_generation_prompt.into());
+        ctx.insert("tools".into(), minijinja::Value::from(()));
+        tmpl.render(ctx)
+            .map_err(|e| format!("rendering chat template: {e:#}"))
     }
 }
