@@ -316,7 +316,9 @@ reasoning block's closing token until the reply closes it, each 0 through `_star
 rising linearly to full over `_window` more. Order: frequency, presence, repetition, the ramps
 (Clover's), then temperature / top-k / top-p. They apply under greedy decoding too, and
 `generation_config.json`'s `presence_penalty`, `frequency_penalty` and `dllm_*` fields count
-whatever `do_sample` says. Tests: `presence_and_frequency_count_the_reply_only`,
+whatever `do_sample` says. Clover's entry: greedy, presence 0.9, frequency 0, repetition 1.05 on
+the response, length 10 from 8192 over 8192, think-end 10 from 4096 over 4096 (its model card and
+generation_config.json). Tests: `presence_and_frequency_count_the_reply_only`,
 `repetition_can_count_the_reply_only`, `ramps_grow_with_the_reply_and_stop_once_seen`.
 
 The shipped entries copy each model's `generation_config.json` (2026-11-04): LFM3 temperature

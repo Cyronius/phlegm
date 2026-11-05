@@ -255,6 +255,25 @@ flip (the control's one). Open: the experts' weights are rounded to bf16 on the 
 remove that); bfp16 dense GEMMs; the ten local / global context changes a token; a clean benchmark. Plan:
 [.plans/gemma4-moe.md](.plans/gemma4-moe.md); spec `OPEN-FAMILY-GEMMA4-MOE`.
 
+## DiffuSpace Clover-35B-A3B-Preview (block diffusion on Qwen3.6-35B-A3B)
+
+Autoregressive Clover runs on the NPU (2026-11-05): `/home/cyrus/models/Clover-35B-A3B-Preview-Q4pure-NPU2`,
+a pure Q4_0 GGUF built from the BF16 weights (@ `4b0402b6`) by the Ornith / Nex recipe, on KAT's kernels
+unchanged (Nex's spec). The converter and the engine read a mapped config (`qwen3_5_moe_text`); the 120
+preview-only tensors are dropped. Text RoPE is the same as Clover's plain RoPE (measured: llama.cpp gives
+bit-identical logits for the same tensors under either label). Pack check ALL OK (Q4_0 rel L2 0). On the
+491-token prompt the NPU agrees with llama.cpp CPU at 464/491 (block, median KL 4.9e-3), the CPU-vs-Vulkan
+control at 462/491. `phlegm run` and `serve` answer, with the thinking split. Development timing, paired
+with Nex: decode 66 ms a token at ~500 tokens (15 tok/s) and 76 ms at ~3000; prefill 3.0 s / 13.5 s.
+Registry: `clover:35b-a3b-q4pure` with Clover's recommended sampling (greedy; on the reply only: presence 0.9,
+repetition 1.05; +10 ramps on the stop tokens from 8192 reply tokens and on `</think>` from 4096; SERVER-SETTINGS).
+Block diffusion is not on the NPU. Estimate from measured parts: a 32-row pass on today's block route is
+padded to 256 rows and costs 1.13-1.24 s (1.44-1.57 s with every row's logits), about 17 decode steps.
+LowConfidence at 0.95 took 18.5-29.9 preview passes per 32-token block on three prompts (llama.cpp PR head,
+CPU), so it would run at 0.7-1.2 tok/s. Self-speculative w=16 accepted 3.3-6.7 tokens per two passes,
+1.3-2.6 tok/s. Both beat AR only if a W-row pass costs a few decode steps (a narrow route, the coreset's
+smaller expert union, a batched head). Plan: [.plans/clover.md](.plans/clover.md); spec `OPEN-FAMILY-CLOVER`.
+
 ## Qwen3.5 MoE 35B-A3B (Ornith 1.5, Nex N2.5 mini, KAT Coder V2.5 Dev)
 
 KAT Coder V2.5 Dev runs on the NPU from bartowski's unmodified Q4_0 GGUF. It uses the qwen36moe

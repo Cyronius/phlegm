@@ -1620,6 +1620,69 @@ The 491-token prompt, against llama.cpp CPU on the same file:
 - Development timing equals KAT's paired control in the same window. No BF16 comparison was made
   for these two. Evidence: `.plans/qwen35moe-gguf.md`.
 
+### OPEN-FAMILY-CLOVER: Clover-35B-A3B-Preview's causal path on the qwen35moe GGUF route
+**Applies to:** OPEN-FAMILY-QWEN36MOE-GGUF's view and kernels, unchanged; the model directory's
+mapped `config.json`; `phlegm-core/config/model_list.json` (`clover:35b-a3b-q4pure`)
+**Test category:** manual (NPU and model)
+
+DiffuSpace's Clover is a block-diffusion fine-tune of Qwen3.6-35B-A3B. Its causal mode (HF
+`preview=False`) is the Qwen3.5-MoE decoder graph with plain RoPE. It shall run on the
+OPEN-FAMILY-QWEN36MOE-GGUF route from a pure Q4_0 GGUF built from its BF16 safetensors:
+- The model directory's `config.json` is Clover's with `model_type` `qwen3_5_moe_text` and
+  `architectures` `Qwen3_5MoeForCausalLM` (the original is kept as `config.clover.json`). Every decoder
+  field is unchanged, so the spec is one the kernels already serve.
+- The 120 preview-only tensors (`linear_attn.conv_right_weight`, `bd_softmax_logit_scale`,
+  `bd_softmax_history_bias`, `bd_softmax_history_c` of the 30 GDN layers) are not converted.
+- Text positions shall be plain RoPE (theta 1e7, 64 of 256 dims, rotate-half). The route places text
+  at (p, p, p) with no section split, which is that.
+- Block diffusion (the preview pass: in-block bidirectional attention, two-sided conv and softmax
+  history mixer in GDN, coreset routing; LowConfidence or CLOVER self-speculative decoding) is out of
+  scope here.
+
+**Acceptance criteria:** the pack check ALL OK; teacher-forced agreement with llama.cpp on the same
+GGUF at the level of llama.cpp's own CPU-vs-Vulkan control; equal greedy tokens away from near ties;
+`phlegm run` and `serve` answer, with the thinking split.
+
+**Result 2026-11-05 (Clover-35B-A3B-Preview @ `4b0402b6`, own pure Q4_0, sha256 `87f6c129...`; Strix
+Halo):** [meas] unless marked.
+- Spec sha256:2f25c1615e4c (Nex N2.5 mini's: `real_vocab` 248077), kernel hash 2a3631c0cf5f; KAT's
+  kernel files byte for byte, a regenerated manifest.
+- Built with llama.cpp a34de8618's converter on an overlay with the mapped config. The preview-capable
+  converter of llama.cpp PR #31306's head (cb09d4355, arch `clover_moe`) with the same quantize gives
+  byte-identical bytes for all 703 shared tensors except `ssm_a` (raw A_log there, -exp(A_log) here).
+- Pack check (layers 0, 3, 5, 7, 38, 39, head): Q4_0 rel L2 0, head 1.653e-3.
+- RoPE: mainline llama.cpp e4b6c8ca on the same tensor bytes labelled `qwen35moe` (IMROPE, sections
+  [11,11,10,0]) and `clover_moe` (NEOX) gives bit-identical top-20 log-probs at all 491 positions.
+
+| 491-token prompt, teacher forced, top-20 partial KL | argmax | KL median / mean / p95 |
+| --- | --- | --- |
+| NPU block vs llama.cpp CPU (build 12015) | 464/491 | 4.9e-3 / 1.8e-2 / 7.3e-2 |
+| NPU sequential vs llama.cpp CPU | 464/491 | 5.4e-3 / 1.9e-2 / 7.4e-2 |
+| NPU block vs llama.cpp Vulkan | 466/491 | 3.7e-3 / 1.3e-2 / 5.5e-2 |
+| control: llama.cpp CPU vs Vulkan | 462/491 | 3.8e-3 / 1.3e-2 / 6.7e-2 |
+| NPU block vs mainline e4b6c8ca (`clover_moe`) | 465/491 | 5.1e-3 / 1.6e-2 / 7.6e-2 |
+
+- Greedy, 32-token prompt: sequential 64/64 with llama.cpp CPU and Vulkan; block route departs at token 6
+  on a near tie. 491-token prompt, 48 greedy: block 48/48; sequential departs at 23 on a near tie.
+  llama.cpp's greedy has to be requested with `repeat_penalty 1.0`, because the converter copies
+  generation_config's 1.05 into `general.sampling.penalty_repeat`.
+- `phlegm run` and `serve` (streamed and not) answer, the thinking going to `reasoning_content`.
+- Development timing, paired and alternating with Nex Q4pure (same kernels): decode 66-67 ms a token at
+  ~500 tokens and 76 ms at ~3000; prefill 2.9-3.3 s (491) and 13.5 s (3000). Nex is the same.
+- Block-diffusion cost [estimate from measured parts]: a 32-row forward on the block route (padded to the
+  route's 256 rows) costs 1.13 s at position 100 and 1.24 s at 3000, 1.44 / 1.57 s with every row's
+  logits. LowConfidence (block 32, threshold 0.95, greedy, Clover's penalties) took 18.5 / 25.9 / 29.9
+  preview passes per block on a reasoning, a code and a chat prompt (llama.cpp cb09d4355, CPU, 256 tokens
+  each), which on this route gives 0.7-1.2 tok/s against 15 tok/s AR. CLOVER self-speculative (w=16)
+  committed 6.7 / 5.5 / 3.3 tokens per preview + verify pair, 1.3-2.6 tok/s on this route. The open
+  preview pass and the cost model are in `.plans/clover.md`.
+
+Sampling: the registry entry carries Clover's recommendations (presence 0.9 and repetition 1.05 on the reply, the
+length and think-end ramps; SERVER-SETTINGS), checked on the NPU with `phlegm run` (2026-11-05).
+Open: a BF16 quality
+comparison; a preview pass validated against HF BF16; a W-row route that does not pad to 256 rows.
+Evidence: `.plans/clover.md`, `target/npu-dev/qwen35moe-ref/clover/`, `target/npu-dev/qwen35moe-run/clover/`.
+
 ### OPEN-FAMILY-QWEN3: Qwen3 dense on the open kernels
 **Applies to:** openflowlm-next (`open_kernels/recipes/qwen3.py`, `designs/dense/dx.py`, `designs/lm_head_q4`, `src/open_qwen36/`)
 **Test category:** manual (needs the NPU and `OpenFlowLM/Qwen3-4B-NPU2`); the recipe's arithmetic is unit-tested in `tests/test_qwen3_dense.py`
