@@ -109,6 +109,13 @@ def quant_for(spec: ModelSpec, model_dir: Path):
         return "q4_1"
     sizes, dtypes = container_chunk_bytes(model_dir, with_dtypes=True)
     if not sizes:
+        # a GGUF-only model: the family may read its projections' types (qwen35: an i-quant
+        # GGUF streams every role at q8, OPEN-FAMILY-SALUKI); otherwise the spec's default
+        from .families import for_spec
+        hook = getattr(for_spec(spec), "quant_for_gguf", None)
+        gguf = Path(model_dir) / "model.gguf"
+        if hook and gguf.is_file():
+            return hook(spec, gguf) or spec.quant
         return spec.quant
     from .families import for_spec
     can = getattr(for_spec(spec), "Q8_ROLES", frozenset())

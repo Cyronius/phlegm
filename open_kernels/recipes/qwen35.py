@@ -583,6 +583,28 @@ def gguf_view(spec: ModelSpec, base: dict) -> dict | None:
     return g
 
 
+# GGUF types the q4_1 law holds as they stand (codes kept; q35_put): anything else in a projection
+# (the i-quants, Q2_K, Q5_x, Q6_K, Q8_0) makes the GGUF view stream every role at q8, where an
+# i-quant block keeps its integer codes (OPEN-FAMILY-SALUKI)
+Q4_EXACT_GGUF = frozenset({"Q4_0", "Q4_1", "Q4_K"})
+GGUF_PROJ_SUFFIXES = ("attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "attn_q.weight", "attn_k.weight",
+                      "attn_v.weight", "attn_output.weight", "ffn_up.weight", "ffn_gate.weight", "ffn_down.weight")
+
+
+def quant_for_gguf(spec: ModelSpec, path) -> dict | None:
+    """recipes/load.py's hook for a GGUF-only model directory: every role at q8 when some projection
+    is a type the q4_1 law cannot hold, else None (the spec's default and its f32-scale twin)."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from gguf_pool import read_gguf
+    _, tensors, _ = read_gguf(str(path))
+    types = {t["type"] for n, t in tensors.items() if n.startswith("blk.") and n.endswith(GGUF_PROJ_SUFFIXES)}
+    if types and not types <= Q4_EXACT_GGUF:
+        return {r: "q8" for r in sorted(Q8_ROLES)}
+    return None
+
+
 def finalize_gguf_manifest(spec: ModelSpec, manifest: dict) -> None:
     """recipes/manifest.py's family hook: add the GGUF view (`gguf_view`) where no twin is shipped."""
     if "gguf" in manifest:
