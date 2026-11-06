@@ -218,6 +218,17 @@ the bf16 control's spread. The default (`LFM2MOE_BLOCK=0` for sequential): the m
 (bridge `bridges/lfm2moe-blk`). Plan:
 [.plans/lfm2moe-native.md](.plans/lfm2moe-native.md); spec: OPEN-FAMILY-LFM2MOE.
 
+## NVIDIA Nemotron 3.5 Lightning 30B-A3B (nemotron_h MoE)
+
+Runs on the NPU from our own pure Q4_0 GGUF (NVIDIA's BF16 safetensors through llama.cpp's converter, `--no-mtp`,
+and `llama quantize --pure`, Q8_0 head; every scale bf16-exact) through its own recipe `recipes/nemotronh.py`: the
+NPU streams the weights (q4 GEMVs for the Mamba in / out and q | k | v / o projections, an 8-slot expert program for
+the six routed experts and the shared expert's two halves, the Q8_0 head) and the host runs the rest between the
+dispatches (the norms, Mamba-2's conv and selective-state update, attention without positional encoding, the
+router, the residual) as `nh_*` program steps of its own runtime patch (`nemotronh-runtime.patch`, over the
+gemma4-moe chain). RESULTS_PLACEHOLDER Plan: [.plans/nemotronh.md](.plans/nemotronh.md); spec:
+OPEN-FAMILY-NEMOTRONH.
+
 ## LiquidAI LFM3-1.7B (lfm3)
 
 Runs on the NPU from LiquidAI's QAD-Q4_0 GGUF (derived: Q8_0 head, per-head gate rows repeated to a q-width

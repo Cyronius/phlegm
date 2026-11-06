@@ -62,6 +62,13 @@ def shared_gemv() -> bool:
     return os.environ.get("NEMOTRONH_SHARED", "0") == "1"
 
 
+def one_image() -> bool:
+    """NEMOTRONH_ONE=1: every block dispatch (the three GEMVs and the experts) as streams of ONE image whose core
+    program is the expert program with runtime-parameter loop counts (designs/nemotronh/nh.py unified_program); the
+    GEMVs then take their activation as f32 at AD_XF. Only the head changes image (R-0003)."""
+    return os.environ.get("NEMOTRONH_ONE", "0") == "1"
+
+
 def kpad(k: int) -> int:
     """A GEMV operand's K: whole 256-wide k-tiles (zero weights past the real width)."""
     return roundup(k, 256)
@@ -89,7 +96,7 @@ class Geometry:
 
 @dataclass(frozen=True)
 class Layout:
-    AD_X: int; AD_Y: int; AD_O: int; AD_XM: int; AD_W: int; AD_H: int; AD_MOE: int; AD_BYTES: int
+    AD_X: int; AD_Y: int; AD_O: int; AD_XM: int; AD_W: int; AD_H: int; AD_MOE: int; AD_XF: int; AD_BYTES: int
     XE: int; XM_ELEMS: int; H_STRIDE: int
     POOL_IN: int; POOL_OUT: int; POOL_MIX_BYTES: int
     UPS: int; DNS: int; POOL_DOWN: int; POOL_MOE_BYTES: int; POOL_BYTES: int
@@ -167,7 +174,8 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> Layout:
     xm_elems = roundup(G.HIDP * 2 + 4 * SLOTS_MAX, ELEM) // ELEM
     h_stride = roundup(G.FFP * 4, ELEM)
     for name, size in (("x", xe * ELEM), ("y", max(G.IN_N, G.QKV_N) * 4), ("o", G.HID * 4),
-                       ("xm", xm_elems * ELEM), ("h", G.SLOTS * h_stride), ("moe", G.HID * 4)):
+                       ("xm", xm_elems * ELEM), ("h", G.SLOTS * h_stride), ("moe", G.HID * 4),
+                       ("xf", max(G.HIDP, G.OUT_K) * 4)):
         a[name] = off
         off += roundup(size, ELEM)
     ad_w = a["xm"] + (xm_elems - 1) * ELEM + 2048      # the 8 routing weights: byte 2048 of xm's last element
@@ -190,7 +198,7 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> Layout:
     bands = rows // LM_BAND_ROWS
     lm_band = 4 * (G.HIDP // 256) * LM_TILE
     return Layout(
-        AD_X=a["x"], AD_Y=a["y"], AD_O=a["o"], AD_XM=a["xm"], AD_W=ad_w, AD_H=a["h"], AD_MOE=a["moe"],
+        AD_X=a["x"], AD_Y=a["y"], AD_O=a["o"], AD_XM=a["xm"], AD_W=ad_w, AD_H=a["h"], AD_MOE=a["moe"], AD_XF=a["xf"],
         AD_BYTES=roundup(off, ELEM), XE=xe, XM_ELEMS=xm_elems, H_STRIDE=h_stride,
         POOL_IN=0, POOL_OUT=pool_out, POOL_MIX_BYTES=pool_mix,
         UPS=ups, DNS=dns, POOL_DOWN=pool_down, POOL_MOE_BYTES=pool_moe, POOL_BYTES=max(pool_mix, pool_moe),
@@ -266,9 +274,16 @@ def pack_plan(spec: ModelSpec) -> dict:
     }
 
 
+def _gemv_x(spec: ModelSpec) -> dict:
+    """Where a host step leaves a projection GEMV's activation: bf16 at AD_X, or f32 at AD_XF in the one-image
+    program (its GEMVs take their x through the expert program's f32 path)."""
+    L = layout(spec)
+    return {"a_x": L.AD_XF, "x_f32": 1} if one_image() else {"a_x": L.AD_X}
+
+
 def _pre(spec: ModelSpec, kernel: str) -> dict:
-    G, L = geometry(spec), layout(spec)
-    return {"op": "nh_pre", "kernel": kernel, "a_x": L.AD_X, "norm": "blk.{l}.attn_norm.weight", "eps": G.EPS,
+    G = geometry(spec)
+    return {"op": "nh_pre", "kernel": kernel, **_gemv_x(spec), "norm": "blk.{l}.attn_norm.weight", "eps": G.EPS,
             "hidden": G.HID, "k": G.HIDP}
 
 
@@ -289,7 +304,7 @@ def route_step(spec: ModelSpec) -> dict:
 def ssm_step(spec: ModelSpec) -> dict:
     G, L = geometry(spec), layout(spec)
     b = "blk.{l}."
-    return {"op": "nh_ssm", "kernel": "nh_out", "a_y": L.AD_Y, "a_x": L.AD_X, "conv_w": b + "ssm_conv1d.weight",
+    return {"op": "nh_ssm", "kernel": "nh_out", "a_y": L.AD_Y, **_gemv_x(spec), "conv_w": b + "ssm_conv1d.weight",
             "conv_b": b + "ssm_conv1d.bias", "dt_b": b + "ssm_dt.bias", "ssm_a": b + "ssm_a", "ssm_d": b + "ssm_d",
             "ssm_norm": b + "ssm_norm.weight", "heads": G.MH, "head_dim": G.MHD, "groups": G.MG, "dstate": G.MDS,
             "taps": G.TAPS, "eps": G.EPS, "state_conv": L.STATE_CONV, "k": G.OUT_K}
@@ -297,7 +312,7 @@ def ssm_step(spec: ModelSpec) -> dict:
 
 def attn_step(spec: ModelSpec) -> dict:
     G, L = geometry(spec), layout(spec)
-    return {"op": "nh_attn", "kernel": "nh_out", "a_y": L.AD_Y, "a_x": L.AD_X, "heads": G.NH, "kv_heads": G.KVH,
+    return {"op": "nh_attn", "kernel": "nh_out", "a_y": L.AD_Y, **_gemv_x(spec), "heads": G.NH, "kv_heads": G.KVH,
             "head_dim": G.HD, "k": G.OUT_K}
 
 
@@ -316,13 +331,17 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
                     {"op": "run", "kernel": "lm", "args": ["lmpool", "hn", "logits"]}],
            "globals": {"xres": G.HID * 4, "hn": G.HIDP * 2, "logits": L.LM_ROWS * 4, "lmpool": L.LMHEAD_POOL_BYTES}}
 
-    shared = shared_gemv()
-    if shared:     # one image, three streams: the context is nh_out's xclbin (every build of it is the same image)
+    shared, one = shared_gemv(), one_image()
+    if one:        # one image, every block stream: the context is nh_out's xclbin (every build is the same image)
+        out["contexts"] = {"nh_one": "nh_out/final.xclbin", "lm": out["contexts"]["lm"]}
+        out["kernels"]["nh_out"]["context"] = "nh_one"
+    elif shared:   # one image, three streams: the context is nh_out's xclbin (every build of it is the same image)
         out["contexts"] = {"nh_gemv": "nh_out/final.xclbin", "lm": out["contexts"]["lm"]}
         out["kernels"]["nh_out"]["context"] = "nh_gemv"
 
     def kern(name: str, patch: str = "") -> None:
-        ctx = "nh_gemv" if shared and name in ("nh_in", "nh_qkv") else name
+        ctx = ("nh_one" if one and name != "lm" else
+               "nh_gemv" if shared and name in ("nh_in", "nh_qkv") else name)
         if ctx == name:
             out["contexts"][name] = f"{name}/final.xclbin"
         out["kernels"][name] = {"context": ctx, "insts": f"{name}/insts.bin", "build": name}
@@ -377,6 +396,12 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
         out["nh_moe"] = {"design": "nemotronh/nh.py",
                          "build_dir": f"nemotronh/build_moe_h{G.HID}_f{G.FF}_s{G.SLOTS}",
                          "env": {"NH_PART": "moe"}}
+    if one_image():
+        for name in ("nh_out", "nh_in", "nh_qkv", "nh_moe"):
+            if name in out:
+                out[name]["build_dir"] = out[name]["build_dir"].removesuffix("_rtp") + "_one"
+                out[name]["env"].pop("NEMOTRONH_SHARED", None)
+                out[name]["env"]["NEMOTRONH_ONE"] = "1"
     return out
 
 
