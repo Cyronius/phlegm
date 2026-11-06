@@ -444,6 +444,21 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   the clone is `target/npu-dev/qwen35moe-runtime`, and a round trip reproduces its tree.
   Kernel sets that carry the new `gguf` section need this runtime to parse their manifest.
 
+- `upstream-patches/saluki-runtime.patch` (2026-11-06) runs Underdog Saluki 27B, a Qwen3.8-27B
+  published only as an IQ2-mix llama.cpp `qwen35` GGUF, on the all-q8 Qwen3.5 dense view
+  (OPEN-FAMILY-SALUKI). `gguf_iq.hpp` decodes IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+  IQ3_S, IQ4_XS and Q2_K a 32-value block at a time as `ggml-quants.c` does; its grid tables
+  (`gguf_iq_tables.hpp`) are generated from llama.cpp `a34de8618b25`'s `ggml-common.h` (MIT).
+  A block with one scale and integer codes keeps those codes in the new `q35_q8` op (q8_perm
+  half-tiles), only its scale rounded to bf16; other blocks are requantized to int8. `q35_mat`
+  gains `split` hi / lo, the block route's exact q4_1 split of the same q8 values. The patch also
+  gives the dense block route the 27B's decode state ABI (`attn_kv_dtype` `bfloat16_pair`,
+  `linear_conv_dtype` `float32`): without it the route's prefill logits are right and the decode
+  that follows is not, which applies to any Qwen3.8-27B set on this lineage. Applies over
+  `beccd46`, the nine Gemma 4 patches, `gptoss-runtime.patch` and
+  `qwen35moe-gguf-runtime.patch`; the clone is `target/npu-dev/saluki-runtime`, and a round trip
+  reproduces its tree.
+
 `designs/dense/dx_attn.py` now takes its recipe module from `for_spec` and its flags from the
 recipe's `attn_flags`, and gained `dx.py`'s ATTN_QLOCAL q loop. It emits byte-identical MLIR
 for the 15 shipped dense specs with a block route that emit at all; `qwen3-14b` refuses at
