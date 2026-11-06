@@ -119,7 +119,7 @@ from layout import (A_BYTES, A_HP, A_RES, A_ROUT, A_XM, AA_BYTES, AA_HP, AA_RES,
                     C_BYTES, C_SGW, CA_BYTES, CA_SGW, KV_BYTES, POOL_BYTES, PTAB_BYTES, STATE_BYTES, R, SPEC)
 import xcommon as X  # noqa: E402
 import xlayer as XL  # noqa: E402
-from recipes.qwen36moe import router_split, stream_knobs  # noqa: E402
+from recipes.qwen36moe import router_split, seq_order, stream_knobs  # noqa: E402
 
 D = R.linear
 A = R.attn
@@ -173,6 +173,9 @@ assert 0 <= WRING <= 24, "ux: a memtile ring deeper than 24 does not fit one BD 
 # held every layer's tail for the time one stream takes to move 1 MB. The helper takes the pairs in
 # element order through router_acc2 (router_acc_impl twice): the same sums, the same top-k.
 RSPLIT = router_split()
+# UX_SEQ: part 0 in dux.py's issue order (xlayer.linear_sequence_seq / full_sequence_seq) and the MoE
+# parts' up | gate halves in one transfer a slot (xcommon.moe_sequence ug_bd): same bytes per channel.
+SEQ = seq_order()
 
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
@@ -258,6 +261,11 @@ def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *,
         for c in range(N_CORES):
             rtp[c][0] = NBANDS_LIN
             rtp[c][1] = DN_HEADS_PC
+        if SEQ:
+            XL.linear_sequence_seq(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
+                                   side_p, gact_p, gout_c, pin_p, pout_c, ACT_T, CONSTS_T, STATE_T,
+                                   early_out=WORDER, rin=rin_p)
+            return
         XL.linear_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
                            side_p, gact_p, gout_c, pin_p, pout_c, act_t=ACT_T, consts_t=CONSTS_T, state_t=STATE_T,
                            early_out=WORDER, rin=rin_p)
@@ -269,6 +277,10 @@ def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *,
         for c in range(N_CORES):
             rtp[c][0] = NBANDS_FULL
             rtp[c][1] = 0
+        if SEQ:
+            XL.full_sequence_seq(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
+                                 ain_p, aout_c, og_cs, ACT_T, CONSTS_T, STATE_T, rin=rin_p)
+            return
         XL.full_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
                          ain_p, aout_c, og_cs, act_t=ACT_T, consts_t=CONSTS_T, kv_t=STATE_T, rin=rin_p)
 
@@ -281,14 +293,14 @@ def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *,
         elif part == 1:
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres,
                            w_prods, x_prod, y_conss, ACT_T, CONSTS_T, A_XM, A_ROUT, A_RES, A_HP, C_SGW,
-                           early_down=WORDER)
+                           early_down=WORDER, ug_bd=SEQ)
         elif part == 2:
             full_sequence(a_pool, c_xres, a_consts, a_state, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
                           ain_p, aout_c, og_cs, rin_p)
         else:
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres,
                            w_prods, x_prod, y_conss, ACT_T, CONSTS_T, AA_XM, AA_ROUT, AA_RES, AA_HP, CA_SGW,
-                           early_down=WORDER)
+                           early_down=WORDER, ug_bd=SEQ)
 
     rt = Runtime(sequence, [pool_ty, xres_ty, consts_ty, state_ty, act_ty, ptab_ty,
                             of_lni.prod(tile=Tile(0, 0)), of_lno.cons(tile=Tile(0, 0)),
@@ -313,6 +325,6 @@ _src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + sorted(f.rea
                 + [(X.LN / "ln.cc").read_bytes(), (X.LN / "ln.h").read_bytes(), (X.LINL / "ln_nr.cc").read_bytes(),
                    (GEMV / "gemv_q4.h").read_bytes(), (GEMV / "gemv_tab.h").read_bytes(),
                    (HERE.parent.parent / "include" / "vecmath.h").read_bytes(), (HERE.parent.parent / "include" / "scalar_fp.h").read_bytes(), SPEC.spec_hash().encode()])
-if WRING or WORDER or RSPLIT:       # a probe build never shares a jit key with the plain image
-    _src += f"WRING={WRING} WORDER={int(WORDER)} RSPLIT={int(RSPLIT)}".encode()
+if WRING or WORDER or RSPLIT or SEQ:   # a probe build never shares a jit key with the plain image
+    _src += f"WRING={WRING} WORDER={int(WORDER)} RSPLIT={int(RSPLIT)} SEQ={int(SEQ)}".encode()
 SPECIALIZE = {"part": PART, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

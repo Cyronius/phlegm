@@ -55,6 +55,13 @@ def stream_knobs() -> tuple[int, bool]:
     return ring, order
 
 
+def seq_order() -> bool:
+    """UX_SEQ=1 at export: the merged image's part 0 streams in dux.py's issue order (xlayer.py
+    linear_sequence_seq / full_sequence_seq) and its MoE parts fetch a slot's up | gate halves in
+    one transfer (xcommon.moe_sequence ug_bd). Same bytes per channel. In the build key."""
+    return os.environ.get("UX_SEQ", "0") == "1"
+
+
 def router_split() -> bool:
     """UX_RSPLIT=1 at export: the merged image's norm helper takes the router's 1 MB W over two
     shim channels (designs/layer_x/ux.py), not one. In the build key (probe_env)."""
@@ -63,7 +70,7 @@ def router_split() -> bool:
 
 # Timing-only ablations of the layer_x main cores (xcommon.py): outputs are garbage, the DMA
 # is unchanged. In the build key so a probe set never shares a key with a real one.
-_LAYER_PROBE_VARS = ("UX_WRING", "UX_WORDER", "UX_RSPLIT", "LX_NULL_GEMV", "LX_NULL_DN")
+_LAYER_PROBE_VARS = ("UX_WRING", "UX_WORDER", "UX_RSPLIT", "UX_SEQ", "LX_NULL_GEMV", "LX_NULL_DN")
 
 
 def probe_env() -> dict[str, str]:

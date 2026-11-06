@@ -582,7 +582,7 @@ def moe_body(win, ain, yout, B, K, nx=NX):
 
 
 def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prods, x_prod, y_conss,
-                 A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW, nx=NX, early_down=False):
+                 A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW, nx=NX, early_down=False, ug_bd=False):
     """Host sequence of the MoE block (one instruction-stream part). Routed slot j's fills carry
     placeholder pool offsets (expert j); moeroute2 rewrites them from the router output.
     nx must match the body's: NE drops the shared expert's fills with its slot.
@@ -591,7 +591,13 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
     BEFORE the wait on its hidden parts instead of after it. They read only the pool, and each
     channel still carries up, gate, down, up, ... in the order the core consumes them, so the
     cores see the same bytes; the weight stream no longer stops for the hidden's DDR round trip
-    (with a memtile ring, the whole down slice is queued while the core waits for h)."""
+    (with a memtile ring, the whole down slice is queued while the core waits for h).
+
+    ug_bd (ux.py UX_SEQ): a slot's up and gate halves as ONE transfer -- the two half taps one
+    stripe apart as the BD's outer (iteration) dimension, the shared expert's two halves likewise --
+    instead of two: the channel carries the same bytes in the same order with one transfer fewer a
+    slot (the stream issues ~0.7 us a transfer). moeroute2 patches the transfer's base, which is
+    the up half's offset as before."""
     spp, cps = C.STRIPES_PER_PROJ, C.CORES_PER_STRIPE
     pipe_x.fill(x_prod, a_act, bt(A_BYTES, A_XM, ELEM))
     for c in range(N_CORES):
@@ -602,8 +608,17 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
         for c in range(N_CORES):
             if e < NE:
                 up = (2 * spp * e + 2 * (c // cps)) * STRIPE + (c % cps) * PAIR
-                pipe_w.fill(w_prods[c], a_pool, half_tap(up))
-                pipe_w.fill(w_prods[c], a_pool, half_tap(up + STRIPE))
+                if ug_bd:
+                    pipe_w.fill(w_prods[c], a_pool, TensorAccessPattern(
+                        (1, POOL_BYTES), up, [2, HID // 256, 4, PAIR // 4], [STRIPE, 2 * PAIR, PAIR // 4, 1]))
+                else:
+                    pipe_w.fill(w_prods[c], a_pool, half_tap(up))
+                    pipe_w.fill(w_prods[c], a_pool, half_tap(up + STRIPE))
+            elif ug_bd:
+                assert HALF % 2048 == 0 and POOL_SHARE_GATE > POOL_SHARE_UP, (HALF, POOL_SHARE_UP, POOL_SHARE_GATE)
+                pipe_w.fill(w_prods[c], a_pool, TensorAccessPattern(
+                    (1, POOL_BYTES), POOL_SHARE_UP + c * HALF, [2, 1, HALF // 2048, 2048],
+                    [POOL_SHARE_GATE - POOL_SHARE_UP, 0, 2048, 1]))
             else:
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_UP + c * HALF, HALF))
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_GATE + c * HALF, HALF))

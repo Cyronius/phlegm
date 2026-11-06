@@ -409,6 +409,116 @@ def linear_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods,
     px.finish()
 
 
+def ln2_router(lni, lno, rin, c_xres, a_consts, a_act, consts_t, act_t, c_postln, c_rw, a_out, a_res, a_xm, a_rout,
+               before_out):
+    """The tail of a part 0 in the issue order of ux.py UX_SEQ: the residual + post-attention norm's
+    inputs that do not depend on the out projection (xres, the norm weight), then `before_out()`
+    (the wait for out), then out, and the router's W straight behind it on lni (and its odd elements
+    on rin, UX_RSPLIT) -- the helper takes W only after the norm, so W may queue behind the norm's
+    inputs, and nothing waits on res / xm in between. Each channel carries what it carried before,
+    in the same order; one wait at the end."""
+    tg = TaskGroup()
+    lni.fill(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg)
+    lni.fill(a_consts, tap=bt(consts_t, c_postln, ELEM), wait=True, group=tg)
+    lno.drain(a_act, tap=bt(act_t, a_res, HID * 4), wait=True, group=tg)
+    lno.drain(a_act, tap=bt(act_t, a_xm, ELEM), wait=True, group=tg)
+    lno.drain(a_act, tap=bt(act_t, a_rout, ELEM), wait=True, group=tg)
+    before_out()                                     # out is in DDR
+    lni.fill(a_act, tap=bt(act_t, a_out, HID * 4), wait=True, group=tg)
+    router_fill(lni, rin, a_consts, consts_t, c_rw, tg)
+    tg.finish()
+
+
+def linear_sequence_seq(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
+                        side_p, gact_p, gout_c, pin_p, pout_c, act_t, consts_t, state_t, early_out=False, rin=None):
+    """linear_sequence in the merged image's UX_SEQ issue order -- the order designs/layer_x/dux.py
+    (the dense twin) was measured into, where a part 0 is bound by how fast the instruction stream
+    issues transfers (~0.7 us each) and by what waits in front of what, more than by its bytes:
+
+    - only each core's first weight fill before the entry norm's wait, the xn at once after it;
+    - DeltaNet head-major over the cores (round h = heads 8h .. 8h+7, one per core: a head is
+      self-contained -- record, S and o at the head's own offsets -- so which core runs it changes
+      no byte), S read for both passes in ONE transfer (the BD's repeat dimension: the w channel
+      carried S twice back to back anyway), and post's group h issued as soon as round h's o is
+      in DDR, so post runs beside DeltaNet instead of after it;
+    - the out projection's weights right behind the last DeltaNet fill (early_out) or after post;
+    - the tail through ln2_router (one wait, router W queued behind the norm's inputs).
+    Every core and helper receives the same bytes in the same order and runs the same calls."""
+    from aie.helpers.taplib import TensorAccessPattern
+    QKV_PC, Z_PC, OUT_PC, VW, OUT_K = D.QKV_PC, D.Z_PC, D.OUT_PC, D.VW, D.OUT_K
+    BB_HID, BB_OUT = X.role_band_bytes("linear", HID), X.role_band_bytes("linear_out", OUT_K)
+    assert NG == X.DN_HEADS_PC and G == N_CORES * SPEC.lin_value_dim, (NG, X.DN_HEADS_PC, G)
+    assert X.DN_SLICE == X.CALL_BYTES, "UX_SEQ: S as plain slices only (the q4_1 / q8 element)"
+    tg_ln = TaskGroup()
+    lni.fill(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln)
+    lni.fill(a_consts, tap=bt(consts_t, C_LNW, ELEM), wait=True, group=tg_ln)
+    lno.drain(a_act, tap=bt(act_t, A_XN, ELEM), wait=True, group=tg_ln)
+    pw, py, px = Pipeline(3), Pipeline(3), Pipeline(3)
+    for c in range(N_CORES):
+        pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_QKV + c * QKV_PC * BB_HID, QKV_PC * BB_HID))
+    tg_ln.finish()                                   # xn is in DDR
+    px.fill(x_prod, a_act, bt(act_t, A_XN, ELEM))
+    for c in range(N_CORES):
+        pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_Z + c * Z_PC * BB_HID, Z_PC * BB_HID))
+        py.drain(y_conss[c], a_act, bt(act_t, A_QKV + c * QKV_PC * YB, QKV_PC * YB))
+        py.drain(y_conss[c], a_act, bt(act_t, A_Z + c * Z_PC * YB, Z_PC * YB))
+    tg_s = TaskGroup()
+    side_p.fill(a_act, tap=bt(act_t, A_XN, ELEM), wait=True, group=tg_s)
+    side_p.fill(a_consts, tap=bt(consts_t, C_SIDE, GLUE_SIDE_BYTES), wait=True, group=tg_s)
+    py.finish_oldest(*y_conss)                       # qkv is in DDR (the cores are on z)
+    pipe = Pipeline(3)
+    for tt in range(NT):
+        pipe.drain(gout_c, a_state, rows3(tt, state_t))
+        if tt >= KEY_TILES:
+            pipe.drain(gout_c, a_act, bt(act_t, A_VEC + (tt - KEY_TILES) * D.HEADS_PER_TILE * D.RECORD_BYTES,
+                                         D.HEADS_PER_TILE * D.RECORD_BYTES))
+        pipe.fill(gact_p, a_act, bt(act_t, A_QKV + tt * TILE * 4, TILE * 4))
+        pipe.fill(gact_p, a_state, rows3(tt, state_t))
+    pipe.finish()                                    # the records are in DDR
+    tg_s.finish()
+    # DeltaNet head-major with post overlapped (dux.py dn_post_sequence, against these totals)
+    rec, ohb = D.RECORD_BYTES, D.O_HEAD_BYTES
+    pp = Pipeline(3)
+    pp.fill(pin_p, a_consts, bt(consts_t, C_NW, ELEM))
+
+    def post_group(g):
+        pp.drain(pout_c, a_act, bt(act_t, A_OG + g * G * 2, G * 2))
+        pp.fill(pin_p, a_act, bt(act_t, A_O + g * G * 4, G * 4))
+        pp.fill(pin_p, a_act, bt(act_t, A_Z + g * G * 4, G * 4))
+
+    for h in range(X.DN_HEADS_PC):
+        for c in range(N_CORES):
+            hd = h * N_CORES + c
+            s_off = STATE_S_OFF + hd * S_HEAD_BYTES
+            pw.fill(w_prods[c], a_act, bt(act_t, A_VEC + hd * rec, X.CALL_BYTES))
+            pw.fill(w_prods[c], a_state, TensorAccessPattern((1, state_t), s_off, [2, 1, 1, S_HEAD_BYTES],
+                                                             [0, 0, 0, 1]))       # S for pass 1 and pass 2
+            py.drain(y_conss[c], a_state, bt(state_t, s_off, S_HEAD_BYTES))     # S' back in place
+            py.drain(y_conss[c], a_act, bt(act_t, A_O + hd * ohb, ohb))
+        if h:
+            assert all(len(py._q(e)) == 3 for e in y_conss)
+            py.finish_oldest(*y_conss)                 # round h-1's o: post group h-1 can run
+            post_group(h - 1)
+
+    def out_fills():
+        for c in range(N_CORES):
+            pw.fill(w_prods[c], a_consts, bt(consts_t, C_WOUT + c * OUT_PC * BB_OUT, OUT_PC * BB_OUT))
+    if early_out:
+        out_fills()
+    py.finish(*y_conss)                                # the last round's o
+    post_group(X.DN_HEADS_PC - 1)
+    for c in range(N_CORES):
+        py.drain(y_conss[c], a_act, bt(act_t, A_OUT + c * OUT_PC * YB, OUT_PC * YB))
+    if not early_out:
+        out_fills()
+    pp.finish()                                        # og is in DDR
+    px.fill(x_prod, a_act, bt(act_t, A_OG, VW * 2))
+    ln2_router(lni, lno, rin, c_xres, a_consts, a_act, consts_t, act_t, C_POSTLN, C_RW, A_OUT, A_RES, A_XM, A_ROUT,
+               lambda: py.finish())
+    pw.finish()
+    px.finish()
+
+
 # ---- the full-attention layer's attention cores (Tile(2 + c, 3), c < ACORES)
 A = R.attn
 if A is not None:
@@ -744,6 +854,57 @@ def full_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_pro
     lno.drain(a_act, tap=bt(act_t, AA_ROUT, ELEM), wait=True, group=tg_r)
     tg_ln2.finish()
     tg_r.finish()
+    pw.finish()
+    pa_in.finish()
+    tg_x.finish()
+
+
+def full_sequence_seq(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
+                      ain_p, aout_c, og_cs, act_t, consts_t, kv_t, rin=None):
+    """full_sequence in the merged image's UX_SEQ issue order (dux.py's, see linear_sequence_seq):
+    only q's weights before the entry norm's wait and the xn at once after it; the o projection's
+    weights and drains as soon as gate | k | v are in DDR, ahead of the attention fills whose
+    throttle waits used to hold them back; the tail through ln2_router. Same bytes, same order on
+    every channel, the same calls on every core."""
+    tg_ln = TaskGroup()
+    lni.fill(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln)
+    lni.fill(a_consts, tap=bt(consts_t, CA_LNW, ELEM), wait=True, group=tg_ln)
+    lno.drain(a_act, tap=bt(act_t, AA_XN, ELEM), wait=True, group=tg_ln)
+    pw, py = Pipeline(3), Pipeline(3)
+    for c in range(N_CORES):
+        pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, *w_regions(c)[0]))
+    tg_ln.finish()                                            # xn is in DDR
+    tg_x = TaskGroup()
+    x_prod.fill(a_act, tap=bt(act_t, AA_XN, ELEM), wait=True, group=tg_x)
+    for c in range(N_CORES):
+        for off, n in w_regions(c)[1:3]:
+            pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, off, n))
+        for off, n in y_regions(c)[:3]:
+            py.drain(y_conss[c], a_act, bt(act_t, off, n))
+    for c in range(N_CORES):
+        pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, *w_regions(c)[3]))
+        py.drain(y_conss[c], a_act, bt(act_t, *y_regions(c)[3]))
+    pa_out, pa_in = Pipeline(3), Pipeline(3)
+    pa_out.drain(aout_c, a_kv, bt(kv_t, KV_ROW, KV_ROW))        # the new row [k' | v'] -> row pos (attnpos)
+    pa_out.drain(aout_c, a_act, bt(act_t, AA_OG, NHL * HD * 2))
+    for c in range(1, ACORES):                                  # heads NHL*c ..
+        pa_out.drain(og_cs[c - 1], a_act, bt(act_t, AA_OG + c * NHL * HD * 2, NHL * HD * 2))
+    pa_in.fill(ain_p, a_consts, bt(consts_t, CA_META, A.E_A))          # [qn | kn], one element
+    pa_in.fill(ain_p, a_ptab, bt(PTAB_BYTES, PTAB_ROW, PTAB_ROW))   # the position record (attnpos)
+    assert all(len(py._q(e)) == 3 for e in y_conss), "q's drain must be the one retired"
+    pa_in.fill(ain_p, a_act, bt(act_t, AA_QG, QW * 4))
+    py.finish(*y_conss)                                       # gate, k, v are in DDR
+    for c in range(N_CORES):
+        pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, *w_regions(c)[4]))
+        py.drain(y_conss[c], a_act, bt(act_t, *y_regions(c)[4]))
+    pa_in.fill(ain_p, a_act, bt(act_t, AA_KVN, KVW * 4))
+    pa_in.fill(ain_p, a_act, bt(act_t, AA_KVN + KVW * 4, KVW * 4))
+    pa_in.fill(ain_p, a_kv, bt(kv_t, 0, KV_ROW))                 # the window: rows [0, nf) (attnpos)
+    pa_in.fill(ain_p, a_act, bt(act_t, AA_QG + QW * 4, QW * 4))
+    pa_out.finish()                                           # og (and the new cache row) are in DDR
+    x_prod.fill(a_act, tap=bt(act_t, AA_OG, QW * 2), wait=True, group=tg_x)
+    ln2_router(lni, lno, rin, c_xres, a_consts, a_act, consts_t, act_t, CA_POSTLN, CA_RW, AA_OUT, AA_RES, AA_XM,
+               AA_ROUT, lambda: py.finish())
     pw.finish()
     pa_in.finish()
     tg_x.finish()
