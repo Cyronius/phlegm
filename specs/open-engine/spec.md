@@ -3680,6 +3680,98 @@ byte-identical at all 300. Over all 64 layers with `--max-tokens 8` the 8 greedy
 the same, and the last prompt position and every decode step have equal argmax and top-5
 (corr >= 0.999971). Not run for the 27B: `oflm-test --llm` through `oflm serve`, which cannot
 load it -- the 27B is not in `src/model_list.json`.
+
+### OPEN-FAMILY-SALUKI: Underdog Saluki 27B, an i-quant Qwen3.8-27B GGUF, at q8 on the NPU
+**Applies to:** `open_kernels/recipes/qwen35.py` (`gguf_view`, `finalize_gguf_manifest`,
+`quant_for_gguf`), `recipes/load.py` (`quant_for`), `recipes/catalogue.py` (`gemv_q8` K),
+`upstream-patches/saluki-runtime.patch` (`gguf_iq.hpp`, `pools.cpp` q35 ops, `block_host.cpp`,
+`manifest.cpp`, `core.cpp`), `model/saluki_gguf_check.py`, `model/saluki_gguf_reference.py`,
+`phlegm-core/config/model_list.json` (`underdog-saluki:27b`)
+**Test category:** unit (`specs/open-engine/tests/test_saluki_gguf.py`) + manual (NPU and model)
+
+ConwayResearch/Underdog-Saluki-27B-1.0 is Qwen3.8-27B published only as a llama.cpp `qwen35` GGUF
+(`Underdog-Saluki-27B-1.0-IQ2-mix.gguf`, 7.9 GB, ISTA DASLab GSQ-RCO with an imatrix). Its geometry
+is exactly OPEN-FAMILY-QWEN35's 27B. Its projections mix eleven types tensor by tensor (IQ1_S,
+IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, Q2_K, Q4_K; alpha / beta Q8_0; the head
+IQ3_S and the embedding IQ1_M), so no kernel streams its codes and one layer type sees several
+types. It shall run on the NPU from the unmodified file:
+- **The weight law is q8.** A model directory whose `model.gguf` has a projection type outside
+  Q4_0 / Q4_1 / Q4_K derives every Qwen3.5 role at q8 (`quant_for_gguf`), so the all-q8 lx / ax
+  two-context set (not the merged image) streams 16-row q8 half-tiles. A 32-value block with one
+  scale and integer codes |c| <= 127 keeps those codes and rounds only the scale to bf16 (RNE):
+  IQ2_XXS (+-8, 25, 43), IQ3_XXS (<= 62), IQ3_S (odd <= 15), IQ1_S (8 g +- 1), IQ4_XS (the
+  non-linear table), Q8_0, Q4_0, and IQ2_XS / IQ2_S / IQ1_M blocks whose two half scales still fit.
+  Every other block is requantized to int8 (amax / 127, scale bf16_ceil). The q4_1 law cannot hold
+  the 2-bit grids: requantized to it, these tensors measure 3.8-8.6e-2 relative L2, against 3-7e-3
+  for a plain int8 requantization and 1.6-1.7e-3 for the kept codes.
+- The decoders follow `ggml-quants.c`'s `dequantize_row_*` value for value (`gguf_iq.hpp`; the
+  grids are generated from llama.cpp's `ggml-common.h`). The embedding row and the head read the
+  same decoders; the head is `lm_head_q8` with the IQ3_S codes kept.
+- The view is the all-q8 manifest itself with every op translated: `q8_perm` -> `q35_q8`, the
+  block route's split `std_perm` halves -> `q35_mat` `split` hi / lo (the exact q4_1 split of the
+  same q8 values), the alpha / beta `transpose` -> `q35_t`, and the qwen35moe view's maps for the
+  per-head `[q | gate]` interleave and the tiled value heads. q4_1 and mixed Qwen3.5 specs keep the
+  manifests they ship.
+- **The dense block route keeps the 27B's decode state ABI.** The layout says `attn_kv_dtype`
+  `bfloat16_pair` and `linear_conv_dtype` `float32`; the route's host attention writes and reads KV
+  rows as [K hi, K lo, V hi, V lo] (lo = bf16(x - hi)) and the DeltaNet keeps an f32 conv history.
+  The NPU block-attention products read plain rows, so a paired set's block attention runs on the
+  host. Without this the route's own prefill logits were right (488/491 against llama.cpp) and every
+  decode step after it was wrong (logit correlation 0.73-0.93 against the sequential path).
+
+**Acceptance criteria (unit):** the all-q8 27B view has only `put` / `q35_*` ops at the base
+manifest's offsets, every `q8_perm` becomes a `q35_q8` with the same `nch` / `in_dim`, and every route
+weight is a `pack` of `q35_mat` hi / lo; the q_proj maps are (512, 256, 0) and (512, 256, 256), qkv's
+untile (16, 3, 128, 4096), ssm_out's on axis 1, alpha / beta 48 rows into 64 lanes; a q4_1 27B spec
+gains no q35 op; `quant_for_gguf` gives all-q8 for an IQ2_XXS projection and nothing for a Q4_0 /
+Q4_K one.
+
+**Result 2026-11-06 (Underdog-Saluki-27B-1.0 @ `442e28ec`, sha256 `4a673518...5d9efb`; kernel set
+spec `sha256:2a09fbd5b07f`, mlir-aie 1.4.2, Peano 21.0.0.2026080301): PASS.**
+- Build: lx fullest core 14 736 / 16 384 B, ax 13 760; the five route GEMMs (the q4_1 27B's N doubled
+  by the split) 4 784 B. POOL_BYTES 465 567 744 a layer; host memory about 33 GB of decode weights
+  plus 29 GB of route weights (`OFLM_OPEN_GEMM_BLOCK=0` skips the latter at load).
+- Pack check (`q35_pack_dump` layers 0, 3, 6, 7 and the head, `model/saluki_gguf_check.py` against
+  gguf-py's dequantization): ALL OK. Kept-code tensors 1.62-1.70e-3 relative L2 (the bf16 scale
+  only), requantized ones IQ1_M 2.4-2.5e-3, Q2_K 5.2e-3, Q4_K 5.6e-3, IQ2_S 6.5-6.6e-3; small
+  tensors bit-equal; every route weight's hi + lo equals the decode pool's q8 values bit for bit.
+- 8-layer slice, 32 positions, against the fp64 reference over the GGUF's own values
+  (`model/saluki_gguf_reference.py`, gguf-py dequantization, replica_qwen35's math): logits corr
+  >= 0.999990 (sequential) / 0.999988 (block route), argmax 32/32, KL median 1.7e-5. This entered
+  `gemv_q8` K 5120 / 6144 / 8192 / 9216 into the catalogue.
+- Whole model, short prompt (32 tokens), three-way: NPU vs fp64 reference argmax 32/32, full-vocabulary
+  KL median 7.4e-6 (max 4.2e-4); llama.cpp CPU vs fp64 reference 32/32, top-20 partial KL median
+  4.2e-4; NPU vs llama.cpp CPU 32/32, 4.8e-4. The NPU is closer to the exact arithmetic than
+  llama.cpp's CPU path (q8_K activations) is.
+- Against llama.cpp build 12015 CPU on the same file (top-20 partial KL; 491-token prompt crossing
+  the 256-row block):
+
+| run | argmax | KL median / mean / p95 | 64 / 48 greedy tokens |
+| --- | --- | --- | --- |
+| short, sequential | prompt 1/1, decode TF 64/64 | 6.9e-6 / 2.5e-4 / 9.7e-4 | 64/64 |
+| short, block route | 64/64 | 7.2e-6 / 2.5e-4 / 1.2e-3 | 64/64 |
+| long, sequential | 488/491 | 3.3e-4 / 1.2e-3 / 9.9e-3 | 48/48 |
+| long, block route | 487/491 | 4.1e-4 / 1.5e-3 / 1.1e-2 | 48/48 |
+
+  Positions 0-255 / 256-490 / 240-271 on the block route: 253/256, 234/235, 32/32.
+  A llama.cpp CPU-vs-Vulkan control was not available (the GPU was leased by another session).
+  Pack checked further on layers 9, 15, 17 and 35 (IQ2_XS 6.6-6.7e-3, IQ3_XXS 1.65-1.68e-3): ALL OK.
+- `phlegm run` (worktree build, `bridges/saluki`, block route): a short reasoning, then "The capital
+  of France is Paris." (127 s wall including the load). `phlegm serve`: `/health` ok, `/v1/models`
+  lists the model; non-streamed "red, blue, yellow" with the thinking in `reasoning_content` (stop,
+  39 tokens, 52 s); streamed with `enable_thinking` false: `sum(i**2 for i in range(1, 11))` in a
+  code fence, then `[DONE]` (34 s).
+- Over the prompt plus llama.cpp's 64 greedy tokens (95 positions) against the fp64 reference: NPU
+  argmax 95/95, full-vocabulary KL median 3.0e-7 (max 4.2e-4), logit corr >= 0.99974; llama.cpp CPU
+  on the 65 decode positions: 65/65, top-20 partial KL median 6.4e-6.
+- **The gap is speed.** Development timing (`.plans/saluki.md`; three rounds, block route, 491-token
+  prompt, 128 decoded tokens, NPU otherwise idle, an fp64 reference job on the CPU): prefill 27.1 /
+  29.0 / 32.0 s (55-65 ms a token, attention on the host), decode 906 / 907 / 924 ms a token (1.1
+  tok/s: q8 streams about 30 GB a token on two contexts). Sequential prefill: 459 s. llama.cpp CPU
+  (16 threads) on the same file, at an earlier hour of the same session: 9.1 s prefill, 246 ms a
+  token. Keeping the i-quant codes on the NPU would need GEMV / GEMM kernels that decode the grids;
+  the q4_1 view would halve the bytes at 20-50x the weight error.
+
 ### OPEN-CONVERT-QWEN35-VHEADS: a GGUF's tiled value heads come back in grouped order
 **Applies to:** openflowlm-next (`utilities/q4nx-build/q4nx/models/qwen35.py`)
 **Verification:** test

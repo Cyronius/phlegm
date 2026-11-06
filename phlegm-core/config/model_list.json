@@ -230,6 +230,23 @@
           "top_p": 0.95
         }
       }
+    },
+    "underdog-saluki": {
+      "27b": {
+        "name": "Underdog-Saluki-27B-1.0-NPU2",
+        "default_context_length": 32768,
+        "details": {
+          "family": "qwen3.5",
+          "parameter_size": "27B",
+          "quantization_level": "IQ2_mix",
+          "think": true
+        },
+        "sampling": {
+          "temperature": 0.6,
+          "top_k": 20,
+          "top_p": 0.95
+        }
+      }
     }
   }
 }

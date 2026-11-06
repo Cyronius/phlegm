@@ -146,9 +146,13 @@ CATALOGUE: dict[str, Template] = {t.name: t for t in [
               "per_call": values(2, 1)},         # chunks per w element (10 KB; 5 KB when the table is wide)
              note="a new K needs gemv_q4/make_test.py + compare.py at that K first"),
     Template("gemv_q8", "designs/gemv_q4/gemv_q8.h",
-             {"K": values(2048, 4096),           # 2048: the 35B's qkv / z / q / k / v / gate;
+             {"K": values(2048, 4096, 5120, 6144, 8192, 9216),
+                                                 # 2048: the 35B's qkv / z / q / k / v / gate;
                                                  # 4096: its out and o projections. Both entered with
                                                  # OPEN-QUANT-Q8's hardware pass (Ornith-1.0-35B-A3B).
+                                                 # 5120 / 6144 / 8192 + 9216 (the down split): the all-q8
+                                                 # Qwen3.8-27B, Underdog Saluki 27B's 8-layer slice against
+                                                 # the fp64 GGUF reference (OPEN-FAMILY-SALUKI, 2026-11-06)
               "rs": values(4),                   # a q8 band is four 16-row half-tiles per k-tile
               "rows_per_core": multiple_of(64),  # one y element per 64-row band, as the q4 GEMV
               "per_call": values(2, 1)},         # half-tiles per w element (same 5120 B element)

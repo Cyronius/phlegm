@@ -762,5 +762,36 @@
     "note": "The same attention_block replacement as block-host-attention-runtime.patch, against the lfm2moe-block point of the chain (attention_block before lfm3's window): the lfm2moe-runtime clone (bridges/lfm2moe-blk) and the hyv3-runtime clone (bridges/hyv3-blk, over hyv3-block-runtime.patch, which does not touch block_host.cpp). Flint's flint-block-runtime.patch carries the same body with its sinks argument folded in (regenerated 2026-11-04). NPU A/B: target/npu-dev/prefill-prof/ab-lfm25.json, ab-hy.json.",
     "patch": "block-host-attention-lfm2moe-runtime.patch",
     "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "saluki_runtime_20261106": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gptoss_runtime_20261031",
+      "qwen35moe_gguf_20261031"
+    ],
+    "files": [
+      "src/open_qwen36/block_host.cpp",
+      "src/open_qwen36/block_host.hpp",
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/gguf_file.cpp",
+      "src/open_qwen36/gguf_iq.hpp",
+      "src/open_qwen36/gguf_iq_tables.hpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp",
+      "src/open_qwen36/pools.cpp",
+      "src/open_qwen36/q35_pack_dump.cpp"
+    ],
+    "note": "Underdog Saluki 27B (Qwen3.8-27B as an IQ2-mix llama.cpp qwen35 GGUF) on the all-q8 Qwen3.5 dense view (OPEN-FAMILY-SALUKI, recipes/qwen35.py gguf_view): gguf_iq.hpp decodes IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / Q2_K per 32-block as ggml-quants.c (tables generated from llama.cpp a34de8618b25 ggml-common.h, MIT) with the block's integer law where it has one; q35 ops read them; new op q35_q8 (q8_perm half-tiles; a law block keeps its codes, scale RNE bf16, others requantized amax/127); q35_mat `split` hi / lo (the block route's exact q4_1 split of the same q8); q35_lmhead keeps an i-quant head's codes; q35_put keeps a law block's codes on the q4_1 grid when they are uniform; GGUF embed_row and sizes for the i-quants; the manifest accepts q35_q8, q35_mat split and q35_mat route weights; the 27B decode state ABI on the block route (layout attn_kv_dtype bfloat16_pair: host attention_block reads / writes [K hi, K lo, V hi, V lo] rows and the NPU block attention is off; linear_conv_dtype float32: deltanet_block keeps an f32 conv history) -- without it the route's prefill is right and the decode after it is not; OFLM_OPEN_GEMM_BLOCK=0 skips the route weights at load; q35_pack_dump dumps route weights. A diff over base plus the nine Gemma 4 patches, gptoss-runtime.patch (8a5f808e) and qwen35moe-gguf-runtime.patch (30d20e96); regenerated as the diff of target/npu-dev/saluki-runtime against qwen35moe-runtime, round-trip checked; built in target/npu-dev/saluki-runtime, bridge target/npu-dev/bridges/saluki",
+    "patch": "saluki-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
   }
 }

@@ -274,6 +274,21 @@ CPU), so it would run at 0.7-1.2 tok/s. Self-speculative w=16 accepted 3.3-6.7 t
 1.3-2.6 tok/s. Both beat AR only if a W-row pass costs a few decode steps (a narrow route, the coreset's
 smaller expert union, a batched head). Plan: [.plans/clover.md](.plans/clover.md); spec `OPEN-FAMILY-CLOVER`.
 
+## Underdog Saluki 27B (Qwen3.8-27B, IQ2-mix GGUF)
+
+Saluki runs on the NPU from its unmodified GGUF (2026-11-06): `/home/cyrus/models/Underdog-Saluki-27B-1.0-NPU2`,
+registry `underdog-saluki:27b`. No kernel reads i-quant codes and the file mixes ten projection types, so the
+model streams every projection at q8: a block with one scale and integer codes keeps them (bf16 scale), the
+rest are requantized to int8 (`saluki-runtime.patch`, the all-q8 Qwen3.5 dense GGUF view). Pack check ALL OK
+(kept codes 1.6-1.7e-3, requantized 2.4-6.6e-3). Against llama.cpp CPU on the same file: 488/491 (sequential)
+and 487/491 (block) on the 491-token prompt at partial KL median 3-4e-4, 64/64 and 48/48 greedy tokens; against
+an fp64 reference over the GGUF's values the NPU is closer than llama.cpp CPU is (KL 7e-6 vs 4e-4). The block
+route needed the 27B's decode state ABI (paired KV rows, f32 conv history) in this runtime lineage. `phlegm run` and
+`serve` (streamed and not) answer, with the thinking in `reasoning_content`. The gap is
+speed: 0.91 s a decode token and 27-32 s for a 491-token prefill, against llama.cpp CPU's 0.25 s and 9 s.
+Open: a CPU-vs-Vulkan control, a quiet-machine timing, kernels that keep the i-quant grids (or a smaller law).
+Plan: [.plans/saluki.md](.plans/saluki.md); spec `OPEN-FAMILY-SALUKI`.
+
 ## Qwen3.5 MoE 35B-A3B (Ornith 1.5, Nex N2.5 mini, KAT Coder V2.5 Dev)
 
 KAT Coder V2.5 Dev runs on the NPU from bartowski's unmodified Q4_0 GGUF. It uses the qwen36moe
