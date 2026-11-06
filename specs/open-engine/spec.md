@@ -7857,6 +7857,74 @@ median ms: base 46.3-46.6 / 46.4-46.9, ring 44.0-44.1 / 44.2-44.4 (re-checked wi
 against final 41.2-41.3 / 41.4-41.6, and base 46.0 / 46.2 in another unit). Same sitting, not kept: a 24-deep ring 41.0 / 41.6
 against 16-deep 41.2 / 41.4 (with one context); the layer's unused last xn and its drain dropped, 41.1 / 41.4.
 
+### OPEN-DECODE-STREAM-UX: the MoE family's merged layer image streams in dux's issue order, through memtile rings
+**Applies to:** openflowlm-next (`open_kernels/designs/layer_x/ux.py`, `xlayer.py` `linear_sequence_seq` /
+`full_sequence_seq` / `ln2_router` / `router_fill`, `xcommon.py` `moe_sequence` / `ln_router_body2`,
+`open_kernels/designs/router/router_acc2.cc`, `open_kernels/recipes/qwen36moe.py` `stream_knobs()` / `seq_order()` /
+`router_split()`)
+**Verification:** manual (the NPU and the model)
+
+For a qwen36moe kernel geometry in `STREAM_MEASURED_KERNELS` (the 35B-A3B geometry, kernel hash
+`sha256:2a3631c0cf5f`: the reference Qwen3.6-35B-A3B and its GGUFs -- KAT Coder, Ornith, Nex, Clover), the merged
+layer image (OPEN-DECODE-ONE-CONTEXT) shall stream as follows. Every core and helper receives the same bytes in the
+same order on every channel and runs the same calls, so every logit is unchanged; the main-core program is untouched
+(16256 of 16384 B, as before).
+- **Ring (`UX_WRING`, default 16):** each main core's weight fifo runs shim -> a 16-deep ring of 10 KB elements in its
+  column's memtile (channels 0 in, 1 out) -> core, OPEN-DECODE-STREAM's ring.
+- **Order (`UX_SEQ`, default on):** part 0 in the issue order designs/layer_x/dux.py (the dense twin) was measured into:
+  only each core's first weight fill ahead of the entry norm's wait and the xn at once after it; DeltaNet head-major
+  over the cores (round h = heads 8h .. 8h+7, one per core; a head is self-contained, so which core runs it changes
+  no byte) with S for both passes in ONE transfer (the BD's repeat dimension) and post's group h issued as soon as
+  round h's o lands; the full layer's o projection issued as soon as gate | k | v land; both tails' post-attention
+  norm inputs, drains and router W queued with one wait (`ln2_router`). The MoE parts fetch a routed slot's up and
+  gate halves (one stripe apart) as ONE transfer through the BD's iteration dimension, the shared expert's likewise;
+  moeroute2 patches that transfer's base, the up half's offset, as before.
+- **Early weights (`UX_WORDER`, default on):** the MoE parts issue each slot's down fills ahead of the wait on its
+  hidden parts; the linear part issues the out projection's fills right behind the last DeltaNet fill.
+- **Router over two channels (`UX_RSPLIT`, default on):** the router's W (256 x 4 KB) reaches the norm helper as its
+  even elements on `lni` and its odd ones on a second fifo `rin` from shim (6, 0)'s free fill channel; the helper
+  takes each pair in element order through `router_acc2` (`router_acc_impl` twice), the same sums.
+- Every knob is an export variable in the build key (`probe_env`, with the `LX_NULL_GEMV` / `LX_NULL_DN` ablations);
+  `=0` forces a change off, and with all four off the image is byte for byte the previous one. Another geometry of
+  the family (the 27B) builds as before until it is measured.
+
+**Verification (manual):**
+1. Export lx0, lx1, ax0, ax1 (`export_qwen36_kernels.py --model-dir <model> --only lx0,lx1,ax0,ax1 --out <dir>`) and
+   overlay them on a copy of the model's set (its manifest is unchanged apart from the build key). Every core's
+   `.text` fits 16384 B.
+2. Against the previous set, the same CLI (`open_qwen36_cli --max-ctx 4096 --quiet`): the 19 ids of
+   OPEN-DECODE-PIPELINE sequentially with `--prefill-logits --max-tokens 20 --dump-logits` (39 files); the 491-token
+   and 3000-token prompts (`qwen35moe-ref/clover/long.cids`, `long3k.cids`) with `--gemm-block --max-tokens 64
+   --dump-logits` (65 files each): every file byte-identical and every token id the same.
+3. Timing: `--bench-step 20` at a fixed position (`--at-position P`), sets alternated round by round, and real decodes
+   (128 tokens after the 491 / 3000-token prompts, block prefill, `OFLM_OPEN_STEP_TRACE=1`) alternated, with the host
+   load and the other NPU / iGPU clients recorded.
+
+**Result 2026-11-06 (Clover-35B-A3B-Preview-Q4pure-NPU2; Strix Halo; development timing, not a benchmark).**
+- What bounds the walk, before: `--bench-decode 10` at position 601, walk minima lx0 0.909 ms (28.6 MB), ax0 0.811
+  (18.6 MB), lx1 / ax1 0.486 (17.2 MB), lm 10.45 (516 MB, 49 GB/s). A build with the GEMV and DeltaNet arithmetic
+  compiled out and every DMA kept (`LX_NULL_GEMV=1 LX_NULL_DN=1`) walked the same (lx0 0.904 against 0.906, lx1 0.495
+  against 0.492, one round), so the main cores' arithmetic was hidden and the layer was bound by its stream: what
+  waits in front of what, and the instruction stream's transfer issue (~0.7 us each, dux.py's measurement). The ring
+  alone did not move the walk.
+- Gates (2) on every variant -- ring alone, ring + early weights, router split, order, order + router split, and all
+  four (the default): every logit file byte-identical (39 + 65 + 65) and every token the same. The assembled
+  default sets (`open_kernels_stream`, below) pass the same gates on Clover and on KAT Coder V2.5 Dev Q4K.
+- Timing on a loaded box (load 8-35; another process's llama.cpp on the iGPU, so the head ran 14.5-16 ms against
+  10.4 quiet; `dibs run --measure` blocked by a GPU lease): `--bench-step 20` at position 601, sets alternated over
+  8 rounds in two sittings, the default set's submit-ahead step against the previous set's, median of the
+  per-round ratios: 0.872-0.881 (step minimum), 0.894-0.900 (step median); at position 3001 (3 rounds) 0.851 /
+  0.902 (24-deep ring 0.860 / 0.931, no early weights 0.957 / 0.962). Of the parts: order alone 0.959 / 0.953, router split alone 0.999 / 0.983, all but the early weights
+  0.889 / 0.929, a 24-deep ring 0.852 / 0.851 (noise against 16), the default with null compute 0.861 / 0.889 (the
+  arithmetic is still hidden). Real decodes (128 tokens after 491 / 3000 prompt tokens, block prefill, 3 alternated
+  rounds): ms/token 91 / 86 / 96 -> 83 / 89 / 86 and 99 / 101 / 105 -> 93 / 97 / 98; per step, in units of the
+  (unchanged) head's time, part 0 2.97 -> 2.67 at ~500 and 3.66 -> 3.42 at ~3000, part 1 1.68 -> 1.54. Again
+  at load 5-7 (the iGPU client still up; the assembled `open_kernels_stream` against `open_kernels`, 3 rounds):
+  step-trace mean 83.9 / 85.0 / 85.7 -> 78.5 / 77.3 / 76.9 ms at ~500 (per-round 0.898-0.936) and 94.8 / 95.2 / 95.0
+  -> 88.4 / 88.1 / 87.7 at ~3000 (0.923-0.933); part 0 -9 to -12 %, part 1 -7 to -12 %, every pair faster. A
+  quiet-box absolute (no iGPU client; the head at its 10.4 ms) is open. Evidence: `target/npu-dev/decode-stream/` (`ab1/`, `ab2/`, `time1/`, `gates/`), plan
+  `.plans/clover.md` 2026-11-06.
+
 ### OPEN-DECODE-ONE-CONTEXT-DENSE: a dense decode token runs in one hardware context
 **Applies to:** openflowlm-next (`open_kernels/designs/dense/dx.py` `DX_ONECTX` / `DX_HEAD`, `open_kernels/recipes/dense.py`
 `one_context()` / `programs()` / `builds()`, `src/open_qwen36/core.cpp` `Core::step_impl`)

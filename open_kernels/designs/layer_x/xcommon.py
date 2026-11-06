@@ -582,10 +582,22 @@ def moe_body(win, ain, yout, B, K, nx=NX):
 
 
 def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prods, x_prod, y_conss,
-                 A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW, nx=NX):
+                 A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW, nx=NX, early_down=False, ug_bd=False):
     """Host sequence of the MoE block (one instruction-stream part). Routed slot j's fills carry
     placeholder pool offsets (expert j); moeroute2 rewrites them from the router output.
-    nx must match the body's: NE drops the shared expert's fills with its slot."""
+    nx must match the body's: NE drops the shared expert's fills with its slot.
+
+    early_down (ux.py UX_WORDER, OPEN-DECODE-STREAM-MOE): each slot's down fills are issued
+    BEFORE the wait on its hidden parts instead of after it. They read only the pool, and each
+    channel still carries up, gate, down, up, ... in the order the core consumes them, so the
+    cores see the same bytes; the weight stream no longer stops for the hidden's DDR round trip
+    (with a memtile ring, the whole down slice is queued while the core waits for h).
+
+    ug_bd (ux.py UX_SEQ): a slot's up and gate halves as ONE transfer -- the two half taps one
+    stripe apart as the BD's outer (iteration) dimension, the shared expert's two halves likewise --
+    instead of two: the channel carries the same bytes in the same order with one transfer fewer a
+    slot (the stream issues ~0.7 us a transfer). moeroute2 patches the transfer's base, which is
+    the up half's offset as before."""
     spp, cps = C.STRIPES_PER_PROJ, C.CORES_PER_STRIPE
     pipe_x.fill(x_prod, a_act, bt(A_BYTES, A_XM, ELEM))
     for c in range(N_CORES):
@@ -596,21 +608,36 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
         for c in range(N_CORES):
             if e < NE:
                 up = (2 * spp * e + 2 * (c // cps)) * STRIPE + (c % cps) * PAIR
-                pipe_w.fill(w_prods[c], a_pool, half_tap(up))
-                pipe_w.fill(w_prods[c], a_pool, half_tap(up + STRIPE))
+                if ug_bd:
+                    pipe_w.fill(w_prods[c], a_pool, TensorAccessPattern(
+                        (1, POOL_BYTES), up, [2, HID // 256, 4, PAIR // 4], [STRIPE, 2 * PAIR, PAIR // 4, 1]))
+                else:
+                    pipe_w.fill(w_prods[c], a_pool, half_tap(up))
+                    pipe_w.fill(w_prods[c], a_pool, half_tap(up + STRIPE))
+            elif ug_bd:
+                assert HALF % 2048 == 0 and POOL_SHARE_GATE > POOL_SHARE_UP, (HALF, POOL_SHARE_UP, POOL_SHARE_GATE)
+                pipe_w.fill(w_prods[c], a_pool, TensorAccessPattern(
+                    (1, POOL_BYTES), POOL_SHARE_UP + c * HALF, [2, 1, HALF // 2048, 2048],
+                    [POOL_SHARE_GATE - POOL_SHARE_UP, 0, 2048, 1]))
             else:
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_UP + c * HALF, HALF))
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_GATE + c * HALF, HALF))
             pipe_y.drain(y_conss[c], a_act, bt(A_BYTES, A_HP + c * HID_PC * 4, HID_PC * 4))
+
+        def down_fills():
+            for c in range(N_CORES):
+                if e < NE:
+                    pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_DOWN + e * UP_BYTES + c * DOWN_PER_CORE * DOWN_BAND,
+                                                       DOWN_PER_CORE * DOWN_BAND))
+                else:
+                    pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_DOWN + c * DOWN_PER_CORE * DOWN_BAND,
+                                                       DOWN_PER_CORE * DOWN_BAND))
+        if early_down:
+            down_fills()
         pipe_y.finish(*y_conss)                           # the hidden parts are in DDR
         pipe_x.fill(x_prod, a_act, bt(A_BYTES, A_HP, ELEM))
-        for c in range(N_CORES):
-            if e < NE:
-                pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_DOWN + e * UP_BYTES + c * DOWN_PER_CORE * DOWN_BAND,
-                                                   DOWN_PER_CORE * DOWN_BAND))
-            else:
-                pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_DOWN + c * DOWN_PER_CORE * DOWN_BAND,
-                                                   DOWN_PER_CORE * DOWN_BAND))
+        if not early_down:
+            down_fills()
     for c in range(N_CORES):
         pipe_y.drain(y_conss[c], c_xres, bt(HID, c * ROWS_PC, ROWS_PC))   # the block output = the new residual
     pipe_w.finish()
@@ -837,6 +864,32 @@ def ln_router_body(ain, aout, xs, acc, f_nr, f_ln, f_rc, f_ra, f_rf):
     for rb in range_(W_ELEMS):
         e = ain.acquire(1)
         f_ra(e, xs, acc, rb)
+        ain.release(1)
+    o = aout.acquire(1)
+    f_rf(acc, o)
+    aout.release(1)
+
+
+def ln_router_body2(ain, aout, rin, xs, acc, f_nr, f_ln, f_rc, f_ra2, f_rf):
+    """ln_router_body with the router's W over two input streams (ux.py UX_RSPLIT): element 2 rb
+    from `ain`, 2 rb + 1 from `rin`, both into one router_acc2 call (router_acc_impl on each, in
+    element order: the same sums as ln_router_body)."""
+    e = ain.acquire(3)
+    o = aout.acquire(1)
+    f_nr(e[0], e[1], e[2], o)
+    aout.release(1)
+    ain.release(3)
+    e = ain.acquire(5)
+    oo = aout.acquire(3)
+    f_ln(e[0], e[1], e[3], e[4], e[2], oo[0], oo[1], oo[2])
+    f_rc(oo[2], xs)
+    aout.release(3)
+    ain.release(5)
+    for rb in range_(W_ELEMS // 2):
+        e0 = ain.acquire(1)
+        e1 = rin.acquire(1)
+        f_ra2(e0, e1, xs, acc, rb)
+        rin.release(1)
         ain.release(1)
     o = aout.acquire(1)
     f_rf(acc, o)
