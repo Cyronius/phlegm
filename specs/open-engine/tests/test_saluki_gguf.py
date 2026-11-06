@@ -29,14 +29,7 @@ ALL_Q8 = {"attn": "q8", "linear": "q8", "linear_out": "q8", "ffn": "q8"}
 
 @pytest.fixture(scope="module")
 def q8_manifest():
-    import os
-    old = os.environ.get("OPEN_KERNELS_UNVALIDATED")
-    os.environ["OPEN_KERNELS_UNVALIDATED"] = "1"     # gemv_q8 at K 5120 / 6144 / 8192 / 9216 until catalogued
-    try:
-        return manifest(_spec(ALL_Q8))
-    finally:
-        if old is None:
-            os.environ.pop("OPEN_KERNELS_UNVALIDATED", None)
+    return manifest(_spec(ALL_Q8))      # gemv_q8 K 5120 / 6144 / 8192 / 9216 are catalogued
 
 
 def test_all_q8_view_translates_every_op(q8_manifest):
