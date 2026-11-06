@@ -71,6 +71,14 @@ def one_image() -> bool:
     return os.environ.get("NEMOTRONH_ONE", "1") != "0"
 
 
+PROBE_VARS = ("NH_NULL",)
+
+
+def probe_env() -> dict[str, str]:
+    """The DMA-only probe (NH_NULL: no arithmetic) folds into the build key (cache.py)."""
+    return {k: os.environ[k] for k in PROBE_VARS if os.environ.get(k)}
+
+
 def kpad(k: int) -> int:
     """A GEMV operand's K: whole 256-wide k-tiles (zero weights past the real width)."""
     return roundup(k, 256)
