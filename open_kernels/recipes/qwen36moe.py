@@ -45,27 +45,44 @@ def merged_image(spec: ModelSpec) -> bool:
     return one_context() and spec.has_linear and spec.has_full and not spec.q8_roles
 
 
-def stream_knobs() -> tuple[int, bool]:
-    """OPEN-DECODE-STREAM on the merged layer image (designs/layer_x/ux.py): (memtile ring depth
+# OPEN-DECODE-STREAM-UX: the kernel geometries the merged image's stream changes below were
+# measured on (bit-identical gates + timing), hence on by default. The 35B-A3B geometry: the
+# reference Qwen3.6-35B-A3B spec and every GGUF of it (KAT Coder, Ornith, Nex, Clover) share it.
+STREAM_MEASURED_KERNELS: tuple[str, ...] = (
+    "sha256:2a3631c0cf5f0265bd639a08350990a24d86f92e9fda2f6c7cd748c3acbe61ad",
+)
+WRING_DEPTH = 16
+
+
+def _measured(spec: ModelSpec | None) -> bool:
+    return spec is not None and spec.kernel_hash() in STREAM_MEASURED_KERNELS
+
+
+def stream_knobs(spec: ModelSpec | None = None) -> tuple[int, bool]:
+    """OPEN-DECODE-STREAM-UX on the merged layer image (designs/layer_x/ux.py): (memtile ring depth
     of each main core's weight stream in 10 KB elements, 0 = shim straight to the core; the MoE
-    parts' down fills issued ahead of the hidden's round trip). `UX_WRING=<n>` / `UX_WORDER=0|1`
-    at export; both are in the build key (probe_env)."""
-    ring = int(os.environ.get("UX_WRING", "0"))
-    order = os.environ.get("UX_WORDER", "0") == "1"
+    parts' down fills, and the linear part's out-projection fills, issued ahead of the wait in front
+    of them). On for a measured geometry; `UX_WRING=<n>` / `UX_WORDER=0|1` at export force either
+    (both in the build key, probe_env)."""
+    on = _measured(spec)
+    ring = int(os.environ.get("UX_WRING", str(WRING_DEPTH) if on else "0"))
+    order = os.environ.get("UX_WORDER", "1" if on else "0") == "1"
     return ring, order
 
 
-def seq_order() -> bool:
-    """UX_SEQ=1 at export: the merged image's part 0 streams in dux.py's issue order (xlayer.py
-    linear_sequence_seq / full_sequence_seq) and its MoE parts fetch a slot's up | gate halves in
-    one transfer (xcommon.moe_sequence ug_bd). Same bytes per channel. In the build key."""
-    return os.environ.get("UX_SEQ", "0") == "1"
+def seq_order(spec: ModelSpec | None = None) -> bool:
+    """The merged image's part 0 in dux.py's issue order (xlayer.py linear_sequence_seq /
+    full_sequence_seq) and its MoE parts fetching a slot's up | gate halves in one transfer
+    (xcommon.moe_sequence ug_bd). Same bytes per channel. On for a measured geometry; `UX_SEQ=0|1`
+    at export forces it (in the build key)."""
+    return os.environ.get("UX_SEQ", "1" if _measured(spec) else "0") == "1"
 
 
-def router_split() -> bool:
-    """UX_RSPLIT=1 at export: the merged image's norm helper takes the router's 1 MB W over two
-    shim channels (designs/layer_x/ux.py), not one. In the build key (probe_env)."""
-    return os.environ.get("UX_RSPLIT", "0") == "1"
+def router_split(spec: ModelSpec | None = None) -> bool:
+    """The merged image's norm helper taking the router's 1 MB W over two shim channels
+    (designs/layer_x/ux.py UX_RSPLIT), not one. On for a measured geometry; `UX_RSPLIT=0|1` at
+    export forces it (in the build key)."""
+    return os.environ.get("UX_RSPLIT", "1" if _measured(spec) else "0") == "1"
 
 
 # Timing-only ablations of the layer_x main cores (xcommon.py): outputs are garbage, the DMA

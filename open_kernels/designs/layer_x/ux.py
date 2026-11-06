@@ -166,16 +166,16 @@ GLUE_TILE = Tile(2, 4)          # lx.py's Tile(2, 3) is ax.py's attention core 0
 # with WORDER the MoE parts queue each slot's down fills ahead of the hidden's round trip. Same
 # bytes to every core in the same order: every logit unchanged. Main-core code is untouched (the
 # core still acquires the same L1 fifo). 0 / off builds the image byte for byte as before.
-WRING, WORDER = stream_knobs()
+WRING, WORDER = stream_knobs(SPEC)
 assert 0 <= WRING <= 24, "ux: a memtile ring deeper than 24 does not fit one BD pool"
 # UX_RSPLIT: the router's W (1 MB, 256 x 4 KB) reaches the norm helper over TWO shim channels -- even
 # elements on lni, odd ones on `rin` from shim (6, 0)'s free fill channel -- instead of one, which
 # held every layer's tail for the time one stream takes to move 1 MB. The helper takes the pairs in
 # element order through router_acc2 (router_acc_impl twice): the same sums, the same top-k.
-RSPLIT = router_split()
+RSPLIT = router_split(SPEC)
 # UX_SEQ: part 0 in dux.py's issue order (xlayer.linear_sequence_seq / full_sequence_seq) and the MoE
 # parts' up | gate halves in one transfer a slot (xcommon.moe_sequence ug_bd): same bytes per channel.
-SEQ = seq_order()
+SEQ = seq_order(SPEC)
 
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
