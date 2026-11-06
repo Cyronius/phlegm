@@ -7714,8 +7714,11 @@ same order on every channel and runs the same calls, so every logit is unchanged
   0.889 / 0.929, a 24-deep ring 0.852 / 0.851 (noise against 16), the default with null compute 0.861 / 0.889 (the
   arithmetic is still hidden). Real decodes (128 tokens after 491 / 3000 prompt tokens, block prefill, 3 alternated
   rounds): ms/token 91 / 86 / 96 -> 83 / 89 / 86 and 99 / 101 / 105 -> 93 / 97 / 98; per step, in units of the
-  (unchanged) head's time, part 0 2.97 -> 2.67 at ~500 and 3.66 -> 3.42 at ~3000, part 1 1.68 -> 1.54. A quiet-box
-  absolute is open. Evidence: `target/npu-dev/decode-stream/` (`ab1/`, `ab2/`, `time1/`, `gates/`), plan
+  (unchanged) head's time, part 0 2.97 -> 2.67 at ~500 and 3.66 -> 3.42 at ~3000, part 1 1.68 -> 1.54. Again
+  at load 5-7 (the iGPU client still up; the assembled `open_kernels_stream` against `open_kernels`, 3 rounds):
+  step-trace mean 83.9 / 85.0 / 85.7 -> 78.5 / 77.3 / 76.9 ms at ~500 (per-round 0.898-0.936) and 94.8 / 95.2 / 95.0
+  -> 88.4 / 88.1 / 87.7 at ~3000 (0.923-0.933); part 0 -9 to -12 %, part 1 -7 to -12 %, every pair faster. A
+  quiet-box absolute (no iGPU client; the head at its 10.4 ms) is open. Evidence: `target/npu-dev/decode-stream/` (`ab1/`, `ab2/`, `time1/`, `gates/`), plan
   `.plans/clover.md` 2026-11-06.
 
 ### OPEN-DECODE-ONE-CONTEXT-DENSE: a dense decode token runs in one hardware context
