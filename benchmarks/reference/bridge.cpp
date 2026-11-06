@@ -11,6 +11,10 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 using json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
@@ -104,30 +108,22 @@ static int prefill(Core& core, const std::vector<int>& ids, const std::string& r
     run_prefill(core, ids, route);
     return greedy(core);
 }
-static std::string encode_base64(const unsigned char* data, size_t size) {
-    static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    out.reserve(((size + 2) / 3) * 4);
-    for (size_t i = 0; i < size; i += 3) {
-        const unsigned a = data[i];
-        const unsigned b = i + 1 < size ? data[i + 1] : 0;
-        const unsigned c = i + 2 < size ? data[i + 2] : 0;
-        out.push_back(alphabet[a >> 2]);
-        out.push_back(alphabet[((a & 3) << 4) | (b >> 4)]);
-        out.push_back(i + 1 < size ? alphabet[((b & 15) << 2) | (c >> 6)] : '=');
-        out.push_back(i + 2 < size ? alphabet[c & 63] : '=');
-    }
-    return out;
-}
-static json logits_reply(const Core& core) {
+// Logits follow their reply line as raw binary32 bytes ("logits_f32_le_bytes" of them, little
+// endian: the bridge builds only for x86-64), not as 1.3 MB of text inside the JSON.
+static void reply_logits(json value, const Core& core) {
     const auto& logits = core.logits();
     const size_t n = core.real_vocab();
     if (!n || logits.size() < n) throw std::runtime_error("incomplete logits");
     for (size_t i = 0; i < n; ++i)
         if (!std::isfinite(logits[i])) throw std::runtime_error("nonfinite logits");
     static_assert(sizeof(float) == 4, "logit transport requires binary32");
-    const auto* bytes = reinterpret_cast<const unsigned char*>(logits.data());
-    return {{"logits_f32_le_base64", encode_base64(bytes, n * sizeof(float))}};
+    const unsigned one = 1;
+    if (*reinterpret_cast<const unsigned char*>(&one) != 1) throw std::runtime_error("logit transport requires little endian");
+    value["ok"] = true;
+    value["logits_f32_le_bytes"] = n * sizeof(float);
+    std::cout << value.dump() << '\n';
+    std::cout.write(reinterpret_cast<const char*>(logits.data()), static_cast<std::streamsize>(n * sizeof(float)));
+    std::cout.flush();
 }
 
 int main() {
@@ -138,6 +134,9 @@ int main() {
     std::unique_ptr<Core> core;
     std::string route;
     Mark mark;
+#ifdef _WIN32
+    _setmode(_fileno(stdout), _O_BINARY);  // the logits are raw bytes
+#endif
     reply({{"protocol", 1}, {"engine", "openflowlm-cpp-reference"}});
     try {
         std::string line;
@@ -207,18 +206,16 @@ int main() {
                     mark.valid = false;
                 if (request.contains("mark")) {
                     const size_t at = prefill_marked(*core, ids, route, request.at("mark").get<size_t>(), mark);
-                    json out = logits_reply(*core);
-                    out["mark"] = at;
-                    reply(std::move(out));
+                    reply_logits({{"mark", at}}, *core);
                 } else {
                     run_prefill(*core, ids, route);
-                    reply(logits_reply(*core));
+                    reply_logits(json::object(), *core);
                 }
             } else if (command == "decode_logits") {
                 const int token = request.at("token").get<int>();
                 if (token < 0 || static_cast<size_t>(token) >= core->real_vocab()) throw std::runtime_error("invalid decode token");
                 core->step(token, true);
-                reply(logits_reply(*core));
+                reply_logits(json::object(), *core);
             } else if (command == "trial" || command == "survey_trial") {
                 const auto ids = prompt_ids(request, *core);
                 const bool survey = command == "survey_trial";

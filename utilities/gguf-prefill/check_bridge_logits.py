@@ -1,6 +1,5 @@
 """Compare resident bridge logits with a CLI dump on the same greedy sequence."""
 import argparse
-import base64
 import json
 from pathlib import Path
 import subprocess
@@ -26,14 +25,17 @@ def main():
         ap.error('token sequence must fit the context capacity')
     with args.out.with_suffix('.stderr').open('w') as log:
         p = subprocess.Popen([str(args.bridge.resolve())], stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=log, text=True)
+                             stdout=subprocess.PIPE, stderr=log)
         def read():
             r = json.loads(p.stdout.readline())
             if not r.get('ok'):
                 raise RuntimeError(r)
+            # Logits follow the line as raw little-endian binary32 bytes.
+            n = r.get('logits_f32_le_bytes', 0)
+            r['logits'] = np.frombuffer(p.stdout.read(n), '<f4') if n else None
             return r
         def request(**value):
-            p.stdin.write(json.dumps(value) + '\n')
+            p.stdin.write((json.dumps(value) + '\n').encode())
             p.stdin.flush()
             return read()
         read()
@@ -44,7 +46,7 @@ def main():
         try:
             reply = request(command='prefill_logits', prompt=ids)
             for step in range(args.steps):
-                logits = np.frombuffer(base64.b64decode(reply['logits_f32_le_base64']), '<f4')
+                logits = reply['logits']
                 ref = np.fromfile(str(args.cli_prefix) + f'_t{step}.bin', '<f4')
                 if ref.size < logits.size or not np.isfinite(logits).all():
                     raise ValueError('incomplete or nonfinite logits')
@@ -60,6 +62,7 @@ def main():
                 p.stdin.close()
                 p.wait(timeout=60)
     passed = all(r['identical'] for r in result)
+    init.pop('logits', None)
     args.out.write_text(json.dumps(dict(init=init, results=result, passed=passed), indent=2) + '\n')
     print(json.dumps(dict(route=init['prefill_route'], steps=len(result), passed=passed)))
     return 0 if passed else 1

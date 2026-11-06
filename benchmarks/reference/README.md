@@ -86,8 +86,14 @@ cargo run -p phlegm-cli -- serve --model-dir C:/models/my-model `
 `--prefill-mode fast|lean`, `--timeout`, and `--dispatch-timeout-ms` select runtime
 settings. `--threads` (the bridge's OpenMP threads) defaults to half the logical
 CPUs, 4 to 16: the block routes' host stages scale with it (LFM3, 8192-token
-prompt: 56 s at 4 threads, 33-36 s at 16, the same logits) and decode does not. The bridge sends logits as base64 little-endian float32 bytes to
-avoid the overhead of a large JSON number array. `serve --mock` runs the
+prompt: 56 s at 4 threads, 33-36 s at 16, the same logits) and decode does not. The bridge sends logits as raw bytes right after their reply
+line: the JSON names their count (`logits_f32_le_bytes`), then that many
+little-endian float32 bytes follow (about 1 MB a token for a 248k vocabulary).
+Before 2026-11-05 they went inside the JSON as base64, which cost an encode,
+a 1.3 MB JSON parse and a decode per token. Through `phlegm serve` (2026-11-06,
+greedy, 256 tokens, three alternating rounds, host load 6-10 from other jobs, identical
+replies; `target/npu-dev/logits-ab/ab.json`): Clover (248k vocabulary) 91.5-111.9 ->
+82.2-88.5 ms a token, faster in every pair; LFM3 (65k) 43.6-46.0 -> 40.2-46.0. `serve --mock` runs the
 explicit test backend. No release tag is needed for run/serve; the strict
 release and power-mode rules below still govern published benchmark reports.
 

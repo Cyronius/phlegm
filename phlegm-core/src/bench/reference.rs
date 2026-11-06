@@ -260,7 +260,9 @@ fn die_with_parent(_: &mut Command) {}
 struct Process {
     child: Child,
     input: ChildStdin,
-    replies: Receiver<Result<Value, String>>,
+    /// Each reply line, with the raw bytes that follow it when it announces
+    /// `logits_f32_le_bytes` (the logits, binary32 little endian).
+    replies: Receiver<Result<(Value, Vec<u8>), String>>,
     timeout: Duration,
 }
 
@@ -297,7 +299,18 @@ impl Process {
                     Ok(0) => Err("reference bridge exited before replying".into()),
                     Ok(_) if line.len() > 8_000_000 => Err("reference reply exceeds 8 MB".into()),
                     Ok(_) => serde_json::from_slice::<Value>(&line)
-                        .map_err(|e| format!("invalid reference reply: {e}")),
+                        .map_err(|e| format!("invalid reference reply: {e}"))
+                        .and_then(|value| {
+                            let n = value.get("logits_f32_le_bytes").and_then(Value::as_u64).unwrap_or(0);
+                            if n > 8_000_000 {
+                                return Err("reference logits exceed 8 MB".to_string());
+                            }
+                            let mut payload = vec![0u8; n as usize];
+                            reader
+                                .read_exact(&mut payload)
+                                .map_err(|e| format!("reading reference logits: {e}"))?;
+                            Ok((value, payload))
+                        }),
                     Err(e) => Err(format!("reading reference reply: {e}")),
                 };
                 let failed = value.is_err();
@@ -322,7 +335,11 @@ impl Process {
     }
 
     fn receive(&mut self) -> Result<Value, String> {
-        let value = self
+        self.receive_with_payload().map(|(value, _)| value)
+    }
+
+    fn receive_with_payload(&mut self) -> Result<(Value, Vec<u8>), String> {
+        let (value, payload) = self
             .replies
             .recv_timeout(self.timeout)
             .map_err(|e| format!("reference bridge reply failed or timed out: {e}"))??;
@@ -333,16 +350,20 @@ impl Process {
                 .unwrap_or("reference bridge failed")
                 .to_owned());
         }
-        Ok(value)
+        Ok((value, payload))
     }
 
     fn request(&mut self, value: Value) -> Result<Value, String> {
+        self.request_with_payload(value).map(|(value, _)| value)
+    }
+
+    fn request_with_payload(&mut self, value: Value) -> Result<(Value, Vec<u8>), String> {
         serde_json::to_writer(&mut self.input, &value).map_err(|e| e.to_string())?;
         self.input
             .write_all(b"\n")
             .and_then(|_| self.input.flush())
             .map_err(|e| format!("writing reference request: {e}"))?;
-        self.receive()
+        self.receive_with_payload()
     }
 }
 
@@ -795,16 +816,11 @@ impl NpuBackend {
     }
 
     fn logits(&mut self, command: Value) -> Result<Vec<f32>, String> {
-        let reply = self.process.request(command)?;
-        self.logits_of(&reply)
+        let (_, bytes) = self.process.request_with_payload(command)?;
+        self.logits_of(&bytes)
     }
 
-    fn logits_of(&self, reply: &Value) -> Result<Vec<f32>, String> {
-        let encoded = reply
-            .get("logits_f32_le_base64")
-            .and_then(Value::as_str)
-            .ok_or("NPU engine returned no binary logits")?;
-        let bytes = base64::decode(encoded).map_err(|e| format!("invalid logit encoding: {e}"))?;
+    fn logits_of(&self, bytes: &[u8]) -> Result<Vec<f32>, String> {
         if bytes.len() != self.real_vocab * 4 {
             return Err(format!(
                 "NPU engine returned {} logit bytes, expected {}",
@@ -869,8 +885,8 @@ impl Backend for NpuBackend {
         if let Some(k) = want_mark {
             prefill["mark"] = json!(k);
         }
-        let reply = self.process.request(prefill)?;
-        let mut logits = self.logits_of(&reply)?;
+        let (reply, bytes) = self.process.request_with_payload(prefill)?;
+        let mut logits = self.logits_of(&bytes)?;
         self.mark = match want_mark {
             Some(_) => Some(
                 reply
@@ -927,9 +943,10 @@ mod generation_tests {
         fs::write(
             &bridge,
             r#"#!/usr/bin/env python3
-import base64, json, struct, sys
+import json, struct, sys
 print(json.dumps({'ok': True, 'protocol': 1, 'engine': 'openflowlm-cpp-reference'}), flush=True)
 phase = 0
+logits = b''
 for line in sys.stdin:
     r = json.loads(line)
     cmd = r['command']
@@ -941,18 +958,22 @@ for line in sys.stdin:
     elif cmd == 'prefill_logits':
         assert phase == 0 and r['prompt'] == [0, 1]
         phase = 1
-        out = {'logits_f32_le_base64': base64.b64encode(struct.pack('<5f', 0, 0, 10, 0, 0)).decode()}
+        out, logits = {}, struct.pack('<5f', 0, 0, 10, 0, 0)
     elif cmd == 'decode_logits':
         assert phase == 1 and r['token'] == 2
         phase = 2
-        out = {'logits_f32_le_base64': base64.b64encode(struct.pack('<5f', 0, 0, 0, 0, 10)).decode()}
+        out, logits = {}, struct.pack('<5f', 0, 0, 0, 0, 10)
     elif cmd == 'quit':
         print(json.dumps({'ok': True}), flush=True)
         break
     else:
         raise RuntimeError(cmd)
     out['ok'] = True
-    print(json.dumps(out), flush=True)
+    if logits:
+        out['logits_f32_le_bytes'] = len(logits)
+    sys.stdout.write(json.dumps(out) + '\n'); sys.stdout.flush()
+    sys.stdout.buffer.write(logits); sys.stdout.buffer.flush()
+    logits = b''
 "#,
         )
         .unwrap();
@@ -1008,12 +1029,13 @@ for line in sys.stdin:
             &bridge,
             format!(
                 r#"#!/usr/bin/env python3
-import base64, json, struct, sys
+import json, struct, sys
 print(json.dumps({{'ok': True, 'protocol': 1, 'engine': 'openflowlm-cpp-reference'}}), flush=True)
 log = open({log:?}, 'a')
 pos, mark, T = 0, None, 4
-def logits(): return base64.b64encode(struct.pack('<6f', 0, 0, 0, 0, 0, 10)).decode()
+LOGITS = struct.pack('<6f', 0, 0, 0, 0, 0, 10)
 for line in sys.stdin:
+    logits = b''
     r = json.loads(line)
     cmd = r['command']
     log.write(json.dumps({{k: v for k, v in r.items() if k != 'model_dir' and k != 'kernel_dir'}}) + '\n'); log.flush()
@@ -1029,14 +1051,17 @@ for line in sys.stdin:
         at -= at % T
         mark = pos + at
         pos += len(r['prompt'])
-        out = {{'logits_f32_le_base64': logits(), 'mark': mark}}
+        out, logits = {{'mark': mark}}, LOGITS
     elif cmd == 'decode_logits':
         pos += 1
-        out = {{'logits_f32_le_base64': logits()}}
+        out, logits = {{}}, LOGITS
     else:
         raise RuntimeError(cmd)
     out['ok'] = True
-    print(json.dumps(out), flush=True)
+    if logits:
+        out['logits_f32_le_bytes'] = len(logits)
+    sys.stdout.write(json.dumps(out) + '\n'); sys.stdout.flush()
+    sys.stdout.buffer.write(logits); sys.stdout.buffer.flush()
 "#
             ),
         )
