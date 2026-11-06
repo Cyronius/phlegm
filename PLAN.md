@@ -218,6 +218,25 @@ the bf16 control's spread. The default (`LFM2MOE_BLOCK=0` for sequential): the m
 (bridge `bridges/lfm2moe-blk`). Plan:
 [.plans/lfm2moe-native.md](.plans/lfm2moe-native.md); spec: OPEN-FAMILY-LFM2MOE.
 
+## NVIDIA Nemotron 3.5 Lightning 30B-A3B (nemotron_h MoE)
+
+Runs on the NPU from our own pure Q4_0 GGUF (NVIDIA's BF16 safetensors through llama.cpp's converter, `--no-mtp`,
+and `llama quantize --pure`, Q8_0 head; every scale bf16-exact) through its own recipe `recipes/nemotronh.py`: the
+NPU streams the weights (q4 GEMVs for the Mamba in / out and q | k | v / o projections, an 8-slot expert program for
+the six routed experts and the shared expert's two halves, the Q8_0 head) and the host runs the rest between the
+dispatches (the norms, Mamba-2's conv and selective-state update, attention without positional encoding, the
+router, the residual) as `nh_*` program steps of its own runtime patch (`nemotronh-runtime.patch`, over the
+gemma4-moe chain). Every block dispatch is a stream of one image (the expert program with runtime-parameter loop
+counts also runs the GEMVs), so only the head changes context. 16/16 greedy tokens of a raw prompt and 32/32 after an
+841-token chat prompt equal llama.cpp's (a chat prompt's 64: the first 46, then a near-tie llama.cpp resolves
+differently itself); every position of the 841-token prompt sits at the bf16 control's distance from the fp32
+reference (827/841 argmax, KL median 1.2e-3; control 825/841, 9.0e-4), and the reference agrees with llama.cpp CPU
+(810/841, partial KL median 6.6e-4). Decode ~103 ms a token, sequential prefill ~109 ms a token (development, loaded
+machine; 145-174 ms on the first one-image-per-projection route). `phlegm run` / `serve` answer (the model dir's
+template tolerates phlegm's `tools` = none). Open: block prefill, the head on the block image, overlapping the host
+steps, a clean benchmark, a llama.cpp Vulkan control. Plan: [.plans/nemotronh.md](.plans/nemotronh.md); spec:
+OPEN-FAMILY-NEMOTRONH.
+
 ## LiquidAI LFM3-1.7B (lfm3)
 
 Runs on the NPU from LiquidAI's QAD-Q4_0 GGUF (derived: Q8_0 head, per-head gate rows repeated to a q-width

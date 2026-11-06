@@ -793,5 +793,34 @@
     "note": "Underdog Saluki 27B (Qwen3.8-27B as an IQ2-mix llama.cpp qwen35 GGUF) on the all-q8 Qwen3.5 dense view (OPEN-FAMILY-SALUKI, recipes/qwen35.py gguf_view): gguf_iq.hpp decodes IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / Q2_K per 32-block as ggml-quants.c (tables generated from llama.cpp a34de8618b25 ggml-common.h, MIT) with the block's integer law where it has one; q35 ops read them; new op q35_q8 (q8_perm half-tiles; a law block keeps its codes, scale RNE bf16, others requantized amax/127); q35_mat `split` hi / lo (the block route's exact q4_1 split of the same q8); q35_lmhead keeps an i-quant head's codes; q35_put keeps a law block's codes on the q4_1 grid when they are uniform; GGUF embed_row and sizes for the i-quants; the manifest accepts q35_q8, q35_mat split and q35_mat route weights; the 27B decode state ABI on the block route (layout attn_kv_dtype bfloat16_pair: host attention_block reads / writes [K hi, K lo, V hi, V lo] rows and the NPU block attention is off; linear_conv_dtype float32: deltanet_block keeps an f32 conv history) -- without it the route's prefill is right and the decode after it is not; OFLM_OPEN_GEMM_BLOCK=0 skips the route weights at load; q35_pack_dump dumps route weights. A diff over base plus the nine Gemma 4 patches, gptoss-runtime.patch (8a5f808e) and qwen35moe-gguf-runtime.patch (30d20e96); regenerated as the diff of target/npu-dev/saluki-runtime against qwen35moe-runtime, round-trip checked; built in target/npu-dev/saluki-runtime, bridge target/npu-dev/bridges/saluki",
     "patch": "saluki-runtime.patch",
     "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "nemotronh_runtime_20261106": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gemma4_moe_20261031",
+      "gemma4_moe_decode_20261101",
+      "gemma4_moe_block_20261103"
+    ],
+    "files": [
+      "src/open_qwen36/CMakeLists.txt",
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp",
+      "src/open_qwen36/nemotronh_pack_check.cpp",
+      "src/open_qwen36/pools.cpp"
+    ],
+    "note": "NVIDIA Nemotron-H MoE (OPEN-FAMILY-NEMOTRONH, 2026-11-06): host program steps nh_pre / nh_ssm (Mamba-2: conv, selective-state update, gate, grouped norm) / nh_attn (GQA without positional encoding over f32 K | V rows) / nh_route (sigmoid router with selection bias, the shared expert as two slots, the `nhroute` fill table) / nh_add / nh_final (also allowed in the tail); a layer type's own pool size (`buffers.pool`); pack ops nh_q40 (g4_q40 with a column window) and nh_lmhead (the flint chain's gx_lmhead law, absent from this chain); the GEMV input as bf16 or f32 (x_f32, the one-image program); nemotronh_pack_check (CPU readback of the packing). sha256 32af8919140c62dc62cb79c1c069bf15e8b74fc68b2b87cccd1a6ea1ad89a268; built in target/npu-dev/nemotronh-runtime, a copy of the gemma4-moe-runtime clone (the unmodified copy: nemotronh-runtime-base; base + patch = the clone, checked by nemotronh/scripts/mkpatch.sh)",
+    "patch": "nemotronh-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
   }
 }

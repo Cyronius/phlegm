@@ -4977,6 +4977,118 @@ route unless `LFM2MOE_BLOCK=0`, a default export's manifest equals `kernels/lfm2
 a bridge built from the block runtime (`bridges/lfm2moe-blk`): a ~700-token prompt plus load 33 s against 133 s with
 `--prefill-route sequential`; the short chat prompt answers "The capital of France is Paris."
 
+### OPEN-FAMILY-NEMOTRONH: NVIDIA Nemotron-H MoE (Nemotron 3.5 Lightning 30B-A3B) derives its own spec and runs on its own recipe from the GGUF
+**Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_nemotronh_hf`, `families.py`, `nemotronh.py`,
+`designs/nemotronh/{nh.py,gen_kernels.py,nh_*.cc}`, `model/nemotronh_gguf_reference.py`; runtime:
+`upstream-patches/nemotronh-runtime.patch` over the gemma4-moe chain)
+**Test category:** unit (`tests/test_nemotronh.py`); manual (the procedure below, which needs the NPU and the GGUF)
+
+A config whose `model_type` is `nemotron_h` shall derive a `ModelSpec` with `family` `nemotronh`. The architecture,
+read from transformers' `models/nemotron_h/modeling_nemotron_h.py` (5.22.1) and llama.cpp's
+`src/models/nemotron-h.cpp` with `llm_build_mamba_base::build_mamba2_layer` (arch `nemotron_h_moe`, build 12015),
+which agree:
+
+- blocks: every block is `x = x + mixer(rms(x) * norm)` (RMSNorm without +1, eps 1e-5), the mixer named by
+  `layers_block_type`: Nemotron 3.5 Lightning has 52 -- 23 `mamba`, 6 `attention` (5, 12, 19, 26, 33, 42), 23 `moe`.
+  There is no FFN inside a mixer block. The checkpoint's MTP (NextN) block is not part of the decoder and is dropped
+  at conversion (`--no-mtp`);
+- Mamba-2: in_proj [10304, 2688] gives z (4096) | xBC (x 4096, B 8 x 128, C 8 x 128) | dt (64 heads); xBC goes
+  through a 4-tap depthwise causal conv WITH bias (the LAST tap on this token; the state is the three previous
+  xBC rows) and SiLU; dt = softplus(dt + dt_bias); per head h of 64 (head dim 64, group h / 8), S_h = S_h exp(dt A_h)
+  + dt x_h B^T, y_h = S_h C + D_h x_h (A = -exp(A_log), the GGUF's `ssm_a`); y = y * silu(z), then an RMSNorm per
+  group of 512 with weight [4096] (the gate before the norm), and out_proj [2688, 4096]. transformers' chunked
+  prefill clamps dt at `time_step_min` (1e-3) and its decode step does not; llama.cpp never clamps; this follows
+  llama.cpp;
+- attention: 32 q / 2 kv heads of 128, no bias, NO positional encoding of any kind (no RoPE), causal, scale
+  1/sqrt(128), no window, no sink, no q/k norm;
+- MoE: 128 routed experts of 1856 and one shared expert of 3712, all NON-gated relu^2 MLPs (`down(relu(up x)^2)`);
+  router: s = sigmoid(x Wr) (F32 [128, 2688]); the top 6 of s + `e_score_correction_bias` (GGUF `exp_probs_b`)
+  are chosen (n_group 1: no group restriction), the weights are the UNBIASED s of those six renormalised (HF adds
+  1e-20, llama.cpp clamps the sum at 6.1e-5) times `routed_scaling_factor` 2.5; the shared expert is added
+  unscaled; no latent projection;
+- final RMSNorm (`norm_f`, GGUF `output_norm`) and an UNTIED head [131072, 2688].
+
+The derivation carries the Mamba geometry in the linear-attention fields (lin_key_heads = n_groups 8, lin_key_dim
+= ssm_state_size 128, lin_value_heads = mamba_num_heads 64, lin_value_dim = mamba_head_dim 64, conv_kernel 4), the
+block kinds as layer types `mamba` / `full_attention` / `moe`, and refuses latent experts (moe_latent_size),
+grouped expert selection, dense `mlp` blocks, projection biases, a tied head, other activations and a window, by
+key. `families.family_module("nemotronh")` is `recipes/nemotronh.py`. No other recipe has a Mamba-2 mixer; the MoE
+recipes' experts are gated (SwiGLU / GELU) and their blocks carry attention and an FFN together.
+
+**The recipe (2026-11-06), from the GGUF.** No GGUF is published for this checkpoint in a form that packs exactly,
+so the file is our own pure Q4_0 from NVIDIA's BF16 safetensors (llama.cpp `convert_hf_to_gguf.py --outtype bf16
+--no-mtp`, then `llama quantize --pure --output-tensor-type q8_0`): every matrix Q4_0, the head Q8_0, every Q4_0
+scale a bf16 value (checked over the file), so the Q4_0-native pool law (4608-B chunks, the bf16 d plane, m = -8 d
+on the core) holds every matrix exactly. The NPU streams the weights and the host does everything between them;
+a block is a short program of host steps (`nh_*`, nemotronh-runtime.patch) around one or two dispatches:
+
+- mamba: `nh_pre` (rms * norm -> bf16 x, zero-padded to K 2816) | `nh_in` (q4 GEMV in_proj [10304, 2816]) |
+  `nh_ssm` (the conv, the selective-state update in f32, D, the gate and the grouped norm -> bf16 [4096]) |
+  `nh_out` (q4 GEMV [2688, 4096]) | `nh_add` (x += o);
+- attention: `nh_pre` | `nh_qkv` (q | k | v GEMV [4608, 2816]) | `nh_attn` (causal GQA over the layer's f32
+  [K | V] rows) | `nh_out` (the o projection: the out_proj's shape at the same pool offset, the same build) |
+  `nh_add`;
+- moe: `nh_route` (rms * norm -> bf16 xm; the router in double over the f32 xm; the six chosen and their weights,
+  then the shared expert's two halves at weight 1, into nh_moe's slot fills: patch `nhroute`, its own table -- up
+  of slot j at j UPS, down at POOL_DOWN + j DNS) | `nh_moe` (8 slots: up bands -> w relu(u)^2 -> h, then down over
+  the 8 h summed in each core's f32 accumulator) | `nh_add`;
+- tail: `nh_final` (rms * output_norm -> bf16 hn) | `lm` (lm_head_q8 with f32 scales, K 2816, 131072 rows).
+
+Widths: every K = hidden operand is padded to 2816 (whole 256-wide k-tiles) with zero weights and a zero activation
+tail (exact); the expert width 1856 is padded to 2048 as the down projection's K; output bands are split unevenly
+over the 8 cores (lm_head_q8's split_bands), so no output row is padded. The shared expert (3712 = 2 x 1856) is two
+slots whose weights are its row halves (up) and column halves (down) -- exact, relu^2 being elementwise -- packed by
+`nh_q40` (g4_q40's law with a column window). Pools are per layer type (`buffers.pool`, a manifest field the patch
+adds): 22 MiB for mamba / attention, 749 MiB for moe (130 experts' up then down), 17.8 GiB in all with the 396 MiB
+head. The residual is f32 on the host and never goes to the device; the Mamba state (3 conv rows | S [64][64][128]
+f32, 2.07 MiB) and the attention's f32 K | V rows (2 KiB a row) are the layers' state BOs, host side, so
+checkpoint / restore / reset treat them as every other family's.
+
+**One image (the default, 2026-11-06).** Every block dispatch is a stream of ONE image (R-0003): the core program is
+the expert program with runtime-parameter loop counts (per core [slots_up, upc, slots_dn, dpc, h_elems, K, chunks a
+band, groups a band, ...], written by each stream, read after the first x acquire as gemm_q4_prefill does). The
+experts run it as above; a projection GEMV runs it with no up phase and one down-phase slot whose x is the f32
+activation at `AD_XF` (the host steps write it with `x_f32`; prepf rounds it to bf16 as prep does, so the table is
+the same). Only the head changes context. `NEMOTRONH_ONE=0` builds the first route (an image a projection, nh_moe
+its own); `NEMOTRONH_SHARED=1` (with it) only the three GEMVs as streams of one image.
+
+**Acceptance (2026-11-06, manual; development numbers on a machine shared with other sessions, load ~22):**
+
+1. Pack: `nemotronh_pack_check <kernels> <model>` (patch file, no NPU) reads 4000 random weights of every pack op of a
+   mamba, a moe and an attention layer and of the head back through the chunk laws against the GGUF's blocks,
+   padding included: PACK-CHECK OK. Every Q4_0 scale of the file is a bf16 value; the non-bf16 F32 values
+   (exp_probs_b, ssm_a) are host-only.
+2. References: `model/nemotronh_gguf_reference.py` (fp32 over the dequantised GGUF) against llama.cpp build 12015 CPU
+   on the same file, teacher-forced top-20: a 28-token chat prompt 27/28 argmax, partial KL median 8.4e-4; an
+   841-token chat prompt 810/841, median 6.6e-4 (mean 2.3e-3, p95 1.6e-2). The reference's `--npu-like` bf16
+   control against fp32: 825/841, KL median 9.0e-4 (mean 2.0e-3, p95 7.4e-3). The reference's Mamba-2 is checked
+   against a direct transcription of the recurrence and across a split of the state (`tests/test_nemotronh.py`).
+3. NPU (`open_qwen36_cli --prefill-logits --dump-logits`, every prompt position): the first two layers (a mamba and
+   a moe block) against the reference cut to two layers: 5/5, KL median 2.5e-5. The whole model: a 5-token raw
+   prompt 5/5 against fp32 (KL median 3.5e-4) and 16/16 greedy tokens equal to llama.cpp's (" Paris.  \nThe capital
+   of Germany is Berlin. ..."); the chat prompt 27/28 against fp32 (median 3.0e-4), 26/28 against llama.cpp (partial
+   median 7.5e-4), and 46 of 64 greedy tokens equal to llama.cpp's before a near-tie (NPU top-2 gap 0.14 nats;
+   llama.cpp's own teacher-forced pass puts the NPU's token first there, its generation the other); the 841-token
+   prompt: 32/32 greedy tokens equal, every position 827/841 against fp32 (KL median 1.16e-3, mean 2.5e-3, p95
+   8.0e-3), 826/841 against the bf16 control (9.7e-4), 808/841 against llama.cpp (partial median 1.16e-3; fp32 and
+   the control score 810 and 807 there) -- the bf16 control's class. The one-image route's logits and tokens are
+   bit-identical to the first route's (KL 0 at every position of the chat prompt, the same 64 tokens).
+4. Timing (development, not a benchmark; `open_qwen36_cli`): weights resident in ~15 s; the first route decodes at
+   145-174 ms a token and prefills sequentially at 161-173 ms a token; the one-image route at 103 ms a token decode
+   (part0 ~60 ms, host steps ~11 ms, part1 ~12 ms, head ~15 ms with its context change) and 109 ms a token prefill.
+   The three-GEMV shared image alone measured 199 ms a token once (not investigated).
+5. phlegm (this branch's binary and bridge, the model dir's default set): `phlegm run` answers "The capital of France
+   is Paris." after its reasoning (split out as reasoning, 28-token prompt, 35 s wall including the load) and, with
+   `--think false` and the registry's sampling, a haiku; `phlegm serve` answers health and /v1/models, a
+   non-streamed chat completion (400 tokens of coherent reasoning toward "Red, Yellow, Blue" in 39 s, cut at
+   max_tokens) and a streamed one with thinking off ("391" for 17 x 23, [DONE]). The publisher's chat template
+   guards `tools` only with `is defined`; phlegm passes `tools` as none, so the model dir's template reads `tools is
+   not defined or tools is none` (the publisher's kept as chat_template.hf.jinja; jinja2 renders both identically).
+
+Open: block prefill (prefill runs at decode speed); the head as a stream of the block image; the one-image
+route's 60 ms of first-dispatch time against ~2.1 GB of weights a token (~20 GB/s); host steps (~11 ms) overlapped
+with the dispatches; a clean benchmark; contexts past 4096 (the attention is host f32, linear in the context).
+
 ### OPEN-FAMILY-LFM3: LiquidAI LFM3 (LFM3-1.7B) derives its own spec and runs on its own recipe from the GGUF
 **Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_lfm3_hf`, `families.py`, `lfm3.py`,
 `designs/lfm3/{lg.py,gen_kernels.py,check_layer.py}`, `model/lfm3_gguf_reference.py`, `model/lfm3_gguf_make.py`; runtime: the
