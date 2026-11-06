@@ -102,9 +102,10 @@ from pathlib import Path
 import numpy as np
 
 import aie.iron as iron
-from aie.iron import Buffer, CompileTime, In, InOut, ObjectFifo, Program, Runtime
+from aie.iron import Buffer, CompileTime, In, InOut, ObjectFifo, Program, Runtime, Worker
 from aie.iron.dataflow.objectfifo import ObjectFifoLink
 from aie.iron.device import Tile
+from aie.iron.kernel import ExternalFunction
 
 HERE = Path(__file__).parent
 GEMV = HERE.parent / "gemv_q4"
@@ -118,7 +119,7 @@ from layout import (A_BYTES, A_HP, A_RES, A_ROUT, A_XM, AA_BYTES, AA_HP, AA_RES,
                     C_BYTES, C_SGW, CA_BYTES, CA_SGW, KV_BYTES, POOL_BYTES, PTAB_BYTES, STATE_BYTES, R, SPEC)
 import xcommon as X  # noqa: E402
 import xlayer as XL  # noqa: E402
-from recipes.qwen36moe import stream_knobs  # noqa: E402
+from recipes.qwen36moe import router_split, stream_knobs  # noqa: E402
 
 D = R.linear
 A = R.attn
@@ -167,6 +168,11 @@ GLUE_TILE = Tile(2, 4)          # lx.py's Tile(2, 3) is ax.py's attention core 0
 # core still acquires the same L1 fifo). 0 / off builds the image byte for byte as before.
 WRING, WORDER = stream_knobs()
 assert 0 <= WRING <= 24, "ux: a memtile ring deeper than 24 does not fit one BD pool"
+# UX_RSPLIT: the router's W (1 MB, 256 x 4 KB) reaches the norm helper over TWO shim channels -- even
+# elements on lni, odd ones on `rin` from shim (6, 0)'s free fill channel -- instead of one, which
+# held every layer's tail for the time one stream takes to move 1 MB. The helper takes the pairs in
+# element order through router_acc2 (router_acc_impl twice): the same sums, the same top-k.
+RSPLIT = router_split()
 
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
@@ -201,6 +207,7 @@ def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *,
     else:
         w_src = of_w
     of_lni, of_lno = XL.ln_fifos(tl)
+    of_rin = ObjectFifo(tl["u8_4k"], name="rin", depth=2) if RSPLIT else None
     of_side, of_gact, of_gout, of_pin, of_pout = XL.glue_post_fifos(g)
     of_ain, of_aout, of_og = XL.attn_fifos(a)
 
@@ -229,14 +236,23 @@ def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *,
         xin.release(2)
         X.moe_body(win, xin, yout, B, K)
 
-    workers = ([XL.ln_worker(of_lni, of_lno, tl, L)]
+    if RSPLIT:
+        racc2 = ExternalFunction("router_acc2", source_file=str(X.RT / "router_acc2.cc"),
+                                 arg_types=[tl["u8_4k"], tl["u8_4k"], tl["xb"], tl["racc"], np.int32], include_dirs=inc)
+        ln_w = Worker(X.ln_router_body2,
+                      fn_args=[of_lni.cons(), of_lno.prod(), of_rin.cons(), Buffer(tl["xb"], name="rxs"),
+                               Buffer(tl["racc"], name="racc"), L["ln_nr"], L["ln"], L["rcopy"], racc2, L["rfin"]],
+                      tile=Tile(0, 3), stack_size=XL.STACK)
+    else:
+        ln_w = XL.ln_worker(of_lni, of_lno, tl, L)
+    workers = ([ln_w]
                + XL.main_workers(main_body, of_w, of_x, of_y, t, K, extra=lambda c: [rtp[c]])
                + XL.glue_post_workers(of_side, of_gact, of_gout, of_pin, of_pout, g, GK, GLUE_TILE)
                + XL.attn_workers(of_ain, of_aout, of_og, a, afns))
 
     # ---- host sequences (one per instruction stream)
     def linear_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
-                        side_p, gact_p, gout_c, pin_p, pout_c):
+                        side_p, gact_p, gout_c, pin_p, pout_c, rin_p=None):
         """lx.py's part 0 (xlayer.linear_sequence), against the merged buffer totals, after
         the two RTP words."""
         for c in range(N_CORES):
@@ -244,30 +260,31 @@ def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *,
             rtp[c][1] = DN_HEADS_PC
         XL.linear_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
                            side_p, gact_p, gout_c, pin_p, pout_c, act_t=ACT_T, consts_t=CONSTS_T, state_t=STATE_T,
-                           early_out=WORDER)
+                           early_out=WORDER, rin=rin_p)
 
     def full_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
-                      ain_p, aout_c, og_cs):
+                      ain_p, aout_c, og_cs, rin_p=None):
         """ax.py's part 0 (xlayer.full_sequence), against the merged buffer totals, after
         the two RTP words."""
         for c in range(N_CORES):
             rtp[c][0] = NBANDS_FULL
             rtp[c][1] = 0
         XL.full_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
-                         ain_p, aout_c, og_cs, act_t=ACT_T, consts_t=CONSTS_T, kv_t=STATE_T)
+                         ain_p, aout_c, og_cs, act_t=ACT_T, consts_t=CONSTS_T, kv_t=STATE_T, rin=rin_p)
 
     def sequence(a_pool, c_xres, a_consts, a_state, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
-                 side_p, gact_p, gout_c, pin_p, pout_c, ain_p, aout_c, og_cs):
+                 side_p, gact_p, gout_c, pin_p, pout_c, ain_p, aout_c, og_cs, *rest):
+        rin_p = rest[0] if RSPLIT else None
         if part == 0:
             linear_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
-                            side_p, gact_p, gout_c, pin_p, pout_c)
+                            side_p, gact_p, gout_c, pin_p, pout_c, rin_p)
         elif part == 1:
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres,
                            w_prods, x_prod, y_conss, ACT_T, CONSTS_T, A_XM, A_ROUT, A_RES, A_HP, C_SGW,
                            early_down=WORDER)
         elif part == 2:
             full_sequence(a_pool, c_xres, a_consts, a_state, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
-                          ain_p, aout_c, og_cs)
+                          ain_p, aout_c, og_cs, rin_p)
         else:
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres,
                            w_prods, x_prod, y_conss, ACT_T, CONSTS_T, AA_XM, AA_ROUT, AA_RES, AA_HP, CA_SGW,
@@ -282,7 +299,8 @@ def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *,
                             of_gout.cons(tile=Tile(2, 0)),
                             of_pin.prod(tile=Tile(4, 0)), of_pout.cons(tile=Tile(1, 0)),
                             of_ain.prod(tile=Tile(5, 0)), of_aout.cons(tile=Tile(6, 0)),
-                            [of_og[c].cons(tile=Tile(3 + c, 0)) for c in range(XL.ACORES - 1)]])
+                            [of_og[c].cons(tile=Tile(3 + c, 0)) for c in range(XL.ACORES - 1)]]
+                 + ([of_rin.prod(tile=Tile(6, 0))] if RSPLIT else []))
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 
@@ -295,6 +313,6 @@ _src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + sorted(f.rea
                 + [(X.LN / "ln.cc").read_bytes(), (X.LN / "ln.h").read_bytes(), (X.LINL / "ln_nr.cc").read_bytes(),
                    (GEMV / "gemv_q4.h").read_bytes(), (GEMV / "gemv_tab.h").read_bytes(),
                    (HERE.parent.parent / "include" / "vecmath.h").read_bytes(), (HERE.parent.parent / "include" / "scalar_fp.h").read_bytes(), SPEC.spec_hash().encode()])
-if WRING or WORDER:                 # a ring / order build never shares a jit key with the plain image
-    _src += f"WRING={WRING} WORDER={int(WORDER)}".encode()
+if WRING or WORDER or RSPLIT:       # a probe build never shares a jit key with the plain image
+    _src += f"WRING={WRING} WORDER={int(WORDER)} RSPLIT={int(RSPLIT)}".encode()
 SPECIALIZE = {"part": PART, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

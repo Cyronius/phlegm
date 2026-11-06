@@ -855,6 +855,32 @@ def ln_router_body(ain, aout, xs, acc, f_nr, f_ln, f_rc, f_ra, f_rf):
     aout.release(1)
 
 
+def ln_router_body2(ain, aout, rin, xs, acc, f_nr, f_ln, f_rc, f_ra2, f_rf):
+    """ln_router_body with the router's W over two input streams (ux.py UX_RSPLIT): element 2 rb
+    from `ain`, 2 rb + 1 from `rin`, both into one router_acc2 call (router_acc_impl on each, in
+    element order: the same sums as ln_router_body)."""
+    e = ain.acquire(3)
+    o = aout.acquire(1)
+    f_nr(e[0], e[1], e[2], o)
+    aout.release(1)
+    ain.release(3)
+    e = ain.acquire(5)
+    oo = aout.acquire(3)
+    f_ln(e[0], e[1], e[3], e[4], e[2], oo[0], oo[1], oo[2])
+    f_rc(oo[2], xs)
+    aout.release(3)
+    ain.release(5)
+    for rb in range_(W_ELEMS // 2):
+        e0 = ain.acquire(1)
+        e1 = rin.acquire(1)
+        f_ra2(e0, e1, xs, acc, rb)
+        rin.release(1)
+        ain.release(1)
+    o = aout.acquire(1)
+    f_rf(acc, o)
+    aout.release(1)
+
+
 def source_hash_inputs():
     """The recipe sources, for the designs' srchash (a recipe change re-jits)."""
     return sorted(f.read_bytes() for f in (HERE.parent.parent / "recipes").glob("*.py"))

@@ -97,6 +97,25 @@ def main_workers(body, of_w, of_x, of_y, t, K, extra=lambda c: []):
             for c in range(N_CORES)]
 
 
+def router_fill(lni, rin, a_consts, consts_t, c_rw, group):
+    """The router's W into the norm helper: one fill on lni, or (rin given, ux.py UX_RSPLIT) the
+    even 4 KB elements on lni and the odd ones on rin, so W arrives over two shim channels and the
+    helper's two input channels. The helper (xcommon.ln_router_body2) takes them pairwise in
+    element order, so the sums are the same. Two BDs per channel, 64 element pairs each (a shim
+    BD's outer dimension stays at 64, its innermost wrap under 4 KB)."""
+    if rin is None:
+        lni.fill(a_consts, tap=bt(consts_t, c_rw, X.W_ELEMS * ELEM), wait=True, group=group)
+        return
+    from aie.helpers.taplib import TensorAccessPattern
+    npair = X.W_ELEMS // 4                           # element pairs per BD
+    assert X.W_ELEMS == 4 * npair and npair <= 64, X.W_ELEMS
+    for h in range(2):
+        base = c_rw + h * 2 * npair * ELEM
+        for ep, k in ((lni, 0), (rin, 1)):
+            ep.fill(a_consts, tap=TensorAccessPattern((1, consts_t), base + k * ELEM, [1, npair, 4, ELEM // 4],
+                                                      [0, 2 * ELEM, ELEM // 4, 1]), wait=True, group=group)
+
+
 # ---- the linear-attention layer's helpers: dn_glue (Tile(2, 3) in lx) and dn_post (Tile(1, 3))
 D = R.linear
 if D is not None:
@@ -296,7 +315,7 @@ def glue_post_workers(of_side, of_gact, of_gout, of_pin, of_pout, g, k, glue_til
 
 def linear_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
                     side_p, gact_p, gout_c, pin_p, pout_c,
-                    act_t=A_BYTES, consts_t=C_BYTES, state_t=STATE_BYTES, stop=99, early_out=False):
+                    act_t=A_BYTES, consts_t=C_BYTES, state_t=STATE_BYTES, stop=99, early_out=False, rin=None):
     """The linear layer's part 0 on the MoE path: ln -> qkv | z -> glue -> DeltaNet -> post ->
     out -> ln (+residual) -> router. `stop` is lx.py's LX_STOP debug truncation (1: after the
     glue, 2: after DeltaNet). `early_out` (ux.py UX_WORDER): the out projection's weight fills go
@@ -383,7 +402,7 @@ def linear_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods,
     lno.drain(a_act, tap=bt(act_t, A_XM, ELEM), wait=True, group=tg_ln)
     tg_ln.finish()
     tg_r = TaskGroup()
-    lni.fill(a_consts, tap=bt(consts_t, C_RW, X.W_ELEMS * ELEM), wait=True, group=tg_r)
+    router_fill(lni, rin, a_consts, consts_t, C_RW, tg_r)
     lno.drain(a_act, tap=bt(act_t, A_ROUT, ELEM), wait=True, group=tg_r)
     tg_r.finish()
     pw.finish()
@@ -671,7 +690,7 @@ def y_regions(c):
 
 
 def full_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
-                  ain_p, aout_c, og_cs, act_t=AA_BYTES, consts_t=CA_BYTES, kv_t=KV_BYTES):
+                  ain_p, aout_c, og_cs, act_t=AA_BYTES, consts_t=CA_BYTES, kv_t=KV_BYTES, rin=None):
     """The full-attention layer's part 0 on the MoE path: ln -> q | gate | k | v -> attention
     -> o -> ln (+residual) -> router."""
     tg_ln = TaskGroup()
@@ -721,7 +740,7 @@ def full_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_pro
     py.finish()                                               # out is in DDR
     lni.fill(a_act, tap=bt(act_t, AA_OUT, HID * 4), wait=True, group=tg_ln2)
     tg_r = TaskGroup()
-    lni.fill(a_consts, tap=bt(consts_t, CA_RW, X.W_ELEMS * ELEM), wait=True, group=tg_r)
+    router_fill(lni, rin, a_consts, consts_t, CA_RW, tg_r)
     lno.drain(a_act, tap=bt(act_t, AA_ROUT, ELEM), wait=True, group=tg_r)
     tg_ln2.finish()
     tg_r.finish()

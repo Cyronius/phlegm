@@ -55,9 +55,15 @@ def stream_knobs() -> tuple[int, bool]:
     return ring, order
 
 
+def router_split() -> bool:
+    """UX_RSPLIT=1 at export: the merged image's norm helper takes the router's 1 MB W over two
+    shim channels (designs/layer_x/ux.py), not one. In the build key (probe_env)."""
+    return os.environ.get("UX_RSPLIT", "0") == "1"
+
+
 # Timing-only ablations of the layer_x main cores (xcommon.py): outputs are garbage, the DMA
 # is unchanged. In the build key so a probe set never shares a key with a real one.
-_LAYER_PROBE_VARS = ("UX_WRING", "UX_WORDER", "LX_NULL_GEMV", "LX_NULL_DN")
+_LAYER_PROBE_VARS = ("UX_WRING", "UX_WORDER", "UX_RSPLIT", "LX_NULL_GEMV", "LX_NULL_DN")
 
 
 def probe_env() -> dict[str, str]:
