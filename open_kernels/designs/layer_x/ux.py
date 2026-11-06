@@ -102,7 +102,8 @@ from pathlib import Path
 import numpy as np
 
 import aie.iron as iron
-from aie.iron import Buffer, CompileTime, In, InOut, Program, Runtime
+from aie.iron import Buffer, CompileTime, In, InOut, ObjectFifo, Program, Runtime
+from aie.iron.dataflow.objectfifo import ObjectFifoLink
 from aie.iron.device import Tile
 
 HERE = Path(__file__).parent
@@ -117,6 +118,7 @@ from layout import (A_BYTES, A_HP, A_RES, A_ROUT, A_XM, AA_BYTES, AA_HP, AA_RES,
                     C_BYTES, C_SGW, CA_BYTES, CA_SGW, KV_BYTES, POOL_BYTES, PTAB_BYTES, STATE_BYTES, R, SPEC)
 import xcommon as X  # noqa: E402
 import xlayer as XL  # noqa: E402
+from recipes.qwen36moe import stream_knobs  # noqa: E402
 
 D = R.linear
 A = R.attn
@@ -157,6 +159,15 @@ STATE_T = max(STATE_BYTES, KV_BYTES)
 
 GLUE_TILE = Tile(2, 4)          # lx.py's Tile(2, 3) is ax.py's attention core 0; rows 4-5 are empty
 
+# OPEN-DECODE-STREAM on this image: each main core's weight fifo runs shim -> a WRING-deep ring of
+# 10 KB elements in its column's memtile -> core (channels 0 in, 1 out), so DDR keeps streaming
+# through an activation wait instead of stopping 20 KB (the core's 2-deep L1 fifo) into it; and
+# with WORDER the MoE parts queue each slot's down fills ahead of the hidden's round trip. Same
+# bytes to every core in the same order: every logit unchanged. Main-core code is untouched (the
+# core still acquires the same L1 fifo). 0 / off builds the image byte for byte as before.
+WRING, WORDER = stream_knobs()
+assert 0 <= WRING <= 24, "ux: a memtile ring deeper than 24 does not fit one BD pool"
+
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
 def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *, part: CompileTime[int] = 0,
@@ -182,6 +193,13 @@ def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *,
 
     # ---- fifos: the union of lx's and ax's
     of_w, of_y, of_x = XL.main_fifos(t)
+    if WRING:
+        of_wm = [ObjectFifo(t["elem"], name=f"wm{c}", depth=WRING) for c in range(N_CORES)]
+        for c in range(N_CORES):
+            ObjectFifoLink(of_wm[c].cons(channel=0), [of_w[c].prod(channel=1)], Tile(c, 1), [], [0])
+        w_src = of_wm
+    else:
+        w_src = of_w
     of_lni, of_lno = XL.ln_fifos(tl)
     of_side, of_gact, of_gout, of_pin, of_pout = XL.glue_post_fifos(g)
     of_ain, of_aout, of_og = XL.attn_fifos(a)
@@ -225,7 +243,8 @@ def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *,
             rtp[c][0] = NBANDS_LIN
             rtp[c][1] = DN_HEADS_PC
         XL.linear_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
-                           side_p, gact_p, gout_c, pin_p, pout_c, act_t=ACT_T, consts_t=CONSTS_T, state_t=STATE_T)
+                           side_p, gact_p, gout_c, pin_p, pout_c, act_t=ACT_T, consts_t=CONSTS_T, state_t=STATE_T,
+                           early_out=WORDER)
 
     def full_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
                       ain_p, aout_c, og_cs):
@@ -244,17 +263,19 @@ def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *,
                             side_p, gact_p, gout_c, pin_p, pout_c)
         elif part == 1:
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres,
-                           w_prods, x_prod, y_conss, ACT_T, CONSTS_T, A_XM, A_ROUT, A_RES, A_HP, C_SGW)
+                           w_prods, x_prod, y_conss, ACT_T, CONSTS_T, A_XM, A_ROUT, A_RES, A_HP, C_SGW,
+                           early_down=WORDER)
         elif part == 2:
             full_sequence(a_pool, c_xres, a_consts, a_state, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
                           ain_p, aout_c, og_cs)
         else:
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres,
-                           w_prods, x_prod, y_conss, ACT_T, CONSTS_T, AA_XM, AA_ROUT, AA_RES, AA_HP, CA_SGW)
+                           w_prods, x_prod, y_conss, ACT_T, CONSTS_T, AA_XM, AA_ROUT, AA_RES, AA_HP, CA_SGW,
+                           early_down=WORDER)
 
     rt = Runtime(sequence, [pool_ty, xres_ty, consts_ty, state_ty, act_ty, ptab_ty,
                             of_lni.prod(tile=Tile(0, 0)), of_lno.cons(tile=Tile(0, 0)),
-                            [of_w[c].prod(tile=Tile(c, 0)) for c in range(N_CORES)],
+                            [w_src[c].prod(tile=Tile(c, 0)) for c in range(N_CORES)],
                             of_x.prod(tile=Tile(1, 0)),
                             [of_y[c].cons(tile=Tile(c, 0)) for c in range(N_CORES)],
                             of_side.prod(tile=Tile(2, 0)), of_gact.prod(tile=Tile(3, 0)),
@@ -274,4 +295,6 @@ _src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + sorted(f.rea
                 + [(X.LN / "ln.cc").read_bytes(), (X.LN / "ln.h").read_bytes(), (X.LINL / "ln_nr.cc").read_bytes(),
                    (GEMV / "gemv_q4.h").read_bytes(), (GEMV / "gemv_tab.h").read_bytes(),
                    (HERE.parent.parent / "include" / "vecmath.h").read_bytes(), (HERE.parent.parent / "include" / "scalar_fp.h").read_bytes(), SPEC.spec_hash().encode()])
+if WRING or WORDER:                 # a ring / order build never shares a jit key with the plain image
+    _src += f"WRING={WRING} WORDER={int(WORDER)}".encode()
 SPECIALIZE = {"part": PART, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

@@ -296,10 +296,12 @@ def glue_post_workers(of_side, of_gact, of_gout, of_pin, of_pout, g, k, glue_til
 
 def linear_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
                     side_p, gact_p, gout_c, pin_p, pout_c,
-                    act_t=A_BYTES, consts_t=C_BYTES, state_t=STATE_BYTES, stop=99):
+                    act_t=A_BYTES, consts_t=C_BYTES, state_t=STATE_BYTES, stop=99, early_out=False):
     """The linear layer's part 0 on the MoE path: ln -> qkv | z -> glue -> DeltaNet -> post ->
     out -> ln (+residual) -> router. `stop` is lx.py's LX_STOP debug truncation (1: after the
-    glue, 2: after DeltaNet)."""
+    glue, 2: after DeltaNet). `early_out` (ux.py UX_WORDER): the out projection's weight fills go
+    out right behind the last DeltaNet fill instead of after the wait on o, so with a memtile ring
+    they stream during the DeltaNet tail too; each channel's order is unchanged."""
     QKV_PC, Z_PC, OUT_PC, VW, OUT_K = D.QKV_PC, D.Z_PC, D.OUT_PC, D.VW, D.OUT_K
     BB_HID, BB_OUT = X.role_band_bytes("linear", HID), X.role_band_bytes("linear_out", OUT_K)
     # 1. layer-entry norm: xn -> act[A_XN]
@@ -341,6 +343,12 @@ def linear_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods,
         return
     # 4. DeltaNet on the main cores: S in place, o -> act[A_O]
     X.dn_sequence(pw, py, a_state, a_act, w_prods, y_conss, act_t, A_VEC, A_O, state_t, STATE_S_OFF, S_HEAD_BYTES)
+
+    def out_fills():
+        for c in range(N_CORES):
+            pw.fill(w_prods[c], a_consts, bt(consts_t, C_WOUT + c * OUT_PC * BB_OUT, OUT_PC * BB_OUT))
+    if early_out and stop > 2:
+        out_fills()                                  # reads consts only; awaits a DeltaNet fill at most
     py.finish()                                      # o is in DDR
     if stop == 2:
         pw.finish()
@@ -352,7 +360,8 @@ def linear_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods,
     # here are already satisfied; each core's w fifo fills with its first out elements
     # while post runs, instead of after.
     for c in range(N_CORES):
-        pw.fill(w_prods[c], a_consts, bt(consts_t, C_WOUT + c * OUT_PC * BB_OUT, OUT_PC * BB_OUT))
+        if not early_out:
+            pw.fill(w_prods[c], a_consts, bt(consts_t, C_WOUT + c * OUT_PC * BB_OUT, OUT_PC * BB_OUT))
         py.drain(y_conss[c], a_act, bt(act_t, A_OUT + c * OUT_PC * YB, OUT_PC * YB))
     # 5. post: og -> act[A_OG] (z from act, o from DeltaNet)
     pipe = Pipeline(3)

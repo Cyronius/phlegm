@@ -582,10 +582,16 @@ def moe_body(win, ain, yout, B, K, nx=NX):
 
 
 def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prods, x_prod, y_conss,
-                 A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW, nx=NX):
+                 A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW, nx=NX, early_down=False):
     """Host sequence of the MoE block (one instruction-stream part). Routed slot j's fills carry
     placeholder pool offsets (expert j); moeroute2 rewrites them from the router output.
-    nx must match the body's: NE drops the shared expert's fills with its slot."""
+    nx must match the body's: NE drops the shared expert's fills with its slot.
+
+    early_down (ux.py UX_WORDER, OPEN-DECODE-STREAM-MOE): each slot's down fills are issued
+    BEFORE the wait on its hidden parts instead of after it. They read only the pool, and each
+    channel still carries up, gate, down, up, ... in the order the core consumes them, so the
+    cores see the same bytes; the weight stream no longer stops for the hidden's DDR round trip
+    (with a memtile ring, the whole down slice is queued while the core waits for h)."""
     spp, cps = C.STRIPES_PER_PROJ, C.CORES_PER_STRIPE
     pipe_x.fill(x_prod, a_act, bt(A_BYTES, A_XM, ELEM))
     for c in range(N_CORES):
@@ -602,15 +608,21 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_UP + c * HALF, HALF))
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_GATE + c * HALF, HALF))
             pipe_y.drain(y_conss[c], a_act, bt(A_BYTES, A_HP + c * HID_PC * 4, HID_PC * 4))
+
+        def down_fills():
+            for c in range(N_CORES):
+                if e < NE:
+                    pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_DOWN + e * UP_BYTES + c * DOWN_PER_CORE * DOWN_BAND,
+                                                       DOWN_PER_CORE * DOWN_BAND))
+                else:
+                    pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_DOWN + c * DOWN_PER_CORE * DOWN_BAND,
+                                                       DOWN_PER_CORE * DOWN_BAND))
+        if early_down:
+            down_fills()
         pipe_y.finish(*y_conss)                           # the hidden parts are in DDR
         pipe_x.fill(x_prod, a_act, bt(A_BYTES, A_HP, ELEM))
-        for c in range(N_CORES):
-            if e < NE:
-                pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_DOWN + e * UP_BYTES + c * DOWN_PER_CORE * DOWN_BAND,
-                                                   DOWN_PER_CORE * DOWN_BAND))
-            else:
-                pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_DOWN + c * DOWN_PER_CORE * DOWN_BAND,
-                                                   DOWN_PER_CORE * DOWN_BAND))
+        if not early_down:
+            down_fills()
     for c in range(N_CORES):
         pipe_y.drain(y_conss[c], c_xres, bt(HID, c * ROWS_PC, ROWS_PC))   # the block output = the new residual
     pipe_w.finish()

@@ -45,6 +45,21 @@ def merged_image(spec: ModelSpec) -> bool:
     return one_context() and spec.has_linear and spec.has_full and not spec.q8_roles
 
 
+def stream_knobs() -> tuple[int, bool]:
+    """OPEN-DECODE-STREAM on the merged layer image (designs/layer_x/ux.py): (memtile ring depth
+    of each main core's weight stream in 10 KB elements, 0 = shim straight to the core; the MoE
+    parts' down fills issued ahead of the hidden's round trip). `UX_WRING=<n>` / `UX_WORDER=0|1`
+    at export; both are in the build key (probe_env)."""
+    ring = int(os.environ.get("UX_WRING", "0"))
+    order = os.environ.get("UX_WORDER", "0") == "1"
+    return ring, order
+
+
+# Timing-only ablations of the layer_x main cores (xcommon.py): outputs are garbage, the DMA
+# is unchanged. In the build key so a probe set never shares a key with a real one.
+_LAYER_PROBE_VARS = ("UX_WRING", "UX_WORDER", "LX_NULL_GEMV", "LX_NULL_DN")
+
+
 def probe_env() -> dict[str, str]:
     """The build key's probe variables (cache.py reads this off the family module). The
     merged-image flavour joins them: it changes what `builds` compiles and what `programs`
@@ -53,6 +68,9 @@ def probe_env() -> dict[str, str]:
     e = dict(_attn_probe_env())
     if one_context():
         e["OPEN_LAYER_ONE_CTX"] = "1"
+    for k in _LAYER_PROBE_VARS:
+        if os.environ.get(k):
+            e[k] = os.environ[k]
     return e
 
 # ---- the q4_1 / q8 pool chunk formats (gemv_q4.h, lm_head_q8.h): format constants, not model ones
