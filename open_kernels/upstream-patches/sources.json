@@ -762,5 +762,34 @@
     "note": "The same attention_block replacement as block-host-attention-runtime.patch, against the lfm2moe-block point of the chain (attention_block before lfm3's window): the lfm2moe-runtime clone (bridges/lfm2moe-blk) and the hyv3-runtime clone (bridges/hyv3-blk, over hyv3-block-runtime.patch, which does not touch block_host.cpp). Flint's flint-block-runtime.patch carries the same body with its sinks argument folded in (regenerated 2026-11-04). NPU A/B: target/npu-dev/prefill-prof/ab-lfm25.json, ab-hy.json.",
     "patch": "block-host-attention-lfm2moe-runtime.patch",
     "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "nemotronh_runtime_20261106": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gemma4_moe_20261031",
+      "gemma4_moe_decode_20261101",
+      "gemma4_moe_block_20261103"
+    ],
+    "files": [
+      "src/open_qwen36/CMakeLists.txt",
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp",
+      "src/open_qwen36/nemotronh_pack_check.cpp",
+      "src/open_qwen36/pools.cpp"
+    ],
+    "note": "NVIDIA Nemotron-H MoE (OPEN-FAMILY-NEMOTRONH, 2026-11-06): host program steps nh_pre / nh_ssm (Mamba-2: conv, selective-state update, gate, grouped norm) / nh_attn (GQA without positional encoding over f32 K | V rows) / nh_route (sigmoid router with selection bias, the shared expert as two slots, the `nhroute` fill table) / nh_add / nh_final (also allowed in the tail); a layer type's own pool size (`buffers.pool`); pack ops nh_q40 (g4_q40 with a column window) and nh_lmhead (the flint chain's gx_lmhead law, absent from this chain); the GEMV input as bf16 or f32 (x_f32, the one-image program); nemotronh_pack_check (CPU readback of the packing). sha256 32af8919140c62dc62cb79c1c069bf15e8b74fc68b2b87cccd1a6ea1ad89a268; built in target/npu-dev/nemotronh-runtime, a copy of the gemma4-moe-runtime clone (the unmodified copy: nemotronh-runtime-base; base + patch = the clone, checked by nemotronh/scripts/mkpatch.sh)",
+    "patch": "nemotronh-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
   }
 }

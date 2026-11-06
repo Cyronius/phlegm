@@ -1,0 +1,780 @@
+--- a/src/open_qwen36/core.cpp
++++ b/src/open_qwen36/core.cpp
+@@ -646,7 +646,7 @@
+     };
+     for (int l = 0; l < nl_; ++l) {
+         const LayerType& lt = *types_[l];
+-        xrt::bo pool = xrt::ext::bo(*dev_, w_->pool_bytes);
++        xrt::bo pool = xrt::ext::bo(*dev_, lt.pool_bytes ? lt.pool_bytes : w_->pool_bytes);
+         uint8_t* pool_host = pool.map<uint8_t*>();
+         pools::pack_pool(*w_, lt, *file_, l, pool_host);
+         build_weights(lt, l, "pool", pool_host);
+@@ -1888,9 +1888,336 @@
+ void Core::host_step(const Step& s, int layer) {
+     if (s.op == "gemma4_route") gemma4_route(s, layer);
+     else if (s.op == "gemma4_combine") gemma4_combine(s, layer);
++    else if (s.op.compare(0, 3, "nh_") == 0) nh_step(s, layer);
+     else route(kerns_.at(s.kernel), layer, s.act_off);
+ }
+ 
++// ============================================================================
++// Nemotron-H (OPEN-FAMILY-NEMOTRONH, open_kernels/recipes/nemotronh.py; nemotronh-runtime.patch). A block is
++// x = x + mixer(rms(x) * norm); the NPU runs the projection GEMVs and the expert program, these host steps the
++// rest. The residual stays in the `xres` global's host map, f32, and never goes to the device; the Mamba state
++// (3 conv rows | the f32 SSM state) and the attention's f32 [K | V] rows live in the layer's state BO, host side.
++// ============================================================================
++
++namespace {
++double nh_num(const Step& s, const char* key) {
++    auto it = s.nh_n.find(key);
++    if (it == s.nh_n.end()) throw std::runtime_error("open_qwen36: " + s.op + " lacks the number '" + key + "'");
++    return it->second;
++}
++const std::string& nh_str(const Step& s, const char* key) {
++    auto it = s.nh_s.find(key);
++    if (it == s.nh_s.end()) throw std::runtime_error("open_qwen36: " + s.op + " lacks the string '" + key + "'");
++    return it->second;
++}
++size_t nh_sz(const Step& s, const char* key) { return static_cast<size_t>(nh_num(s, key)); }
++/// rms(x) * w over n values (the mean in double), as bf16 into dst, then zeros up to k
++void nh_rms_bf16(const float* x, const float* w, size_t n, size_t k, double eps, uint16_t* dst) {
++    double ss = 0.0;
++    for (size_t i = 0; i < n; ++i) ss += static_cast<double>(x[i]) * x[i];
++    const double r = 1.0 / std::sqrt(ss / static_cast<double>(n) + eps);
++    for (size_t i = 0; i < n; ++i) dst[i] = f32_to_bf16(static_cast<float>(x[i] * r * w[i]));
++    for (size_t i = n; i < k; ++i) dst[i] = 0;
++}
++inline float nh_silu(float v) { return v / (1.0f + std::exp(-v)); }
++/// the step's GEMV input format: f32 when the step says x_f32 (the one-image program), else bf16
++bool nh_f32(const Step& s) { auto it = s.nh_n.find("x_f32"); return it != s.nh_n.end() && it->second != 0.0; }
++/// write v[0..n) then zeros up to k at dst in the step's format; returns the bytes written
++size_t nh_put_x(const Step& s, const float* v, size_t n, size_t k, uint8_t* dst) {
++    if (nh_f32(s)) {
++        float* o = reinterpret_cast<float*>(dst);
++        std::memcpy(o, v, n * 4);
++        for (size_t i = n; i < k; ++i) o[i] = 0.0f;
++        return k * 4;
++    }
++    uint16_t* o = reinterpret_cast<uint16_t*>(dst);
++    for (size_t i = 0; i < n; ++i) o[i] = f32_to_bf16(v[i]);
++    for (size_t i = n; i < k; ++i) o[i] = 0;
++    return k * 2;
++}
++}  // namespace
++
++const std::vector<float>& Core::nh_tensor(const std::string& pattern, int layer, size_t n) {
++    std::string name = pattern;
++    const size_t at = name.find("{l}");
++    if (at != std::string::npos) name.replace(at, 3, std::to_string(layer));
++    auto it = nh_w_.find(name);
++    if (it != nh_w_.end()) return it->second;
++    std::vector<float> v = file_->f32(name);
++    if (n && v.size() != n)
++        throw std::runtime_error("open_qwen36: " + name + " has " + std::to_string(v.size()) + " values, the step wants " +
++                                 std::to_string(n));
++    return nh_w_.emplace(name, std::move(v)).first->second;
++}
++
++void Core::nh_step(const Step& s, int layer) {
++    auto t0 = std::chrono::steady_clock::now();
++    if (s.op == "nh_pre") nh_pre(s, layer);
++    else if (s.op == "nh_ssm") nh_ssm(s, layer);
++    else if (s.op == "nh_attn") nh_attn(s, layer);
++    else if (s.op == "nh_route") nh_route(s, layer);
++    else if (s.op == "nh_add") nh_add(s, layer);
++    else if (s.op == "nh_final") nh_final(s);
++    else throw std::runtime_error("open_qwen36: unknown host step " + s.op);
++    timing_.route_ms += ms_since(t0);
++}
++
++void Core::nh_pre(const Step& s, int layer) {
++    // the block's input norm: rms(x) * norm as the GEMV's bf16 x, zero-padded to the operand's K
++    const size_t hid = nh_sz(s, "hidden"), k = nh_sz(s, "k"), ax = nh_sz(s, "a_x");
++    const std::vector<float>& w = nh_tensor(nh_str(s, "norm"), layer, hid);
++    xrt::bo& act = act_[layer];
++    const float* x = buffer("xres", 0).map<float*>();
++    double ss = 0.0;
++    for (size_t i = 0; i < hid; ++i) ss += static_cast<double>(x[i]) * x[i];
++    const double r = 1.0 / std::sqrt(ss / static_cast<double>(hid) + nh_num(s, "eps"));
++    std::vector<float> xn(hid);
++    for (size_t i = 0; i < hid; ++i) xn[i] = static_cast<float>(x[i] * r * w[i]);
++    act.sync(XCL_BO_SYNC_BO_TO_DEVICE, nh_put_x(s, xn.data(), hid, k, act.map<uint8_t*>() + ax), ax);
++}
++
++void Core::nh_add(const Step& s, int layer) {
++    // x += the mixer's output (f32 [hidden] at a_o)
++    const size_t hid = nh_sz(s, "hidden"), ao = nh_sz(s, "a_o");
++    xrt::bo& act = act_[layer];
++    read_back(act, hid * 4, ao);
++    const float* o = reinterpret_cast<const float*>(act.map<uint8_t*>() + ao);
++    float* x = buffer("xres", 0).map<float*>();
++    for (size_t i = 0; i < hid; ++i) x[i] += o[i];
++}
++
++void Core::nh_final(const Step& s) {
++    // the final norm into the head's bf16 input
++    const size_t hid = nh_sz(s, "hidden"), k = nh_sz(s, "k");
++    const std::vector<float>& w = nh_tensor(nh_str(s, "norm"), 0, hid);
++    xrt::bo& hn = buffer(nh_str(s, "dst"), 0);
++    if (hn.size() < k * 2) throw std::runtime_error("open_qwen36: nh_final: the head input is smaller than K");
++    nh_rms_bf16(buffer("xres", 0).map<float*>(), w.data(), hid, k, nh_num(s, "eps"), hn.map<uint16_t*>());
++    hn.sync(XCL_BO_SYNC_BO_TO_DEVICE, k * 2, 0);
++}
++
++void Core::nh_ssm(const Step& s, int layer) {
++    // Mamba-2 (transformers NemotronHMamba2Mixer, llama.cpp build_mamba2_layer) for one token, from the in_proj
++    // GEMV's [z | xBC | dt] (f32 at a_y) to the out GEMV's bf16 input (a_x):
++    //   xBC = silu(conv(previous 3 rows, xBC) + bias); dt = softplus(dt + dt_bias); dA = exp(dt A)
++    //   per head h (group g = h / (heads / groups)): S_h = S_h dA + dt x_h B_g^T;  y_h = S_h C_g + D_h x_h
++    //   y = y * silu(z); the grouped RMSNorm (groups of di / groups) * ssm_norm
++    const size_t nh = nh_sz(s, "heads"), hd = nh_sz(s, "head_dim"), ng = nh_sz(s, "groups"), ds = nh_sz(s, "dstate");
++    const size_t taps = nh_sz(s, "taps"), ay = nh_sz(s, "a_y"), ax = nh_sz(s, "a_x"), k = nh_sz(s, "k");
++    const size_t di = nh * hd, cdim = di + 2 * ng * ds, n_in = di + cdim + nh;
++    const double eps = nh_num(s, "eps");
++    if (taps < 2 || nh % ng || k < di || nh_sz(s, "state_conv") != (taps - 1) * cdim * 4)
++        throw std::runtime_error("open_qwen36: nh_ssm: the geometry does not fit the state");
++    const LayerType& lt = *types_[layer];
++    if (lt.state_bytes < (taps - 1) * cdim * 4 + nh * hd * ds * 4)
++        throw std::runtime_error("open_qwen36: nh_ssm: layer " + std::to_string(layer) + "'s state BO is too small");
++    const std::vector<float>& cw = nh_tensor(nh_str(s, "conv_w"), layer, cdim * taps);
++    const std::vector<float>& cb = nh_tensor(nh_str(s, "conv_b"), layer, cdim);
++    const std::vector<float>& dtb = nh_tensor(nh_str(s, "dt_b"), layer, nh);
++    const std::vector<float>& A = nh_tensor(nh_str(s, "ssm_a"), layer, nh);
++    const std::vector<float>& D = nh_tensor(nh_str(s, "ssm_d"), layer, nh);
++    const std::vector<float>& nw = nh_tensor(nh_str(s, "ssm_norm"), layer, di);
++    xrt::bo& act = act_[layer];
++    read_back(act, n_in * 4, ay);
++    const float* in = reinterpret_cast<const float*>(act.map<uint8_t*>() + ay);
++    const float* z = in;
++    const float* xbc = in + di;
++    const float* dtr = in + di + cdim;
++    float* conv = state_[layer].map<float*>();                    // [taps - 1][cdim], the oldest first
++    float* S = conv + (taps - 1) * cdim;                          // [nh][hd][ds]
++    std::vector<float> xc(cdim);
++#pragma omp parallel for schedule(static)
++    for (long long cc = 0; cc < static_cast<long long>(cdim); ++cc) {
++        const size_t c = static_cast<size_t>(cc);
++        const float* w = cw.data() + c * taps;                    // the GGUF's [cdim][taps]: the last tap on this token
++        double a = cb[c];
++        for (size_t t = 0; t + 1 < taps; ++t) a += static_cast<double>(w[t]) * conv[t * cdim + c];
++        a += static_cast<double>(w[taps - 1]) * xbc[c];
++        for (size_t t = 0; t + 2 < taps; ++t) conv[t * cdim + c] = conv[(t + 1) * cdim + c];
++        conv[(taps - 2) * cdim + c] = xbc[c];
++        xc[c] = nh_silu(static_cast<float>(a));
++    }
++    std::vector<float> y(di);
++    const size_t hpg = nh / ng;
++#pragma omp parallel for schedule(static)
++    for (long long hh = 0; hh < static_cast<long long>(nh); ++hh) {
++        const size_t h = static_cast<size_t>(hh), g = h / hpg;
++        const double u = static_cast<double>(dtr[h]) + dtb[h];
++        const float dt = static_cast<float>(u > 20.0 ? u : std::log1p(std::exp(u)));
++        const float dA = std::exp(dt * A[h]);
++        const float* xh = xc.data() + h * hd;
++        const float* B = xc.data() + di + g * ds;
++        const float* C = xc.data() + di + ng * ds + g * ds;
++        float* Sh = S + h * hd * ds;
++        for (size_t p = 0; p < hd; ++p) {
++            float* row = Sh + p * ds;
++            const float dx = dt * xh[p];
++            double acc = 0.0;
++            for (size_t n = 0; n < ds; ++n) {
++                row[n] = row[n] * dA + dx * B[n];
++                acc += static_cast<double>(row[n]) * C[n];
++            }
++            y[h * hd + p] = static_cast<float>(acc + static_cast<double>(D[h]) * xh[p]);
++        }
++    }
++    const size_t gw = di / ng;
++    for (size_t g = 0; g < ng; ++g) {
++        double ss = 0.0;
++        for (size_t i = g * gw; i < (g + 1) * gw; ++i) {
++            y[i] *= nh_silu(z[i]);
++            ss += static_cast<double>(y[i]) * y[i];
++        }
++        const double r = 1.0 / std::sqrt(ss / static_cast<double>(gw) + eps);
++        for (size_t i = g * gw; i < (g + 1) * gw; ++i) y[i] = static_cast<float>(y[i] * r * nw[i]);
++    }
++    act.sync(XCL_BO_SYNC_BO_TO_DEVICE, nh_put_x(s, y.data(), di, k, act.map<uint8_t*>() + ax), ax);
++}
++
++void Core::nh_attn(const Step& s, int layer) {
++    // causal GQA attention for one token, NO positional encoding (transformers NemotronHAttention, llama.cpp
++    // nemotron-h build_attention_layer): q | k | v from the GEMV (f32 at a_y); the new [K | V] row (f32) at row
++    // pos_ of the layer's state; the output heads as the o GEMV's bf16 input (a_x)
++    const size_t nh = nh_sz(s, "heads"), kvh = nh_sz(s, "kv_heads"), hd = nh_sz(s, "head_dim");
++    const size_t ay = nh_sz(s, "a_y"), ax = nh_sz(s, "a_x"), k = nh_sz(s, "k");
++    const size_t qw = nh * hd, kvw = kvh * hd, grp = nh / kvh;
++    const LayerType& lt = *types_[layer];
++    if (lt.state_row != 2 * kvw * 4 || nh % kvh || k < qw)
++        throw std::runtime_error("open_qwen36: nh_attn: the KV row is not f32 [K | V]");
++    xrt::bo& act = act_[layer];
++    read_back(act, (qw + 2 * kvw) * 4, ay);
++    const float* q = reinterpret_cast<const float*>(act.map<uint8_t*>() + ay);
++    float* kv = state_[layer].map<float*>();
++    const size_t row = 2 * kvw, pos = static_cast<size_t>(pos_), L = pos + 1;
++    std::memcpy(kv + pos * row, q + qw, 2 * kvw * 4);            // K | V of this token
++    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
++    std::vector<float> og(qw);
++#pragma omp parallel
++    {
++        std::vector<double> sc(L);
++#pragma omp for schedule(static)
++        for (long long hh = 0; hh < static_cast<long long>(nh); ++hh) {
++            const size_t h = static_cast<size_t>(hh), g = h / grp;
++            const float* qh = q + h * hd;
++            double mx = -1e300;
++            for (size_t t = 0; t < L; ++t) {
++                const float* kt = kv + t * row + g * hd;
++                double d = 0.0;
++                for (size_t i = 0; i < hd; ++i) d += static_cast<double>(qh[i]) * kt[i];
++                sc[t] = d * scale;
++                mx = std::max(mx, sc[t]);
++            }
++            double sum = 0.0;
++            for (size_t t = 0; t < L; ++t) sum += (sc[t] = std::exp(sc[t] - mx));
++            std::vector<double> o(hd, 0.0);
++            for (size_t t = 0; t < L; ++t) {
++                const float* vt = kv + t * row + kvw + g * hd;
++                const double p = sc[t] / sum;
++                for (size_t i = 0; i < hd; ++i) o[i] += p * vt[i];
++            }
++            for (size_t i = 0; i < hd; ++i) og[h * hd + i] = static_cast<float>(o[i]);
++        }
++    }
++    act.sync(XCL_BO_SYNC_BO_TO_DEVICE, nh_put_x(s, og.data(), qw, k, act.map<uint8_t*>() + ax), ax);
++}
++
++void Core::nh_route(const Step& s, int layer) {
++    // the expert block's input norm and router (transformers NemotronHTopkRouter with n_group 1, llama.cpp
++    // build_moe_ffn: sigmoid, exp_probs_b, norm_w, expert_weights_scale): xm = rms(x) * norm as nh_moe's bf16
++    // input; s = sigmoid(W xm) over the F32 router (xm in f32); the top k of s + bias (ties to the lower expert);
++    // weights the unbiased s of the chosen, renormalised, times scale; slots k.. are the shared expert's halves
++    // (pool experts E, E + 1, ...) at weight 1. The slots' up / down fills are re-pointed (`nhroute`).
++    const size_t hid = nh_sz(s, "hidden"), kp = nh_sz(s, "k"), E = nh_sz(s, "experts"), K = nh_sz(s, "topk");
++    const size_t slots = nh_sz(s, "slots"), axm = nh_sz(s, "a_xm"), aw = nh_sz(s, "a_w");
++    const uint64_t ups = static_cast<uint64_t>(nh_num(s, "ups")), dns = static_cast<uint64_t>(nh_num(s, "dns"));
++    const uint64_t pdown = static_cast<uint64_t>(nh_num(s, "pool_down"));
++    const double scale = nh_num(s, "scale"), eps = nh_num(s, "eps");
++    if (slots > 8 || K > slots || K > E) throw std::runtime_error("open_qwen36: nh_route geometry");
++    const std::vector<float>& nw = nh_tensor(nh_str(s, "norm"), layer, hid);
++    const std::vector<float>& wr = nh_tensor(nh_str(s, "router"), layer, E * hid);
++    const std::vector<float>& bias = nh_tensor(nh_str(s, "bias"), layer, E);
++    const float* x = buffer("xres", 0).map<float*>();
++    std::vector<float> xm(hid);
++    {
++        double ss = 0.0;
++        for (size_t i = 0; i < hid; ++i) ss += static_cast<double>(x[i]) * x[i];
++        const double r = 1.0 / std::sqrt(ss / static_cast<double>(hid) + eps);
++        for (size_t i = 0; i < hid; ++i) xm[i] = static_cast<float>(x[i] * r * nw[i]);
++    }
++    std::vector<double> sg(E), choice(E);
++#pragma omp parallel for schedule(static)
++    for (long long ee = 0; ee < static_cast<long long>(E); ++ee) {
++        const size_t e = static_cast<size_t>(ee);
++        const float* w = wr.data() + e * hid;
++        double a8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++        size_t i = 0;
++        for (; i + 8 <= hid; i += 8)
++            for (size_t j = 0; j < 8; ++j) a8[j] += static_cast<double>(w[i + j]) * xm[i + j];
++        for (size_t j = 0; i < hid; ++i, ++j) a8[j] += static_cast<double>(w[i]) * xm[i];
++        const double lg = ((a8[0] + a8[1]) + (a8[2] + a8[3])) + ((a8[4] + a8[5]) + (a8[6] + a8[7]));
++        sg[e] = 1.0 / (1.0 + std::exp(-lg));
++        choice[e] = sg[e] + bias[e];
++    }
++    std::vector<uint32_t> order(E);
++    for (size_t e = 0; e < E; ++e) order[e] = static_cast<uint32_t>(e);
++    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return choice[a] > choice[b]; });
++    uint32_t idx[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++    float wv[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++    double sum = 0.0;
++    for (size_t j = 0; j < K; ++j) sum += sg[order[j]];
++    for (size_t j = 0; j < K; ++j) {
++        idx[j] = order[j];
++        wv[j] = static_cast<float>(sg[order[j]] / sum * scale);
++    }
++    for (size_t j = K; j < slots; ++j) {
++        idx[j] = static_cast<uint32_t>(E + (j - K));
++        wv[j] = 1.0f;
++    }
++    xrt::bo& act = act_[layer];
++    uint8_t* a = act.map<uint8_t*>();
++    uint16_t* xb = reinterpret_cast<uint16_t*>(a + axm);
++    for (size_t i = 0; i < hid; ++i) xb[i] = f32_to_bf16(xm[i]);
++    for (size_t i = hid; i < kp; ++i) xb[i] = 0;
++    std::memcpy(a + aw, wv, sizeof wv);
++    if (aw < axm + kp * 2) throw std::runtime_error("open_qwen36: nh_route: the weights overlap xm");
++    act.sync(XCL_BO_SYNC_BO_TO_DEVICE, aw + sizeof wv - axm, axm);
++    if (route_log_on_) {
++        std::vector<uint8_t> rec(sizeof idx + sizeof wv);
++        std::memcpy(rec.data(), idx, sizeof idx);
++        std::memcpy(rec.data() + sizeof idx, wv, sizeof wv);
++        route_log_.push_back({layer, rec});
++    }
++    // the slots' fills: compiled as pool experts 0..slots-1 (up at j ups, down at pool_down + j dns)
++    Kern& k = kerns_.at(s.kernel);
++    if (k.moe2.empty()) {
++        const std::vector<uint32_t>& w = k.words;
++        size_t nup = 0, ndn = 0;
++        for (size_t i = 4; i < w.size(); i += stream_patch::op_len(w[i])) {
++            if (w[i] != 0x81 || i + 11 >= w.size() || w[i + 8] != 0) continue;
++            const uint64_t off = w[i + 10];
++            if (off < pdown) {
++                if (off / ups < slots) { k.moe2.push_back({i + 10, static_cast<size_t>(off / ups), 0, 0, off % ups}); ++nup; }
++            } else if ((off - pdown) / dns < slots) {
++                k.moe2.push_back({i + 10, static_cast<size_t>((off - pdown) / dns) | 0x100, 0, 0, (off - pdown) % dns});
++                ++ndn;
++            }
++        }
++        if (!nup || !ndn)
++            throw std::runtime_error("open_qwen36: nhroute: " + k.name + " has " + std::to_string(nup) + " up and " +
++                                     std::to_string(ndn) + " down expert fills");
++        log("nhroute " + k.name + ": " + std::to_string(nup) + " up / " + std::to_string(ndn) + " down fills");
++    }
++    for (size_t j = 0; j < slots; ++j)
++        if (idx[j] >= E + (slots - K)) throw std::runtime_error("open_qwen36: nh_route: expert " + std::to_string(idx[j]));
++    uint32_t* iw = k.iw();
++    for (const auto& p : k.moe2) {
++        const uint64_t e = idx[p.slot & 0xff];
++        const uint64_t v = (p.slot & 0x100) == 0 ? e * ups + p.intra : pdown + e * dns + p.intra;
++        if (v >> 32) throw std::runtime_error("open_qwen36: nhroute: a fill past a 32-bit offset");
++        iw[p.word] = static_cast<uint32_t>(v);
++    }
++    k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
++}
++
+ Core::G4Moe& Core::g4moe(const Step& s, int layer) {
+     auto it = g4moe_.find(layer);
+     if (it != g4moe_.end() && !(s.op == "gemma4_route" ? it->second.router.empty() : it->second.post_norm.empty()))
+@@ -2314,8 +2641,10 @@
+             timing_.dispatch_ms += wait_run(tail0).first;
+             first = 1;
+         }
+-        for (size_t i = first; i < w_->tail.size(); ++i)
++        for (size_t i = first; i < w_->tail.size(); ++i) {
++            if (w_->tail[i].op != "run") { host_step(w_->tail[i], 0); continue; }   // nh_final
+             timing_.dispatch_ms += run(kerns_.at(w_->tail[i].kernel), w_->tail[i].args, 0);
++        }
+         xrt::bo& lg = buffer("logits", 0);
+         read_back(lg, w_->vocab * 4, 0);
+         std::memcpy(logits_host_.data(), lg.map<uint8_t*>(), w_->vocab * 4);
+@@ -2537,7 +2866,10 @@
+     xrt::bo& xres1 = buffer("xres", 0);
+     std::memcpy(xres1.map<uint8_t*>(), row, w_->hidden * 4);
+     xres1.sync(XCL_BO_SYNC_BO_TO_DEVICE, w_->hidden * 4, 0);
+-    for (const Step& s : w_->tail) run(kerns_.at(s.kernel), s.args, 0);
++    for (const Step& s : w_->tail) {
++        if (s.op != "run") host_step(s, 0);       // nh_final
++        else run(kerns_.at(s.kernel), s.args, 0);
++    }
+     xrt::bo& lg = buffer("logits", 0);
+     read_back(lg, w_->vocab * 4, 0);
+     std::memcpy(logits_host_.data(), lg.map<uint8_t*>(), w_->vocab * 4);
+--- a/src/open_qwen36/core.hpp
++++ b/src/open_qwen36/core.hpp
+@@ -308,7 +308,7 @@
+         std::unique_ptr<xrt::kernel> k;
+         std::unique_ptr<xrt::bo> instr;
+         std::vector<uint32_t> words;
+-        std::vector<stream_patch::MoePatch> moe2;    ///< moeroute2 / moebatch: the routed-expert fills
++        std::vector<stream_patch::MoePatch> moe2;    ///< moeroute2 / moebatch / nhroute: the routed-expert fills
+         size_t slots = 0;                            ///< moebatch: expert slots the stream carries
+         std::vector<stream_patch::AttnPatch> attn;
+         std::vector<stream_patch::AttnRowPatch> attn_rows;   ///< attnrows: the L-row pass's sites
+@@ -580,6 +580,19 @@
+     double g4split_[7] = {0, 0, 0, 0, 0, 0, 0};   ///< OFLM_G4_SPLIT: route rb / math / act sync / patch; combine rb / math / sync
+     bool g4split_on_ = false;
+     G4Moe& g4moe(const Step& s, int layer);
++    /// Nemotron-H's host steps (OPEN-FAMILY-NEMOTRONH, nemotronh-runtime.patch): the norms, the Mamba-2
++    /// conv / selective-state update / gated norm, the attention, the router and the residual around the
++    /// projection GEMVs and the expert program. Their per-layer F32 tensors are read from the file once.
++    void nh_step(const Step& s, int layer);
++    void nh_pre(const Step& s, int layer);
++    void nh_ssm(const Step& s, int layer);
++    void nh_attn(const Step& s, int layer);
++    void nh_route(const Step& s, int layer);
++    void nh_add(const Step& s, int layer);
++    void nh_final(const Step& s);
++    const std::vector<float>& nh_tensor(const std::string& pattern, int layer, size_t n);
++    std::map<std::string, std::vector<float>> nh_w_;   ///< the tensors nh_tensor has read, by name
++    std::vector<std::vector<double>> nh_rows_;         ///< scratch: the attention scores
+     void log(const std::string& s) const;
+ 
+     // ---- the block route's helpers (core.cpp)
+--- a/src/open_qwen36/manifest.cpp
++++ b/src/open_qwen36/manifest.cpp
+@@ -58,6 +58,7 @@
+     p.cols = j.value("cols", 0ull);
+     p.elem = j.value("elem", 0ull);
+     p.dst_rows = j.value("dst_rows", 0ull);
++    p.col0 = j.value("col0", 0ull);
+     p.split = j.value("split", "");
+     p.via = j.value("via", "");
+     p.row0 = j.value("row0", 0ull);
+@@ -77,7 +78,8 @@
+     };
+     if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm" || p.op == "bfp16_gemm" ||
+         p.op == "put" || p.op == "expert_down" || p.op == "conv_transpose" || p.op == "lmhead_q8" ||
+-        p.op == "transpose" || p.op == "transpose_banked" || p.op == "g4_q40" || p.op == "g4_lmhead_q8") {
++        p.op == "transpose" || p.op == "transpose_banked" || p.op == "g4_q40" || p.op == "g4_lmhead_q8" ||
++        p.op == "nh_q40" || p.op == "nh_lmhead") {
+         if (p.tensor.empty()) fail(where, p.op + " without a tensor");
+     } else if (p.op == "expert_stripes") {
+         if (p.up.empty() || p.gate.empty()) fail(where, "expert_stripes without up / gate");
+@@ -99,6 +101,10 @@
+         need_all({{"nch", p.nch}, {"in_dim", p.in_dim}, {"src_dim", p.src_dim}, {"rows", p.rows}, {"experts", p.experts},
+                   {"n_total", p.n_total}});
+     else if (p.op == "g4_lmhead_q8") need_all({{"rows", p.rows}, {"in_dim", p.in_dim}});
++    else if (p.op == "nh_lmhead") need_all({{"rows", p.rows}, {"in_dim", p.in_dim}});
++    else if (p.op == "nh_q40")
++        need_all({{"nch", p.nch}, {"in_dim", p.in_dim}, {"src_dim", p.src_dim}, {"rows", p.rows}, {"experts", p.experts},
++                  {"n_total", p.n_total}});
+     return p;
+ }
+ 
+@@ -141,6 +147,15 @@
+                 if (st.div_running.find("{j}") == std::string::npos)
+                     fail(where, "gemma4_combine: div_running names a per-layer {j} tensor");
+             }
++        } else if (st.op == "nh_pre" || st.op == "nh_ssm" || st.op == "nh_attn" || st.op == "nh_route" ||
++                   st.op == "nh_add" || st.op == "nh_final") {
++            // Nemotron-H's host steps (nemotronh-runtime.patch): their fields as they come
++            for (const auto& [k, v] : s.items()) {
++                if (k == "op" || k == "kernel") continue;
++                if (v.is_string()) st.nh_s[k] = v.get<std::string>();
++                else if (v.is_number()) st.nh_n[k] = v.get<double>();
++                else fail(where, st.op + ": field " + k + " is neither a string nor a number");
++            }
+         } else {
+             fail(where, "unknown program op '" + st.op + "'");
+         }
+@@ -253,7 +268,7 @@
+                             " needs 2 or 4 rows, the attnpos patch table and rb 1");
+         if (!m.contexts.count(d.context)) fail(where, "kernel " + k + " names unknown context " + d.context);
+         if (!d.patch.empty() && d.patch != "moeroute2" && d.patch != "attnpos" && d.patch != "moebatch" &&
+-            d.patch != "attnrows")
++            d.patch != "attnrows" && d.patch != "nhroute")
+             fail(where, "kernel " + k + ": unknown patch " + d.patch);
+         if ((d.patch == "moeroute2" || d.patch == "moebatch") && !m.has_moe)
+             fail(where, "kernel " + k + " wants " + d.patch + " but layout.moe is absent");
+@@ -291,6 +306,8 @@
+         const json& b = need(v, "buffers", tw);
+         t.consts_bytes = get<uint64_t>(b, "consts", tw);
+         t.act_bytes = get<uint64_t>(b, "act", tw);
++        t.pool_bytes = b.value("pool", 0ull);
++        if (t.pool_bytes > m.pool_bytes) fail(tw, "buffers.pool is larger than layout.pool_bytes");
+         const json& st = need(b, "state", tw);
+         t.state_kind = get<std::string>(st, "kind", tw);
+         if (t.state_kind == "linear") t.state_bytes = get<uint64_t>(st, "bytes", tw);
+--- a/src/open_qwen36/manifest.hpp
++++ b/src/open_qwen36/manifest.hpp
+@@ -54,6 +54,7 @@
+                                                                         ///< destination row to this
+                                                                         ///< many values, tail zeroed
+                                                                         ///< (0 = rows, no padding)
++    uint64_t col0 = 0;                                                  ///< nh_q40: the first file column read
+ };
+ 
+ /// One verb of a layer type's (or the tail's) program.
+@@ -77,6 +78,11 @@
+     uint64_t n_pad = 0;                      ///< fmt bfp16: the weight's rows padded to a whole number of tile groups
+     bool split = false;                      ///< run, block route: the weight is a q8 projection's exact q4_1
+                                              ///< split, [hi | lo]; the GEMM runs twice the rows and the halves add
++    /// nh_* (Nemotron-H, OPEN-FAMILY-NEMOTRONH, nemotronh-runtime.patch): the host steps around the
++    /// projection GEMVs. Every string field of the step lands in nh_s, every number in nh_n; the step
++    /// itself names the keys it needs (Core::nh_need) and fails at its first run without them.
++    std::map<std::string, std::string> nh_s;
++    std::map<std::string, double> nh_n;
+ };
+ 
+ /// The block prefill route (OPEN-PREFILL-BATCH): T tokens through a layer's
+@@ -211,7 +217,8 @@
+ struct LayerType {
+     std::string name;
+     uint64_t consts_bytes = 0, act_bytes = 0;
+-    std::string state_kind;                  ///< "linear" (a fixed-size state BO) | "kv" (max_ctx x state_row)
++    uint64_t pool_bytes = 0;                 ///< buffers.pool: this type's own pool size (0 = layout.pool_bytes)
++    std::string state_kind;                ///< "linear" (a fixed-size state BO) | "kv" (max_ctx x state_row)
+     uint64_t state_bytes = 0, state_row = 0;
+     std::vector<Step> program;
+     GemmBlockProgram gemm_block;
+--- a/src/open_qwen36/pools.cpp
++++ b/src/open_qwen36/pools.cpp
+@@ -840,6 +840,123 @@
+                 std::memcpy(dd + c * ch, ds + (2 * rt + cg) * ch, ch);
+             }
+         }
++    } else if (op.op == "nh_lmhead") {
++        // Nemotron-H's head (OPEN-FAMILY-NEMOTRONH): the GGUF's Q8_0 [vocab, hidden] as lm_head_q8.h's f32-scale
++        // chunks (LMHEAD_SCALES_F32, 32 rows x 256 K, 9216 B: f32 scale[kb*32 + r] at [0:1024), the codes
++        // code[(r/16)*4096 + k*16 + r%16] at [1024:9216)) in 128-row bands of 4 quarters x K/256 k-tiles, chunk c of a
++        // band the quarter c % 4 and the k-tile c / 4; the fp16 scales widened exactly, rows past the file's and
++        // columns past its width (hidden 2688 -> K 2816) zero. The flint chain's gx_lmhead law, which this chain lacks.
++        constexpr size_t HEAD = 9216;
++        const std::string name = with_layer(op.tensor, layer);
++        const GgufFile* g = dynamic_cast<const GgufFile*>(&m);
++        if (!g) fail("nh_lmhead " + name + ": a GGUF-only op");
++        const GgufFile::TensorInfo& t = g->tensor(name);
++        if (t.type != GgufFile::Type::Q8_0 || t.dims.size() != 2)
++            fail("nh_lmhead " + name + ": not a [rows, cols] Q8_0 tensor");
++        const size_t cols = t.dims[0], rows = t.dims[1];
++        if (rows > op.rows || cols > op.in_dim || op.rows % 128 || op.in_dim % 256 || cols % 32)
++            fail("nh_lmhead " + name + ": [" + std::to_string(rows) + ", " + std::to_string(cols) +
++                 "] does not pad to [" + std::to_string(op.rows) + ", " + std::to_string(op.in_dim) + "]");
++        const size_t nB = op.rows / 128, nkt = op.in_dim / 256, bpr = cols / 32;
++        bounds(op, nB * nkt * 4 * HEAD, dst_bytes);
++        const uint8_t* src = raw(m, name, rows * cols / 32 * 34);
++        uint8_t* out = dst + op.dst;
++#pragma omp parallel for schedule(dynamic)
++        for (long long Bl = 0; Bl < static_cast<long long>(nB); ++Bl) {
++            const size_t B = static_cast<size_t>(Bl);
++            for (size_t kt = 0; kt < nkt; ++kt)
++                for (size_t q = 0; q < 4; ++q) {
++                    uint8_t* c = out + ((B * nkt + kt) * 4 + q) * HEAD;
++                    std::memset(c, 0, HEAD);
++                    for (size_t r = 0; r < 32; ++r) {
++                        const size_t row = 128 * B + 32 * q + r;
++                        if (row >= rows) continue;
++                        for (size_t kb = 0; kb < 8; ++kb) {
++                            const size_t blk = kt * 8 + kb;
++                            if (blk >= bpr) continue;
++                            const uint8_t* b = src + (row * bpr + blk) * 34;
++                            uint16_t h;
++                            std::memcpy(&h, b, 2);
++                            const float d = fp16_to_f32(h);
++                            std::memcpy(c + 4 * (kb * 32 + r), &d, 4);
++                            for (size_t i = 0; i < 32; ++i)
++                                c[1024 + (r / 16) * 4096 + (kb * 32 + i) * 16 + r % 16] = b[2 + i];
++                        }
++                    }
++                }
++        }
++    } else if (op.op == "nh_q40") {
++        // Nemotron-H (OPEN-FAMILY-NEMOTRONH, recipes/nemotronh.py _q40): g4_q40's law with a column window. For
++        // e < experts, `rows` rows of a Q4_0 GGUF tensor from file row row0 + e * n_total, and src_dim columns from
++        // file column col0 (whole 32-blocks), as Q4_0-native chunks (4608 B: the bf16 d plane, then the codes; the
++        // cores take m = -8 d) of a [nch / (in_dim / 128) * 64, in_dim] matrix in std_perm's band law. Rows past
++        // `rows` and columns past src_dim stay zero (hidden 2688 -> K 2816, the expert width 1856 -> K 2048); the
++        // window is the shared expert's down halves. Expert e lands at dst + e * expert_bytes, its bands contiguous.
++        const std::string name = with_layer(op.tensor, layer);
++        ktiles_or_fail("nh_q40", op.in_dim);
++        if (ch != Q40_CHUNK) fail("nh_q40 " + name + ": pool chunk " + std::to_string(ch) + " is not the Q4_0-native 4608");
++        const GgufFile* g = dynamic_cast<const GgufFile*>(&m);
++        if (!g) fail("nh_q40 " + name + ": a GGUF-only op");
++        const GgufFile::TensorInfo& t = g->tensor(name);
++        if (t.type != GgufFile::Type::Q4_0) fail(name + " is " + GgufFile::type_name(t.type) + "; nh_q40 packs Q4_0 only");
++        const uint64_t fcols = t.dims.empty() ? 0 : t.dims[0];
++        if (op.src_dim % 32 || op.col0 % 32 || op.src_dim > op.in_dim || op.col0 + op.src_dim > fcols)
++            fail("nh_q40 " + name + ": columns [" + std::to_string(op.col0) + ", +" + std::to_string(op.src_dim) +
++                 ") of rows of " + std::to_string(fcols) + " into K " + std::to_string(op.in_dim));
++        const uint64_t frows = t.nvalues() / fcols;
++        const uint64_t E = op.experts, per_band = op.in_dim / 128;
++        if (op.nch % per_band) fail("nh_q40 " + name + ": nch " + std::to_string(op.nch) + " is not whole bands");
++        const uint64_t bands = op.nch / per_band, band_bytes = per_band * ch;
++        if (op.rows > bands * 64 || op.row0 + (E - 1) * op.n_total + op.rows > frows)
++            fail("nh_q40 " + name + ": rows [" + std::to_string(op.row0) + ", +" + std::to_string(op.rows) + ") of " +
++                 std::to_string(E) + " x " + std::to_string(op.n_total) + " (file " + std::to_string(frows) +
++                 ") into " + std::to_string(bands * 64) + " pool rows");
++        const uint64_t span = bands * band_bytes;
++        if (E > 1 && op.expert_bytes < span) fail("nh_q40 " + name + ": expert_bytes under one expert's bands");
++        bounds(op, (E - 1) * op.expert_bytes + span, dst_bytes);
++        const size_t nb = fcols / 32, cb0 = op.col0 / 32, ncb = op.src_dim / 32;
++        size_t n = 0;
++        const uint8_t* src = raw(m, name, 0, &n);
++        if (n < frows * nb * 18) fail(name + " is " + std::to_string(n) + " B, shorter than its Q4_0 rows");
++        auto one = [&](uint64_t e) {
++            for (uint64_t c = 0; c < op.nch; ++c) {
++                const uint64_t band = c / per_band, i = c % per_band, part = i % 2, kt = i / 2;
++                uint8_t* d = dst + op.dst + e * op.expert_bytes + band * band_bytes + i * ch;
++                std::memset(d, 0, ch);
++                for (size_t r = 0; r < 32; ++r) {
++                    const uint64_t prow = 64 * band + 32 * part + r;
++                    if (prow >= op.rows) break;                  // padded rows: zero scales and codes
++                    const uint8_t* srow = src + (op.row0 + e * op.n_total + prow) * nb * 18;
++                    const uint8_t rb = static_cast<uint8_t>(r / 16), rl = static_cast<uint8_t>(r % 16);
++                    for (size_t kb = 0; kb < 8; ++kb) {
++                        const size_t fb = kt * 8 + kb;
++                        if (fb >= ncb) break;                    // padded columns stay zero
++                        const uint8_t* b = srow + (cb0 + fb) * 18;
++                        uint16_t ud;
++                        std::memcpy(&ud, b, 2);
++                        const uint16_t db = bf16_rne(fp16_to_f32(ud));
++                        std::memcpy(d + 2 * (kb * 32 + r), &db, 2);
++                        for (size_t q = 0; q < 16; ++q) {
++                            const uint8_t byte = b[2 + q];
++                            const uint8_t lo = byte & 0xF, hi = byte >> 4;
++                            const size_t p0 = rb * 4096 + (kb * 32 + q) * 16 + rl;
++                            d[512 + (p0 >> 1)] |= (p0 & 1) ? lo << 4 : lo;
++                            const size_t p1 = p0 + 256;
++                            d[512 + (p1 >> 1)] |= (p1 & 1) ? hi << 4 : hi;
++                        }
++                    }
++                }
++            }
++        };
++        if (E == 1) {
++            one(0);
++        } else {
++            const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency() / 2));
++            std::vector<std::thread> th;
++            for (unsigned w = 0; w < nt; ++w)
++                th.emplace_back([&, w] { for (uint64_t e = w; e < E; e += nt) one(e); });
++            for (auto& x : th) x.join();
++        }
+     } else if (op.op == "g4_q40") {
+         // Gemma 4 26B-A4B (OPEN-FAMILY-GEMMA4-MOE, recipes/gemma4.py _q40_op): `rows` rows of a Q4_0
+         // GGUF tensor, from file row row0 (+ e * n_total for expert e of `experts`), each src_dim long,
+@@ -1059,8 +1176,9 @@
+ }
+ 
+ void pack_pool(const Manifest& m, const LayerType& lt, const WeightFile& f, int layer, uint8_t* dst) {
+-    std::memset(dst, 0, m.pool_bytes);
+-    for (const auto& op : lt.pool) apply(op, f, layer, dst, m.pool_bytes, m.chunk_bytes);
++    const size_t bytes = lt.pool_bytes ? lt.pool_bytes : m.pool_bytes;   // a type's own pool size (nemotronh)
++    std::memset(dst, 0, bytes);
++    for (const auto& op : lt.pool) apply(op, f, layer, dst, bytes, m.chunk_bytes);
+ }
+ 
+ void pack_consts(const Manifest& m, const LayerType& lt, const WeightFile& f, int layer, uint8_t* dst) {
+--- a/src/open_qwen36/CMakeLists.txt
++++ b/src/open_qwen36/CMakeLists.txt
+@@ -41,7 +41,9 @@
+ 
+ add_executable(manifest_test manifest_test.cpp manifest.cpp gguf_file.cpp q4nx_file.cpp)
+ add_executable(gguf_pack_test gguf_pack_test.cpp gguf_file.cpp pools.cpp manifest.cpp q4nx_file.cpp)
+-foreach(t gguf_pack_test)
++# nemotronh_pack_check (no XRT, needs the model and its kernel set): Nemotron-H's packing read back (OPEN-FAMILY-NEMOTRONH)
++add_executable(nemotronh_pack_check nemotronh_pack_check.cpp gguf_file.cpp pools.cpp manifest.cpp q4nx_file.cpp)
++foreach(t gguf_pack_test nemotronh_pack_check)
+     target_include_directories(${t} PRIVATE ${_inc})
+ endforeach()
+ target_include_directories(manifest_test PRIVATE ${_inc})
+--- a/src/open_qwen36/nemotronh_pack_check.cpp
++++ b/src/open_qwen36/nemotronh_pack_check.cpp
+@@ -0,0 +1,126 @@
++// nemotronh_pack_check: Nemotron-H's packing on the CPU, no NPU (OPEN-FAMILY-NEMOTRONH, nemotronh-runtime.patch).
++// Loads the kernel set's manifest (its gguf view), checks the model's config against it, packs one layer of each
++// type and the head, and reads random weights back out of the pools through the Q4_0-native chunk law (and the
++// head's f32-scale q8 law), against the GGUF's own blocks: every routed expert slot, the shared expert's row /
++// column halves, the zero padding past the real rows and columns.
++//   nemotronh_pack_check <kernel dir> <model dir> [samples]
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <random>
++#include <string>
++#include <vector>
++
++#include "open_qwen36/gguf_file.hpp"
++#include "open_qwen36/manifest.hpp"
++#include "open_qwen36/pools.hpp"
++
++using namespace open_qwen36;
++
++namespace {
++float bf(uint16_t u) { uint32_t x = static_cast<uint32_t>(u) << 16; float f; std::memcpy(&f, &x, 4); return f; }
++float h2f(uint16_t h) {
++    const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
++    float v = e == 0 ? std::ldexp(static_cast<float>(m), -24) : std::ldexp(static_cast<float>(m | 1024), static_cast<int>(e) - 25);
++    return s ? -v : v;
++}
++/// value (r, k) of a [rows, K] Q4_0-native band-law matrix at `base`
++float pool_q40(const uint8_t* base, size_t K, size_t r, size_t k) {
++    const size_t per_band = K / 128, band = r / 64, part = (r % 64) / 32, rr = r % 32, kt = k / 256, kin = k % 256;
++    const uint8_t* c = base + (band * per_band + kt * 2 + part) * 4608;
++    uint16_t d;
++    std::memcpy(&d, c + 2 * ((kin / 32) * 32 + rr), 2);
++    const size_t p = (rr / 16) * 4096 + kin * 16 + rr % 16;
++    const uint8_t byte = c[512 + (p >> 1)];
++    const int q = (p & 1) ? byte >> 4 : byte & 15;
++    return bf(d) * static_cast<float>(q - 8);
++}
++/// value (r, k) of a Q4_0 GGUF [rows, cols] tensor (its row r of a flattened [.., rows, cols])
++float file_q40(const uint8_t* src, size_t cols, size_t r, size_t k) {
++    const uint8_t* b = src + (r * (cols / 32) + k / 32) * 18;
++    uint16_t d;
++    std::memcpy(&d, b, 2);
++    const size_t i = k % 32;
++    const int q = i < 16 ? (b[2 + i] & 15) : (b[2 + i - 16] >> 4);
++    return h2f(d) * static_cast<float>(q - 8);
++}
++int fails = 0;
++void expect(bool ok, const std::string& what) {
++    if (!ok && fails++ < 20) std::fprintf(stderr, "MISMATCH %s\n", what.c_str());
++}
++}  // namespace
++
++int main(int argc, char** argv) {
++    if (argc < 3) { std::fprintf(stderr, "usage: %s <kernel dir> <model dir> [samples]\n", argv[0]); return 2; }
++    const std::string kd = argv[1], md = argv[2];
++    const int samples = argc > 3 ? std::atoi(argv[3]) : 4000;
++    Manifest man = Manifest::load(kd + "/manifest.json");
++    const Manifest& w = *man.gguf;
++    GgufFile f(md + "/model.gguf");
++    std::ifstream cf(md + "/config.json");
++    nlohmann::json j = nlohmann::json::parse(cf);
++    w.check_model(j, "model");
++    std::printf("manifest ok: %zu layers, %zu layer types, chunk %zu\n", w.layers.size(), w.layer_types.size(), w.chunk_bytes);
++    std::mt19937_64 rng(7);
++    auto tensor_bytes = [&](const std::string& name) {
++        size_t n = 0;
++        const auto& t = f.tensor(name);
++        (void)t;
++        return f.raw(name, &n);
++    };
++    for (int layer : {0, 1, 5}) {
++        const LayerType& lt = w.layer_type(static_cast<size_t>(layer));
++        const size_t bytes = lt.pool_bytes ? lt.pool_bytes : w.pool_bytes;
++        std::vector<uint8_t> pool(bytes);
++        pools::pack_pool(w, lt, f, layer, pool.data());
++        size_t checked = 0;
++        for (const PackOp& op : lt.pool) {
++            std::string name = op.tensor;
++            name.replace(name.find("{l}"), 3, std::to_string(layer));
++            const auto& t = f.tensor(name);
++            const size_t fcols = t.dims[0];
++            const uint8_t* src = tensor_bytes(name);
++            const size_t prow = op.nch / (op.in_dim / 128) * 64;          // pool rows of one expert
++            for (int s = 0; s < samples; ++s) {
++                const size_t e = rng() % op.experts, r = rng() % prow, k = rng() % op.in_dim;
++                const float got = pool_q40(pool.data() + op.dst + e * op.expert_bytes, op.in_dim, r, k);
++                float want = 0.f;
++                if (r < op.rows && k < op.src_dim) want = file_q40(src, fcols, op.row0 + e * op.n_total + r, op.col0 + k);
++                expect(got == want, name + " e" + std::to_string(e) + " r" + std::to_string(r) + " k" + std::to_string(k) +
++                                        " pool " + std::to_string(got) + " file " + std::to_string(want));
++                ++checked;
++            }
++        }
++        std::printf("layer %d (%s): %zu ops, %zu samples, pool %zu MiB\n", layer, lt.name.c_str(), lt.pool.size(), checked,
++                    bytes >> 20);
++    }
++    {
++        std::vector<uint8_t> head(w.lmhead_pool_bytes);
++        pools::pack_lmhead(w, f, head.data());
++        const PackOp& op = w.lmhead_ops.at(0);
++        const auto& t = f.tensor(op.tensor);
++        const size_t cols = t.dims[0], rows = t.dims[1], nkt = op.in_dim / 256;
++        const uint8_t* src = tensor_bytes(op.tensor);
++        for (int s = 0; s < samples; ++s) {
++            const size_t r = rng() % op.rows, k = rng() % op.in_dim;
++            const size_t B = r / 128, q = (r % 128) / 32, rr = r % 32, kt = k / 256, kin = k % 256;
++            const uint8_t* c = head.data() + ((B * nkt + kt) * 4 + q) * 9216;
++            float sc;
++            std::memcpy(&sc, c + 4 * ((kin / 32) * 32 + rr), 4);
++            const float got = sc * static_cast<float>(static_cast<int8_t>(c[1024 + (rr / 16) * 4096 + kin * 16 + rr % 16]));
++            float want = 0.f;
++            if (r < rows && k < cols) {
++                const uint8_t* b = src + (r * (cols / 32) + k / 32) * 34;
++                uint16_t d;
++                std::memcpy(&d, b, 2);
++                want = h2f(d) * static_cast<float>(static_cast<int8_t>(b[2 + k % 32]));
++            }
++            expect(got == want, "head r" + std::to_string(r) + " k" + std::to_string(k));
++        }
++        std::printf("head: %d samples\n", samples);
++    }
++    std::printf(fails ? "PACK-CHECK FAIL (%d)\n" : "PACK-CHECK OK\n", fails);
++    return fails ? 1 : 0;
++}

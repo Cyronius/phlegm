@@ -63,10 +63,12 @@ def shared_gemv() -> bool:
 
 
 def one_image() -> bool:
-    """NEMOTRONH_ONE=1: every block dispatch (the three GEMVs and the experts) as streams of ONE image whose core
-    program is the expert program with runtime-parameter loop counts (designs/nemotronh/nh.py unified_program); the
-    GEMVs then take their activation as f32 at AD_XF. Only the head changes image (R-0003)."""
-    return os.environ.get("NEMOTRONH_ONE", "0") == "1"
+    """The default (NEMOTRONH_ONE=0: one image a projection, the first route): every block dispatch (the three GEMVs
+    and the experts) as streams of ONE image whose core program is the expert program with runtime-parameter loop
+    counts (designs/nemotronh/nh.py unified_program); the GEMVs then take their activation as f32 at AD_XF. Only the
+    head changes image (R-0003). Bit-identical logits to the per-projection images, 103 against 148 ms a token
+    (2026-11-06, development)."""
+    return os.environ.get("NEMOTRONH_ONE", "1") != "0"
 
 
 def kpad(k: int) -> int:
@@ -267,7 +269,7 @@ def pack_plan(spec: ModelSpec) -> dict:
         "pool_bytes": L.POOL_BYTES, "chunk_bytes": CH,
         "layer_types": {k: _layer_plan(spec, k) for k in KINDS if k in spec.layer_types},
         "lm_head": {"pool_bytes": L.LMHEAD_POOL_BYTES,
-                    "ops": [{"op": "gx_lmhead", "tensor": "output.weight", "dst": 0, "rows": L.LM_ROWS,
+                    "ops": [{"op": "nh_lmhead", "tensor": "output.weight", "dst": 0, "rows": L.LM_ROWS,
                              "in_dim": G.HIDP}]},
         "embed": {"tensor": "token_embd.weight", "dim": G.HID},
         "norm": {"tensor": "output_norm.weight", "bytes": G.HID * 2},
