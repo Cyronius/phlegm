@@ -3755,6 +3755,12 @@ spec `sha256:2a09fbd5b07f`, mlir-aie 1.4.2, Peano 21.0.0.2026080301): PASS.**
 
   Positions 0-255 / 256-490 / 240-271 on the block route: 253/256, 234/235, 32/32.
   A llama.cpp CPU-vs-Vulkan control was not available (the GPU was leased by another session).
+  Pack checked further on layers 9, 15, 17 and 35 (IQ2_XS 6.6-6.7e-3, IQ3_XXS 1.65-1.68e-3): ALL OK.
+- `phlegm run` (worktree build, `bridges/saluki`, block route): a short reasoning, then "The capital
+  of France is Paris." (127 s wall including the load). `phlegm serve`: `/health` ok, `/v1/models`
+  lists the model; non-streamed "red, blue, yellow" with the thinking in `reasoning_content` (stop,
+  39 tokens, 52 s); streamed with `enable_thinking` false: `sum(i**2 for i in range(1, 11))` in a
+  code fence, then `[DONE]` (34 s).
 - Over the prompt plus llama.cpp's 64 greedy tokens (95 positions) against the fp64 reference: NPU
   argmax 95/95, full-vocabulary KL median 3.0e-7 (max 4.2e-4), logit corr >= 0.99974; llama.cpp CPU
   on the 65 decode positions: 65/65, top-20 partial KL median 6.4e-6.

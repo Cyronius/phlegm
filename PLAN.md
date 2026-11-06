@@ -283,7 +283,8 @@ rest are requantized to int8 (`saluki-runtime.patch`, the all-q8 Qwen3.5 dense G
 (kept codes 1.6-1.7e-3, requantized 2.4-6.6e-3). Against llama.cpp CPU on the same file: 488/491 (sequential)
 and 487/491 (block) on the 491-token prompt at partial KL median 3-4e-4, 64/64 and 48/48 greedy tokens; against
 an fp64 reference over the GGUF's values the NPU is closer than llama.cpp CPU is (KL 7e-6 vs 4e-4). The block
-route needed the 27B's decode state ABI (paired KV rows, f32 conv history) in this runtime lineage. The gap is
+route needed the 27B's decode state ABI (paired KV rows, f32 conv history) in this runtime lineage. `phlegm run` and
+`serve` (streamed and not) answer, with the thinking in `reasoning_content`. The gap is
 speed: 0.91 s a decode token and 27-32 s for a 491-token prefill, against llama.cpp CPU's 0.25 s and 9 s.
 Open: a CPU-vs-Vulkan control, a quiet-machine timing, kernels that keep the i-quant grids (or a smaller law).
 Plan: [.plans/saluki.md](.plans/saluki.md); spec `OPEN-FAMILY-SALUKI`.
