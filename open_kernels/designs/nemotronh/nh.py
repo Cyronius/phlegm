@@ -1,0 +1,256 @@
+r"""nh: Nemotron-H's NPU dispatches (OPEN-FAMILY-NEMOTRONH, recipes/nemotronh.py) -- the weight streams of a block;
+the host does everything between them (nemotronh-runtime.patch).
+
+  NH_PART=in | qkv | out   one q4 GEMV y[N] = W[N, K] x[K] over a layer pool region: x (bf16, K padded to whole
+                           k-tiles with zeros) from act, y (f32) to act. in: the Mamba in_proj [10304, 2816];
+                           qkv: q | k | v [4608, 2816]; out: the Mamba out_proj / the attention o [2688, 4096]
+                           (the same offset in both pools). args: pool, act
+  NH_PART=moe              the routed experts and the shared expert's two halves as 8 slots: per slot, the up
+                           projection's bands -> h = w_e relu(up)^2 (one f32 element a band), then the down
+                           projection over the 8 h's, summed in each core's accumulator -> m f32 [hidden].
+                           Slot j is compiled as pool expert j (up at j UPS, down at POOL_DOWN + j DNS); the host's
+                           nh_route writes xm (bf16) with the 8 weights at AD_W and re-points the slots (`nhroute`).
+                           args: pool, act
+
+Eight main cores (Tile(c, 2)) on w (two 4608-B Q4_0-native chunks an element) / x (4 KB elements, broadcast) / y
+(64 floats) streams, lm_head_q8's uneven band split over the cores, gm.py's expert program. No norm helper, no
+attention core: the norms, the SSM, the attention and the router are the host's.
+
+Build: OPEN_KERNELS_SPEC=<nemotronh spec> NH_PART=in|qkv|out|moe python build_design.py designs/nemotronh/nh.py <out>
+"""
+from __future__ import annotations
+
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+from ml_dtypes import bfloat16
+
+import aie.iron as iron
+from aie.iron import Buffer, CompileTime, In, InOut, ObjectFifo, Program, Runtime, Worker
+from aie.iron.controlflow import range_
+from aie.iron.device import Tile
+from aie.iron.kernel import ExternalFunction
+from aie.helpers.taplib import TensorAccessPattern
+
+HERE = Path(__file__).parent
+GEMV = HERE.parent / "gemv_q4"
+sys.path.insert(0, str(HERE.parent.parent))
+from ironutil import Pipeline, include_dirs  # noqa: E402
+from recipes.load import current_spec  # noqa: E402
+from recipes import nemotronh as NR  # noqa: E402
+from recipes.qwen36moe import BAND_ROWS, ELEM, tab_bytes  # noqa: E402
+
+SPEC = current_spec()
+R = NR.recipe(SPEC)
+L, G = R.layout, R.geo
+PART = os.environ.get("NH_PART", "out")
+assert PART in ("in", "qkv", "out", "moe"), f"NH_PART={PART!r} (in | qkv | out | moe)"
+N_CORES = NR.N_CORES
+OS = ["-Os"]
+YB = BAND_ROWS * 4
+NULL = ["-DGEMV_NULL"] if os.environ.get("NH_NULL") else []
+
+
+def bt(total, off, n):
+    return TensorAccessPattern((1, total), off, [1, 1, 1, n], [0, 0, 0, 1])
+
+
+def offsets(counts):
+    out, o = [], 0
+    for n in counts:
+        out.append(o)
+        o += n
+    return out
+
+
+def _ef(sym, args, flags=OS):
+    return ExternalFunction(sym, source_file=str(HERE / f"{sym}.cc"), arg_types=args,
+                            include_dirs=include_dirs() + [str(GEMV)], compile_flags=flags)
+
+
+def _types(K):
+    return dict(
+        elem=np.ndarray[(NR.PER_CALL * NR.CH,), np.dtype[np.uint8]],
+        x_ty=np.ndarray[(ELEM // 2,), np.dtype[bfloat16]],
+        y_ty=np.ndarray[(BAND_ROWS,), np.dtype[np.float32]],
+        tab_ty=np.ndarray[(tab_bytes(K),), np.dtype[np.uint8]],
+        act_ty=np.ndarray[(L.AD_BYTES,), np.dtype[np.uint8]],
+    )
+
+
+def gemv_program():
+    sh = NR.gemv_shapes(SPEC)[PART]
+    N, K, POOL, AX, AY, PB_BYTES = sh["n"], sh["k"], sh["pool"], sh["ax"], sh["ay"], sh["pool_bytes"]
+    assert N % BAND_ROWS == 0 and K % 256 == 0
+    per_band = K // 128                       # chunks a 64-row band: K/256 k-tiles x 2 row halves
+    ngroups = per_band // NR.PER_CALL
+    bb = NR.band_bytes(K)
+    xe_n = (K * 2 + ELEM - 1) // ELEM         # x elements the activation spans
+    counts = NR.split_bands(N // BAND_ROWS)
+    offs = offsets(counts)
+    T = _types(K)
+    elem, x_ty, y_ty, tab_ty, act_ty = T["elem"], T["x_ty"], T["y_ty"], T["tab_ty"], T["act_ty"]
+    pool_ty = np.ndarray[(PB_BYTES,), np.dtype[np.uint8]]
+    i32 = np.int32
+    f_gy = _ef("nh_gy", [elem, tab_ty, y_ty, i32, i32, i32], OS + NULL)
+    f_prep = _ef("nh_prep", [x_ty, tab_ty, i32, i32])
+
+    of_w = [ObjectFifo(elem, name=f"w{c}", depth=2) for c in range(N_CORES)]
+    of_y = [ObjectFifo(y_ty, name=f"y{c}", depth=2) for c in range(N_CORES)]
+    of_x = ObjectFifo(x_ty, name="x", depth=xe_n)
+
+    def make_body(nb):
+        def body(win, xin, yout, tab, gy, prep):
+            xe = xin.acquire(xe_n)
+            xs = [xe] if xe_n == 1 else xe
+            for i in range(xe_n):
+                prep(xs[i], tab, K, i)
+            xin.release(xe_n)
+            for _ in range_(nb):
+                ye = yout.acquire(1)
+                for g in range_(ngroups):
+                    we = win.acquire(1)
+                    gy(we, tab, ye, g, per_band, 2)
+                    win.release(1)
+                yout.release(1)
+        return body
+
+    workers = [Worker(make_body(counts[c]),
+                      fn_args=[of_w[c].cons(), of_x.cons(), of_y[c].prod(), Buffer(tab_ty, name=f"tab{c}"), f_gy, f_prep],
+                      tile=Tile(c, 2), stack_size=0x1000)
+               for c in range(N_CORES)]
+
+    def sequence(a_pool, a_act, w_prods, x_prod, y_conss):
+        pw, py, px = Pipeline(3), Pipeline(3), Pipeline(3)
+        px.fill(x_prod, a_act, bt(L.AD_BYTES, AX, xe_n * ELEM))
+        for c in range(N_CORES):
+            py.drain(y_conss[c], a_act, bt(L.AD_BYTES, AY + offs[c] * YB, counts[c] * YB))
+        for c in range(N_CORES):
+            pw.fill(w_prods[c], a_pool, bt(PB_BYTES, POOL + offs[c] * bb, counts[c] * bb))
+        py.finish()
+        pw.finish()
+        px.finish()
+
+    fn_args = [[of_w[c].prod(tile=Tile(c, 0)) for c in range(N_CORES)], of_x.prod(tile=Tile(N_CORES - 1, 0)),
+               [of_y[c].cons(tile=Tile(c, 0)) for c in range(N_CORES)]]
+    rt = Runtime(sequence, [pool_ty, act_ty, *fn_args])
+    return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
+
+
+def moe_program():
+    HIDP, FFP, SLOTS = G.HIDP, G.FFP, G.SLOTS
+    K = max(HIDP, FFP)
+    T = _types(K)
+    elem, x_ty, y_ty, tab_ty, act_ty = T["elem"], T["x_ty"], T["y_ty"], T["tab_ty"], T["act_ty"]
+    pool_ty = np.ndarray[(L.POOL_MOE_BYTES,), np.dtype[np.uint8]]
+    up_counts = NR.split_bands(G.FF // BAND_ROWS)
+    dn_counts = NR.split_bands(G.HID // BAND_ROWS)
+    up_offs, dn_offs = offsets(up_counts), offsets(dn_counts)
+    ms_ty = np.ndarray[(192,), np.dtype[np.float32]]               # u band @0 | the down band @128
+    acc_ty = np.ndarray[(max(dn_counts) * BAND_ROWS,), np.dtype[np.float32]]
+    wv_ty = np.ndarray[(8,), np.dtype[np.float32]]
+    i32 = np.int32
+    f_gms = _ef("nh_gms", [elem, tab_ty, ms_ty, i32, i32, i32], OS + NULL)
+    f_gacc = _ef("nh_gacc", [elem, tab_ty, ms_ty, acc_ty, i32, i32, i32, i32, i32], OS + NULL)
+    f_act = _ef("nh_act", [ms_ty, y_ty, wv_ty, i32])
+    f_wgrab = _ef("nh_wgrab", [x_ty, wv_ty])
+    f_copy = _ef("nh_copy", [acc_ty, y_ty, i32])
+    f_prep = _ef("nh_prep", [x_ty, tab_ty, i32, i32])
+    f_prepf = _ef("nh_prepf", [x_ty, tab_ty, i32, i32])
+    pb_h, pb_f = HIDP // 128, FFP // 128
+    ng_h, ng_f = pb_h // NR.PER_CALL, pb_f // NR.PER_CALL
+    bb_h, bb_f = NR.band_bytes(HIDP), NR.band_bytes(FFP)
+    h_elems = L.H_STRIDE // ELEM
+    XM = L.XM_ELEMS
+
+    of_w = [ObjectFifo(elem, name=f"w{c}", depth=2) for c in range(N_CORES)]
+    of_y = [ObjectFifo(y_ty, name=f"y{c}", depth=2) for c in range(N_CORES)]
+    of_x = ObjectFifo(x_ty, name="x", depth=XM)
+
+    def make_body(upc, dpc):
+        def body(win, xin, yout, tab, ms, acc, wv, gms, gacc, act, wgrab, copy, prep, prepf):
+            # xm and, in its last element, the slots' weights
+            xe = xin.acquire(XM)
+            for i in range(XM):
+                prep(xe[i], tab, HIDP, i)
+            wgrab(xe[XM - 1], wv)
+            xin.release(XM)
+            # per slot: each up band -> h band = w_e relu(u)^2
+            for e in range_(SLOTS):
+                for _ in range_(upc):
+                    for g in range_(ng_h):
+                        we = win.acquire(1)
+                        gms(we, tab, ms, g, pb_h, 0)
+                        win.release(1)
+                    ye = yout.acquire(1)
+                    act(ms, ye, wv, e)
+                    yout.release(1)
+            # down: h_e's table, then slot e's bands onto the accumulator
+            for e in range_(SLOTS):
+                for i in range_(h_elems):
+                    he = xin.acquire(1)
+                    prepf(he, tab, FFP, i)
+                    xin.release(1)
+                for b in range_(dpc):
+                    for g in range_(ng_f):
+                        we = win.acquire(1)
+                        gacc(we, tab, ms, acc, g, pb_f, b, e, ng_f)
+                        win.release(1)
+            for b in range_(dpc):
+                ye = yout.acquire(1)
+                copy(acc, ye, b)
+                yout.release(1)
+        return body
+
+    workers = [Worker(make_body(up_counts[c], dn_counts[c]),
+                      fn_args=[of_w[c].cons(), of_x.cons(), of_y[c].prod(), Buffer(tab_ty, name=f"tab{c}"),
+                               Buffer(ms_ty, name=f"ms{c}"), Buffer(acc_ty, name=f"acc{c}"), Buffer(wv_ty, name=f"wv{c}"),
+                               f_gms, f_gacc, f_act, f_wgrab, f_copy, f_prep, f_prepf],
+                      tile=Tile(c, 2), stack_size=NR.STACK)
+               for c in range(N_CORES)]
+
+    def sequence(a_pool, a_act, w_prods, x_prod, y_conss):
+        pw, py, px = Pipeline(3), Pipeline(3), Pipeline(3)
+        # 1. xm (+ the weights) to every core
+        px.fill(x_prod, a_act, bt(L.AD_BYTES, L.AD_XM, XM * ELEM))
+        # 2. up: each core's h bands of every slot in ONE drain (slot e's at AD_H + e H_STRIDE), then slot e's
+        #    fills -- compiled as pool expert e, re-pointed by the host (nhroute)
+        for c in range(N_CORES):
+            py.drain(y_conss[c], a_act, TensorAccessPattern((1, L.AD_BYTES), L.AD_H + up_offs[c] * YB,
+                                                            [1, 1, SLOTS, up_counts[c] * YB], [0, 0, L.H_STRIDE, 1]))
+        for e in range(SLOTS):
+            for c in range(N_CORES):
+                pw.fill(w_prods[c], a_pool, bt(L.POOL_MOE_BYTES, e * L.UPS + up_offs[c] * bb_h, up_counts[c] * bb_h))
+        py.finish()                                               # every h_e is in DDR
+        # 3. down: h_e, then slot e's down bands; the cores hold the sum
+        for c in range(N_CORES):
+            py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_MOE + dn_offs[c] * YB, dn_counts[c] * YB))
+        for e in range(SLOTS):
+            px.fill(x_prod, a_act, bt(L.AD_BYTES, L.AD_H + e * L.H_STRIDE, L.H_STRIDE))
+            for c in range(N_CORES):
+                pw.fill(w_prods[c], a_pool, bt(L.POOL_MOE_BYTES, L.POOL_DOWN + e * L.DNS + dn_offs[c] * bb_f,
+                                               dn_counts[c] * bb_f))
+        py.finish()                                               # m is in DDR
+        pw.finish()
+        px.finish()
+
+    fn_args = [[of_w[c].prod(tile=Tile(c, 0)) for c in range(N_CORES)], of_x.prod(tile=Tile(N_CORES - 1, 0)),
+               [of_y[c].cons(tile=Tile(c, 0)) for c in range(N_CORES)]]
+    rt = Runtime(sequence, [pool_ty, act_ty, *fn_args])
+    return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
+
+
+@iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
+def nh(pool: In, act: InOut, *, part: CompileTime[str] = "out", srchash: CompileTime[int] = 0):
+    return moe_program() if part == "moe" else gemv_program()
+
+
+DESIGN = nh
+_src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + sorted(f.read_bytes() for f in HERE.glob("*.py"))
+                + [(HERE.parent.parent / "recipes" / "nemotronh.py").read_bytes(), (GEMV / "gemv_q4.h").read_bytes(),
+                   (GEMV / "gemv_tab.h").read_bytes(), (HERE.parent.parent / "include" / "vecmath.h").read_bytes(),
+                   SPEC.spec_hash().encode()])
+SPECIALIZE = {"part": PART, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

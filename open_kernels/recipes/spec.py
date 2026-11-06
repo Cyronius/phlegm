@@ -18,7 +18,8 @@ from typing import Any, Mapping
 
 LINEAR, FULL, DENSE, DENSE_LOCAL = "linear_attention", "full_attention", "dense", "dense_local"
 SHORT_CONV = "short_conv"                             # LFM2: a short depthwise causal conv INSTEAD of attention
-LAYER_TYPES = (LINEAR, FULL, DENSE, DENSE_LOCAL, SHORT_CONV)   # dense_local: a dense layer with sliding-window attention
+MAMBA, MOE_BLOCK = "mamba", "moe"                     # Nemotron-H: a Mamba-2 mixer block / a routed-expert block
+LAYER_TYPES = (LINEAR, FULL, DENSE, DENSE_LOCAL, SHORT_CONV, MAMBA, MOE_BLOCK)   # dense_local: a dense layer with sliding-window attention
 # Adding a member here is free: `layer_types` is one field and no shipped spec uses the new
 # value, so no hash moves. Adding a dataclass FIELD is not - spec_hash() covers every field.
 
@@ -921,6 +922,83 @@ def _lfm2moe_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
         extra={"model_type": cfg["model_type"], "source": "hf_config",
                "router_scale": float(cfg.get("routed_scaling_factor", 1.0)),
                "router": "sigmoid+bias, renormalised"},
+    )
+
+
+_NEMOTRONH_BLOCKS = {"mamba": MAMBA, "linear_attention": MAMBA, "attention": FULL, "full_attention": FULL,
+                     "moe": MOE_BLOCK}
+
+
+def _nemotronh_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+    """NVIDIA Nemotron-H with routed experts (`nemotron_h`, NemotronHForCausalLM; transformers'
+    models/nemotron_h, llama.cpp's src/models/nemotron-h.cpp + build_mamba2_layer for arch nemotron_h_moe):
+    single-mixer pre-norm blocks, `layers_block_type` picking each block's mixer -- a Mamba-2 SSM (grouped
+    B / C, a 4-tap causal conv with bias, softplus dt with a per-head bias, A = -exp(A_log), D skip, a
+    silu(z) gate then a grouped RMSNorm), GQA attention with NO positional encoding, or routed non-gated
+    relu^2 experts with one non-gated shared expert (OPEN-FAMILY-NEMOTRONH). Routing: sigmoid scores, the
+    e_score_correction_bias picks, the unbiased scores weigh, renormalised over the top k, times
+    `routed_scaling_factor`; host arithmetic, so the constants ride in `extra`. The Mamba geometry rides in
+    the linear-attention fields: lin_key_heads = n_groups, lin_key_dim = ssm_state_size, lin_value_heads =
+    mamba_num_heads, lin_value_dim = mamba_head_dim. Refused: latent MoE projections (Nemotron 3 Super),
+    grouped expert selection, dense MLP blocks, biases on the projections, a tied head, other activations."""
+    n_cfg = _need(cfg, "num_hidden_layers")
+    raw = cfg.get("layers_block_type") or cfg.get("layer_types")
+    if not raw:
+        raise SpecError("nemotron_h: config.json lacks 'layers_block_type'")
+    bad = sorted({t for t in raw if t not in _NEMOTRONH_BLOCKS})
+    if bad:
+        raise SpecError(f"nemotron_h: block types {bad} are not implemented (have mamba, attention, moe)")
+    layers = tuple(_NEMOTRONH_BLOCKS[t] for t in raw)
+    if len(layers) != n_cfg:
+        raise SpecError(f"nemotron_h: {len(layers)} block types for num_hidden_layers {n_cfg}")
+    if cfg.get("moe_latent_size") is not None:
+        raise SpecError("nemotron_h: moe_latent_size (latent expert projections) is not implemented")
+    for key, want in (("n_group", 1), ("topk_group", 1)):
+        if int(cfg.get(key, want)) != want:
+            raise SpecError(f"nemotron_h: {key} {cfg.get(key)!r} (grouped expert selection) is not implemented")
+    for key, want in (("attention_bias", False), ("mlp_bias", False), ("mamba_proj_bias", False),
+                      ("use_bias", False), ("norm_topk_prob", True), ("tie_word_embeddings", False)):
+        if bool(cfg.get(key, want)) != want:
+            raise SpecError(f"nemotron_h: {key} = {cfg.get(key)!r} is not implemented (need {want!r})")
+    for key, want in (("mlp_hidden_act", "relu2"), ("mamba_hidden_act", "silu")):
+        if cfg.get(key, want) != want:
+            raise SpecError(f"nemotron_h: {key} {cfg.get(key)!r} is not {want!r}")
+    if cfg.get("sliding_window"):
+        raise SpecError("nemotron_h: a sliding window is not implemented")
+    hidden = _need(cfg, "hidden_size")
+    heads = _need(cfg, "num_attention_heads")
+    hd = cfg.get("head_dim") or hidden // heads
+    vocab = _need(cfg, "vocab_size")
+    shared = int(cfg.get("moe_shared_expert_intermediate_size", 0)) * int(cfg.get("n_shared_experts", 1))
+    return ModelSpec(
+        family="nemotronh",
+        hidden=hidden,
+        num_layers=n_cfg,
+        layer_types=layers,
+        vocab=vocab,
+        real_vocab=real_vocab if real_vocab is not None else vocab,
+        num_heads=heads,
+        num_kv_heads=_need(cfg, "num_key_value_heads"),
+        head_dim=hd,
+        rotary_dim=0,
+        rope_theta=0.0,
+        qk_norm=False,
+        attn_gate=False,
+        lin_key_heads=int(_need(cfg, "n_groups")),
+        lin_value_heads=int(_need(cfg, "mamba_num_heads")),
+        lin_key_dim=int(_need(cfg, "ssm_state_size")),
+        lin_value_dim=int(_need(cfg, "mamba_head_dim")),
+        conv_kernel=int(_need(cfg, "conv_kernel")),
+        activation="relu2",
+        num_experts=int(_need(cfg, "n_routed_experts")),
+        experts_per_tok=int(_need(cfg, "num_experts_per_tok")),
+        moe_intermediate=int(_need(cfg, "moe_intermediate_size")),
+        shared_expert_intermediate=shared,
+        norm_eps=float(cfg.get("layer_norm_epsilon", cfg.get("norm_eps", 1e-5))),
+        quant="q4_0",
+        extra={"model_type": cfg["model_type"], "source": "hf_config",
+               "router_scale": float(cfg.get("routed_scaling_factor", 1.0)),
+               "router": "sigmoid+bias, renormalised", "conv_bias": bool(cfg.get("use_conv_bias", True))},
     )
 
 
@@ -2085,7 +2163,8 @@ HF_FAMILIES = {"qwen3_5_moe": _qwen36moe_hf, "qwen3_5_moe_text": _qwen36moe_hf,
                "gpt_oss": _gptoss_hf, "k2_horizon": _k2_hf, "dflash2": _dflash2_hf,
                "gemma4_unified": _gemma4_hf, "gemma4_unified_text": _gemma4_hf,
                "gemma4": _gemma4_unsupported, "gemma4_text": _gemma4_unsupported,
-               "flint": _flint_hf, "hy_v3": _hyv3_hf, "lfm2_moe": _lfm2moe_hf, "lfm3": _lfm3_hf}
+               "flint": _flint_hf, "hy_v3": _hyv3_hf, "lfm2_moe": _lfm2moe_hf, "lfm3": _lfm3_hf,
+               "nemotron_h": _nemotronh_hf}
 GGUF_FAMILIES = {"qwen35moe": _qwen36moe_gguf, "qwen3next": _qwen36moe_gguf, "qwen35": _qwen35_gguf, "qwen3": _qwen3_gguf, "llama": _llama3_gguf,
                  "gemma3": _gemma3_gguf, "hunyuan-dense": _hunyuan_gguf, "granite": _granite_gguf}
 _FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen35_hf: "qwen35",
@@ -2097,7 +2176,7 @@ _FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen35_
               _granite_hf: "granite", _granite_gguf: "granite", _phi3_hf: "phi3",
               _lfm2_hf: "lfm2", _gptoss_hf: "gptoss", _k2_hf: "k2", _dflash2_hf: "dflash2",
               _gemma4_hf: "gemma4", _gemma4_unsupported: "gemma4", _flint_hf: "flint",
-              _hyv3_hf: "hyv3", _lfm2moe_hf: "lfm2moe", _lfm3_hf: "lfm3"}
+              _hyv3_hf: "hyv3", _lfm2moe_hf: "lfm2moe", _lfm3_hf: "lfm3", _nemotronh_hf: "nemotronh"}
 
 
 def hf_model_types(family: str) -> list[str]:
@@ -2161,6 +2240,11 @@ ROLE_TENSORS["lfm3"] = {"attn_q.weight": "attn", "attn_k.weight": "attn", "attn_
                         "attn_output.weight": "attn", "attn_gate.weight": "attn",
                         "ffn_up.weight": "ffn", "ffn_gate.weight": "ffn", "ffn_down.weight": "ffn",
                         "shortconv.in_proj.weight": "linear", "shortconv.out_proj.weight": "linear_out"}
+# Nemotron-H's GGUF names (the recipe reads only the GGUF): the Mamba in / out projections take the linear roles
+ROLE_TENSORS["nemotronh"] = {"attn_q.weight": "attn", "attn_k.weight": "attn", "attn_v.weight": "attn",
+                             "attn_output.weight": "attn", "ssm_in.weight": "linear", "ssm_out.weight": "linear_out",
+                             "ffn_up_exps.weight": "experts", "ffn_down_exps.weight": "experts",
+                             "ffn_up_shexp.weight": "shared", "ffn_down_shexp.weight": "shared"}
 
 _GGUF_BLOCK = re.compile(r"^blk\.\d+\.")
 _GGUF_ROLE = {"attn_q.weight": "attn", "attn_k.weight": "attn", "attn_v.weight": "attn",
