@@ -17,8 +17,8 @@ const USAGE: &str = "usage: phlegm <command>
 
 commands:
   run --model-dir DIR --kernels DIR --bridge EXE --prompt TEXT [--max-tokens N (0 or -1: until the context is full)] [--seed N] [--turbo]
-  serve --model-dir DIR --kernels DIR --bridge EXE [--turbo]
-  serve --mock
+  serve --model-dir DIR --kernels DIR --bridge EXE [--turbo] [--host 127.0.0.1] [--port 52625]
+  serve --mock [--host H] [--port N]   (--host / --port override PHLEGM_HOST / PHLEGM_PORT)
   config show [--model-dir DIR | --config-model TAG] [--json]   the settings in effect, and where each comes from
   config set [--model-dir DIR | --config-model TAG] --config-key KEY --config-value VALUE
   config unset [--model-dir DIR | --config-model TAG] --config-key KEY
@@ -191,6 +191,12 @@ fn run(args: &[String]) -> Result<(), String> {
 fn serve(args: &[String]) -> Result<(), String> {
     let opts = flags(args)?;
     let mut cfg = ServerConfig::from_env();
+    if let Some(host) = opts.get("--host") {
+        cfg.host = host.clone();
+    }
+    if let Some(port) = opts.get("--port") {
+        cfg.port = port.parse().map_err(|_| "invalid --port".to_string())?;
+    }
     let settings = model_settings(&opts)?;
     cfg.default_max_tokens = settings.usize("max_tokens");
     cfg.defaults = GenDefaults::from_settings(&settings)?;
