@@ -307,6 +307,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn none_tools_is_not_iterable() {
+        // NVIDIA Nemotron-H's guard, reduced: only `tools is defined` resets it, so with tools =
+        // none the template relies on jinja2's `none is iterable` being false.
+        let (dir, _) = fixture(false, false);
+        std::fs::write(
+            dir.join("chat_template.jinja"),
+            "{%- if not tools is defined %}{%- set tools = [] %}{%- endif %}\
+             {%- if tools is iterable and tools | length > 0 %}T{%- endif %}\
+             {{ messages[0].content }}|{{ [] is iterable }}{{ 'ab' is iterable }}{{ 3 is iterable }}",
+        )
+        .unwrap();
+        let tokenizer = Tokenizer::load(&dir).unwrap();
+        let msg = [ChatMessage { role: "user".into(), content: "A".into() }];
+        assert_eq!(tokenizer.render_chat(&msg, true, &Map::new()).unwrap(), "A|TrueTrueFalse");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn effort_templates_get_their_own_values() {
         use crate::reasoning_effort::{template_kwargs, Levels, TemplateVars, Thinking};
         let (dir, _) = fixture(false, false);
@@ -523,6 +541,10 @@ impl Tokenizer {
         // a plain `{# ... #}` comment and `{% if %}` blocks, whose newlines transformers drops.
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
+        // jinja2's `iterable` is `iter(value)` succeeding, so `none is iterable` is false there;
+        // minijinja iterates none as empty and says true. We pass `tools` = none as transformers
+        // does, so Nemotron-H's `tools is iterable and tools | length > 0` failed on `length`.
+        env.add_test("iterable", |v: &minijinja::Value| !v.is_none() && v.try_iter().is_ok());
         env.add_function(
             "raise_exception",
             |msg: String| -> Result<String, minijinja::Error> {

@@ -48,6 +48,14 @@ open_kernels/designs/*/in.bin
 open_kernels/designs/*/run*.cfg
 open_kernels/designs/*/big.bin
 open_kernels/designs/*/*.log
+# Generated kernel TUs: written per spec by the exports, never source
+# (specs/open-engine/tests/test_generated_tus_untracked.py)
+open_kernels/designs/dense/*.cc
+open_kernels/designs/layer_x/*.cc
+open_kernels/designs/layer_x/xh_signs.h
+open_kernels/designs/lm_head_q4/*.cc
+open_kernels/designs/gemv_q4/gemv_q4_prep_k*.cc
+open_kernels/designs/gemv_t2/*.cc
 open_kernels/model/out*/
 open_kernels/harness/out/
 
