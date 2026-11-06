@@ -226,7 +226,15 @@ NPU streams the weights (q4 GEMVs for the Mamba in / out and q | k | v / o proje
 the six routed experts and the shared expert's two halves, the Q8_0 head) and the host runs the rest between the
 dispatches (the norms, Mamba-2's conv and selective-state update, attention without positional encoding, the
 router, the residual) as `nh_*` program steps of its own runtime patch (`nemotronh-runtime.patch`, over the
-gemma4-moe chain). RESULTS_PLACEHOLDER Plan: [.plans/nemotronh.md](.plans/nemotronh.md); spec:
+gemma4-moe chain). Every block dispatch is a stream of one image (the expert program with runtime-parameter loop
+counts also runs the GEMVs), so only the head changes context. 16/16 greedy tokens of a raw prompt and 32/32 after an
+841-token chat prompt equal llama.cpp's (a chat prompt's 64: the first 46, then a near-tie llama.cpp resolves
+differently itself); every position of the 841-token prompt sits at the bf16 control's distance from the fp32
+reference (827/841 argmax, KL median 1.2e-3; control 825/841, 9.0e-4), and the reference agrees with llama.cpp CPU
+(810/841, partial KL median 6.6e-4). Decode ~103 ms a token, sequential prefill ~109 ms a token (development, loaded
+machine; 145-174 ms on the first one-image-per-projection route). `phlegm run` / `serve` answer (the model dir's
+template tolerates phlegm's `tools` = none). Open: block prefill, the head on the block image, overlapping the host
+steps, a clean benchmark, a llama.cpp Vulkan control. Plan: [.plans/nemotronh.md](.plans/nemotronh.md); spec:
 OPEN-FAMILY-NEMOTRONH.
 
 ## LiquidAI LFM3-1.7B (lfm3)
