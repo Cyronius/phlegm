@@ -290,6 +290,14 @@ Ornith's heavier KL tail, a clean benchmark. The `<think>` block goes to `reason
 (SERVER-REASONING; checked on KAT). Plan: [.plans/qwen35moe-gguf.md](.plans/qwen35moe-gguf.md);
 spec: OPEN-FAMILY-QWEN36MOE-GGUF.
 
+Decode stream (2026-11-06, OPEN-DECODE-STREAM-UX): the decode layers were bound by their DMA issue
+order, not by core arithmetic (a null-compute build walked as fast). dux.py's issue order, memtile
+weight rings, early weight fills and a two-channel router W are now the default for this geometry,
+with no main-core change and bit-identical logits on every gate. On a loaded box the decode step is
+~10% shorter at ~500 tokens and ~5-10% at ~3000 (paired ratios; a quiet-box absolute is open). The
+eight 35B-A3B model folders carry the new set as `open_kernels_stream` beside the old `open_kernels`;
+switching is in [.plans/clover.md](.plans/clover.md).
+
 ## Native image model support
 
 Qwen Image 2.1 and FLUX 3 Image Klein are requested for text-to-image and
