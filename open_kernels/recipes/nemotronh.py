@@ -36,6 +36,7 @@ GGUF; the embedding (Q4_0) stays on the host (embed_row).
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
 
 from .catalogue import OpRangeError
@@ -53,6 +54,12 @@ LM_TILE = 9216            # lm_head_q8.h's f32-scale chunk: 32 rows x 256 K
 STATE_MOE = 64            # a moe block's (unused) state BO: the engine wants one per layer
 CONSTS = 4096             # no consts are packed: the host reads the small F32 tensors from the GGUF
 KINDS = (MAMBA, FULL, MOE_BLOCK)
+
+
+def shared_gemv() -> bool:
+    """NEMOTRONH_SHARED=1: the three projection GEMVs as streams of ONE image (runtime-parameter shapes, no context
+    change between them; R-0003). Off: one image a projection."""
+    return os.environ.get("NEMOTRONH_SHARED", "0") == "1"
 
 
 def kpad(k: int) -> int:
@@ -309,9 +316,16 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
                     {"op": "run", "kernel": "lm", "args": ["lmpool", "hn", "logits"]}],
            "globals": {"xres": G.HID * 4, "hn": G.HIDP * 2, "logits": L.LM_ROWS * 4, "lmpool": L.LMHEAD_POOL_BYTES}}
 
+    shared = shared_gemv()
+    if shared:     # one image, three streams: the context is nh_out's xclbin (every build of it is the same image)
+        out["contexts"] = {"nh_gemv": "nh_out/final.xclbin", "lm": out["contexts"]["lm"]}
+        out["kernels"]["nh_out"]["context"] = "nh_gemv"
+
     def kern(name: str, patch: str = "") -> None:
-        out["contexts"][name] = f"{name}/final.xclbin"
-        out["kernels"][name] = {"context": name, "insts": f"{name}/insts.bin", "build": name}
+        ctx = "nh_gemv" if shared and name in ("nh_in", "nh_qkv") else name
+        if ctx == name:
+            out["contexts"][name] = f"{name}/final.xclbin"
+        out["kernels"][name] = {"context": ctx, "insts": f"{name}/insts.bin", "build": name}
         if patch:
             out["kernels"][name]["patch"] = patch
     mix = {"consts": CONSTS, "act": L.AD_BYTES, "pool": L.POOL_MIX_BYTES}
@@ -354,6 +368,11 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
     if FULL in ks:
         out["nh_qkv"] = {"design": "nemotronh/nh.py", "build_dir": f"nemotronh/build_qkv_n{G.QKV_N}_k{G.HIDP}",
                          "env": {"NH_PART": "qkv"}}
+    if shared_gemv():
+        for name in ("nh_out", "nh_in", "nh_qkv"):
+            if name in out:
+                out[name]["build_dir"] += "_rtp"
+                out[name]["env"]["NEMOTRONH_SHARED"] = "1"
     if MOE_BLOCK in ks:
         out["nh_moe"] = {"design": "nemotronh/nh.py",
                          "build_dir": f"nemotronh/build_moe_h{G.HID}_f{G.FF}_s{G.SLOTS}",
@@ -391,7 +410,7 @@ def hf_config_check(spec: ModelSpec) -> dict:
             "routed_scaling_factor": router_scale(spec), "norm_topk_prob": True, "tie_word_embeddings": False}
 
 
-GEN_KERNELS = None
+GEN_KERNELS = "designs/nemotronh/gen_kernels.py"
 KERNEL_SOURCES = [
     "designs/nemotronh/*.py", "designs/nemotronh/*.cc",
     "designs/gemv_q4/gemv_q4.h", "designs/gemv_q4/gemv_tab.h", "designs/gemv_q4/gemv_q4.py",

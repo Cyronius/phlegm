@@ -169,6 +169,22 @@
         }
       }
     },
+    "nemotron-3.5-lightning": {
+      "30b-a3b": {
+        "name": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NPU2",
+        "default_context_length": 32768,
+        "details": {
+          "family": "nemotron_h",
+          "parameter_size": "30B-A3B",
+          "quantization_level": "Q4_0",
+          "think": true
+        },
+        "sampling": {
+          "temperature": 1.0,
+          "top_p": 0.95
+        }
+      }
+    },
     "nex-n2.5": {
       "mini-q4k": {
         "name": "Nex-N2.5-mini-Q4K-NPU2",

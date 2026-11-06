@@ -52,6 +52,7 @@ N_CORES = NR.N_CORES
 OS = ["-Os"]
 YB = BAND_ROWS * 4
 NULL = ["-DGEMV_NULL"] if os.environ.get("NH_NULL") else []
+SHARED = NR.shared_gemv()        # the three GEMVs as streams of one image (runtime-parameter shapes)
 
 
 def bt(total, off, n):
@@ -91,7 +92,17 @@ def gemv_program():
     xe_n = (K * 2 + ELEM - 1) // ELEM         # x elements the activation spans
     counts = NR.split_bands(N // BAND_ROWS)
     offs = offsets(counts)
-    T = _types(K)
+    if SHARED:
+        # one core program for every projection (R-0003: the three GEMVs are streams of ONE image, no context
+        # change between them): K, the band law and each core's band count arrive as runtime parameters, x is
+        # always XE elements (the widest operand's), the table always sized for the widest K
+        K_T, xe_n = NR.geometry(SPEC).OUT_K, L.XE
+        assert K <= K_T and (K * 2 + ELEM - 1) // ELEM <= xe_n
+        pool_ty = np.ndarray[(L.POOL_MIX_BYTES,), np.dtype[np.uint8]]
+        PB_BYTES = L.POOL_MIX_BYTES
+    else:
+        K_T = K
+    T = _types(K_T)
     elem, x_ty, y_ty, tab_ty, act_ty = T["elem"], T["x_ty"], T["y_ty"], T["tab_ty"], T["act_ty"]
     pool_ty = np.ndarray[(PB_BYTES,), np.dtype[np.uint8]]
     i32 = np.int32
@@ -101,29 +112,47 @@ def gemv_program():
     of_w = [ObjectFifo(elem, name=f"w{c}", depth=2) for c in range(N_CORES)]
     of_y = [ObjectFifo(y_ty, name=f"y{c}", depth=2) for c in range(N_CORES)]
     of_x = ObjectFifo(x_ty, name="x", depth=xe_n)
+    # [bands, K, chunks a band, groups a band] per core, written by each stream (zeros in the image: a
+    # shape-dependent initializer would be exactly the bytes that keep two streams' images apart)
+    rtps = [Buffer(np.ndarray[(4,), np.dtype[np.int32]], name=f"rtp{c}", initial_value=np.zeros(4, dtype=np.int32),
+                   use_write_rtp=True) for c in range(N_CORES)] if SHARED else []
 
     def make_body(nb):
-        def body(win, xin, yout, tab, gy, prep):
+        def body(win, xin, yout, tab, gy, prep, *rtp):
             xe = xin.acquire(xe_n)
             xs = [xe] if xe_n == 1 else xe
+            if SHARED:
+                # read after the x acquire: it completes only once the stream has issued the fill, which it
+                # does after the rtp writes (gemm_q4_prefill's ordering, no runtime barrier)
+                r = rtp[0]
+                n_b, k_r, pb_r, ng_r = r[0], r[1], r[2], r[3]
+            else:
+                n_b, k_r, pb_r, ng_r = nb, K, per_band, ngroups
             for i in range(xe_n):
-                prep(xs[i], tab, K, i)
+                prep(xs[i], tab, k_r, i)
             xin.release(xe_n)
-            for _ in range_(nb):
+            for _ in range_(n_b):
                 ye = yout.acquire(1)
-                for g in range_(ngroups):
+                for g in range_(ng_r):
                     we = win.acquire(1)
-                    gy(we, tab, ye, g, per_band, 2)
+                    gy(we, tab, ye, g, pb_r, 2)
                     win.release(1)
                 yout.release(1)
         return body
 
     workers = [Worker(make_body(counts[c]),
-                      fn_args=[of_w[c].cons(), of_x.cons(), of_y[c].prod(), Buffer(tab_ty, name=f"tab{c}"), f_gy, f_prep],
+                      fn_args=[of_w[c].cons(), of_x.cons(), of_y[c].prod(), Buffer(tab_ty, name=f"tab{c}"), f_gy, f_prep,
+                               *([rtps[c]] if SHARED else [])],
                       tile=Tile(c, 2), stack_size=0x1000)
                for c in range(N_CORES)]
 
     def sequence(a_pool, a_act, w_prods, x_prod, y_conss):
+        if SHARED:
+            for c in range(N_CORES):
+                rtps[c][0] = counts[c]
+                rtps[c][1] = K
+                rtps[c][2] = per_band
+                rtps[c][3] = ngroups
         pw, py, px = Pipeline(3), Pipeline(3), Pipeline(3)
         px.fill(x_prod, a_act, bt(L.AD_BYTES, AX, xe_n * ELEM))
         for c in range(N_CORES):
@@ -253,4 +282,4 @@ _src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + sorted(f.rea
                 + [(HERE.parent.parent / "recipes" / "nemotronh.py").read_bytes(), (GEMV / "gemv_q4.h").read_bytes(),
                    (GEMV / "gemv_tab.h").read_bytes(), (HERE.parent.parent / "include" / "vecmath.h").read_bytes(),
                    SPEC.spec_hash().encode()])
-SPECIALIZE = {"part": PART, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}
+SPECIALIZE = {"part": PART, "srchash": int(hashlib.sha1(_src + (b"shared" if SHARED else b"")).hexdigest()[:8], 16)}
