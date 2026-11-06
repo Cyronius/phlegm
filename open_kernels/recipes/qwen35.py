@@ -500,6 +500,98 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     return out
 
 
+# ---- the GGUF view (OPEN-FAMILY-SALUKI): the manifest itself, every pack op read from a llama.cpp
+# `qwen35` GGUF by the runtime's q35_* ops (upstream-patches/saluki-runtime.patch over
+# qwen35moe-gguf-runtime.patch). An all-q8 spec only: its projections stream as q35_q8 (q8_perm's
+# half-tiles; an i-quant block keeps its integer codes, rounding only its scale to bf16) and its
+# block-route weights are q35_mat's exact q4_1 split of the same q8 values. A q4_1 spec keeps the
+# f32-scale twin it already ships (GGUF.section), so no shipped manifest moves.
+GGUF_DENSE_MAT = {"mlp.up_proj.weight": "ffn_up.weight", "mlp.gate_proj.weight": "ffn_gate.weight",
+                  "mlp.down_proj.weight": "ffn_down.weight"}
+
+
+def _gguf_proj(spec: ModelSpec, op: dict) -> dict:
+    """A std_perm / q8_perm projection (or a route weight's std_perm split half) -> q35_mat / q35_q8."""
+    stem = op["tensor"].replace("model.layers.{l}.", "")
+    name = GGUF_DENSE_MAT.get(stem) or M.GGUF_MAT.get(stem)
+    if not name:
+        raise OpRangeError(f"gguf view: no GGUF form for the projection {op['tensor']}")
+    hd, kd, vd, kh = spec.head_dim, spec.lin_key_dim, spec.lin_value_dim, spec.lin_key_heads
+    g = {"op": "q35_q8" if op["op"] == "q8_perm" else "q35_mat", "tensor": M._G + name, "dst": op["dst"],
+         "nch": op["nch"], "in_dim": op["in_dim"]}
+    if op.get("split"):
+        g["split"] = op["split"]
+    if stem == "self_attn.q_proj.weight":
+        # [q_h | gate_h] per head in the GGUF; the container's chunk0 picked the half
+        g.update(period=2 * hd, take=hd, offset=hd if op.get("chunk0", 0) else 0)
+    elif stem == "linear_attn.qkv_proj.weight":
+        g.update(M.gguf_vtile(spec, 2 * kh * kd, vd))
+    elif stem == "self_attn.gate_proj.weight":
+        g.update(M.gguf_vtile(spec, 0, vd))
+    elif stem == "linear_attn.ssm_out_proj.weight":
+        g.update(M.gguf_vtile(spec, 0, vd, axis=1))
+    return g
+
+
+def _gguf_op(spec: ModelSpec, op: dict) -> dict:
+    """One container pack op of this family's plan -> the q35_* op that writes it from the GGUF."""
+    o, t = op["op"], op.get("tensor", "")
+    stem = t.replace("model.layers.{l}.", "")
+    if o in ("std_perm", "q8_perm"):
+        return _gguf_proj(spec, op)
+    if o == "lmhead_q8":
+        return {"op": "q35_lmhead", "tensor": M.GGUF_GLOBALS[t], "dst": op["dst"], "in_dim": op["in_dim"]}
+    if o == "put":
+        if stem in M.GGUF_PUT:
+            return {"op": "put", "tensor": M._G + M.GGUF_PUT[stem], "dst": op["dst"], "cap": op["cap"]}
+        if stem in ("linear_attn.ssm_a", "linear_attn.ssm_dt.bias"):
+            return {"op": "q35_vec", "tensor": M._G + ("ssm_a" if stem.endswith("ssm_a") else "ssm_dt.bias"),
+                    "dst": op["dst"], "cap": op["cap"], "elem": 4, **M.gguf_vtile(spec, 0, 1)}
+    if o == "transpose" and stem in ("linear_attn.ssm_alpha_proj.bf16.weight", "linear_attn.ssm_beta_proj.bf16.weight"):
+        g = {"op": "q35_t", "tensor": M._G + ("ssm_alpha.weight" if "alpha" in stem else "ssm_beta.weight"),
+             "dst": op["dst"], "rows": op["rows"], "cols": op["cols"], **M.gguf_vtile(spec, 0, 1)}
+        if op.get("dst_rows"):
+            g["dst_rows"] = op["dst_rows"]
+        return g
+    if o == "conv_transpose":
+        return {"op": "q35_conv", "tensor": M._G + "ssm_conv1d.weight", "dst": op["dst"], "taps": op["taps"],
+                "groups": op["groups"], "width": op["width"],
+                **M.gguf_vtile(spec, 2 * spec.lin_key_heads * spec.lin_key_dim, spec.lin_value_dim)}
+    raise OpRangeError(f"gguf view: no GGUF form for pack op {o} ({t})")
+
+
+def gguf_view(spec: ModelSpec, base: dict) -> dict | None:
+    """The manifest's `gguf` section for an all-q8 spec: the manifest itself (kernels, programs, block
+    route, layouts) with every pack op -- the layers' pool and consts, the head, and the route's own
+    `pack` weights -- translated by `_gguf_op`, in the same order at the same offsets."""
+    if spec.hadamard or not Q8_ROLES <= spec.q8_roles:
+        return None
+    import copy
+    g = copy.deepcopy({k: v for k, v in base.items() if k != "gguf"})
+    for lt in g["layer_types"].values():
+        for key in ("pool", "consts"):
+            lt["pack"][key] = [_gguf_op(spec, op) for op in lt["pack"][key]]
+        gb = lt.get("gemm_block")
+        for key in ("weights", "shared_weights", "ffn_weights"):
+            for w in ((gb or {}).get(key) or {}).values():
+                if w.get("from") == "pack":
+                    w["pack"] = [_gguf_proj(spec, op) for op in w["pack"]]
+    pk = g["pack"]
+    pk["lm_head"]["ops"] = [_gguf_op(spec, op) for op in pk["lm_head"]["ops"]]
+    pk["embed"]["tensor"] = M.GGUF_GLOBALS[pk["embed"]["tensor"]]
+    pk["norm"]["tensor"] = M.GGUF_GLOBALS[pk["norm"]["tensor"]]
+    return g
+
+
+def finalize_gguf_manifest(spec: ModelSpec, manifest: dict) -> None:
+    """recipes/manifest.py's family hook: add the GGUF view (`gguf_view`) where no twin is shipped."""
+    if "gguf" in manifest:
+        return
+    view = gguf_view(spec, manifest)
+    if view is not None:
+        manifest["gguf"] = view
+
+
 def hf_config_check(spec: ModelSpec) -> dict:
     return {"hidden_size": spec.hidden, "num_hidden_layers": spec.num_layers, "vocab_size": spec.vocab,
             "intermediate_size": spec.intermediate, "head_dim": spec.head_dim,
