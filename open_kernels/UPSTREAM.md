@@ -55,6 +55,7 @@ sync is a plain diff of these two directories.
 
 | date | phlegm ref | upstream PR | state |
 |---|---|---|---|
+| 2026-11-07 | `nanbeige-runtime.patch` `lmhead_q8` fp16 fix (OPEN-FAMILY-NANBEIGE) | #232 `feat/gguf-direct`, commit `e87740cc` with a `gguf_pack_test` case | pushed to the open PR's branch; [comment](https://github.com/Atomic-Germ/OpenFlowLM-Next/pull/232#issuecomment-6709022463) |
 
 ## Linux baseline build correction (2026-10-24)
 
