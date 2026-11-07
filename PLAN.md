@@ -308,6 +308,23 @@ speed: 0.91 s a decode token and 27-32 s for a 491-token prefill, against llama.
 Open: a CPU-vs-Vulkan control, a quiet-machine timing, kernels that keep the i-quant grids (or a smaller law).
 Plan: [.plans/saluki.md](.plans/saluki.md); spec `OPEN-FAMILY-SALUKI`.
 
+## Nanbeige4.3-33B (dense Llama, 7168 / 52 / 22016)
+
+Prepared offline, not yet run on the NPU (2026-11-07; the user approves NPU use). Our own pure Q4_0 GGUF
+from the BF16 (Q8_0 head; sha256 `455b6d44...`) in `/home/cyrus/models/Nanbeige4.3-33B-Q4pure-NPU2`,
+registry `nanbeige4.3:33b`. The dense recipe gained four rules, each only where its old one fails (every
+other checked-in manifest unchanged): a 7-core x 8-head attention split on Gemma 4's row-4 placement
+(56 / 8 heads do not split into whole og elements over 4 cores), a quarter-element norm helper (7168's
+14 KB elements overflow the norm core), a down split whose last piece ends inside an f32 element (FF
+22016), and a q4_1-law `gguf` section for a split-FF Llama (the q4_1 program packed by `std_perm_gguf`,
+the Q8_0 head on `lm_head_q8`). The kernel set compiles within program, data and BD budgets. The runtime
+is `reference-runtime-next` (it un-permutes llama.cpp's Q / K rows) plus `nanbeige-runtime.patch`, which
+fixes subnormal fp16 scales in the Q8_0 head packer. Pack check ALL OK (projections bit-exact, head
+1.7e-3); an fp64 reference over the GGUF agrees with llama.cpp CPU at 53/55 (KL median 2.7e-4), and
+llama.cpp CPU against Vulkan, the control, is 528/545 on a 545-token prompt. Next: the NPU gates in
+`target/npu-dev/nanbeige/scripts/` (quarter norm, 8-layer slice, whole model, `phlegm run` / `serve`,
+timing). Plan: [.plans/nanbeige.md](.plans/nanbeige.md); spec `OPEN-FAMILY-NANBEIGE`.
+
 ## Qwen3.5 MoE 35B-A3B (Ornith 1.5, Nex N2.5 mini, KAT Coder V2.5 Dev)
 
 KAT Coder V2.5 Dev runs on the NPU from bartowski's unmodified Q4_0 GGUF. It uses the qwen36moe
