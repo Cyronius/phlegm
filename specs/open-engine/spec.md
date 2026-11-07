@@ -3854,9 +3854,12 @@ every hardware gate is pending.**
 | llama.cpp CPU vs Vulkan, short prompt + 64 greedy | 119 | 117/119 | 8.7e-6 / 6.0e-4 / 4.4e-3 |
 | fp64 reference vs llama.cpp CPU, short prompt | 55 | 53/55 | 2.7e-4 / 1.5e-3 / 8.9e-3 |
 | fp64 reference vs llama.cpp Vulkan, short prompt | 55 | 54/55 | 1.0e-4 / 5.1e-4 / 4.8e-3 |
+| fp64 reference vs llama.cpp CPU, 545-token prompt | 545 | 528/545 | 7.3e-4 / 2.0e-3 / 1.0e-2 |
+| fp64 reference vs llama.cpp Vulkan, 545-token prompt | 545 | 533/545 | 2.7e-4 / 1.3e-3 / 7.8e-3 |
 
-  CPU and Vulkan greedy agree 64/64 (short) and 48/48 (long); the fp64 / CPU flips are near ties
-  (0.001 and 0.06 nats). Development timing, loaded host: CPU 16 threads 22.5 tok/s prefill, 1.79 s a
+  CPU and Vulkan greedy agree 64/64 (short) and 48/48 (long); the short prompt's fp64 / CPU flips are
+  near ties (0.001 and 0.06 nats). The fp64 forward (`model/nanbeige_gguf_reference.py`, 52 layers,
+  753 s for 545 tokens) sits closer to Vulkan than to the CPU path (q8 activations). Development timing, loaded host: CPU 16 threads 22.5 tok/s prefill, 1.79 s a
   token; Vulkan 95.6 tok/s prefill, 178 ms a token.
 - Hardware gates pending: the quarter norm unit test, the 8-layer slice (which would catalogue `ln` 7168,
   `gemv_q4` K 7168 / 11776, `lm_head_q4` / q8 K 7168 and the attention tuple (128, 56, 8, 128)), the
