@@ -78,6 +78,14 @@ NPTAB, CSE = G.PTAB_ELEMS, G.PTAB_CS_ELEM   # elements per position record; whic
 ATTN_FLAGS = QR.attn_flags(G, QR.probe_env().items())
 QLOCAL = bool(G.QLOCAL)                                # attn.h ATTN_QLOCAL (Gemma 4), as dx.py
 ACORES, NHL, RB = G.ACORES, G.NHL, G.RB
+# The wide split (recipes/dense.py wide_attention, Gemma 4's AWIDE): more attention cores than
+# Tile(2 + c, 3) has columns. dx.py compiles its attention cores with these two flags there, so
+# this dispatch does too (the same kernels); its cores and og drains take one column each.
+AWIDE = bool(G.AWIDE)
+if AWIDE:
+    ATTN_FLAGS.extend(["-DATTN_INTFP=1", "-DATTN_EXP32=1"])
+ATILE = (lambda c: Tile(c % 8, 2 + c // 8)) if AWIDE else (lambda c: Tile(2 + c, 3))
+OGCOL = (lambda c: c) if AWIDE else (lambda c: 2 + c)       # column 1's second S2MM beside aout
 # og elements, as dx.py has them now: attn_fin writes kOGH = min(NHL, HPO) heads per element,
 # and each core -- core 0 included -- emits its own N_OG of them on its own fifo. The earlier
 # form this file was copied from put core 0's og on the KV-row fifo (so an og element had to
@@ -307,10 +315,10 @@ def dx_attn(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, 
     bcons = (lambda: [of_abias.cons()]) if QKVB else (lambda: [])
 
     workers = [Worker(attn_body, fn_args=[of_ain.cons()] + bcons() + [of_aout.prod(), of_og[0].prod()] + abufs(0) + afns,
-                      tile=Tile(2, 3), stack_size=0x1800)]
+                      tile=ATILE(0), stack_size=0x1800)]
     for c in range(1, ACORES):
         workers.append(Worker(make_attn_body(c), fn_args=[of_ain.cons()] + bcons() + [of_og[c].prod()] + abufs(c) + afns,
-                              tile=Tile(2 + c, 3), stack_size=0x1800))
+                              tile=ATILE(c), stack_size=0x1800))
 
     def _sequence_attn(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, ain_p, aout_c, og_cs, abias_p):
         # a_pool / c_xres: unused dummies, kept only for buffer-argument
@@ -355,7 +363,7 @@ def dx_attn(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, 
     rt = Runtime(sequence_attn,
                  [pool_ty, xres_ty, consts_ty, kv_ty, act_ty, ptab_ty,
                   of_ain.prod(tile=Tile(2, 0))] + bprod + [of_aout.cons(tile=Tile(1, 0)),
-                  [of_og[c].cons(tile=Tile(2 + c, 0)) for c in range(ACORES)]])
+                  [of_og[c].cons(tile=Tile(OGCOL(c), 0)) for c in range(ACORES)]])
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 

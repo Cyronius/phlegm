@@ -169,6 +169,22 @@
         }
       }
     },
+    "nanbeige4.3": {
+      "33b": {
+        "name": "Nanbeige4.3-33B-Q4pure-NPU2",
+        "default_context_length": 32768,
+        "details": {
+          "family": "nanbeige",
+          "parameter_size": "33B",
+          "quantization_level": "Q4_0",
+          "think": true
+        },
+        "sampling": {
+          "temperature": 0.6,
+          "top_p": 0.95
+        }
+      }
+    },
     "nemotron-3.5-lightning": {
       "30b-a3b": {
         "name": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NPU2",

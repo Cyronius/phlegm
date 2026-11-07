@@ -116,6 +116,13 @@ def test_gguf_section_is_the_f32_program(spec_path: Path):
                     walk(v)
 
         walk(section.get("pack", {}))
+        if m["family"] == "llama3":
+            # A split-FF Llama (OPEN-FAMILY-NANBEIGE, recipes/dense.py gguf_q41_view): the q4_1 program
+            # with std_perm_gguf writing the q4_1 law's chunks and the Q8_0 head kept as codes.
+            pool = {o["op"] for lt in section["layer_types"].values() for o in lt["pack"]["pool"]}
+            assert pool == {"std_perm_gguf"} and ops == {"lmhead_q8"}, (
+                f"{spec_path.name}: the dense q4_1 gguf view packs {sorted(pool)} and a {sorted(ops)} head")
+            return
         assert ops and all(o.startswith("q35_") for o in ops), (
             f"{spec_path.name}: a q4_1 gguf view must pack through the q35_* ops, got {sorted(ops)}")
         return

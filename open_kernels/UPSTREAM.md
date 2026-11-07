@@ -459,6 +459,15 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   `qwen35moe-gguf-runtime.patch`; the clone is `target/npu-dev/saluki-runtime`, and a round trip
   reproduces its tree.
 
+- `upstream-patches/nanbeige-runtime.patch` (2026-11-07) serves Nanbeige4.3-33B, a dense Llama run
+  from our own pure Q4_0 GGUF on the dense recipe's q4_1-law GGUF view (OPEN-FAMILY-NANBEIGE). It is a
+  diff over `reference-runtime-next` (`478dbea` plus `linux-runtime-pr209.patch`, the lineage that
+  already un-permutes llama.cpp's Q / K rows in `std_perm_gguf`), not over `beccd46`. It fixes the
+  raw-GGUF Q8_0 head path of `lmhead_q8`, whose own fp16 widening wrapped a subnormal scale to inf /
+  NaN (0.6% of this head's blocks), with a `gguf_pack_test` case that failed 4096 / 4096 before; and it
+  adds `gguf_pack_dump`, the no-XRT dump `open_kernels/model/nanbeige_gguf_check.py` reads. The clone is
+  `target/npu-dev/nanbeige-runtime`, and a round trip reproduces its tree.
+
 `designs/dense/dx_attn.py` now takes its recipe module from `for_spec` and its flags from the
 recipe's `attn_flags`, and gained `dx.py`'s ATTN_QLOCAL q loop. It emits byte-identical MLIR
 for the 15 shipped dense specs with a block route that emit at all; `qwen3-14b` refuses at

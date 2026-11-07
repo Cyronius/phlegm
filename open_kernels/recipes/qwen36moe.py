@@ -685,7 +685,7 @@ def kwide(spec: ModelSpec, ffn: str = "moe") -> int:
     return max(wide, *(down_split(spec) or (spec.intermediate,)))
 
 
-def down_split(spec: ModelSpec, chunk: int = CHUNK, stack: int = STACK) -> tuple[int, ...]:
+def down_split(spec: ModelSpec, chunk: int = CHUNK, stack: int = STACK, partial: bool = False) -> tuple[int, ...]:
     """The dense down GEMV's K pieces, or () when FF's table fits a main core whole.
 
     The down GEMV reduces over FF, and its activation table is 2.25 FF bytes. At the 27B's
@@ -702,6 +702,12 @@ def down_split(spec: ModelSpec, chunk: int = CHUNK, stack: int = STACK) -> tuple
     pieces and the budget they are measured against live in one place. `chunk` and `stack`
     are the build's own (the dense f32-scale build's chunk is 6 KB), so the decision and
     the budget agree.
+
+    `partial` (the dense recipe only, whose dx.py fills a piece by whole elements and whose
+    prep stops at the piece's width): the LAST piece may end inside an f32 element of h, so an
+    FF that is a whole number of 256-wide k-tiles but not of 1024-value elements (Nanbeige4.3's
+    22016 = 21.5 elements) still splits -- the first piece stays a whole number of elements, so
+    the second starts on an element boundary. Off, the refusal is what it always was.
     """
     if not spec.intermediate:
         return ()
@@ -714,7 +720,7 @@ def down_split(spec: ModelSpec, chunk: int = CHUNK, stack: int = STACK) -> tuple
     e = ELEM // 4
     k0 = ff // 2 // e * e
     pieces = (k0, ff - k0)
-    if not k0 or ff % e or any(core_l1(tab_bytes(max(base, k)), FFN_MS_FLOATS, ds, 1, xh_l1(spec), chunk, stack) > L1_BUDGET
+    if not k0 or ff % (CHUNK_COLS if partial else e) or any(core_l1(tab_bytes(max(base, k)), FFN_MS_FLOATS, ds, 1, xh_l1(spec), chunk, stack) > L1_BUDGET
                                for k in pieces):
         raise OpRangeError(f"dense: an FF of {ff} does not fit a main core's L1 in two pieces of "
                            f"whole f32 elements ({pieces}); a three-way split is not implemented")

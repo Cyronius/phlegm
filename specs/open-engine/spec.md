@@ -3772,6 +3772,99 @@ spec `sha256:2a09fbd5b07f`, mlir-aie 1.4.2, Peano 21.0.0.2026080301): PASS.**
   token. Keeping the i-quant codes on the NPU would need GEMV / GEMM kernels that decode the grids;
   the q4_1 view would halve the bytes at 20-50x the weight error.
 
+### OPEN-FAMILY-NANBEIGE: Nanbeige4.3-33B, a dense Llama, from its own pure Q4_0 GGUF
+**Applies to:** `open_kernels/recipes/dense.py` (`wide_attention`, `norm_quarter`, `gguf_q41_view`,
+`finalize_gguf_manifest`, `_ffn_split`), `recipes/qwen36moe.py` (`down_split` `partial`),
+`designs/dense/dx.py`, `designs/dense/dx_attn.py`, `designs/ln/ln.py`, `designs/ln/ln_nrq.cc`,
+`ln_split.py` (`quarter_*`), `designs/lm_head_q8/lm_head_q8.py`, `recipes/specs/nanbeige43-33b.json`,
+`upstream-patches/nanbeige-runtime.patch` (`pools.cpp` `lmhead_q8`, `gguf_pack_dump.cpp`),
+`model/nanbeige_gguf_check.py`, `model/nanbeige_gguf_reference.py`,
+`phlegm-core/config/model_list.json` (`nanbeige4.3:33b`)
+**Test category:** unit (`specs/open-engine/tests/test_nanbeige.py`) + manual (NPU and model)
+
+Nanbeige/Nanbeige4.3-33B (@ `df919e1e`) is `LlamaForCausalLM`: hidden 7168, 52 layers, FF 22016,
+56 query heads over 8 kv heads (a GQA group of 7) at head dim 128, rope theta 1.2e8 unscaled, eps
+1e-5, an untied 166912-row head over 166107 tokenizer ids (SentencePiece, `legacy` false), ChatML
+with a `<think>` block on by default (`enable_thinking`). It runs from a GGUF we build ourselves:
+llama.cpp build 12015's `convert_hf_to_gguf.py` to BF16, then `llama quantize --pure
+--output-tensor-type q8_0 ... Q4_0` (no imatrix), so every projection is Q4_0 whose scale (block
+max / -8 of a BF16 value) is a bf16 value, and the head is Q8_0. The model shall run on the dense
+recipe with four rules it did not have, each applied only where the old rule fails, so every other
+checked-in spec's manifest is unchanged:
+- **Wide attention split.** The default (`attn_cores`: the largest head divisor up to six) gives 4
+  cores of 14 heads, not whole 8-head og elements. `wide_attention` takes the smallest core count
+  past six that gives whole og and q elements (7 x 8), on Gemma 4's AWIDE placement (attention cores
+  on row 4, og joined in memtiles) with ATTN_QLOCAL (8 heads of q, 4 KB of L1 instead of 28 KB) and
+  4 rows a call. `dx_attn.py` (the block route's per-token attention) takes the same split, one
+  column a core.
+- **Quarter norm helper.** At 7168 the split helper's 14 KB elements (four inputs, one output, a 6 KB
+  stack) overflow the norm core. `norm_quarter` streams HID-byte elements: the residual adds a
+  quarter at a time (`ln_add2` / `ln_add3` compiled at LN_N / 2), the norm as `ln_nrq` (four f32
+  quarters and one bf16 weight half in, one xn half out; the same sum-of-squares walk as `ln_nr`), at
+  most five inputs held; the norm's fills go through a 3-deep pipeline so shim (0, 0) stays inside its
+  16 BDs. The final-norm design `ln.py` has the same form.
+- **Partial down piece.** FF 22016 is 21.5 f32 elements of h. The dense down split's last piece may
+  end inside an element (`down_split(partial=True)`: 10240 + 11776); dx.py fills it by whole elements
+  and the prep stops at the piece. The MoE / Qwen3.5 tails keep the refusal.
+- **q4_1-law GGUF view.** A split-FF dense model has no f32-scale twin, so `GGUF.section` emits no
+  `gguf` section. `gguf_q41_view` (llama3) makes the section the q4_1 program itself with its
+  projections packed by `std_perm_gguf` (codes kept, the fp16 scale pair rounded to bf16; Q4_0's
+  m = -8 d is exact; the runtime un-permutes llama.cpp's Q / K rows) and the Q8_0 head kept as codes
+  on `lm_head_q8` with bf16 scales, which takes one chunk a weight element at K 7168.
+- The runtime is `reference-runtime-next` (478dbea + `linux-runtime-pr209.patch`), the lineage with the
+  Llama Q / K un-permute, plus `nanbeige-runtime.patch`: `lmhead_q8`'s raw-GGUF Q8_0 path widened fp16
+  scales by hand and turned every subnormal one into inf / NaN / 1e38; a pure Q8_0 head from BF16 has
+  them wherever a block's amax is under 127 x 2^-14 (227 461 of this head's 37.4 M blocks).
+
+**Acceptance criteria (unit):** the derivation and the checked-in spec agree (hash
+`sha256:96b4cde5...`); 8 main cores, bands (14, 2, 14, 43, 14), down pieces (10240, 11776), PER_CALL 1;
+the attention split is 7 x 8 with AWIDE and QLOCAL, and every split that works by default is left alone;
+the quarter helper applies at 7168 and not at 5120; the shared `down_split` still refuses 22016; the
+quarter body consumes [w0 x0..x3 w1] as two calls and the adds a quarter at a time; the `gguf`
+section is the base program with every pool op `std_perm_gguf` at the same offsets and an `lmhead_q8`
+head on `lm_head_q8_gguf`; `lm_head_q8.py` keeps two chunks a call at K 2048 / 4096 / 5120 and takes one at
+7168. `gguf_pack_test` covers a Q8_0 head with subnormal scales (4096 of 4096 wrong before the fix).
+
+**Procedure (manual):** model folder `/home/cyrus/models/Nanbeige4.3-33B-Q4pure-NPU2` (model.gguf, the
+Hub's config / tokenizer files, `open_kernels/`); runtime `target/npu-dev/nanbeige-runtime`, bridge
+`bridges/nanbeige`; scripts in `target/npu-dev/nanbeige/scripts/`: `npu-0-ln.sh` (the 7168 quarter norm
+against fp64), `npu-1-slice.sh` (8 layers, sequential and block route, against
+`nanbeige_gguf_reference.py --layers 8`), `npu-2-gate.sh` and `cmp.sh` (the whole model, short and
+545-token prompts, against llama.cpp CPU and the fp64 reference), `serve-test.sh` (`phlegm run` /
+`serve`), `timing.sh`.
+
+**Result 2026-11-07 (offline; Nanbeige4.3-33B @ `df919e1e`, GGUF sha256 `455b6d44...6cdb91`, 19 234 228 992
+B; kernel set `kernels/nanbeige43-33b`, mlir-aie 1.4.2, Peano 21.0.0.2026080301). No NPU run yet:
+every hardware gate is pending.**
+- Build: main cores 9 664 / 16 384 B program and 64 384 / 65 536 B data (x fifo 4 deep at XN_ELEMS 4);
+  attention cores 13 040 / 44 832; norm core 6 528 / 56 320; final `ln` 4 400 / 56 320; `dx_attn` 13 056 /
+  46 880; q8 head 2 304 / 52 992; GEMM n7168_k22016 4 784 / 61 448. POOL_BYTES 370 147 328 a layer
+  (19.2 GB for 52 layers; the block route's weight copies about as much again), head 1.27 GB.
+- Pack check (`gguf_pack_dump` layers 0, 1, 9, 25, 51 and the head, `model/nanbeige_gguf_check.py`
+  against gguf-py with the Q / K permutation undone in NumPy): ALL OK. Every Q4_0 projection rel L2 0
+  (bit-exact), norms exact, the Q8_0 head 1.68e-3 (its fp16 scales rounded to bf16).
+- Tokenizer: tokenizer.json equals the slow SentencePiece tokenizer on chat prompts (English, Chinese,
+  545 tokens, thinking on and off), and phlegm's own template + tokenizer reproduce transformers' text
+  and ids exactly.
+- References on the same GGUF (llama.cpp build 12015; top-20 partial KL):
+
+| comparison | positions | argmax | KL median / mean / p95 |
+| --- | --- | --- | --- |
+| llama.cpp CPU vs Vulkan (control), 545-token prompt | 545 | 528/545 | 4.8e-4 / 1.9e-3 / 1.1e-2 |
+| llama.cpp CPU vs Vulkan, short prompt + 64 greedy | 119 | 117/119 | 8.7e-6 / 6.0e-4 / 4.4e-3 |
+| fp64 reference vs llama.cpp CPU, short prompt | 55 | 53/55 | 2.7e-4 / 1.5e-3 / 8.9e-3 |
+| fp64 reference vs llama.cpp Vulkan, short prompt | 55 | 54/55 | 1.0e-4 / 5.1e-4 / 4.8e-3 |
+| fp64 reference vs llama.cpp CPU, 545-token prompt | 545 | 528/545 | 7.3e-4 / 2.0e-3 / 1.0e-2 |
+| fp64 reference vs llama.cpp Vulkan, 545-token prompt | 545 | 533/545 | 2.7e-4 / 1.3e-3 / 7.8e-3 |
+
+  CPU and Vulkan greedy agree 64/64 (short) and 48/48 (long); the short prompt's fp64 / CPU flips are
+  near ties (0.001 and 0.06 nats). The fp64 forward (`model/nanbeige_gguf_reference.py`, 52 layers,
+  753 s for 545 tokens) sits closer to Vulkan than to the CPU path (q8 activations). Development timing, loaded host: CPU 16 threads 22.5 tok/s prefill, 1.79 s a
+  token; Vulkan 95.6 tok/s prefill, 178 ms a token.
+- Hardware gates pending: the quarter norm unit test, the 8-layer slice (which would catalogue `ln` 7168,
+  `gemv_q4` K 7168 / 11776, `lm_head_q4` / q8 K 7168 and the attention tuple (128, 56, 8, 128)), the
+  whole-model agreement and greedy runs, `phlegm run` / `serve`, timing.
+
 ### OPEN-CONVERT-QWEN35-VHEADS: a GGUF's tiled value heads come back in grouped order
 **Applies to:** openflowlm-next (`utilities/q4nx-build/q4nx/models/qwen35.py`)
 **Verification:** test

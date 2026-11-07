@@ -822,5 +822,20 @@
     "note": "NVIDIA Nemotron-H MoE (OPEN-FAMILY-NEMOTRONH, 2026-11-06): host program steps nh_pre / nh_ssm (Mamba-2: conv, selective-state update, gate, grouped norm) / nh_attn (GQA without positional encoding over f32 K | V rows) / nh_route (sigmoid router with selection bias, the shared expert as two slots, the `nhroute` fill table) / nh_add / nh_final (also allowed in the tail); a layer type's own pool size (`buffers.pool`); pack ops nh_q40 (g4_q40 with a column window) and nh_lmhead (the flint chain's gx_lmhead law, absent from this chain); the GEMV input as bf16 or f32 (x_f32, the one-image program); nemotronh_pack_check (CPU readback of the packing). sha256 32af8919140c62dc62cb79c1c069bf15e8b74fc68b2b87cccd1a6ea1ad89a268; built in target/npu-dev/nemotronh-runtime, a copy of the gemma4-moe-runtime clone (the unmodified copy: nemotronh-runtime-base; base + patch = the clone, checked by nemotronh/scripts/mkpatch.sh)",
     "patch": "nemotronh-runtime.patch",
     "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
+  },
+  "nanbeige_runtime_20261107": {
+    "base": "478dbea3f00f868ac58205803cc537b402c6cad5",
+    "applies_after": [
+      "linux_runtime_pr209_20261024"
+    ],
+    "files": [
+      "src/open_qwen36/CMakeLists.txt",
+      "src/open_qwen36/gguf_pack_dump.cpp",
+      "src/open_qwen36/gguf_pack_test.cpp",
+      "src/open_qwen36/pools.cpp"
+    ],
+    "note": "Nanbeige4.3-33B (dense llama, OPEN-FAMILY-NANBEIGE) from its pure Q4_0 GGUF on the q4_1-law GGUF view (recipes/dense.py gguf_q41_view), which this lineage already packs (std_perm_gguf at the 5120-B chunk with llama.cpp's Q/K rows un-permuted; lmhead_q8 for the Q8_0 head). Fixes lmhead_q8's raw-GGUF Q8_0 path: its hand-rolled fp16 -> f32 widening wrapped a subnormal scale's exponent to inf / NaN / 1e38 (227 461 of the head's 37.4 M blocks); it now uses weight_file.hpp fp16_to_f32 (gguf_pack_test: a subnormal-scale head, 4096 of 4096 scales wrong before, 0 after). Adds gguf_pack_dump (no XRT): a GGUF view's packed pool / consts / head bytes for open_kernels/model/nanbeige_gguf_check.py. A diff over reference-runtime-next (478dbea + linux-runtime-pr209.patch, which reverse-applies cleanly to it); built in target/npu-dev/nanbeige-runtime (the unmodified copy: nanbeige-runtime-base; base + patch = the clone), bridge target/npu-dev/bridges/nanbeige",
+    "patch": "nanbeige-runtime.patch",
+    "source_head": "478dbea3f00f868ac58205803cc537b402c6cad5"
   }
 }

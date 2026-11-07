@@ -47,6 +47,17 @@ N_CORES = int(os.environ.get("LMHEAD_CORES", 8))
 PER_CALL = 2            # 2 x 8704 = 17408 B per element, x2 buffered -> 34 KB of L1
 
 
+def _core_bytes(per_call: int) -> int:
+    """A core's L1: the 4 KB stack, two weight elements, the activation table, the whole x, two results."""
+    return 0x1000 + 2 * per_call * TILE_BYTES + (2 * K + K // 4) + 2 * K + 2 * BAND_ROWS * 4
+
+
+# One chunk per element where two do not fit beside a wide x (Nanbeige4.3, K = 7168: 70 400 B at two,
+# 52 992 B at one). Every K that built at two (2048 / 4096 / 5120) still gets two.
+if _core_bytes(PER_CALL) > 64 * 1024:
+    PER_CALL = 1
+
+
 def _include_dirs() -> list[str]:
     from aie.iron.kernels._common import _detect_arch, _include_dirs as base
 

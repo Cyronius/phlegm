@@ -1,0 +1,157 @@
+diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/CMakeLists.txt patch-b/src/open_qwen36/CMakeLists.txt
+--- a/src/open_qwen36/CMakeLists.txt	2026-11-07 07:04:35.469652042 -0600
++++ b/src/open_qwen36/CMakeLists.txt	2026-11-07 07:04:35.475651987 -0600
+@@ -50,7 +50,10 @@
+ target_include_directories(q4nx_file_test PRIVATE ${_inc})
+
+ add_executable(gguf_pack_test gguf_pack_test.cpp gguf_file.cpp pools.cpp manifest.cpp q4nx_file.cpp)
+-foreach(t gguf_pack_test)
++# gguf_pack_dump (no XRT): a GGUF view's packed pool / consts / head bytes for an independent decode
++# (open_kernels/model/nanbeige_gguf_check.py, OPEN-FAMILY-NANBEIGE)
++add_executable(gguf_pack_dump gguf_pack_dump.cpp gguf_file.cpp pools.cpp manifest.cpp q4nx_file.cpp)
++foreach(t gguf_pack_test gguf_pack_dump)
+     target_include_directories(${t} PRIVATE ${_inc})
+ endforeach()
+ target_include_directories(manifest_test PRIVATE ${_inc})
+diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/gguf_pack_dump.cpp patch-b/src/open_qwen36/gguf_pack_dump.cpp
+--- a/src/open_qwen36/gguf_pack_dump.cpp	1969-12-31 18:00:00.000000000 -0600
++++ b/src/open_qwen36/gguf_pack_dump.cpp	2026-11-07 07:04:35.483651914 -0600
+@@ -0,0 +1,65 @@
++/// \file gguf_pack_dump.cpp
++/// \brief No-XRT tool for a dense GGUF view (OPEN-FAMILY-NANBEIGE): packs the named layers' pool and
++///        consts (and optionally the head) from model.gguf through the manifest's gguf section, exactly
++///        as Core does (pools::pack_pool / pack_consts / pack_lmhead), and writes the bytes for an
++///        independent decode (open_kernels/model/nanbeige_gguf_check.py). Opens no device.
++///
++///     gguf_pack_dump <manifest.json> <model.gguf> <out_dir> <layer,layer,...|-> [head]
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <sstream>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++#include "open_qwen36/gguf_file.hpp"
++#include "open_qwen36/manifest.hpp"
++#include "open_qwen36/pools.hpp"
++
++using namespace open_qwen36;
++
++static void write(const std::string& path, const std::vector<uint8_t>& b) {
++    std::ofstream f(path, std::ios::binary);
++    f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
++    if (!f) throw std::runtime_error("cannot write " + path);
++}
++
++int main(int argc, char** argv) {
++    if (argc < 5) {
++        std::fprintf(stderr, "usage: %s manifest.json model.gguf out_dir layers|- [head]\n", argv[0]);
++        return 2;
++    }
++    try {
++        Manifest top = Manifest::load(argv[1]);
++        if (!top.gguf) throw std::runtime_error("the manifest has no gguf section");
++        const Manifest& m = *top.gguf;
++        GgufFile g(argv[2]);
++        const std::string out = argv[3];
++        if (std::string(argv[4]) != "-") {
++            std::stringstream ss(argv[4]);
++            std::string tok;
++            while (std::getline(ss, tok, ',')) {
++                const int l = std::atoi(tok.c_str());
++                const LayerType& lt = m.layer_type(static_cast<size_t>(l));
++                std::vector<uint8_t> pool(m.pool_bytes), consts(lt.consts_bytes);
++                pools::pack_pool(m, lt, g, l, pool.data());
++                pools::pack_consts(m, lt, g, l, consts.data());
++                write(out + "/pool" + tok + ".bin", pool);
++                write(out + "/consts" + tok + ".bin", consts);
++                std::printf("layer %d (%s): pool %zu B (chunk %zu), consts %zu B\n", l, lt.name.c_str(), pool.size(),
++                            static_cast<size_t>(m.chunk_bytes), consts.size());
++            }
++        }
++        if (argc > 5 && std::string(argv[5]) == "head") {
++            std::vector<uint8_t> head(m.lmhead_pool_bytes);
++            pools::pack_lmhead(m, g, head.data());
++            write(out + "/lmhead.bin", head);
++            std::printf("head: %zu B\n", head.size());
++        }
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "gguf_pack_dump: %s\n", e.what());
++        return 1;
++    }
++    return 0;
++}
+diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/gguf_pack_test.cpp patch-b/src/open_qwen36/gguf_pack_test.cpp
+--- a/src/open_qwen36/gguf_pack_test.cpp	2026-11-07 07:04:35.488651868 -0600
++++ b/src/open_qwen36/gguf_pack_test.cpp	2026-11-07 07:04:35.489651859 -0600
+@@ -613,6 +613,38 @@
+                             }
+                         }
+         std::printf("ok    Q8 head GGUF band/tile/quarter order\n");
++
++        // The same head with every block's fp16 scale subnormal (a pure Q8_0 head from BF16 has them
++        // wherever amax < 127 * 2^-14): each must widen exactly and round to bf16, not wrap to inf / NaN.
++        Blocks sub_blocks = wide;
++        const size_t nblk = sub_blocks.bytes.size() / 34;
++        for (size_t b = 0; b < nblk; ++b) {
++            const uint16_t h = static_cast<uint16_t>(1 + (b * 37) % 0x3FF);   // exponent 0, mantissa 1..1023
++            std::memcpy(sub_blocks.bytes.data() + b * 34, &h, 2);
++        }
++        const fs::path sub2 = dir / "q8-head-subnormal";
++        fs::create_directories(sub2);
++        GgufFile q8s(write_gguf(sub2, mm, sub_blocks, norm));
++        std::vector<uint8_t> hs(16 * 8704, 0);
++        pools::apply(h, q8s, 0, hs.data(), hs.size(), 6144);
++        size_t bad_sub = 0;
++        for (size_t band = 0; band < 2; ++band)
++            for (size_t kt = 0; kt < 2; ++kt)
++                for (size_t quarter = 0; quarter < 4; ++quarter)
++                    for (size_t row = 0; row < 32; ++row)
++                        for (size_t kb = 0; kb < 8; ++kb) {
++                            const size_t logical = band * 128 + quarter * 32 + row;
++                            const uint8_t* raw = sub_blocks.bytes.data() + (logical * 16 + kt * 8 + kb) * 34;
++                            uint16_t half; std::memcpy(&half, raw, 2);
++                            const float value = fp16_to_f32(half);
++                            uint32_t bits; std::memcpy(&bits, &value, 4);
++                            const uint16_t want = static_cast<uint16_t>((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
++                            const uint8_t* chunk = hs.data() + ((band * 2 + kt) * 4 + quarter) * 8704;
++                            uint16_t got; std::memcpy(&got, chunk + 2 * (kb * 32 + row), 2);
++                            bad_sub += got != want;
++                        }
++        std::printf("%s Q8 head GGUF subnormal fp16 scales (%zu differ)\n", bad_sub ? "FAIL" : "ok   ", bad_sub);
++        if (bad_sub) return 1;
+     }
+
+     // ---- pack_norm: f32 -> bf16 (RNE)
+diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/pools.cpp patch-b/src/open_qwen36/pools.cpp
+--- a/src/open_qwen36/pools.cpp	2026-11-07 07:04:35.494651814 -0600
++++ b/src/open_qwen36/pools.cpp	2026-11-07 07:04:35.498651777 -0600
+@@ -945,21 +945,12 @@
+                             const uint8_t* blk = rp + (base_col / 32 + b) * q8blk;
+                             uint16_t d16;
+                             std::memcpy(&d16, blk, 2);
+-                            // widen fp16 -> bf16 via RNE (the converter's cast)
+-                            const float dval = [&](){ uint32_t u = d16; u = (u & 0x7FFFu) << 13; // approximate
+-                                // use proper fp16->f32 then bf16_rne
+-                                float f; uint32_t fu;
+-                                // fp16 to f32
+-                                uint32_t sign = (d16 & 0x8000u) << 16;
+-                                uint32_t exp = (d16 >> 10) & 0x1Fu;
+-                                uint32_t mant = d16 & 0x3FFu;
+-                                if (exp == 0) { if (mant) { exp = 1; while (!(mant & 0x400u)) { mant <<= 1; exp--; } mant &= 0x3FFu; } }
+-                                else if (exp == 31) { exp = 255; }
+-                                else exp += 112;
+-                                fu = sign | (exp << 23) | (mant << 13);
+-                                memcpy(&f, &fu, 4);
+-                                return f;
+-                            }();
++                            // widen fp16 -> f32 exactly, then RNE to bf16 (the converter's cast). The
++                            // hand-rolled widening this replaced lost a subnormal scale: the exponent
++                            // walked below zero in an unsigned and wrapped to inf / NaN / 1e38. A pure
++                            // Q8_0 head from BF16 has them (Nanbeige4.3-33B: 227 461 of 37.4 M blocks, every
++                            // amax under 127 * 2^-14), OPEN-FAMILY-NANBEIGE.
++                            const float dval = fp16_to_f32(d16);
+                             uint16_t scale = bf16_rne(dval);
+                             std::memcpy(dst + op.dst + k * CH8 + 2 * (b * 32 + rr), &scale, 2);
+                             for (unsigned i = 0; i < 32; ++i) {

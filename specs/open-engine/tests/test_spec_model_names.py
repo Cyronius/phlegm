@@ -47,6 +47,7 @@ EXPECTED = {
     "bonsai2-27b": "Ternary-Bonsai-2-27B-NPU2-lmhead",   # the published container's own name
     "qwen3-1.7b": "Qwen3-1.7B-NPU2",
     "qwen3-14b": "Qwen3-14B-NPU2",
+    "nanbeige43-33b": "Nanbeige4.3-33B-Q4pure-NPU2",   # our pure Q4_0 GGUF from BF16 (OPEN-FAMILY-NANBEIGE)
 }
 
 
