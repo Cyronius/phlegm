@@ -3834,8 +3834,8 @@ against fp64), `npu-1-slice.sh` (8 layers, sequential and block route, against
 `serve`), `timing.sh`.
 
 **Result 2026-11-07 (offline; Nanbeige4.3-33B @ `df919e1e`, GGUF sha256 `455b6d44...6cdb91`, 19 234 228 992
-B; kernel set `kernels/nanbeige43-33b`, mlir-aie 1.4.2, Peano 21.0.0.2026080301). No NPU run yet:
-every hardware gate is pending.**
+B; kernel set `kernels/nanbeige43-33b`, mlir-aie 1.4.2, Peano 21.0.0.2026080301). Offline checks
+first, then the NPU gates (same day, below): PASS.**
 - Build: main cores 9 664 / 16 384 B program and 64 384 / 65 536 B data (x fifo 4 deep at XN_ELEMS 4);
   attention cores 13 040 / 44 832; norm core 6 528 / 56 320; final `ln` 4 400 / 56 320; `dx_attn` 13 056 /
   46 880; q8 head 2 304 / 52 992; GEMM n7168_k22016 4 784 / 61 448. POOL_BYTES 370 147 328 a layer
@@ -3861,9 +3861,37 @@ every hardware gate is pending.**
   near ties (0.001 and 0.06 nats). The fp64 forward (`model/nanbeige_gguf_reference.py`, 52 layers,
   753 s for 545 tokens) sits closer to Vulkan than to the CPU path (q8 activations). Development timing, loaded host: CPU 16 threads 22.5 tok/s prefill, 1.79 s a
   token; Vulkan 95.6 tok/s prefill, 178 ms a token.
-- Hardware gates pending: the quarter norm unit test, the 8-layer slice (which would catalogue `ln` 7168,
-  `gemv_q4` K 7168 / 11776, `lm_head_q4` / q8 K 7168 and the attention tuple (128, 56, 8, 128)), the
-  whole-model agreement and greedy runs, `phlegm run` / `serve`, timing.
+
+**Result 2026-11-07 (NPU, Strix Halo, XRT 2.27.0; `nanbeige-runtime` build, the kernel set above, max-ctx
+4096; host load average about 50 from other sessions' jobs; logs `target/npu-dev/nanbeige/run/`).**
+- Quarter norm (`npu-0-ln.sh`, 7168, random inputs, 2 runs): y PASS max rel 8.7e-8; xn PASS cos 0.99999999,
+  2/7168 bf16 one-ulp differences.
+- 8-layer slice (`npu-1-slice.sh`, short prompt, every position) against the fp64 8-layer reference:
+  sequential 55/55 argmax, KL median 1.9e-5 (max 4.2e-5); block route 55/55, 2.1e-5 (max 6.4e-5).
+- Whole model (`npu-2-gate.sh`, `cmp.sh`), every prompt position:
+
+| comparison | route | argmax | KL median |
+| --- | --- | --- | --- |
+| NPU vs llama.cpp CPU, short (top-20 partial) | block / seq | 53/55 / 53/55 | 4.2e-4 / 4.2e-4 |
+| NPU vs fp64 reference, short (full vocab) | block / seq | 55/55 / 55/55 | 1.8e-5 / 1.7e-5 |
+| NPU vs llama.cpp CPU, 545 tokens (top-20 partial) | block / seq | 526/545 / 526/545 | 7.1e-4 / 6.5e-4 |
+| NPU vs fp64 reference, 545 tokens (full vocab) | block / seq | 543/545 / 543/545 | 9.5e-5 / 8.3e-5 |
+
+  The bar was llama.cpp CPU vs Vulkan, 528/545 at 4.8e-4, and llama.cpp CPU vs fp64, 528/545: the NPU sits
+  closer to the fp64 forward than llama.cpp CPU does. The largest single KL is position 327 of the long
+  prompt (block 0.39, sequential 0.085, argmax agrees), the same position where llama.cpp CPU vs fp64 is
+  worst (0.18). Greedy: the 48 long-prompt tokens equal llama.cpp CPU's on both routes; the 64 short-prompt
+  tokens differ in one word ("Fibonacci number" for llama.cpp's "Fibonacci sequence"), both coherent.
+- `phlegm run` and `phlegm serve` (`serve-test.sh`, port 8404, release build of `133d624`):
+  correct answers with reasoning separated (`reasoning_content`), stop at `<|im_end|>`, streamed and
+  non-streamed, `enable_thinking: false` honoured.
+- Development timing on that loaded host (not a benchmark): decode 536-643 ms a token (part1 about 92%,
+  head 27-46 ms); the 545-token prompt 88 s on the block route, 329 s sequential. A quiet-host timing
+  (`timing.sh`) is still to run.
+- Catalogued from this pass: `ln` 7168, `gemv_q4` K 7168 / 11776, `lm_head_q8` K 7168, attention
+  (128, 56, 8, 128). The base manifest's `lm_head_q4` K 7168 never ran (the GGUF view uses the Q8_0 head),
+  so the export still needs `OPEN_KERNELS_UNVALIDATED=1` for that one point
+  (`test_only_the_q4_head_is_unvalidated`). Contexts past 4096 are untested.
 
 ### OPEN-CONVERT-QWEN35-VHEADS: a GGUF's tiled value heads come back in grouped order
 **Applies to:** openflowlm-next (`utilities/q4nx-build/q4nx/models/qwen35.py`)

@@ -33,6 +33,9 @@ HF_NANBEIGE43_33B = {
 
 @pytest.fixture
 def spec(monkeypatch):
+    # The 2026-11-07 hardware pass catalogued ln 7168, gemv_q4 K 7168 / 11776, lm_head_q8 K 7168 and the
+    # (128, 56, 8, 128) attention. The base manifest's q4 head (lm_head_q4 K 7168) never ran -- the GGUF view
+    # uses the Q8_0 head -- so it stays outside the catalogue (test_only_the_q4_head_is_unvalidated).
     monkeypatch.setenv("OPEN_KERNELS_UNVALIDATED", "1")
     return ModelSpec.from_hf_config(HF_NANBEIGE43_33B, real_vocab=166107)
 
@@ -164,3 +167,12 @@ def test_q8_head_takes_one_chunk_a_call_at_7168(monkeypatch):
         mod = importlib.util.module_from_spec(mod_spec)
         mod_spec.loader.exec_module(mod)
         assert mod.PER_CALL == want, k
+
+
+def test_only_the_q4_head_is_unvalidated(monkeypatch):
+    """Without OPEN_KERNELS_UNVALIDATED the recipe refuses exactly at lm_head_q4 K 7168: every point the
+    hardware pass exercised (norm, GEMVs, Q8 head, attention) is catalogued."""
+    monkeypatch.delenv("OPEN_KERNELS_UNVALIDATED", raising=False)
+    s = ModelSpec.from_hf_config(HF_NANBEIGE43_33B, real_vocab=166107)
+    with pytest.raises(OpRangeError, match=r"lm_head_q4: K=7168"):
+        DR.recipe(s)

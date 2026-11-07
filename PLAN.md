@@ -310,7 +310,7 @@ Plan: [.plans/saluki.md](.plans/saluki.md); spec `OPEN-FAMILY-SALUKI`.
 
 ## Nanbeige4.3-33B (dense Llama, 7168 / 52 / 22016)
 
-Prepared offline, not yet run on the NPU (2026-11-07; the user approves NPU use). Our own pure Q4_0 GGUF
+Runs on the NPU (2026-11-07): the whole model matches the fp64 GGUF reference at 543/545 positions (KL median 9e-5; llama.cpp CPU manages 528/545) and `phlegm run` / `serve` answer correctly; decode about 0.55-0.64 s a token on a loaded host. Our own pure Q4_0 GGUF
 from the BF16 (Q8_0 head; sha256 `455b6d44...`) in `/home/cyrus/models/Nanbeige4.3-33B-Q4pure-NPU2`,
 registry `nanbeige4.3:33b`. The dense recipe gained four rules, each only where its old one fails (every
 other checked-in manifest unchanged): a 7-core x 8-head attention split on Gemma 4's row-4 placement
@@ -321,9 +321,8 @@ the Q8_0 head on `lm_head_q8`). The kernel set compiles within program, data and
 is `reference-runtime-next` (it un-permutes llama.cpp's Q / K rows) plus `nanbeige-runtime.patch`, which
 fixes subnormal fp16 scales in the Q8_0 head packer. Pack check ALL OK (projections bit-exact, head
 1.7e-3); an fp64 reference over the GGUF agrees with llama.cpp CPU at 53/55 (KL median 2.7e-4), and
-llama.cpp CPU against Vulkan, the control, is 528/545 on a 545-token prompt. Next: the NPU gates in
-`target/npu-dev/nanbeige/scripts/` (quarter norm, 8-layer slice, whole model, `phlegm run` / `serve`,
-timing). Plan: [.plans/nanbeige.md](.plans/nanbeige.md); spec `OPEN-FAMILY-NANBEIGE`.
+llama.cpp CPU against Vulkan, the control, is 528/545 on a 545-token prompt. Next: a quiet-host
+`timing.sh`, contexts past 4096, and a Q4_0-native pool (about 10% fewer bytes a token). Plan: [.plans/nanbeige.md](.plans/nanbeige.md); spec `OPEN-FAMILY-NANBEIGE`.
 
 ## Qwen3.5 MoE 35B-A3B (Ornith 1.5, Nex N2.5 mini, KAT Coder V2.5 Dev)
 
