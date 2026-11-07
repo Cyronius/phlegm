@@ -235,6 +235,13 @@ assert not ONE_CTX or (L.LMHEAD_BANDS % N_CORES == 0 and not G.SANDWICH and NEED
 OGH = min(NHL, G.HPO)                                  # heads in one og element (attn.h's kOGH)
 N_OG = NHL // OGH                                      # og elements a core emits
 LN_FLAGS = [f"-DLN_N={HID}", f"-DLN_EPS={G.EPS:g}f"]
+# The quarter norm helper (recipes/dense.py norm_quarter): HID-byte elements. ln_add2 / ln_add3 are
+# compiled at LN_N = HID / 2, whose "half" is then a quarter of HID; ln_nrq at the model's width.
+NORM_Q = bool(G.NORM_Q)
+ELQ = HID                                              # bytes: a quarter of x in f32, a half of w / xn in bf16
+LN_FLAGS_Q = [f"-DLN_N={HID // 2}", f"-DLN_EPS={G.EPS:g}f"]
+assert not NORM_Q or (not ONE_CTX and not G.SANDWICH and SPEC.norm_groups == 1), \
+    "dx.py: the quarter norm helper serves the plain residual chain only"
 if SPEC.norm_groups != 1:                  # ln.h defaults it to 1; adding the flag would change
     LN_FLAGS.append(f"-DLN_GROUPS={SPEC.norm_groups}")   # every other family's build line (K2: 2)
 
@@ -248,6 +255,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
     tab_ty = np.ndarray[(G.TAB_BYTES,), np.dtype[np.uint8]]
     ms_ty = np.ndarray[(G.MS_FLOATS,), np.dtype[np.float32]]
     u8_ln = np.ndarray[(ELN,), np.dtype[np.uint8]]
+    u8_lq = np.ndarray[(ELQ,), np.dtype[np.uint8]]          # the quarter helper's element (NORM_Q)
     u8_a = np.ndarray[(E_A,), np.dtype[np.uint8]]
     u8_ab = np.ndarray[(E_A // 2,), np.dtype[np.uint8]]    # the same heads of a bf16 bias
     pool_ty = np.ndarray[(L.POOL_BYTES,), np.dtype[np.uint8]]
@@ -294,8 +302,13 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
     f_nr = ef("ln_nr", LINL / "ln_nr.cc", [u8_ln] * 4, LN_FLAGS)
     f_lny = ef("ln_y", LN / "ln_y.cc", [u8_ln] * 5 + [i32], LN_FLAGS)
     f_lnx = ef("ln_xn", LN / "ln_xn.cc", [u8_ln] * 6, LN_FLAGS)
-    f_add3 = ef("ln_add3", LN / "ln_add3.cc", [u8_ln] * 4, LN_FLAGS) if G.DOWN_SPLIT else None
-    f_add2 = ef("ln_add2", LN / "ln_add2.cc", [u8_ln] * 3, LN_FLAGS) if G.NORM_SPLIT else None
+    if NORM_Q:
+        f_add3 = ef("ln_add3", LN / "ln_add3.cc", [u8_lq] * 4, LN_FLAGS_Q) if G.DOWN_SPLIT else None
+        f_add2 = ef("ln_add2", LN / "ln_add2.cc", [u8_lq] * 3, LN_FLAGS_Q)
+        f_nrq = ef("ln_nrq", LN / "ln_nrq.cc", [u8_lq] * 6 + [i32], LN_FLAGS)
+    else:
+        f_add3 = ef("ln_add3", LN / "ln_add3.cc", [u8_ln] * 4, LN_FLAGS) if G.DOWN_SPLIT else None
+        f_add2 = ef("ln_add2", LN / "ln_add2.cc", [u8_ln] * 3, LN_FLAGS) if G.NORM_SPLIT else None
     f_nr32 = ef("ln_nr32", LN / "ln_nr32.cc", [u8_ln] * 4 + [i32], LN_FLAGS) if G.SANDWICH else None
     pz = [u8_a] if NPTAB > 1 else []                        # the record's second element
     f_meta = ef("attn_meta", ATTN / "attn_meta.cc", [u8_a, u8_a] + pz + [bhd, bhd, fcs, pb_ty], ATTN_FLAGS)
@@ -350,8 +363,12 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
     # (Qwen3-14B) it is three, and the fifo has to hold as many as the largest acquire.
     # o's table streams instead (OG_STREAM) when og alone is wider than the norms.
     of_x = ObjectFifo(x_ty, name="x", depth=X_DEPTH if OG_STREAM else max(X_DEPTH, G.OG_ELEMS))
-    of_lni = ObjectFifo(u8_ln, name="lni", depth=3 if G.NORM_SPLIT else 5)
-    of_lno = ObjectFifo(u8_ln, name="lno", depth=1)      # one output element at a time (8 KB elements at 4096 wide)
+    if NORM_Q:                                           # five quarter inputs held at most (ln_split.quarter_norm)
+        of_lni = ObjectFifo(u8_lq, name="lni", depth=5)
+        of_lno = ObjectFifo(u8_lq, name="lno", depth=1)
+    else:
+        of_lni = ObjectFifo(u8_ln, name="lni", depth=3 if G.NORM_SPLIT else 5)
+        of_lno = ObjectFifo(u8_ln, name="lno", depth=1)      # one output element at a time (8 KB elements at 4096 wide)
     of_ain = ObjectFifo(u8_a, name="ain", depth=max(4, 1 + NPTAB + 1) if KVSL else max(4, 2 * RB + 2, 1 + NPTAB + 1))   # a block is acquired at once
     # Two block elements: the DMA fills the next block while the core computes this one.
     of_kw = [ObjectFifo(u8_w, name=f"kw{g}", depth=2) for g in range(len(KW_GROUPS))] if KVSL else []
@@ -778,6 +795,12 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
     if ONE_CTX:
         workers = [Worker(ln_body, fn_args=[of_lni.cons(), of_lno.prod(), f_nr, f_lny, f_lnx] + ([f_nr32] if G.SANDWICH else [])
                           + mode_args(N_CORES), tile=Tile(0, 3), stack_size=0x1800)]
+    elif NORM_Q:
+        # The quarter helper (open_kernels/ln_split.py): at HID 7168 even the split form's 14 KB
+        # elements do not fit the norm core.
+        body = LS.ln_quarter_body3 if G.DOWN_SPLIT else LS.ln_quarter_body
+        workers = [Worker(body, fn_args=[of_lni.cons(), of_lno.prod(), f_nrq, f_add2] + ([f_add3] if G.DOWN_SPLIT else []),
+                          tile=Tile(0, 3), stack_size=0x1800)]
     elif G.NORM_SPLIT:
         # The norm helper streams (open_kernels/ln_split.py): at HID 5120 the fused form's
         # five 10 KB input elements do not fit the norm core's 64 KB.
@@ -853,8 +876,13 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             set_mode(False)
         # 1. layer-entry norm: xn -> act
         tg_ln = TaskGroup()
-        lni.fill(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln)
-        lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_LNW, ELN), wait=True, group=tg_ln)
+        if NORM_Q:                                       # [w0 x0 x1 x2 x3 w1] (ln_split.quarter_norm)
+            lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_LNW, ELQ), wait=True, group=tg_ln)
+            lni.fill(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln)
+            lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_LNW + ELQ, ELQ), wait=True, group=tg_ln)
+        else:
+            lni.fill(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln)
+            lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_LNW, ELN), wait=True, group=tg_ln)
         lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_XN, ELN), wait=True, group=tg_ln)
         # 2. q | k | v: weights now, xn after the norm
         pw, py = Pipeline(3), Pipeline(3)
@@ -953,6 +981,26 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_T, HID * 4), wait=True, group=tg_ln2)
             lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_RES, HID * 4), wait=True, group=tg_ln2)
             lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_XM, ELN), wait=True, group=tg_ln2)
+        elif NORM_Q:
+            # The quarter helper: res = x + out a quarter at a time, res to DDR, then
+            # [w0 res0..3 w1] -> xm by halves.
+            # Shim tile (0, 0) has 16 BDs for lni, lno, w0 and y0 together: the drain goes first and the
+            # eight fills through a 3-deep pipeline (a fill completes once it lands in the 5-deep fifo).
+            py.finish()                                           # out is in DDR
+            tg_ln2b = TaskGroup()
+            pln = Pipeline(3)
+            qq = HID // 4
+            lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_RES, HID * 4), wait=True, group=tg_ln2)
+            for i in range(4):
+                pln.fill(lni, c_xres, bt(HID, i * qq, qq))
+                pln.fill(lni, a_act, bt(L.AD_BYTES, L.AD_OUT + i * ELQ, ELQ))
+            pln.finish()
+            tg_ln2.finish()                                       # res is in DDR
+            lno.drain(a_act, tap=bt(L.AD_BYTES, L.AD_XM, ELN), wait=True, group=tg_ln2b)
+            lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_POSTLN, ELQ), wait=True, group=tg_ln2b)
+            lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_RES, HID * 4), wait=True, group=tg_ln2b)
+            lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_POSTLN + ELQ, ELQ), wait=True, group=tg_ln2b)
+            tg_ln2b.finish()                                      # xm is in DDR
         elif G.NORM_SPLIT:
             # The streaming norm helper (open_kernels/ln_split.py): the residual add goes
             # half by half (ln_add2), the sum goes to DDR, and the norm reads it back.
@@ -997,9 +1045,12 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
         if G.DOWN_SPLIT:
             # The down GEMV in K pieces (recipes/dense.py down_split): each piece's h
             # elements, its strided slice of every band, and its own output region.
+            # A piece fills whole x elements: the core acquires roundup(k * 4, ELEM) / ELEM of them
+            # and its prep stops at k. Equal to k * 4 unless the last piece ends inside an element
+            # (recipes/qwen36moe.py down_split `partial`); h's act region is whole elements either way.
             k0 = 0
             for k, dst in zip(G.DOWN_SPLIT, (L.AD_OUT2, L.AD_OUT2B)):
-                x_prod.fill(a_act, tap=bt(L.AD_BYTES, L.AD_H + k0 * 4, k * 4), wait=True, group=tg_x)
+                x_prod.fill(a_act, tap=bt(L.AD_BYTES, L.AD_H + k0 * 4, roundup(k * 4, ELEM)), wait=True, group=tg_x)
                 for c in range(N_CORES):
                     pw.fill(w_prods[c], a_pool,
                             piece_tap(L.POOL_BYTES,
@@ -1025,6 +1076,19 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             lni.fill(a_consts, tap=bt(L.CD_BYTES, L.CD_POSTFFN, ELN), wait=True, group=tg_ln3)   # unused w
             lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_T2, HID * 4), wait=True, group=tg_ln3)
             lno.drain(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln3)
+        elif NORM_Q:
+            # xres = res + out2 (+ out2b), a quarter at a time: the quarter helper's close. out2 is
+            # read only once it is in DDR; the drain goes first and the twelve fills through a
+            # 3-deep pipeline (shim tile (0, 0)'s 16 BDs, as stage 5).
+            py.finish()                                           # out2, out2b are in DDR
+            lno.drain(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln3)
+            pln = Pipeline(3)
+            for i in range(4):
+                pln.fill(lni, a_act, bt(L.AD_BYTES, L.AD_RES + i * ELQ, ELQ))
+                pln.fill(lni, a_act, bt(L.AD_BYTES, L.AD_OUT2 + i * ELQ, ELQ))
+                if G.DOWN_SPLIT:
+                    pln.fill(lni, a_act, bt(L.AD_BYTES, L.AD_OUT2B + i * ELQ, ELQ))
+            pln.finish()
         elif G.NORM_SPLIT:
             # xres = res + out2 (+ out2b), half by half: the streaming helper's close.
             for i in range(2):

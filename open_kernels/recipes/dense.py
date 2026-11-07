@@ -45,7 +45,7 @@ from . import gguf as GGUF
 from .catalogue import LIMITS, OpRangeError, check_buffer_args, require
 from .qwen36moe import ATTN_LMAX  # Path A: the widest attention GEMM stream (window chunk)
 from .qwen36moe import (BAND_ROWS, CHUNK, ELEM, GEMM_T, MB, _op_index, band_bytes, chunk_bytes, core_l1,
-                        down_split, gguf_direct, norm_split, q4_bytes, proj_op, q4_chunks, mixed_check,
+                        down_split, gguf_direct, norm_split, q4_bytes, proj_op, q4_chunks, mixed_check, NORM_L1,
                         quant_check, require_gemv, role_bytes, roundup, tab_bytes)
 from .spec import DENSE, DENSE_LOCAL, ModelSpec
 
@@ -90,6 +90,7 @@ class DenseGeometry:
     ACORES: int; NHL: int; RB: int                                  # attention cores; heads each owns; rows per call
     DOWN_SPLIT: tuple = ()                                          # the down GEMV's K pieces; () when the FF fits whole
     NORM_SPLIT: bool = False                                        # the norm helper streams instead of holding five elements
+    NORM_Q: bool = False                                            # ... in HID-byte quarter elements (norm_quarter)
     # Gemma 4 (OPEN-FAMILY-GEMMA4); the defaults are every other family, whose flags then
     # stay off the build line (dx.py), so their kernels compile byte for byte as before
     VNORM: int = 0                                                  # attn.h ATTN_VNORM: weightless RMSNorm on V
@@ -281,7 +282,7 @@ def _ffn_split(spec: ModelSpec) -> tuple[int, ...]:
         return pieces
     ch = chunk_bytes(pool_quant(spec))
     stack = 0x1400 if pool_quant(spec) == "q4_1_f32" else STACK
-    return down_split(spec, ch, stack)
+    return down_split(spec, ch, stack, partial=True)
 
 
 def per_call(spec: ModelSpec) -> int:
@@ -376,6 +377,9 @@ def geometry(spec: ModelSpec) -> DenseGeometry:
     # it; every other family's artifacts stay byte-identical until it has been.
     A = attn_knobs(spec, nh, hpo)
     vexp, acores, nhl, mls, rb = A.VEXP, A.ACORES, A.NHL, A.MLS, A.RB
+    aw = wide_attention(nh, hpe, hpo, A)
+    if aw:
+        acores, nhl, mls, rb = aw.ACORES, aw.NHL, aw.MLS, aw.RB
     return DenseGeometry(
         N_CORES=n, HID=hid, FF=ff, NH=nh, KVH=kvh, HD=hd, ROT=spec.rotary_dim, GATE=spec.attn_gate,
         QKNORM=spec.qk_norm, QKNORM_POST=spec.qk_norm and spec.family in QKNORM_POST_ROPE,
@@ -396,7 +400,48 @@ def geometry(spec: ModelSpec) -> DenseGeometry:
         VEXP=vexp, MLS=mls, ACORES=acores, NHL=nhl, RB=rb,
         DOWN_SPLIT=split,
         NORM_SPLIT=os.environ.get("DENSE_NORM_SPLIT") == "1" or norm_split(spec),
+        NORM_Q=norm_quarter(spec),
+        **({"AWIDE": 1, "QLOCAL": 1} if aw else {}),
     )
+
+
+def wide_attention(nh: int, hpe: int, hpo: int, A):
+    """The attention split for a head count the default one cannot serve, or None.
+
+    `attn_cores` takes the largest head-count divisor up to MAX_ATTN_CORES (dx.py's Tile(2 + c, 3)
+    row has six free columns). A core then has to emit whole og elements of min(NHL, HPO) heads.
+    Nanbeige4.3-33B is where that fails: 56 heads over 8 kv heads put 14 heads on each of 4 cores,
+    and 14 is not a whole number of 8-head og elements. The fix is the Gemma 4 placement dx.py
+    already has (AWIDE: the attention cores on row 4, their og joined in memtiles) at the smallest
+    core count past six that divides the heads into whole og elements, with each core keeping only
+    its own q heads (ATTN_QLOCAL: 8 heads of q instead of 56, 4 KB instead of 28 KB of L1 at head
+    dim 128), which needs a core's heads to be whole q elements. Every geometry whose default split
+    works returns None, so its kernels compile exactly as before."""
+    if not A.VEXP or A.NHL % min(A.NHL, hpo) == 0:
+        return None
+    for cores in range(MAX_ATTN_CORES + 1, LIMITS["n_cols"] + 1):
+        if nh % cores:
+            continue
+        nhl = nh // cores
+        if nhl % min(nhl, hpo) or nhl % hpe:
+            continue
+        lanes = max(nhl, 8)                                  # attnknobs.block_lanes
+        rb = max((r for r in (4, 2, 1) if (r * lanes) in (8, 16, 32)), default=1)
+        rb = int(os.environ.get("ATTN_RB", rb))              # the probe, as attnknobs._probe_rb
+        return replace(A, ACORES=cores, NHL=nhl, MLS=((nhl + 31) // 32) * 32, RB=rb)
+    raise OpRangeError(f"dense: {nh} heads split over no core count up to {LIMITS['n_cols']} into whole "
+                       f"{hpo}-head og elements and {hpe}-head q elements")
+
+
+def norm_quarter(spec: ModelSpec) -> bool:
+    """True when even the split norm helper does not fit its core. The 2026-10-26 compile probe at
+    Nanbeige4.3's 7168 found four HID * 2-byte input buffers (the depth-3 fifo's three-element
+    acquire) and one output buffer beside the 0x1800 stack: 5 x 14336 + 6144 B, over the 64 KB.
+    The quarter form streams HID-byte elements -- the residual a quarter at a time, the norm
+    weights and the output by halves -- and holds at most five inputs and one output
+    (designs/ln/ln_nrq.cc). Every width the split form serves (the 27B's 5120: 57 344 B by the
+    same count) keeps it."""
+    return norm_split(spec) and 5 * spec.hidden * 2 + STACK > NORM_L1
 
 
 def attn_flags(G: DenseGeometry, probe_env=()) -> list[str]:
@@ -1037,12 +1082,61 @@ def f32_twin_fits(spec: ModelSpec) -> bool:
     return not geometry(spec).DOWN_SPLIT
 
 
+# Families whose split-FF GGUF runs as the q4_1-law view: there is no f32-scale twin at a split FF
+# (f32_twin_fits), so GGUF.section emits nothing, and without this a model.gguf would not load.
+GGUF_Q41_VIEW_FAMILIES = ("llama3",)
+
+
+def gguf_q41_view(spec: ModelSpec) -> bool:
+    """The manifest's `gguf` section is the q4_1 program itself, packed from the GGUF (OPEN-FAMILY-NANBEIGE).
+
+    `std_perm_gguf` packs a Q4_0 / Q4_1 tensor into the q4_1 law's 5120-B chunk with its codes kept
+    and its fp16 scale pair rounded to bf16 (what the f32-scale kernels narrow it to on the core
+    anyway); a pure Q4_0 GGUF from BF16 has bf16-exact scales and m = -8 d, so it packs exactly. The
+    runtime un-permutes llama.cpp's Q / K rows there. The head is the GGUF's Q8_0 kept as codes
+    (`lmhead_q8` on lm_head_q8 with bf16 scales), not requantized to q4_1. Only a spec that would
+    otherwise have no section takes it (split FF, no f32 twin), so every other manifest is unchanged."""
+    return (spec.family in GGUF_Q41_VIEW_FAMILIES and spec.quant == "q4_1" and not spec.q8_roles
+            and not f32_twin_fits(spec))
+
+
+def gguf_q41_head_build(spec: ModelSpec) -> dict:
+    n = cores_for(spec)
+    return {"design": "lm_head_q8/lm_head_q8.py",
+            "build_dir": f"lm_head_q8/build_gguf_n{lm_rows(spec)}_k{spec.hidden}_c{n}",
+            "env": {"LMHEAD_N": str(lm_rows(spec)), "LMHEAD_K": str(spec.hidden),
+                    "LMHEAD_CORES": str(n), "LMHEAD_SCALES_F32": "0"}}
+
+
+def _gguf_q41_section(spec: ModelSpec, manifest: dict) -> dict:
+    """The q4_1 manifest with its projections packed by std_perm_gguf and the Q8_0 head on lm_head_q8."""
+    g = copy.deepcopy({k: v for k, v in manifest.items() if k != "gguf"})
+    for name, lt in g["layer_types"].items():
+        for op in lt["pack"]["pool"]:
+            if op["op"] != "std_perm":
+                raise OpRangeError(f"gguf q4_1 view: layer type {name} packs {op['tensor']} by {op['op']}")
+            op["op"] = "std_perm_gguf"
+    head = roundup(lm_rows(spec) * spec.hidden // 8192 * 8704, MB)
+    g["pack"]["lm_head"] = {"pool_bytes": head,
+                            "ops": [{"op": "lmhead_q8", "tensor": "lm_head.weight", "dst": 0,
+                                     "chunk_bytes": 8704, "in_dim": spec.hidden}]}
+    g["layout"]["lmhead_pool_bytes"] = head
+    g["globals"]["lmpool"] = head
+    g["contexts"]["lm"] = "lm_head_q8_gguf/final.xclbin"
+    g["kernels"]["lm"] = {"context": "lm", "insts": "lm_head_q8_gguf/insts.bin", "build": "lm_head_q8_gguf"}
+    return g
+
+
 def finalize_gguf_manifest(spec: ModelSpec, manifest: dict) -> None:
     """Opt-in BF16 scale storage: the same rounding already done by the cores.
 
     Keep the GGUF Q8 head and attention route while borrowing the ordinary
     Q4 projection kernels and their pool geometry. No source codes are requantized.
+
+    A split-FF Llama (gguf_q41_view) gets its `gguf` section here, the q4_1 program itself.
     """
+    if gguf_q41_view(spec) and "gguf" not in manifest:
+        manifest["gguf"] = _gguf_q41_section(spec, manifest)
     if os.environ.get("DENSE_GGUF_COMPACT") != "1" or spec.quant == "q4_1_f32":
         return
     if (spec.family != "llama3" or spec.quant != "q4_1" or spec.q8_roles
@@ -1206,6 +1300,8 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
         gr = gemm_route(replace(spec, quant="q4_1_f32"))
         if gr:
             b.update(gr["builds"])
+    if gguf_q41_view(spec):
+        b["lm_head_q8_gguf"] = gguf_q41_head_build(spec)        # the q4_1-law GGUF view's Q8_0 head
     if gguf_q8_head(replace(spec, quant="q4_1_f32")) and f32_twin_fits(spec):
         b["lm_head_q8_gguf"] = {"design": "lm_head_q8/lm_head_q8.py",
             "build_dir": f"lm_head_q8/build_gguf_n{lm_rows(spec)}_k{spec.hidden}_c{n}",

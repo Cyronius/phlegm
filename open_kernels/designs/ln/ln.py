@@ -34,6 +34,10 @@ ELEM = N * 2
 # true through N = 4096 (55 296 B), false at the 27B's 5120 (67 584 B). Past it the residual
 # streams half by half and the norm reads the sum back (recipes/qwen36moe.py norm_split).
 SPLIT = 6 * ELEM + 0x1800 > 64 * 1024
+# ... and past 5 elements + stack (Nanbeige4.3's 7168: 14 KB elements) even the split form's four
+# inputs and one output do not fit: the quarter form streams N-byte elements (recipes/dense.py
+# norm_quarter, open_kernels/ln_split.py quarter_*), the same bits.
+QUARTER = 5 * ELEM + 0x1800 > 64 * 1024
 if GROUPS not in (1, 2, 4):
     raise SystemExit(f"LN_GROUPS={GROUPS}: only 1 (plain RMSNorm), 2 or 4 (K2's groups) supported")
 if GROUPS > 1 and N <= 2048:
@@ -70,6 +74,25 @@ def ln(x: In, add: In, w: In, y: Out, xn: Out, *, n: CompileTime[int] = 2048, ep
             ain.release(5)
 
         worker = Worker(core_body, fn_args=[of_in.cons(), of_out.prod(), fn], tile=Tile(0, 2), stack_size=0x1800)
+    elif QUARTER:
+        if GROUPS != 1 or DIV != N:
+            raise SystemExit(f"ln.py: the quarter form (N={N}) is ungrouped and unpadded")
+        sys.path.insert(0, str(HERE.parent.parent))
+        import ln_split as LS
+        uq = np.ndarray[(N,), np.dtype[np.uint8]]
+        flags_q = [f"-DLN_N={N // 2}", f"-DLN_EPS={EPS:g}f"]
+        f_add = ExternalFunction("ln_add2", source_file=str(HERE / "ln_add2.cc"), arg_types=[uq] * 3,
+                                 include_dirs=include_dirs(), compile_flags=flags_q)
+        f_nrq = ExternalFunction("ln_nrq", source_file=str(HERE / "ln_nrq.cc"), arg_types=[uq] * 6 + [np.int32],
+                                 include_dirs=include_dirs(), compile_flags=flags)
+        of_in = ObjectFifo(uq, name="in", depth=5)
+        of_out = ObjectFifo(uq, name="out", depth=1)
+
+        def core_body(ain, aout, fa, fn):
+            LS.quarter_adds(ain, aout, fa, 2)       # [x_q a_q] -> y_q
+            LS.quarter_norm(ain, aout, fn)          # [w0 y0 y1 y2 y3 w1] -> xn0, xn1
+
+        worker = Worker(core_body, fn_args=[of_in.cons(), of_out.prod(), f_add, f_nrq], tile=Tile(0, 2), stack_size=0x1800)
     elif SPLIT:
         # widest: [x_i a_i] -> y_i for each half, y to DDR, then [y0 y1 w] -> xn through the
         # layer-entry norm's kernel. ln_add2 forms the sum exactly as ln_y / ln_xn do, so xn is
@@ -134,7 +157,28 @@ def ln(x: In, add: In, w: In, y: Out, xn: Out, *, n: CompileTime[int] = 2048, ep
         pipe.drain(outc, c_xn, tap(0, N))
         pipe.finish()
 
+    def quarter_sequence(a_x, a_add, a_w, c_y, c_xn, inp, outc):
+        q, h = N // 4, N // 2
+
+        def tap(off, n):
+            return TensorAccessPattern((1, N), off, [1, 1, 1, n], [0, 0, 0, 1])
+
+        pipe = Pipeline(3)
+        for i in range(4):
+            pipe.fill(inp, a_x, tap(i * q, q))
+            pipe.fill(inp, a_add, tap(i * q, q))
+        pipe.drain(outc, c_y, tap(0, N))
+        pipe.finish()                            # y is in DDR
+        pipe.fill(inp, a_w, tap(0, h))
+        pipe.fill(inp, c_y, tap(0, N))
+        pipe.fill(inp, a_w, tap(h, h))
+        pipe.drain(outc, c_xn, tap(0, N))
+        pipe.finish()
+
     def sequence(a_x, a_add, a_w, c_y, c_xn, inp, outc):
+        if QUARTER:
+            quarter_sequence(a_x, a_add, a_w, c_y, c_xn, inp, outc)
+            return
         if SPLIT:
             split_sequence(a_x, a_add, a_w, c_y, c_xn, inp, outc)
             return
