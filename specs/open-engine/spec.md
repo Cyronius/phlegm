@@ -5205,7 +5205,9 @@ its own); `NEMOTRONH_SHARED=1` (with it) only the three GEMVs as streams of one 
    max_tokens) and a streamed one with thinking off ("391" for 17 x 23, [DONE]). The publisher's chat template
    guards `tools` only with `is defined` and relies on jinja2's `none is iterable` being false; phlegm passes `tools`
    as none, and minijinja said true. phlegm's tokenizer now overrides `iterable` (none -> false, test
-   `none_tools_is_not_iterable`), so the model dir carries the publisher's template unchanged.
+   `none_tools_is_not_iterable`), so the model dir carries the publisher's template unchanged: on the NPU
+   (2026-11-07, `phlegm run`, release build of `133d624`) it answers "The capital of France is Paris." with its
+   reasoning separated.
 
 Open: block prefill (prefill runs at decode speed); the head as a stream of the block image; the one-image
 route's 60 ms of first-dispatch time against ~2.1 GB of weights a token (~20 GB/s); host steps (~11 ms) overlapped
