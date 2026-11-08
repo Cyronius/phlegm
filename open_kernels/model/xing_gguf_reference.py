@@ -30,7 +30,11 @@ Writes, for the first N layers (all of them by default):
     <out>/ref_res{l}.bin           f32[T, 4, hidden]   layer l's output streams at every position (--dump-res)
 
     python -I open_kernels/model/xing_gguf_reference.py --gguf model.gguf --ids-file short.ids --out OUT \
-        [--layers 8] [--positions all|last|a,b,...] [--dump-res] [--gguf-py <llama.cpp>/gguf-py]
+        [--layers 8] [--positions all|last|a,b,...] [--dump-res] [--npu-like] [--gguf-py <llama.cpp>/gguf-py]
+
+--npu-like is a control, not a reference: the runtime's arithmetic (the absorbed attention, bf16 GEMV inputs, f32
+GEMV outputs / streams / KV rows, the dense MLP as 1024-wide slots, h rounded to bf16 before each down part) over
+the same file, to measure what the NPU route's roundings cost against the fp64 forward.
 """
 from __future__ import annotations
 
@@ -86,6 +90,17 @@ class Gguf:
         cols = int(t.shape[0])
         data = t.data.reshape(int(t.shape[1]), -1)
         return np.stack([self.dq(data[i], t.tensor_type).reshape(-1)[:cols] for i in ids]).astype(np.float64)
+
+
+def bf(x: np.ndarray) -> np.ndarray:
+    """f32 -> bf16 (round to nearest even) -> fp64: what a GEMV's prep makes of its f32 / bf16 activation."""
+    u = np.asarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    u = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16
+    return u.astype(np.uint32).view(np.float32).astype(np.float64)
+
+
+def f32(x: np.ndarray) -> np.ndarray:
+    return np.asarray(x, dtype=np.float32).astype(np.float64)
 
 
 def rms(x: np.ndarray, w, eps: float) -> np.ndarray:
@@ -174,7 +189,36 @@ def mla(g: Gguf, p: str, h: np.ndarray, pos: np.ndarray, cfg: dict) -> np.ndarra
     return out.reshape(T, nh * vd) @ g.w(p + "attn_output.weight").T
 
 
-def moe(g: Gguf, p: str, m: np.ndarray, cfg: dict) -> np.ndarray:
+def mla_absorbed(g: Gguf, p: str, h: np.ndarray, pos: np.ndarray, cfg: dict) -> np.ndarray:
+    """--npu-like: the runtime's form (xing-runtime.patch xg_qnorm / xg_mla): the GEMV inputs rounded to bf16 (h,
+    the normed q_a, the attention output), the GEMV outputs and the KV rows [latent | rope key] f32, q_nope absorbed
+    through k_b into the latent, the output through v_b."""
+    T = h.shape[0]
+    nh, nope, rot, vd, kvl = cfg["heads"], cfg["nope"], cfg["rope"], cfg["vdim"], cfg["kv_lora"]
+    eps = cfg["eps"]
+    hb = bf(h)
+    qkva = f32(hb @ np.concatenate([g.w(p + "attn_q_a.weight"), g.w(p + "attn_kv_a_mqa.weight")]).T)
+    ql = qkva.shape[1] - kvl - rot
+    qa = f32(rms(qkva[:, :ql], g.w(p + "attn_q_a_norm.weight").astype(np.float64), eps))
+    c = f32(rms(qkva[:, ql:ql + kvl], g.w(p + "attn_kv_a_norm.weight").astype(np.float64), eps))
+    kr = f32(rope_pairs(qkva[:, None, ql + kvl:], pos, cfg["inv"])[:, 0, :])
+    q = f32(bf(qa) @ g.w(p + "attn_q_b.weight").T).reshape(T, nh, nope + rot)
+    qr = f32(rope_pairs(q[:, :, nope:], pos, cfg["inv"]))
+    kb = g.w(p + "attn_k_b.weight").astype(np.float64)               # [heads, kv_lora, nope]
+    vb = g.w(p + "attn_v_b.weight").astype(np.float64)               # [heads, vdim, kv_lora]
+    mask = np.triu(np.full((T, T), -np.inf), 1)
+    out = np.empty((T, nh, vd))
+    for hh in range(nh):
+        lat = q[:, hh, :nope] @ kb[hh].T                             # [T, kv_lora]
+        s = (lat @ c.T + qr[:, hh, :] @ kr.T) * cfg["scale"] + mask
+        s -= s.max(axis=1, keepdims=True)
+        pr = np.exp(s)
+        pr /= pr.sum(axis=1, keepdims=True)
+        out[:, hh, :] = (pr @ c) @ vb[hh].T
+    return f32(bf(f32(out.reshape(T, nh * vd))) @ g.w(p + "attn_output.weight").T)
+
+
+def moe(g: Gguf, p: str, m: np.ndarray, cfg: dict, npu: bool = False) -> np.ndarray:
     T, hid = m.shape
     E, K, scale = cfg["experts"], cfg["topk"], cfg["router_scale"]
     s = sigmoid(m @ g.w(p + "ffn_gate_inp.weight").T.astype(np.float64))      # [T, E]
@@ -183,22 +227,33 @@ def moe(g: Gguf, p: str, m: np.ndarray, cfg: dict) -> np.ndarray:
     wts = np.take_along_axis(s, idx, axis=1)
     wts = wts / (wts.sum(axis=1, keepdims=True) + 1e-20) * scale
     out = np.zeros((T, hid))
+    if npu:                                         # xm bf16, weights f32, h f32 rounded to bf16 for down
+        m, wts = bf(m), f32(wts)
+    r = bf if npu else (lambda v: v)
     for e in np.unique(idx):
         rows, slot = np.nonzero(idx == e)
         x = m[rows]
         gt = x @ g.expert(p + "ffn_gate_exps.weight", int(e)).T
         up = x @ g.expert(p + "ffn_up_exps.weight", int(e)).T
-        y = (silu(gt) * up) @ g.expert(p + "ffn_down_exps.weight", int(e)).T
-        out[rows] += y * wts[rows, slot][:, None]
+        y = r(silu(gt) * up * (wts[rows, slot][:, None] if npu else 1.0)) @ g.expert(p + "ffn_down_exps.weight", int(e)).T
+        out[rows] += y if npu else y * wts[rows, slot][:, None]
     gt = m @ g.w(p + "ffn_gate_shexp.weight").T
     up = m @ g.w(p + "ffn_up_shexp.weight").T
-    return out + (silu(gt) * up) @ g.w(p + "ffn_down_shexp.weight").T
+    return out + r(silu(gt) * up) @ g.w(p + "ffn_down_shexp.weight").T
 
 
-def dense(g: Gguf, p: str, m: np.ndarray) -> np.ndarray:
-    gt = m @ g.w(p + "ffn_gate.weight").T
-    up = m @ g.w(p + "ffn_up.weight").T
-    return (silu(gt) * up) @ g.w(p + "ffn_down.weight").T
+def dense(g: Gguf, p: str, m: np.ndarray, npu: bool = False, ff: int = 1024) -> np.ndarray:
+    if not npu:
+        gt = m @ g.w(p + "ffn_gate.weight").T
+        up = m @ g.w(p + "ffn_up.weight").T
+        return (silu(gt) * up) @ g.w(p + "ffn_down.weight").T
+    # --npu-like: the 1024-wide slices the runtime runs as slots, each h rounded to bf16 for its down part
+    m = bf(m)
+    G, U, D = g.w(p + "ffn_gate.weight"), g.w(p + "ffn_up.weight"), g.w(p + "ffn_down.weight")
+    out = np.zeros((m.shape[0], D.shape[0]))
+    for j in range(0, G.shape[0], ff):
+        out += bf(silu(m @ G[j:j + ff].T) * (m @ U[j:j + ff].T)) @ D[:, j:j + ff].T
+    return out
 
 
 def config(g: Gguf) -> dict:
@@ -239,6 +294,8 @@ def main() -> int:
     ap.add_argument("--positions", default="all", help="all | last | comma-separated positions")
     ap.add_argument("--dump-res", action="store_true", help="write every layer's output streams")
     ap.add_argument("--gguf-py", default=None)
+    ap.add_argument("--npu-like", action="store_true",
+                    help="the runtime's arithmetic: absorbed MLA, bf16 GEMV inputs, f32 streams / KV rows / outputs")
     a = ap.parse_args()
     g = Gguf(a.gguf, a.gguf_py)
     cfg = config(g)
@@ -259,13 +316,19 @@ def main() -> int:
         p = f"blk.{l}."
         h, post, comb = hc_pre(S, g.w(p + "hc_attn_fn.weight"), g.w(p + "hc_attn_base.weight").astype(np.float64),
                                g.w(p + "hc_attn_scale.weight").astype(np.float64), eps, cfg["hc_iters"], cfg["hc_eps"])
-        y = mla(g, p, rms(h, g.w(p + "attn_norm.weight").astype(np.float64), eps), pos, cfg)
+        att = mla_absorbed if a.npu_like else mla
+        y = att(g, p, rms(h, g.w(p + "attn_norm.weight").astype(np.float64), eps), pos, cfg)
         S = hc_post(y, S, post, comb)
+        if a.npu_like:
+            S = f32(S)
         h, post, comb = hc_pre(S, g.w(p + "hc_ffn_fn.weight"), g.w(p + "hc_ffn_base.weight").astype(np.float64),
                                g.w(p + "hc_ffn_scale.weight").astype(np.float64), eps, cfg["hc_iters"], cfg["hc_eps"])
         m = rms(h, g.w(p + "ffn_norm.weight").astype(np.float64), eps)
-        y = dense(g, p, m) if l < cfg["dense_lead"] else moe(g, p, m, cfg)
-        S = hc_post(y, S, post, comb)
+        y = (dense(g, p, m, a.npu_like, int(g.meta(f"{ARCH}.expert_feed_forward_length"))) if l < cfg["dense_lead"]
+             else moe(g, p, m, cfg, a.npu_like))
+        S = hc_post(f32(y) if a.npu_like else y, S, post, comb)
+        if a.npu_like:
+            S = f32(S)
         if a.dump_res:
             S.astype(np.float32).tofile(out / f"ref_res{l}.bin")
         print(f"  layer {l}: |S| {np.abs(S).max():.3f}  {time.time() - t0:.0f} s", flush=True)
@@ -276,6 +339,8 @@ def main() -> int:
     else:
         ps = [int(s) for s in a.positions.split(",")]
     hn = rms(S[ps].mean(axis=1), g.w("output_norm.weight").astype(np.float64), eps)
+    if a.npu_like:
+        hn = bf(hn)
     W = g.w("output.weight")
     logits = np.empty((len(ps), W.shape[0]))
     for r0 in range(0, W.shape[0], 16384):

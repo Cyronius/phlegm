@@ -469,6 +469,18 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   adds `gguf_pack_dump`, the no-XRT dump `open_kernels/model/nanbeige_gguf_check.py` reads. The clone is
   `target/npu-dev/nanbeige-runtime`, and a round trip reproduces its tree.
 
+- `upstream-patches/xing-runtime.patch` (2026-11-08) serves Xing4.0-29B-A4B, a DeepSeek-V3 decoder (MLA,
+  routed SiLU experts) with DeepSeek's mHC residual, from our own pure Q4_0 GGUF (OPEN-FAMILY-XING). It is a
+  diff over the Nemotron-H clone (`beccd46` plus the Gemma 4 / gemma4-moe chain plus
+  `nemotronh-runtime.patch`), whose host-step program, one-image expert stream and `nh_q40` pack op it
+  reuses. It adds the `xg_*` host steps: mHC pre / post over four f32 residual streams in the `xres` global,
+  the MLA glue (q / kv norms, interleaved YaRN RoPE, an f32 KV row of latent plus rope key per position, the
+  absorbed attention through `attn_k_b` / `attn_v_b`), the sigmoid router with the shared expert as one more
+  slot (`nhroute` with a pool base), and the stream mean before the head. It also adds `band_stride` to
+  `nh_q40`, for the gate | up band interleave, and `xing_pack_check`, a CPU readback whose samples
+  `open_kernels/model/xing_gguf_check.py` compares with gguf-py. The clone is `target/npu-dev/xing-runtime`,
+  and a round trip reproduces its tree.
+
 `designs/dense/dx_attn.py` now takes its recipe module from `for_spec` and its flags from the
 recipe's `attn_flags`, and gained `dx.py`'s ATTN_QLOCAL q loop. It emits byte-identical MLIR
 for the 15 shipped dense specs with a block route that emit at all; `qwen3-14b` refuses at

@@ -279,6 +279,23 @@
           "top_p": 0.95
         }
       }
+    },
+    "xing4.0": {
+      "29b-a4b": {
+        "name": "Xing4.0-29B-A4B-Q4pure-NPU2",
+        "default_context_length": 4096,
+        "details": {
+          "family": "xing",
+          "parameter_size": "29B-A4B",
+          "quantization_level": "Q4_0",
+          "think": true
+        },
+        "sampling": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "repetition_penalty": 1.05
+        }
+      }
     }
   }
 }

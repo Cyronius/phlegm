@@ -837,5 +837,35 @@
     "note": "Nanbeige4.3-33B (dense llama, OPEN-FAMILY-NANBEIGE) from its pure Q4_0 GGUF on the q4_1-law GGUF view (recipes/dense.py gguf_q41_view), which this lineage already packs (std_perm_gguf at the 5120-B chunk with llama.cpp's Q/K rows un-permuted; lmhead_q8 for the Q8_0 head). Fixes lmhead_q8's raw-GGUF Q8_0 path: its hand-rolled fp16 -> f32 widening wrapped a subnormal scale's exponent to inf / NaN / 1e38 (227 461 of the head's 37.4 M blocks); it now uses weight_file.hpp fp16_to_f32 (gguf_pack_test: a subnormal-scale head, 4096 of 4096 scales wrong before, 0 after). Adds gguf_pack_dump (no XRT): a GGUF view's packed pool / consts / head bytes for open_kernels/model/nanbeige_gguf_check.py. A diff over reference-runtime-next (478dbea + linux-runtime-pr209.patch, which reverse-applies cleanly to it); built in target/npu-dev/nanbeige-runtime (the unmodified copy: nanbeige-runtime-base; base + patch = the clone), bridge target/npu-dev/bridges/nanbeige",
     "patch": "nanbeige-runtime.patch",
     "source_head": "478dbea3f00f868ac58205803cc537b402c6cad5"
+  },
+  "xing_runtime_20261108": {
+    "base": "beccd4699d812642b63741255322d19a0c1dd738",
+    "applies_after": [
+      "gemma4_block_prefill_20261029",
+      "gemma4_bringup_dumps_20261029",
+      "gemma4_compact_gguf_20261029",
+      "gemma4_attn_block_20261029",
+      "gemma4_prefill_host_20261029",
+      "gemma4_bfp16_prefill_20261030",
+      "gemma4_prefill_pipeline_20261030",
+      "gemma4_q40_gguf_20261030",
+      "gemma4_kvslice_20261030",
+      "gemma4_moe_20261031",
+      "gemma4_moe_decode_20261101",
+      "gemma4_moe_block_20261103",
+      "nemotronh_runtime_20261106"
+    ],
+    "files": [
+      "src/open_qwen36/CMakeLists.txt",
+      "src/open_qwen36/core.cpp",
+      "src/open_qwen36/core.hpp",
+      "src/open_qwen36/manifest.cpp",
+      "src/open_qwen36/manifest.hpp",
+      "src/open_qwen36/pools.cpp",
+      "src/open_qwen36/xing_pack_check.cpp"
+    ],
+    "note": "Xing 4.0 / Xing4.0-29B-A4B (OPEN-FAMILY-XING, recipes/xing.py) from our pure Q4_0 GGUF: host program steps xg_pre (mHC pre: the 4 f32 residual streams in the xres global, the 24 mixes through hc_fn, pre / post / the 20-step Sinkhorn comb, the collapsed input and its norm, as the GEMV's f32 x or as the expert program's bf16 xm with the slots' weights f32[16]; route mode: the sigmoid router with exp_probs_b, the top 4 + the shared expert as pool expert 64, the expert stream's gate|up and down fills re-pointed (nhroute with a pool base); dense mode: the 9 dense-MLP slices at weight 1), xg_qnorm (q_a / kv_a norms, interleaved-pair YaRN RoPE on the rope key, the layer's f32 KV row [latent 512 | rope 64] in its kv state), xg_mla (the absorbed MLA attention: q_nope through attn_k_b into the latent, the scores over the KV rows, the output through attn_v_b; both widened to f32 from the GGUF at first use by xg_tensor, which reads any rank), xg_post (S_i <- post_i y + sum_j comb_ij S_j), xg_final (the stream mean, output_norm; also allowed in the tail); nh_q40 gains band_stride (the gate | up band interleave); xing_pack_check (CPU readback of the packing, a sample file for open_kernels/model/xing_gguf_check.py). A diff over the nemotronh-runtime clone (beccd46 + the Gemma 4 / gemma4-moe chain + nemotronh-runtime.patch, verified equal to base + the checked-in patch). sha256 9209fadd33a344c36fca90aef401a2cd0e87fa703030f5559a83ff3203af87bc; built in target/npu-dev/xing-runtime (the unmodified copy: xing-runtime-base; base + patch = the clone, checked by xing/scripts/mkpatch.sh), bridge target/npu-dev/bridges/xing. manifest_test does not compile on this chain (pre-existing).",
+    "patch": "xing-runtime.patch",
+    "source_head": "beccd4699d812642b63741255322d19a0c1dd738"
   }
 }

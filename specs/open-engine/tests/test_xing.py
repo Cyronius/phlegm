@@ -289,3 +289,28 @@ def test_the_reference_router_picks_with_the_bias_and_weighs_without_it():
             g = np.full(4, 0.1 * (e + 1) * m[t].sum())
             want += wt * np.full(hid, 0.1 * (e + 1)) * (g / (1 + np.exp(-g)) * g).sum()
         assert np.allclose(out[t], want)
+
+
+def test_the_npu_like_control_computes_the_same_attention_at_bf16_distance():
+    """--npu-like's absorbed form (the runtime's) against the reference's HF form: equal up to the bf16 roundings
+    of the GEMV inputs."""
+    R = reference()
+    rng = np.random.default_rng(13)
+    nh, nope, rot, vd, kvl, ql, hid, T = 4, 16, 8, 12, 24, 32, 32, 7
+    p = "blk.0."
+    W = {p + "attn_q_a.weight": rng.standard_normal((ql, hid)).astype(np.float32) * 0.3,
+         p + "attn_q_a_norm.weight": (1 + 0.1 * rng.standard_normal(ql)).astype(np.float32),
+         p + "attn_q_b.weight": rng.standard_normal((nh * (nope + rot), ql)).astype(np.float32) * 0.3,
+         p + "attn_kv_a_mqa.weight": rng.standard_normal((kvl + rot, hid)).astype(np.float32) * 0.3,
+         p + "attn_kv_a_norm.weight": (1 + 0.1 * rng.standard_normal(kvl)).astype(np.float32),
+         p + "attn_k_b.weight": rng.standard_normal((nh, kvl, nope)).astype(np.float32) * 0.3,
+         p + "attn_v_b.weight": rng.standard_normal((nh, vd, kvl)).astype(np.float32) * 0.3,
+         p + "attn_output.weight": rng.standard_normal((hid, nh * vd)).astype(np.float32) * 0.3}
+    inv = R.yarn_inv_freq(rot, 10000.0, 64.0, 4096.0, 32.0, 1.0)
+    cfg = {"heads": nh, "nope": nope, "rope": rot, "vdim": vd, "kv_lora": kvl, "eps": 1e-6, "inv": inv, "scale": 0.17}
+    h = rng.standard_normal((T, hid))
+    a = R.mla(_G(W), p, h, np.arange(T), cfg)
+    b = R.mla_absorbed(_G(W), p, h, np.arange(T), cfg)
+    rel = np.linalg.norm(a - b) / np.linalg.norm(a)
+    assert 0 < rel < 2e-2
+    assert R.bf(np.array([1.0 + 2 ** -9, 1.0 + 3 * 2 ** -9]))[0] == 1.0      # ties to even

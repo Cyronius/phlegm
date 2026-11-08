@@ -1,0 +1,690 @@
+diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/CMakeLists.txt patch-b/src/open_qwen36/CMakeLists.txt
+--- a/src/open_qwen36/CMakeLists.txt	2026-11-08 09:49:17.821980800 -0600
++++ b/src/open_qwen36/CMakeLists.txt	2026-11-08 09:49:17.821980800 -0600
+@@ -43,7 +43,9 @@
+ add_executable(gguf_pack_test gguf_pack_test.cpp gguf_file.cpp pools.cpp manifest.cpp q4nx_file.cpp)
+ # nemotronh_pack_check (no XRT, needs the model and its kernel set): Nemotron-H's packing read back (OPEN-FAMILY-NEMOTRONH)
+ add_executable(nemotronh_pack_check nemotronh_pack_check.cpp gguf_file.cpp pools.cpp manifest.cpp q4nx_file.cpp)
+-foreach(t gguf_pack_test nemotronh_pack_check)
++# xing_pack_check (no XRT, needs the model and its kernel set): Xing 4.0's packing read back (OPEN-FAMILY-XING)
++add_executable(xing_pack_check xing_pack_check.cpp gguf_file.cpp pools.cpp manifest.cpp q4nx_file.cpp)
++foreach(t gguf_pack_test nemotronh_pack_check xing_pack_check)
+     target_include_directories(${t} PRIVATE ${_inc})
+ endforeach()
+ target_include_directories(manifest_test PRIVATE ${_inc})
+diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/core.cpp patch-b/src/open_qwen36/core.cpp
+--- a/src/open_qwen36/core.cpp	2026-11-08 09:49:17.822980790 -0600
++++ b/src/open_qwen36/core.cpp	2026-11-08 09:49:17.823980780 -0600
+@@ -1889,6 +1889,7 @@
+     if (s.op == "gemma4_route") gemma4_route(s, layer);
+     else if (s.op == "gemma4_combine") gemma4_combine(s, layer);
+     else if (s.op.compare(0, 3, "nh_") == 0) nh_step(s, layer);
++    else if (s.op.compare(0, 3, "xg_") == 0) xg_step(s, layer);
+     else route(kerns_.at(s.kernel), layer, s.act_off);
+ }
+
+@@ -2218,6 +2219,406 @@
+     k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+ }
+
++// ============================================================================
++// Xing 4.0 (OPEN-FAMILY-XING, open_kernels/recipes/xing.py; xing-runtime.patch). A DeepSeek-V3 decoder whose
++// residual is DeepSeek's mHC: `hc` f32 streams of [hidden] in the xres global's host map (the embedding lands in
++// stream 0; layer 0's first step copies it to the others). Around every sublayer: xg_pre (the streams' rms, the
++// 24 mixes through hc_fn, pre / post / the Sinkhorn comb, the collapsed input and its norm) and xg_post (S_i <-
++// post_i y + sum_j comb_ij S_j). The NPU runs the projection GEMVs and the gated expert program; xg_qnorm and
++// xg_mla are the MLA glue: the q / kv norms, RoPE, the layer's KV row [latent | rope key] (f32, in its state BO,
++// host side), the absorbed attention (q_nope through attn_k_b into the latent, the output through attn_v_b).
++// The arithmetic is the Hub's modeling_xing4_0.py @ ac0fc307 (llama.cpp src/models/xing4-0.cpp agrees).
++// ============================================================================
++
++namespace {
++double xg_sigmoid(double v) { return 1.0 / (1.0 + std::exp(-v)); }
++/// pairs (2i, 2i + 1) of v[0..2 half) turned by pos * inv[i] (HF rope_interleave, llama.cpp's normal RoPE)
++void xg_rope(float* v, size_t half, double pos, const std::vector<double>& inv) {
++    for (size_t i = 0; i < half; ++i) {
++        const double a = pos * inv[i], c = std::cos(a), sn = std::sin(a);
++        const double x0 = v[2 * i], x1 = v[2 * i + 1];
++        v[2 * i] = static_cast<float>(x0 * c - x1 * sn);
++        v[2 * i + 1] = static_cast<float>(x0 * sn + x1 * c);
++    }
++}
++/// rms(x[0..n)) * w as f32 into dst, the mean in double
++void xg_rms(const float* x, const float* w, size_t n, double eps, float* dst) {
++    double ss = 0.0;
++    for (size_t i = 0; i < n; ++i) ss += static_cast<double>(x[i]) * x[i];
++    const double r = 1.0 / std::sqrt(ss / static_cast<double>(n) + eps);
++    for (size_t i = 0; i < n; ++i) dst[i] = static_cast<float>(x[i] * r * w[i]);
++}
++}  // namespace
++
++const std::vector<float>& Core::xg_tensor(const std::string& pattern, int layer, size_t n) {
++    std::string name = pattern;
++    const size_t at = name.find("{l}");
++    if (at != std::string::npos) name.replace(at, 3, std::to_string(layer));
++    auto it = nh_w_.find(name);
++    if (it != nh_w_.end()) return it->second;
++    const GgufFile* g = dynamic_cast<const GgufFile*>(file_.get());
++    if (!g) throw std::runtime_error("open_qwen36: xg_tensor " + name + ": a GGUF-only step");
++    const GgufFile::TensorInfo& t = g->tensor(name);
++    const size_t nv = static_cast<size_t>(t.nvalues());
++    if (n && nv != n)
++        throw std::runtime_error("open_qwen36: " + name + " has " + std::to_string(nv) + " values, the step wants " +
++                                 std::to_string(n));
++    size_t nb = 0;
++    const uint8_t* p = g->raw(name, &nb);
++    std::vector<float> v(nv);
++    auto f16 = [](const uint8_t* b) { uint16_t h; std::memcpy(&h, b, 2); return fp16_to_f32(h); };
++    switch (t.type) {
++        case GgufFile::Type::F32:
++            if (nb < nv * 4) throw std::runtime_error("open_qwen36: " + name + " is short");
++            std::memcpy(v.data(), p, nv * 4);
++            break;
++        case GgufFile::Type::F16:
++            for (size_t i = 0; i < nv; ++i) v[i] = f16(p + 2 * i);
++            break;
++        case GgufFile::Type::BF16:
++            for (size_t i = 0; i < nv; ++i) { uint16_t u; std::memcpy(&u, p + 2 * i, 2); v[i] = bf16_to_f32(u); }
++            break;
++        case GgufFile::Type::Q4_0:
++            if (nv % 32 || nb < nv / 32 * 18) throw std::runtime_error("open_qwen36: " + name + " is not whole Q4_0 blocks");
++            for (size_t b = 0; b < nv / 32; ++b) {
++                const uint8_t* q = p + b * 18;
++                const float d = f16(q);
++                for (size_t i = 0; i < 16; ++i) {
++                    v[b * 32 + i] = d * static_cast<float>((q[2 + i] & 15) - 8);
++                    v[b * 32 + 16 + i] = d * static_cast<float>((q[2 + i] >> 4) - 8);
++                }
++            }
++            break;
++        case GgufFile::Type::Q8_0:
++            if (nv % 32 || nb < nv / 32 * 34) throw std::runtime_error("open_qwen36: " + name + " is not whole Q8_0 blocks");
++            for (size_t b = 0; b < nv / 32; ++b) {
++                const uint8_t* q = p + b * 34;
++                const float d = f16(q);
++                for (size_t i = 0; i < 32; ++i) v[b * 32 + i] = d * static_cast<float>(static_cast<int8_t>(q[2 + i]));
++            }
++            break;
++        default:
++            throw std::runtime_error("open_qwen36: xg_tensor " + name + ": type " + GgufFile::type_name(t.type));
++    }
++    return nh_w_.emplace(name, std::move(v)).first->second;
++}
++
++void Core::xg_step(const Step& s, int layer) {
++    auto t0 = std::chrono::steady_clock::now();
++    if (s.op == "xg_pre") xg_pre(s, layer);
++    else if (s.op == "xg_qnorm") xg_qnorm(s, layer);
++    else if (s.op == "xg_mla") xg_mla(s, layer);
++    else if (s.op == "xg_post") xg_post(s, layer);
++    else if (s.op == "xg_final") xg_final(s);
++    else throw std::runtime_error("open_qwen36: unknown host step " + s.op);
++    timing_.route_ms += ms_since(t0);
++}
++
++void Core::xg_pre(const Step& s, int layer) {
++    // mHC pre (Xing4_0HyperConnection): f = the streams flattened stream-major, / rms (eps); m = f hc_fn^T [24];
++    // pre = sigmoid(m[0:4] s0 + b), post = 2 sigmoid(m[4:8] s1 + b), comb = Sinkhorn(exp(clamp(m[8:24] s2 + b)
++    // - rowmax)) with `hc_iters` (row / (sum + eps), then column) normalisations; h = sum_i pre_i S_i; then the
++    // sublayer's norm: mode x -> f32 at a_x (the GEMV's x); route / dense -> bf16 xm at a_xm and the slots'
++    // weights f32[16] at a_w (route: the sigmoid router, the top k of s + bias, the unbiased s renormalised x
++    // scale, slot topk the shared expert at 1, the fills re-pointed; dense: every slot at 1)
++    const size_t hid = nh_sz(s, "hidden"), hc = nh_sz(s, "hc"), k = nh_sz(s, "k");
++    const size_t mix = (2 + hc) * hc;
++    const std::string& mode = nh_str(s, "mode");
++    if (hc != 4) throw std::runtime_error("open_qwen36: xg_pre: " + std::to_string(hc) + " streams (4 are held)");
++    const double eps = nh_num(s, "eps"), heps = nh_num(s, "hc_eps"), clamp = nh_num(s, "hc_clamp");
++    const size_t iters = nh_sz(s, "hc_iters");
++    const std::vector<float>& fn = xg_tensor(nh_str(s, "hc_fn"), layer, mix * hc * hid);
++    const std::vector<float>& base = xg_tensor(nh_str(s, "hc_base"), layer, mix);
++    const std::vector<float>& sc = xg_tensor(nh_str(s, "hc_scale"), layer, 3);
++    const std::vector<float>& nw = nh_tensor(nh_str(s, "norm"), layer, hid);
++    xrt::bo& xb = buffer("xres", 0);
++    if (xb.size() < hc * hid * 4) throw std::runtime_error("open_qwen36: xg_pre: xres holds fewer than 4 streams");
++    float* S = xb.map<float*>();
++    if (layer == 0 && mode == "x")                                    // the embedding (stream 0) into every stream
++        for (size_t i = 1; i < hc; ++i) std::memcpy(S + i * hid, S, hid * 4);
++    const size_t n = hc * hid;
++    if (n % 8) throw std::runtime_error("open_qwen36: xg_pre: the streams are not whole 8-value groups");
++    double ss = 0.0;
++    for (size_t i = 0; i < n; ++i) ss += static_cast<double>(S[i]) * S[i];
++    const double r = 1.0 / std::sqrt(ss / static_cast<double>(n) + eps);
++    double m[24];
++#pragma omp parallel for schedule(static)
++    for (long long jj = 0; jj < static_cast<long long>(mix); ++jj) {
++        const float* w = fn.data() + static_cast<size_t>(jj) * n;
++        double a8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++        for (size_t i = 0; i < n; i += 8)
++            for (size_t j = 0; j < 8; ++j) a8[j] += static_cast<double>(w[i + j]) * S[i + j];
++        m[jj] = (((a8[0] + a8[1]) + (a8[2] + a8[3])) + ((a8[4] + a8[5]) + (a8[6] + a8[7]))) * r;
++    }
++    double pre[4], cm[16];
++    for (size_t i = 0; i < hc; ++i) {
++        pre[i] = xg_sigmoid(m[i] * sc[0] + base[i]);
++        xg_post_[i] = 2.0 * xg_sigmoid(m[hc + i] * sc[1] + base[hc + i]);
++    }
++    for (size_t i = 0; i < hc; ++i) {
++        double mx = -1e300;
++        for (size_t j = 0; j < hc; ++j) {
++            double v = m[2 * hc + i * hc + j] * sc[2] + base[2 * hc + i * hc + j];
++            v = std::min(std::max(v, -clamp), clamp);
++            cm[i * hc + j] = v;
++            mx = std::max(mx, v);
++        }
++        for (size_t j = 0; j < hc; ++j) cm[i * hc + j] = std::exp(cm[i * hc + j] - mx);
++    }
++    for (size_t it = 0; it < iters; ++it) {
++        for (size_t i = 0; i < hc; ++i) {
++            double t = 0.0;
++            for (size_t j = 0; j < hc; ++j) t += cm[i * hc + j];
++            for (size_t j = 0; j < hc; ++j) cm[i * hc + j] /= t + heps;
++        }
++        for (size_t j = 0; j < hc; ++j) {
++            double t = 0.0;
++            for (size_t i = 0; i < hc; ++i) t += cm[i * hc + j];
++            for (size_t i = 0; i < hc; ++i) cm[i * hc + j] /= t + heps;
++        }
++    }
++    std::memcpy(xg_comb_, cm, sizeof cm);
++    std::vector<float> h(hid), hn(hid);
++    for (size_t d = 0; d < hid; ++d) {
++        double a = 0.0;
++        for (size_t i = 0; i < hc; ++i) a += pre[i] * S[i * hid + d];
++        h[d] = static_cast<float>(a);
++    }
++    xg_rms(h.data(), nw.data(), hid, eps, hn.data());
++    xrt::bo& act = act_[layer];
++    uint8_t* a = act.map<uint8_t*>();
++    if (mode == "x") {
++        const size_t ax = nh_sz(s, "a_x");
++        if (k < hid) throw std::runtime_error("open_qwen36: xg_pre: K under hidden");
++        float* o = reinterpret_cast<float*>(a + ax);
++        std::memcpy(o, hn.data(), hid * 4);
++        for (size_t i = hid; i < k; ++i) o[i] = 0.0f;
++        act.sync(XCL_BO_SYNC_BO_TO_DEVICE, k * 4, ax);
++        return;
++    }
++    const size_t axm = nh_sz(s, "a_xm"), aw = nh_sz(s, "a_w"), slots = nh_sz(s, "slots");
++    if (slots > 16 || aw < axm + k * 2) throw std::runtime_error("open_qwen36: xg_pre: the slot record geometry");
++    uint32_t idx[16] = {};
++    float wv[16] = {};
++    if (mode == "dense") {
++        for (size_t j = 0; j < slots; ++j) { idx[j] = static_cast<uint32_t>(j); wv[j] = 1.0f; }
++    } else if (mode == "route") {
++        const size_t E = nh_sz(s, "experts"), K = nh_sz(s, "topk");
++        if (K + 1 != slots || K > E) throw std::runtime_error("open_qwen36: xg_pre route: top-k + 1 shared != slots");
++        const std::vector<float>& wr = xg_tensor(nh_str(s, "router"), layer, E * hid);
++        const std::vector<float>& bias = xg_tensor(nh_str(s, "bias"), layer, E);
++        const double scale = nh_num(s, "scale");
++        std::vector<double> sg(E), choice(E);
++#pragma omp parallel for schedule(static)
++        for (long long ee = 0; ee < static_cast<long long>(E); ++ee) {
++            const size_t e = static_cast<size_t>(ee);
++            const float* w = wr.data() + e * hid;
++            double a8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++            size_t i = 0;
++            for (; i + 8 <= hid; i += 8)
++                for (size_t j = 0; j < 8; ++j) a8[j] += static_cast<double>(w[i + j]) * hn[i + j];
++            for (size_t j = 0; i < hid; ++i, ++j) a8[j] += static_cast<double>(w[i]) * hn[i];
++            const double lg = ((a8[0] + a8[1]) + (a8[2] + a8[3])) + ((a8[4] + a8[5]) + (a8[6] + a8[7]));
++            sg[e] = xg_sigmoid(lg);
++            choice[e] = sg[e] + bias[e];
++        }
++        std::vector<uint32_t> order(E);
++        for (size_t e = 0; e < E; ++e) order[e] = static_cast<uint32_t>(e);
++        std::stable_sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) { return choice[x] > choice[y]; });
++        double sum = 0.0;
++        for (size_t j = 0; j < K; ++j) sum += sg[order[j]];
++        for (size_t j = 0; j < K; ++j) {
++            idx[j] = order[j];
++            wv[j] = static_cast<float>(sg[order[j]] / (sum + 1e-20) * scale);
++        }
++        idx[K] = static_cast<uint32_t>(E);                        // the shared expert, pool expert E
++        wv[K] = 1.0f;
++    } else {
++        throw std::runtime_error("open_qwen36: xg_pre: unknown mode " + mode);
++    }
++    uint16_t* xm = reinterpret_cast<uint16_t*>(a + axm);
++    for (size_t i = 0; i < hid; ++i) xm[i] = f32_to_bf16(hn[i]);
++    for (size_t i = hid; i < k; ++i) xm[i] = 0;
++    std::memcpy(a + aw, wv, sizeof wv);
++    act.sync(XCL_BO_SYNC_BO_TO_DEVICE, aw + sizeof wv - axm, axm);
++    if (route_log_on_) {
++        std::vector<uint8_t> rec(sizeof idx + sizeof wv);
++        std::memcpy(rec.data(), idx, sizeof idx);
++        std::memcpy(rec.data() + sizeof idx, wv, sizeof wv);
++        route_log_.push_back({layer, rec});
++    }
++    if (mode != "route") return;                                     // dense: slot j is compiled at slice j
++    // the slots' fills: compiled as pool experts 0..slots-1 (gate | up at pool_exp + j ups, down at pool_down + j dns)
++    const size_t E = nh_sz(s, "experts");
++    const uint64_t ups = static_cast<uint64_t>(nh_num(s, "ups")), dns = static_cast<uint64_t>(nh_num(s, "dns"));
++    const uint64_t pexp = static_cast<uint64_t>(nh_num(s, "pool_exp")), pdown = static_cast<uint64_t>(nh_num(s, "pool_down"));
++    Kern& kk = kerns_.at(s.kernel);
++    if (kk.moe2.empty()) {
++        const std::vector<uint32_t>& w = kk.words;
++        size_t nup = 0, ndn = 0;
++        for (size_t i = 4; i < w.size(); i += stream_patch::op_len(w[i])) {
++            if (w[i] != 0x81 || i + 11 >= w.size() || w[i + 8] != 0) continue;
++            const uint64_t off = w[i + 10];
++            if (off >= pexp && off < pdown) {
++                if ((off - pexp) / ups < slots) {
++                    kk.moe2.push_back({i + 10, static_cast<size_t>((off - pexp) / ups), 0, 0, (off - pexp) % ups});
++                    ++nup;
++                }
++            } else if (off >= pdown && (off - pdown) / dns < slots) {
++                kk.moe2.push_back({i + 10, static_cast<size_t>((off - pdown) / dns) | 0x100, 0, 0, (off - pdown) % dns});
++                ++ndn;
++            }
++        }
++        if (!nup || !ndn)
++            throw std::runtime_error("open_qwen36: nhroute: " + kk.name + " has " + std::to_string(nup) + " gate|up and " +
++                                     std::to_string(ndn) + " down expert fills");
++        log("nhroute " + kk.name + ": " + std::to_string(nup) + " gate|up / " + std::to_string(ndn) + " down fills");
++    }
++    for (size_t j = 0; j < slots; ++j)
++        if (idx[j] > E) throw std::runtime_error("open_qwen36: xg_pre: expert " + std::to_string(idx[j]));
++    uint32_t* iw = kk.iw();
++    for (const auto& p : kk.moe2) {
++        const uint64_t e = idx[p.slot & 0xff];
++        const uint64_t v = (p.slot & 0x100) == 0 ? pexp + e * ups + p.intra : pdown + e * dns + p.intra;
++        if (v >> 32) throw std::runtime_error("open_qwen36: nhroute: a fill past a 32-bit offset");
++        iw[p.word] = static_cast<uint32_t>(v);
++    }
++    kk.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
++}
++
++void Core::xg_post(const Step& s, int layer) {
++    // S_i <- post_i y + sum_j comb_ij S_j, y the sublayer's f32 [hidden] at a_o (the last xg_pre's post / comb)
++    const size_t hid = nh_sz(s, "hidden"), hc = nh_sz(s, "hc"), ao = nh_sz(s, "a_o");
++    if (hc != 4) throw std::runtime_error("open_qwen36: xg_post: 4 streams are held");
++    xrt::bo& act = act_[layer];
++    read_back(act, hid * 4, ao);
++    const float* y = reinterpret_cast<const float*>(act.map<uint8_t*>() + ao);
++    float* S = buffer("xres", 0).map<float*>();
++#pragma omp parallel for schedule(static)
++    for (long long dd = 0; dd < static_cast<long long>(hid); ++dd) {
++        const size_t d = static_cast<size_t>(dd);
++        double old[4], nw[4];
++        for (size_t j = 0; j < 4; ++j) old[j] = S[j * hid + d];
++        for (size_t i = 0; i < 4; ++i) {
++            double a = xg_post_[i] * y[d];
++            for (size_t j = 0; j < 4; ++j) a += xg_comb_[i * 4 + j] * old[j];
++            nw[i] = a;
++        }
++        for (size_t i = 0; i < 4; ++i) S[i * hid + d] = static_cast<float>(nw[i]);
++    }
++}
++
++void Core::xg_qnorm(const Step& s, int layer) {
++    // the q_a | kv_a GEMV's [q_lora | kv_lora | rope] (f32 at a_y): q_a_norm -> the q_b GEMV's f32 x (a_x);
++    // kv_a_norm on the latent and RoPE on the key's rope part -> the layer's KV row [latent | rope] at row pos_
++    const size_t ql = nh_sz(s, "q_lora"), kvl = nh_sz(s, "kv_lora"), rot = nh_sz(s, "rope");
++    const size_t ay = nh_sz(s, "a_y"), ax = nh_sz(s, "a_x"), k = nh_sz(s, "k");
++    const double eps = nh_num(s, "eps");
++    const LayerType& lt = *types_[layer];
++    if (lt.state_row != (kvl + rot) * 4 || k < ql || rot / 2 > w_->rope_inv_freq.size())
++        throw std::runtime_error("open_qwen36: xg_qnorm: the KV row is not f32 [latent | rope]");
++    const std::vector<float>& qw = nh_tensor(nh_str(s, "q_norm"), layer, ql);
++    const std::vector<float>& kw = nh_tensor(nh_str(s, "kv_norm"), layer, kvl);
++    xrt::bo& act = act_[layer];
++    read_back(act, (ql + kvl + rot) * 4, ay);
++    uint8_t* a = act.map<uint8_t*>();
++    const float* y = reinterpret_cast<const float*>(a + ay);
++    float* row = state_[layer].map<float*>() + static_cast<size_t>(pos_) * (kvl + rot);
++    std::vector<float> qa(ql);
++    xg_rms(y, qw.data(), ql, eps, qa.data());
++    xg_rms(y + ql, kw.data(), kvl, eps, row);
++    std::memcpy(row + kvl, y + ql + kvl, rot * 4);
++    xg_rope(row + kvl, rot / 2, static_cast<double>(pos_), w_->rope_inv_freq);
++    float* o = reinterpret_cast<float*>(a + ax);
++    std::memcpy(o, qa.data(), ql * 4);
++    for (size_t i = ql; i < k; ++i) o[i] = 0.0f;
++    act.sync(XCL_BO_SYNC_BO_TO_DEVICE, k * 4, ax);
++}
++
++void Core::xg_mla(const Step& s, int layer) {
++    // the absorbed MLA attention for one token (DeepSeek-V2's MQA form; llama.cpp xing4-0.cpp): q [heads][nope |
++    // rope] from the q_b GEMV (f32 at a_y); per head: q_rope turned at pos_, q_lat = k_b[h] q_nope (kv_lora), the
++    // scores (q_lat . c_t + q_rope . r_t) * scale over the KV rows 0..pos_, softmax, ctx = sum_t p_t c_t, out =
++    // v_b[h] ctx (v_dim) -> the o GEMV's f32 x (a_x)
++    const size_t nh = nh_sz(s, "heads"), nope = nh_sz(s, "nope"), rot = nh_sz(s, "rope"), vd = nh_sz(s, "v_dim");
++    const size_t kvl = nh_sz(s, "kv_lora"), ay = nh_sz(s, "a_y"), ax = nh_sz(s, "a_x"), k = nh_sz(s, "k");
++    const double scale = nh_num(s, "scale");
++    const size_t qd = nope + rot, row = kvl + rot;
++    const LayerType& lt = *types_[layer];
++    if (lt.state_row != row * 4 || k < nh * vd) throw std::runtime_error("open_qwen36: xg_mla: the KV row geometry");
++    const std::vector<float>& kb = xg_tensor(nh_str(s, "k_b"), layer, nh * kvl * nope);   // [h][kvl][nope]
++    const std::vector<float>& vb = xg_tensor(nh_str(s, "v_b"), layer, nh * vd * kvl);     // [h][vd][kvl]
++    xrt::bo& act = act_[layer];
++    read_back(act, nh * qd * 4, ay);
++    uint8_t* a = act.map<uint8_t*>();
++    const float* q = reinterpret_cast<const float*>(a + ay);
++    const float* kv = state_[layer].map<float*>();
++    const size_t L = static_cast<size_t>(pos_) + 1;
++    std::vector<float> out(nh * vd);
++#pragma omp parallel
++    {
++        std::vector<double> sc(L), lat(kvl), ctx(kvl);
++        std::vector<float> qr(rot);
++#pragma omp for schedule(static)
++        for (long long hh = 0; hh < static_cast<long long>(nh); ++hh) {
++            const size_t h = static_cast<size_t>(hh);
++            const float* qh = q + h * qd;
++            std::memcpy(qr.data(), qh + nope, rot * 4);
++            xg_rope(qr.data(), rot / 2, static_cast<double>(pos_), w_->rope_inv_freq);
++            const float* kbh = kb.data() + h * kvl * nope;
++            for (size_t r = 0; r < kvl; ++r) {
++                double acc = 0.0;
++                for (size_t i = 0; i < nope; ++i) acc += static_cast<double>(kbh[r * nope + i]) * qh[i];
++                lat[r] = acc;
++            }
++            double mx = -1e300;
++            for (size_t t = 0; t < L; ++t) {
++                const float* ct = kv + t * row;
++                double d = 0.0;
++                for (size_t r = 0; r < kvl; ++r) d += lat[r] * ct[r];
++                for (size_t i = 0; i < rot; ++i) d += static_cast<double>(qr[i]) * ct[kvl + i];
++                sc[t] = d * scale;
++                mx = std::max(mx, sc[t]);
++            }
++            double sum = 0.0;
++            for (size_t t = 0; t < L; ++t) sum += (sc[t] = std::exp(sc[t] - mx));
++            std::fill(ctx.begin(), ctx.end(), 0.0);
++            for (size_t t = 0; t < L; ++t) {
++                const float* ct = kv + t * row;
++                const double p = sc[t] / sum;
++                for (size_t r = 0; r < kvl; ++r) ctx[r] += p * ct[r];
++            }
++            const float* vbh = vb.data() + h * vd * kvl;
++            for (size_t j = 0; j < vd; ++j) {
++                double acc = 0.0;
++                for (size_t r = 0; r < kvl; ++r) acc += static_cast<double>(vbh[j * kvl + r]) * ctx[r];
++                out[h * vd + j] = static_cast<float>(acc);
++            }
++        }
++    }
++    float* o = reinterpret_cast<float*>(a + ax);
++    std::memcpy(o, out.data(), nh * vd * 4);
++    for (size_t i = nh * vd; i < k; ++i) o[i] = 0.0f;
++    act.sync(XCL_BO_SYNC_BO_TO_DEVICE, k * 4, ax);
++}
++
++void Core::xg_final(const Step& s) {
++    // the streams' mean, then output_norm -> the head's bf16 input
++    const size_t hid = nh_sz(s, "hidden"), hc = nh_sz(s, "hc"), k = nh_sz(s, "k");
++    const std::vector<float>& w = nh_tensor(nh_str(s, "norm"), 0, hid);
++    const float* S = buffer("xres", 0).map<float*>();
++    std::vector<float> mean(hid);
++    for (size_t d = 0; d < hid; ++d) {
++        double a = 0.0;
++        for (size_t i = 0; i < hc; ++i) a += S[i * hid + d];
++        mean[d] = static_cast<float>(a / static_cast<double>(hc));
++    }
++    xrt::bo& hn = buffer(nh_str(s, "dst"), 0);
++    if (hn.size() < k * 2) throw std::runtime_error("open_qwen36: xg_final: the head input is smaller than K");
++    nh_rms_bf16(mean.data(), w.data(), hid, k, nh_num(s, "eps"), hn.map<uint16_t*>());
++    hn.sync(XCL_BO_SYNC_BO_TO_DEVICE, k * 2, 0);
++}
++
+ Core::G4Moe& Core::g4moe(const Step& s, int layer) {
+     auto it = g4moe_.find(layer);
+     if (it != g4moe_.end() && !(s.op == "gemma4_route" ? it->second.router.empty() : it->second.post_norm.empty()))
+@@ -2642,7 +3043,7 @@
+             first = 1;
+         }
+         for (size_t i = first; i < w_->tail.size(); ++i) {
+-            if (w_->tail[i].op != "run") { host_step(w_->tail[i], 0); continue; }   // nh_final
++            if (w_->tail[i].op != "run") { host_step(w_->tail[i], 0); continue; }   // nh_final / xg_final
+             timing_.dispatch_ms += run(kerns_.at(w_->tail[i].kernel), w_->tail[i].args, 0);
+         }
+         xrt::bo& lg = buffer("logits", 0);
+@@ -2867,7 +3268,7 @@
+     std::memcpy(xres1.map<uint8_t*>(), row, w_->hidden * 4);
+     xres1.sync(XCL_BO_SYNC_BO_TO_DEVICE, w_->hidden * 4, 0);
+     for (const Step& s : w_->tail) {
+-        if (s.op != "run") host_step(s, 0);       // nh_final
++        if (s.op != "run") host_step(s, 0);       // nh_final / xg_final
+         else run(kerns_.at(s.kernel), s.args, 0);
+     }
+     xrt::bo& lg = buffer("logits", 0);
+diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/core.hpp patch-b/src/open_qwen36/core.hpp
+--- a/src/open_qwen36/core.hpp	2026-11-08 09:49:17.824980770 -0600
++++ b/src/open_qwen36/core.hpp	2026-11-08 09:49:17.825980760 -0600
+@@ -593,6 +593,20 @@
+     const std::vector<float>& nh_tensor(const std::string& pattern, int layer, size_t n);
+     std::map<std::string, std::vector<float>> nh_w_;   ///< the tensors nh_tensor has read, by name
+     std::vector<std::vector<double>> nh_rows_;         ///< scratch: the attention scores
++    /// Xing 4.0's host steps (OPEN-FAMILY-XING, xing-runtime.patch): mHC around every sublayer (the residual is
++    /// `hc` f32 streams in the xres global), the MLA glue (q / kv norms, RoPE, the KV row, the absorbed
++    /// attention), the router and the final stream mean. A layer's attention / FFN pre keeps its post and comb
++    /// for the matching xg_post.
++    void xg_step(const Step& s, int layer);
++    void xg_pre(const Step& s, int layer);
++    void xg_qnorm(const Step& s, int layer);
++    void xg_mla(const Step& s, int layer);
++    void xg_post(const Step& s, int layer);
++    void xg_final(const Step& s);
++    /// every value of a GGUF tensor (any rank: F32 / F16 / BF16 / Q4_0 / Q8_0) as f32, read once
++    const std::vector<float>& xg_tensor(const std::string& pattern, int layer, size_t n);
++    double xg_post_[4] = {0, 0, 0, 0};                 ///< the last xg_pre's post weights
++    double xg_comb_[16] = {};                          ///< ... and its Sinkhorn matrix, comb[i][j] at 4 i + j
+     void log(const std::string& s) const;
+
+     // ---- the block route's helpers (core.cpp)
+diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/manifest.cpp patch-b/src/open_qwen36/manifest.cpp
+--- a/src/open_qwen36/manifest.cpp	2026-11-08 09:49:17.826980750 -0600
++++ b/src/open_qwen36/manifest.cpp	2026-11-08 09:49:17.827980740 -0600
+@@ -59,6 +59,7 @@
+     p.elem = j.value("elem", 0ull);
+     p.dst_rows = j.value("dst_rows", 0ull);
+     p.col0 = j.value("col0", 0ull);
++    p.band_stride = j.value("band_stride", 0ull);
+     p.split = j.value("split", "");
+     p.via = j.value("via", "");
+     p.row0 = j.value("row0", 0ull);
+@@ -148,7 +149,9 @@
+                     fail(where, "gemma4_combine: div_running names a per-layer {j} tensor");
+             }
+         } else if (st.op == "nh_pre" || st.op == "nh_ssm" || st.op == "nh_attn" || st.op == "nh_route" ||
+-                   st.op == "nh_add" || st.op == "nh_final") {
++                   st.op == "nh_add" || st.op == "nh_final" || st.op == "xg_pre" || st.op == "xg_qnorm" ||
++                   st.op == "xg_mla" || st.op == "xg_post" || st.op == "xg_final") {
++            // (xg_*: Xing 4.0's host steps, xing-runtime.patch; the same field law)
+             // Nemotron-H's host steps (nemotronh-runtime.patch): their fields as they come
+             for (const auto& [k, v] : s.items()) {
+                 if (k == "op" || k == "kernel") continue;
+diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/manifest.hpp patch-b/src/open_qwen36/manifest.hpp
+--- a/src/open_qwen36/manifest.hpp	2026-11-08 09:49:17.828980730 -0600
++++ b/src/open_qwen36/manifest.hpp	2026-11-08 09:49:17.829980720 -0600
+@@ -55,6 +55,9 @@
+                                                                         ///< many values, tail zeroed
+                                                                         ///< (0 = rows, no padding)
+     uint64_t col0 = 0;                                                  ///< nh_q40: the first file column read
++    uint64_t band_stride = 0;                                           ///< nh_q40: bytes from one 64-row band to the
++                                                                        ///< next (0 = the band's own size; Xing's
++                                                                        ///< gate | up interleave: 2 bands)
+ };
+
+ /// One verb of a layer type's (or the tail's) program.
+diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/pools.cpp patch-b/src/open_qwen36/pools.cpp
+--- a/src/open_qwen36/pools.cpp	2026-11-08 09:49:17.830980710 -0600
++++ b/src/open_qwen36/pools.cpp	2026-11-08 09:49:17.831980700 -0600
+@@ -911,7 +911,11 @@
+             fail("nh_q40 " + name + ": rows [" + std::to_string(op.row0) + ", +" + std::to_string(op.rows) + ") of " +
+                  std::to_string(E) + " x " + std::to_string(op.n_total) + " (file " + std::to_string(frows) +
+                  ") into " + std::to_string(bands * 64) + " pool rows");
+-        const uint64_t span = bands * band_bytes;
++        // band_stride (xing-runtime.patch): band b at b * band_stride (Xing interleaves each gate band with its up
++        // band, so a core's slot fill is one run); 0 = the bands back to back
++        const uint64_t bstride = op.band_stride ? op.band_stride : band_bytes;
++        if (bstride < band_bytes) fail("nh_q40 " + name + ": band_stride under one band");
++        const uint64_t span = bands ? (bands - 1) * bstride + band_bytes : 0;
+         if (E > 1 && op.expert_bytes < span) fail("nh_q40 " + name + ": expert_bytes under one expert's bands");
+         bounds(op, (E - 1) * op.expert_bytes + span, dst_bytes);
+         const size_t nb = fcols / 32, cb0 = op.col0 / 32, ncb = op.src_dim / 32;
+@@ -921,7 +925,7 @@
+         auto one = [&](uint64_t e) {
+             for (uint64_t c = 0; c < op.nch; ++c) {
+                 const uint64_t band = c / per_band, i = c % per_band, part = i % 2, kt = i / 2;
+-                uint8_t* d = dst + op.dst + e * op.expert_bytes + band * band_bytes + i * ch;
++                uint8_t* d = dst + op.dst + e * op.expert_bytes + band * bstride + i * ch;
+                 std::memset(d, 0, ch);
+                 for (size_t r = 0; r < 32; ++r) {
+                     const uint64_t prow = 64 * band + 32 * part + r;
+diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/xing_pack_check.cpp patch-b/src/open_qwen36/xing_pack_check.cpp
+--- a/src/open_qwen36/xing_pack_check.cpp	1969-12-31 18:00:00.000000000 -0600
++++ b/src/open_qwen36/xing_pack_check.cpp	2026-11-08 09:49:17.832980690 -0600
+@@ -0,0 +1,152 @@
++// xing_pack_check: Xing 4.0's packing on the CPU, no NPU (OPEN-FAMILY-XING, xing-runtime.patch). Loads the kernel
++// set's manifest (its gguf view), checks the model's config against it, packs the layers named and the head, and
++// reads random weights back out of the pools through the Q4_0-native chunk law (band_stride included: the gate |
++// up interleave) and the head's f32-scale q8 law, against the GGUF's own blocks: every routed expert, the shared
++// expert, the dense MLP's slices and their down column windows. It also checks that the host steps' tensors exist
++// with the values their steps want. With a sample file it writes every sample (tensor, file row, file column,
++// pool value) for open_kernels/model/xing_gguf_check.py, which reads them against gguf-py's dequantization.
++//   xing_pack_check <kernel dir> <model dir> [samples] [layers, comma-separated] [sample file]
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <random>
++#include <sstream>
++#include <string>
++#include <vector>
++
++#include "open_qwen36/gguf_file.hpp"
++#include "open_qwen36/manifest.hpp"
++#include "open_qwen36/pools.hpp"
++
++using namespace open_qwen36;
++
++namespace {
++float bf(uint16_t u) { uint32_t x = static_cast<uint32_t>(u) << 16; float f; std::memcpy(&f, &x, 4); return f; }
++float h2f(uint16_t h) {
++    const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
++    float v = e == 0 ? std::ldexp(static_cast<float>(m), -24) : std::ldexp(static_cast<float>(m | 1024), static_cast<int>(e) - 25);
++    return s ? -v : v;
++}
++/// value (r, k) of a [rows, K] Q4_0-native band-law matrix at `base`, band b at b * bstride
++float pool_q40(const uint8_t* base, size_t K, size_t bstride, size_t r, size_t k) {
++    const size_t band = r / 64, part = (r % 64) / 32, rr = r % 32, kt = k / 256, kin = k % 256;
++    const uint8_t* c = base + band * bstride + (kt * 2 + part) * 4608;
++    uint16_t d;
++    std::memcpy(&d, c + 2 * ((kin / 32) * 32 + rr), 2);
++    const size_t p = (rr / 16) * 4096 + kin * 16 + rr % 16;
++    const uint8_t byte = c[512 + (p >> 1)];
++    const int q = (p & 1) ? byte >> 4 : byte & 15;
++    return bf(d) * static_cast<float>(q - 8);
++}
++/// value (r, k) of a Q4_0 GGUF [rows, cols] tensor (its row r of a flattened [.., rows, cols])
++float file_q40(const uint8_t* src, size_t cols, size_t r, size_t k) {
++    const uint8_t* b = src + (r * (cols / 32) + k / 32) * 18;
++    uint16_t d;
++    std::memcpy(&d, b, 2);
++    const size_t i = k % 32;
++    const int q = i < 16 ? (b[2 + i] & 15) : (b[2 + i - 16] >> 4);
++    return h2f(d) * static_cast<float>(q - 8);
++}
++int fails = 0;
++void expect(bool ok, const std::string& what) {
++    if (!ok && fails++ < 20) std::fprintf(stderr, "MISMATCH %s\n", what.c_str());
++}
++std::string at_layer(std::string s, int layer) {
++    const size_t at = s.find("{l}");
++    if (at != std::string::npos) s.replace(at, 3, std::to_string(layer));
++    return s;
++}
++}  // namespace
++
++int main(int argc, char** argv) {
++    if (argc < 3) {
++        std::fprintf(stderr, "usage: %s <kernel dir> <model dir> [samples] [layers] [sample file]\n", argv[0]);
++        return 2;
++    }
++    const std::string kd = argv[1], md = argv[2];
++    const int samples = argc > 3 ? std::atoi(argv[3]) : 4000;
++    std::vector<int> layers = {0, 1, 2, 39};
++    if (argc > 4) {
++        layers.clear();
++        std::stringstream ss(argv[4]);
++        for (std::string t; std::getline(ss, t, ',');) layers.push_back(std::atoi(t.c_str()));
++    }
++    std::FILE* out = argc > 5 ? std::fopen(argv[5], "w") : nullptr;
++    Manifest man = Manifest::load(kd + "/manifest.json");
++    const Manifest& w = *man.gguf;
++    GgufFile f(md + "/model.gguf");
++    std::ifstream cf(md + "/config.json");
++    nlohmann::json j = nlohmann::json::parse(cf);
++    w.check_model(j, "model");
++    std::printf("manifest ok: %zu layers, %zu layer types, chunk %zu\n", w.layers.size(), w.layer_types.size(), w.chunk_bytes);
++    std::mt19937_64 rng(7);
++    for (int layer : layers) {
++        if (layer < 0 || static_cast<size_t>(layer) >= w.layers.size()) { std::fprintf(stderr, "no layer %d\n", layer); return 2; }
++        const LayerType& lt = w.layer_type(static_cast<size_t>(layer));
++        const size_t bytes = lt.pool_bytes ? lt.pool_bytes : w.pool_bytes;
++        std::vector<uint8_t> pool(bytes);
++        pools::pack_pool(w, lt, f, layer, pool.data());
++        size_t checked = 0;
++        for (const PackOp& op : lt.pool) {
++            const std::string name = at_layer(op.tensor, layer);
++            const auto& t = f.tensor(name);
++            const size_t fcols = t.dims[0];
++            const uint8_t* src = f.raw(name, nullptr);
++            const size_t per_band = op.in_dim / 128, bands = op.nch / per_band, prow = bands * 64;
++            const size_t bstride = op.band_stride ? op.band_stride : per_band * 4608;
++            for (int s = 0; s < samples; ++s) {
++                const size_t e = rng() % op.experts, r = rng() % prow, k = rng() % op.in_dim;
++                const float got = pool_q40(pool.data() + op.dst + e * op.expert_bytes, op.in_dim, bstride, r, k);
++                float want = 0.f;
++                const bool real = r < op.rows && k < op.src_dim;
++                const size_t frow = op.row0 + e * op.n_total + r, fcol = op.col0 + k;
++                if (real) want = file_q40(src, fcols, frow, fcol);
++                expect(got == want, name + " e" + std::to_string(e) + " r" + std::to_string(r) + " k" + std::to_string(k) +
++                                        " pool " + std::to_string(got) + " file " + std::to_string(want));
++                if (out && real) std::fprintf(out, "%s\t%zu\t%zu\t%.9g\n", name.c_str(), frow, fcol, got);
++                ++checked;
++            }
++        }
++        // the host steps' tensors: present, with the values their steps read
++        for (const Step& st : lt.program) {
++            for (const auto& [key, val] : st.nh_s) {
++                if (val.find("blk.") != 0) continue;
++                const std::string name = at_layer(val, layer);
++                expect(f.tensor(name).nvalues() > 0, "host tensor " + name);
++            }
++        }
++        std::printf("layer %d (%s): %zu ops, %zu samples, pool %zu MiB\n", layer, lt.name.c_str(), lt.pool.size(), checked,
++                    bytes >> 20);
++    }
++    {
++        std::vector<uint8_t> head(w.lmhead_pool_bytes);
++        pools::pack_lmhead(w, f, head.data());
++        const PackOp& op = w.lmhead_ops.at(0);
++        const auto& t = f.tensor(op.tensor);
++        const size_t cols = t.dims[0], rows = t.dims[1], nkt = op.in_dim / 256;
++        const uint8_t* src = f.raw(op.tensor, nullptr);
++        for (int s = 0; s < samples; ++s) {
++            const size_t r = rng() % op.rows, k = rng() % op.in_dim;
++            const size_t B = r / 128, q = (r % 128) / 32, rr = r % 32, kt = k / 256, kin = k % 256;
++            const uint8_t* c = head.data() + ((B * nkt + kt) * 4 + q) * 9216;
++            float sc;
++            std::memcpy(&sc, c + 4 * ((kin / 32) * 32 + rr), 4);
++            const float got = sc * static_cast<float>(static_cast<int8_t>(c[1024 + (rr / 16) * 4096 + kin * 16 + rr % 16]));
++            float want = 0.f;
++            if (r < rows && k < cols) {
++                const uint8_t* b = src + (r * (cols / 32) + k / 32) * 34;
++                uint16_t d;
++                std::memcpy(&d, b, 2);
++                want = h2f(d) * static_cast<float>(static_cast<int8_t>(b[2 + k % 32]));
++                if (out) std::fprintf(out, "%s\t%zu\t%zu\t%.9g\n", op.tensor.c_str(), r, k, got);
++            }
++            expect(got == want, "head r" + std::to_string(r) + " k" + std::to_string(k));
++        }
++        std::printf("head: %d samples\n", samples);
++    }
++    if (out) std::fclose(out);
++    std::printf(fails ? "PACK-CHECK FAIL (%d)\n" : "PACK-CHECK OK\n", fails);
++    return fails ? 1 : 0;
++}
