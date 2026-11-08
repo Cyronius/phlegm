@@ -152,8 +152,10 @@ def test_the_pack_plan_interleaves_gate_and_up_bands_and_slices_the_dense_mlp():
     assert plan["lm_head"]["ops"][0]["in_dim"] == 3584 and plan["chunk_bytes"] == 4608
 
 
-def test_the_programs_run_one_image_and_the_manifest_nests_its_gguf_view():
+def test_the_programs_run_one_image_and_the_manifest_nests_its_gguf_view(monkeypatch):
     from recipes import manifest as M
+    # the sequential set (the block route adds its GEMM and xmb contexts: test_xing_block.py)
+    monkeypatch.setenv("XING_BLOCK", "0")
     s = spec()
     m = M.manifest(s, 4096, "k")
     assert m["family"] == "xing" and "gguf" in m and m["gguf"]["layer_types"] == m["layer_types"]

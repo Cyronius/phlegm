@@ -48,10 +48,11 @@ the host (embed_row).
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
 
-from .catalogue import OpRangeError
-from .qwen36moe import BAND_ROWS, ELEM, MB, roundup
+from .catalogue import OpRangeError, check_buffer_args
+from .qwen36moe import BAND_ROWS, ELEM, GEMM_T, MB, roundup
 from .spec import DENSE, MOE_BLOCK, ModelSpec
 
 CH = 4608                 # a Q4_0-native chunk: 32 rows x 256 K, the bf16 d plane then the codes (gemv_q4.h)
@@ -409,6 +410,135 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
                 "buffers": {"consts": CONSTS, "act": L.AD_BYTES, "pool": pool,
                             "state": {"kind": "kv", "row": L.KV_ROW}},
                 "program": program(kind)}
+    br = block_route(spec, max_ctx)
+    if br:
+        for kind, gb in br["layer_types"].items():
+            out["layer_types"][kind]["gemm_block"] = gb
+        for k in ("contexts", "kernels", "globals"):
+            out[k].update(br[k])
+    return out
+
+
+# ---- the block prefill route (OPEN-FAMILY-XING "Block prefill"; .plans/xing.md, 2026-11-08 block route)
+#
+# The sequential program streams every weight once a token. The block route streams the projections once for up to
+# GEMM_T tokens (gemm_q4_prefill's Q4_0-native format, reading the LAYER POOL IN PLACE: the runtime re-points each
+# GEMM's weight fills at the step's pool offset, so no weight is copied) and the routed experts once for up to MB_NT
+# of their tokens (xmb: LFM2.5's mbl on the Q4_0-native pool, also in place). The host keeps the sequential route's
+# arithmetic between them, per token (mHC, the norms, RoPE, the router) and over the whole block (the absorbed MLA
+# attention as f32 GEMMs). The runtime runs the whole prompt through each layer before the next (one context change
+# from the GEMMs to xmb and back a layer).
+
+def block_on() -> bool:
+    """The block route's kernels and manifest keys: on by default (XING_BLOCK=0 drops them: sequential prefill, and
+    programs() / builds() are the decode set's alone, its manifest the pre-block one byte for byte)."""
+    return os.environ.get("XING_BLOCK") != "0"
+
+
+MB_NT = 8                 # xmb's token slots per expert visit (one 8-token MAC tile)
+GEMM_FMT = "q4_0"         # gemm_q4_prefill GQP_FMT: two 4608-B Q4_0-native chunks a band-k-group (the pool's law)
+GEMM_ROWS = 256           # gemm_q4_prefill: N tiles into 4 x 64-row blocks
+
+
+def moe_batch_slots(spec: ModelSpec) -> list[int]:
+    """xmb's dispatch lengths, longest first: a binary ladder down from the routed expert count (an unused slot
+    streams a real expert and is wasted, so the rungs decide the padding)."""
+    return [s for s in (spec.num_experts >> i for i in range(30)) if s >= 8 and s % 8 == 0]
+
+
+def gemm_name(N: int, K: int) -> str:
+    return f"gemm_n{N}_k{K}"
+
+
+def block_steps(spec: ModelSpec, kind: str) -> list[dict]:
+    """A layer kind's GEMM steps, each reading `rows` real rows of the layer pool from byte `pool_off` (the weight
+    fills re-pointed there per dispatch; `count` dispatches `stride` bytes apart for the dense down slices). N is
+    rounded up to whole 256-row blocks: q_a | kv_a (1344 rows) runs as 1536, its last 192 rows reading the bytes
+    after it in the pool (q_b's), whose outputs the host never reads -- every output row is its own weight row's
+    product, so the real rows do not depend on them. The FFN's gate | up is the pool's band interleave as it lies
+    (64 gate rows, then the same band's 64 up rows), de-interleaved by the host."""
+    G, L = geometry(spec), layout(spec)
+    pool_bytes = L.POOL_DENSE_BYTES if kind == DENSE else L.POOL_MOE_BYTES
+
+    def run(role: str, rows: int, K: int, off: int, count: int = 1, stride: int = 0) -> dict:
+        N = roundup(rows, GEMM_ROWS)
+        end = off + (count - 1) * stride + N // BAND_ROWS * band_bytes(K)
+        if end > pool_bytes:
+            raise OpRangeError(f"xing block route: {role} reads [{off}, {end}) past the {kind} pool ({pool_bytes} B)")
+        st = {"op": "run", "kernel": gemm_name(N, K), "args": ["pool", f"gemm_x_k{K}", f"gemm_y_n{N}"],
+              "role": role, "pool_off": off, "rows": rows}
+        if count > 1:
+            st.update(count=count, stride=stride)
+        return st
+
+    if L.UPS != 2 * (G.FF // BAND_ROWS) * band_bytes(G.HID):
+        raise OpRangeError("xing block route: an expert's gate | up is not one contiguous band run")
+    steps = [run("qkva", G.QKVA_N, G.HID, L.POOL_QKVA), run("qb", G.QB_N, G.QL, L.POOL_QB),
+             run("o", G.HID, G.O_K, L.POOL_O)]
+    if kind == DENSE:
+        # all nine 1024-wide slices' gate | up (contiguous: slice j at POOL_EXP + j UPS), then each slice's down
+        steps += [run("ffn_ug", 2 * G.FF * G.DSLOTS, G.HID, L.POOL_EXP),
+                  run("ffn_dn", G.HID, G.FF, L.POOL_DOWN_D, count=G.DSLOTS, stride=L.DNS)]
+    else:
+        # the shared expert (pool expert EXPERTS) over every token; the routed experts go through xmb
+        steps += [run("ffn_ug", 2 * G.FF, G.HID, L.POOL_EXP + G.EXPERTS * L.UPS),
+                  run("ffn_dn", G.HID, G.FF, L.POOL_DOWN_M + G.EXPERTS * L.DNS)]
+    return steps
+
+
+def block_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
+    """Per layer kind the `gemm_block` (kind `xing`) the runtime reads, plus the contexts / kernels / globals /
+    builds the route adds. None under XING_BLOCK=0."""
+    if not block_on():
+        return None
+    from .catalogue import require
+    G, L = geometry(spec), layout(spec)
+    T = GEMM_T
+    ks = set(spec.layer_types)
+    if MOE_BLOCK in ks:
+        require("xmb", hidden=G.HID, ff=G.FF, nt=MB_NT, slots_max=max(moe_batch_slots(spec)))
+    out: dict = {"layer_types": {}, "contexts": {}, "kernels": {}, "globals": {}, "builds": {}}
+    shapes: set[tuple[int, int]] = set()
+    slots = moe_batch_slots(spec)
+    xmb_args = ["pool", "xmb_x", "xmb_h", "xmb_y"]
+    check_buffer_args("xmb", xmb_args)
+    for kind in (DENSE, MOE_BLOCK):
+        if kind not in ks:
+            continue
+        steps = block_steps(spec, kind)
+        for st in steps:
+            N, K = st["kernel"][len("gemm_n"):].split("_k")
+            shapes.add((int(N), int(K)))
+        gb: dict = {"t": T, "kind": "xing", "eps": G.EPS, "program": steps,
+                    "xing": {"ff": G.FF, "slots": G.DSLOTS if kind == DENSE else G.MSLOTS}}
+        if kind == MOE_BLOCK:
+            gb["xing"].update(pool_exp=L.POOL_EXP, ups=L.UPS, pool_down=L.POOL_DOWN_M, dns=L.DNS,
+                              experts=G.EXPERTS, topk=G.TOPK)
+            gb["xmb"] = {"kernels": {str(s): f"xmb_s{s}" for s in slots}, "args": xmb_args, "nt": MB_NT}
+        out["layer_types"][kind] = gb
+    for N, K in sorted(shapes):
+        name = gemm_name(N, K)
+        out["contexts"].setdefault("gemm", f"{name}/final.xclbin")
+        out["kernels"][name] = {"context": "gemm", "insts": f"{name}/insts.bin", "build": name}
+        out["globals"][f"gemm_x_k{K}"] = K * T * 2
+        out["globals"][f"gemm_y_n{N}"] = N * T * 4
+        out["builds"][name] = {"design": "gemm_q4_prefill/gemm_q4_prefill.py",
+                               "build_dir": f"gemm_q4_prefill/build_n{N}_k{K}_t{T}_q40",
+                               "env": {"GQP_N": str(N), "GQP_K": str(K), "GQP_T": str(T), "GQP_FMT": GEMM_FMT}}
+    if MOE_BLOCK in ks:
+        for s in slots:
+            name = f"xmb_s{s}"
+            out["contexts"].setdefault("xmb", f"xmb_s{slots[0]}/final.xclbin")
+            out["kernels"][name] = {"context": "xmb", "insts": f"{name}/insts.bin", "patch": "xgbatch", "build": name}
+            out["builds"][name] = {"design": "xing_batch/xmb.py",
+                                   "build_dir": f"xing_batch/build_s{s}_h{G.HID}_f{G.FF}",
+                                   "env": {"XMB_SLOTS": str(s), "XMB_NT": str(MB_NT), "XMB_HID": str(G.HID),
+                                           "XMB_FF": str(G.FF), "XMB_EXPERTS": str(G.MEXPERTS),
+                                           "XMB_POOL_EXP": str(L.POOL_EXP), "XMB_POOL_DOWN": str(L.POOL_DOWN_M),
+                                           "XMB_POOL_BYTES": str(L.POOL_MOE_BYTES)}}
+        out["globals"]["xmb_x"] = slots[0] * G.HID * MB_NT * 2
+        out["globals"]["xmb_h"] = slots[0] * G.FF * MB_NT * 2
+        out["globals"]["xmb_y"] = slots[0] * G.HID * MB_NT * 4
     return out
 
 
@@ -428,6 +558,9 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
     if MOE_BLOCK in ks:
         out["xg_moe"] = {"design": "xing/xg.py", "build_dir": f"xing/build_moe_h{G.HID}_f{G.FF}_s{G.MSLOTS}",
                          "env": {"XG_PART": "moe"}}
+    br = block_route(spec)
+    if br:
+        out.update(br["builds"])
     return out
 
 
@@ -469,3 +602,17 @@ KERNEL_SOURCES = [
     "designs/lm_head_q8/*.py", "designs/lm_head_q8/*.h", "designs/lm_head_q8/*.cc",
     "include/vecmath.h", "ironutil.py", "build_design.py",
 ]
+# the block route's designs: in the build key only while the route is emitted (XING_BLOCK=0 keeps the sequential
+# set's key, so its manifest is the pre-block one byte for byte)
+BLOCK_SOURCES = [
+    "designs/xing_batch/*.py", "designs/xing_batch/*.cc", "designs/xing_batch/*.h",
+    "designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.h", "designs/gemm_q4_prefill/*.cc",
+]
+
+
+def __getattr__(name: str):
+    """recipes/cache.py reads KERNEL_SOURCES_MOE for a family with experts; Xing's is the block route's designs, and
+    only when block_on() (PEP 562: evaluated at each read, so the switch is honoured per export)."""
+    if name == "KERNEL_SOURCES_MOE":
+        return list(BLOCK_SOURCES) if block_on() else []
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

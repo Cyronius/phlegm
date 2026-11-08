@@ -480,6 +480,22 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   `nh_q40`, for the gate | up band interleave, and `xing_pack_check`, a CPU readback whose samples
   `open_kernels/model/xing_gguf_check.py` compares with gguf-py. The clone is `target/npu-dev/xing-runtime`,
   and a round trip reproduces its tree.
+  Since the evening of 2026-11-08 the same patch also carries Xing's block prefill route (`gemm_block` kind
+  `xing`, `Core::xg_prefill`): the whole prompt through each layer, the projections as q4_0
+  `gemm_q4_prefill` GEMMs and the routed experts on `designs/xing_batch/xmb.py` (mbl on the Q4_0-native
+  pool), both reading the layer pool in place (each GEMM's weight fills re-pointed per dispatch, the xmb
+  slots by the `xgbatch` table), the host's mHC, norms and router per token with `xg_pre`'s sums, and the
+  MLA attention over the call as AVX2 f32 GEMMs in the absorbed or the expanded arrangement. The decode
+  step now reads `attn_k_b` / `attn_v_b` from one transposed f32 copy made at load (the same sums; its
+  logits are bit-identical). The block clone is `target/npu-dev/xing-blk-runtime`; the patch is still one
+  diff over the Nemotron-H clone, and a round trip reproduces the block clone's tree.
+  Finding for the other token-batched expert designs (not changed here): `lfm2moe_batch/mbl.h` and
+  `gemma4_moe_batch/mb4.h` set the core's rounding mode only in their silu / gelu step, so the first gate /
+  up band of a dispatch on a fresh core (the first after a context change) rounds its dequantised weights
+  in the core's default mode. On Xing's copy the first dispatch's h differed from every later one's for
+  the first 8 slots (3.2e-3 against 2.8e-3 from fp64); `xmb_zero_ug.cc` sets `conv_even` first. Flint,
+  LFM2.5, Hy-Memory and Gemma 4 run the unchanged kernels and would want the same one-line fix and their
+  own gates.
 
 `designs/dense/dx_attn.py` now takes its recipe module from `for_spec` and its flags from the
 recipe's `attn_flags`, and gained `dx.py`'s ATTN_QLOCAL q loop. It emits byte-identical MLIR

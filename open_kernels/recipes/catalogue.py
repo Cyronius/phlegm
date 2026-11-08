@@ -275,6 +275,13 @@ CATALOGUE: dict[str, Template] = {t.name: t for t in [
              note="Xing's one-image program (OPEN-FAMILY-XING): the three attention GEMVs and the gated expert "
                   "streams. Xing4.0-29B-A4B's point passed the stream fixtures (designs/xing/check_xg.py), the "
                   "1-, 3- and 8-layer cuts and the whole model against the fp64 GGUF reference (2026-11-08)"),
+    Template("xmb", "designs/xing_batch/xmb.py",
+             combos=(combination((3584, 1024, 8, 64),
+                                 keys=("hidden", "ff", "nt", "slots_max")),),
+             note="Xing's token-batched experts (OPEN-FAMILY-XING block route): mbl on the Q4_0-native pool, read in "
+                  "place from POOL_EXP. Xing4.0-29B-A4B's point passed the stream fixtures "
+                  "(designs/xing_batch/check_xmb.py, with every q4_0 GEMM shape of the route), the 1-, 3- and 8-layer "
+                  "cuts and the whole model against the fp64 GGUF reference (2026-11-08)"),
     Template("lm_head_q4", "designs/lm_head_q4/lm_head_q4.py",
              {"K": values(1024, 2048, 2560, 3072, 3840, 4096), "vocab": multiple_of(64)},
              note="the q4 head is the gemv_q4 kernel with lm_head_q8's uneven band split; validated per K"),
