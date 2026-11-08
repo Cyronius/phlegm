@@ -117,6 +117,13 @@ class ModelSpec:
     # instead of the experts (`mlp_only_layers` [0, 1]). 0 on every other family and then absent
     # from to_dict(), as norm_groups is, so no shipped spec_hash moves.
     dense_lead: int = 0
+    # Xing 4.0 (OPEN-FAMILY-XING): multi-head latent attention (DeepSeek-V2/V3 MLA: q through a
+    # q_lora_rank bottleneck, K / V through a kv_lora_rank latent plus a shared rope key) and the
+    # manifold-constrained hyper-connections (mHC: `mult` residual streams mixed by a Sinkhorn
+    # matrix around every sublayer). None on every other family and then absent from to_dict(),
+    # as hadamard is, so no shipped spec_hash moves.
+    mla: dict | None = None           # {"q_lora_rank", "kv_lora_rank", "qk_nope_dim", "qk_rope_dim", "v_head_dim"}
+    hyper: dict | None = None         # {"mult", "sinkhorn_iters", "eps", "clamp"}
 
     # ---- derived
     @property
@@ -276,6 +283,9 @@ class ModelSpec:
                 del d[k]           # the Gemma 4 fields, likewise: absent on every other family
         if d["dense_lead"] == 0:
             del d["dense_lead"]    # Flint's, likewise
+        for k in ("mla", "hyper"):
+            if d.get(k) is None:
+                d.pop(k, None)     # Xing's, likewise
         return d
 
     def to_json(self) -> str:
@@ -999,6 +1009,99 @@ def _nemotronh_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
         extra={"model_type": cfg["model_type"], "source": "hf_config",
                "router_scale": float(cfg.get("routed_scaling_factor", 1.0)),
                "router": "sigmoid+bias, renormalised", "conv_bias": bool(cfg.get("use_conv_bias", True))},
+    )
+
+
+def _xing_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+    """Xing 4.0 (`xing4_0`, Xing4_0ForCausalLM; the Hub's modeling_xing4_0.py @ ac0fc307, llama.cpp's
+    src/models/xing4-0.cpp, PR #31589): a DeepSeek-V3 decoder -- multi-head latent attention (q through a
+    q_lora_rank bottleneck with an RMSNorm; K / V from a kv_lora_rank latent with an RMSNorm plus one shared
+    64-dim rope key; interleaved-pair YaRN RoPE), leading dense SiLU MLPs (`first_k_dense_replace`), then
+    routed SiLU experts beside a gated shared expert, routed by sigmoid scores with a selection-only
+    e_score_correction_bias, renormalised over the top k and scaled by `routed_scaling_factor` -- whose
+    residual is DeepSeek's manifold-constrained hyper-connection (mHC): `hc_mult` streams, each sublayer fed
+    sum_i pre_i S_i and writing S_i <- post_i y + sum_j C_ij S_j with C a Sinkhorn-normalised 4 x 4 matrix;
+    the streams are averaged before the final norm (OPEN-FAMILY-XING).
+
+    Layer types: DENSE for the dense-MLP layers, MOE_BLOCK for the routed ones (every layer has the MLA
+    attention). head_dim is the q / k head (nope + rope), rotary_dim the rope part; the latent ranks and the
+    hyper-connection constants ride in `mla` / `hyper` (they shape the kernels). attn_scale is the score scale
+    192^-0.5 mscale^2 (YaRN mscale_all_dim); cos / sin are unscaled (attention_factor = mscale / mscale_all_dim
+    = 1). The router's constants are host arithmetic and ride in `extra`. The MTP layer
+    (num_nextn_predict_layers) is not part of the decoder (HF drops it on load) and is recorded in `extra`.
+    Refused: grouped expert selection, softmax routing, no renormalisation, biases, a tied head, a q without
+    the lora bottleneck, rope_interleave false, other activations."""
+    import math
+    n = int(_need(cfg, "num_hidden_layers"))
+    for key, want in (("n_group", 1), ("topk_group", 1)):
+        if int(cfg.get(key, want)) != want:
+            raise SpecError(f"xing4_0: {key} {cfg.get(key)!r} (grouped expert selection) is not implemented")
+    for key, want in (("attention_bias", False), ("norm_topk_prob", True), ("tie_word_embeddings", False),
+                      ("rope_interleave", True)):
+        if bool(cfg.get(key, want)) != want:
+            raise SpecError(f"xing4_0: {key} = {cfg.get(key)!r} is not implemented (need {want!r})")
+    for key, want in (("hidden_act", "silu"), ("scoring_func", "sigmoid"), ("topk_method", "noaux_tc")):
+        if cfg.get(key, want) != want:
+            raise SpecError(f"xing4_0: {key} {cfg.get(key)!r} is not {want!r}")
+    if not cfg.get("q_lora_rank"):
+        raise SpecError("xing4_0: a q projection without the lora bottleneck (q_lora_rank null) is not implemented")
+    if int(cfg.get("moe_layer_freq", 1)) != 1:
+        raise SpecError("xing4_0: moe_layer_freq other than 1 is not implemented")
+    heads = int(_need(cfg, "num_attention_heads"))
+    nope, rope_d, vd = int(_need(cfg, "qk_nope_head_dim")), int(_need(cfg, "qk_rope_head_dim")), int(_need(cfg, "v_head_dim"))
+    sc = dict(cfg.get("rope_scaling") or {})
+    kind = sc.get("rope_type", sc.get("type"))
+    if kind != "yarn":
+        raise SpecError(f"xing4_0: rope scaling {kind!r} is not implemented (yarn only)")
+    factor = float(sc["factor"])
+    mall = float(sc.get("mscale_all_dim") or 0.0)
+    ms = float(sc.get("mscale") or 0.0)
+
+    def mscale(m: float) -> float:
+        return 1.0 if factor <= 1 or not m else 0.1 * m * math.log(factor) + 1.0
+    attn_factor = mscale(ms) / mscale(mall) if ms and mall else mscale(ms)
+    scale = (nope + rope_d) ** -0.5 * (mscale(mall) ** 2 if mall else 1.0)
+    rope_scaling = {"rope_type": "yarn", "factor": factor,
+                    "original_max_position_embeddings": int(sc["original_max_position_embeddings"]),
+                    "beta_fast": float(sc.get("beta_fast") or 32), "beta_slow": float(sc.get("beta_slow") or 1),
+                    "attention_factor": attn_factor}
+    lead = int(cfg.get("first_k_dense_replace", 0))
+    if not 0 <= lead <= n:
+        raise SpecError(f"xing4_0: first_k_dense_replace {lead} of {n} layers")
+    hc = int(cfg.get("hc_mult", 4))
+    vocab = int(_need(cfg, "vocab_size"))
+    return ModelSpec(
+        family="xing",
+        hidden=int(_need(cfg, "hidden_size")),
+        num_layers=n,
+        layer_types=tuple([DENSE] * lead + [MOE_BLOCK] * (n - lead)),
+        vocab=vocab,
+        real_vocab=real_vocab if real_vocab is not None else vocab,
+        num_heads=heads,
+        num_kv_heads=int(cfg.get("num_key_value_heads") or heads),
+        head_dim=nope + rope_d,
+        rotary_dim=rope_d,
+        rope_theta=float(cfg.get("rope_theta", 10000.0)),
+        rope_scaling=rope_scaling,
+        qk_norm=False,
+        attn_gate=False,
+        intermediate=int(_need(cfg, "intermediate_size")) if lead else 0,
+        activation="silu",
+        num_experts=int(_need(cfg, "n_routed_experts")),
+        experts_per_tok=int(_need(cfg, "num_experts_per_tok")),
+        moe_intermediate=int(_need(cfg, "moe_intermediate_size")),
+        shared_expert_intermediate=int(_need(cfg, "moe_intermediate_size")) * int(cfg.get("n_shared_experts", 1)),
+        norm_eps=float(cfg.get("rms_norm_eps", 1e-6)),
+        attn_scale=scale,
+        quant="q4_0",
+        mla={"q_lora_rank": int(cfg["q_lora_rank"]), "kv_lora_rank": int(_need(cfg, "kv_lora_rank")),
+             "qk_nope_dim": nope, "qk_rope_dim": rope_d, "v_head_dim": vd},
+        hyper={"mult": hc, "sinkhorn_iters": int(cfg.get("hc_sinkhorn_iters", 20)),
+               "eps": float(cfg.get("hc_eps", 1e-6)), "clamp": float(cfg.get("mhc_h_res_clamp_max", 30))},
+        extra={"model_type": cfg["model_type"], "source": "hf_config",
+               "router_scale": float(cfg.get("routed_scaling_factor", 1.0)),
+               "router": "sigmoid+bias, renormalised", "mtp_layers": int(cfg.get("num_nextn_predict_layers") or 0),
+               "max_position_embeddings": int(cfg.get("max_position_embeddings") or 0)},
     )
 
 
@@ -2164,7 +2267,7 @@ HF_FAMILIES = {"qwen3_5_moe": _qwen36moe_hf, "qwen3_5_moe_text": _qwen36moe_hf,
                "gemma4_unified": _gemma4_hf, "gemma4_unified_text": _gemma4_hf,
                "gemma4": _gemma4_unsupported, "gemma4_text": _gemma4_unsupported,
                "flint": _flint_hf, "hy_v3": _hyv3_hf, "lfm2_moe": _lfm2moe_hf, "lfm3": _lfm3_hf,
-               "nemotron_h": _nemotronh_hf}
+               "nemotron_h": _nemotronh_hf, "xing4_0": _xing_hf}
 GGUF_FAMILIES = {"qwen35moe": _qwen36moe_gguf, "qwen3next": _qwen36moe_gguf, "qwen35": _qwen35_gguf, "qwen3": _qwen3_gguf, "llama": _llama3_gguf,
                  "gemma3": _gemma3_gguf, "hunyuan-dense": _hunyuan_gguf, "granite": _granite_gguf}
 _FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen35_hf: "qwen35",
@@ -2176,7 +2279,8 @@ _FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen35_
               _granite_hf: "granite", _granite_gguf: "granite", _phi3_hf: "phi3",
               _lfm2_hf: "lfm2", _gptoss_hf: "gptoss", _k2_hf: "k2", _dflash2_hf: "dflash2",
               _gemma4_hf: "gemma4", _gemma4_unsupported: "gemma4", _flint_hf: "flint",
-              _hyv3_hf: "hyv3", _lfm2moe_hf: "lfm2moe", _lfm3_hf: "lfm3", _nemotronh_hf: "nemotronh"}
+              _hyv3_hf: "hyv3", _lfm2moe_hf: "lfm2moe", _lfm3_hf: "lfm3", _nemotronh_hf: "nemotronh",
+              _xing_hf: "xing"}
 
 
 def hf_model_types(family: str) -> list[str]:
