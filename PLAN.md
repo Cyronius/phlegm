@@ -324,6 +324,24 @@ fixes subnormal fp16 scales in the Q8_0 head packer. Pack check ALL OK (projecti
 llama.cpp CPU against Vulkan, the control, is 528/545 on a 545-token prompt. Next: a quiet-host
 `timing.sh`, contexts past 4096, and a Q4_0-native pool (about 10% fewer bytes a token). Plan: [.plans/nanbeige.md](.plans/nanbeige.md); spec `OPEN-FAMILY-NANBEIGE`.
 
+## Xing4.0-29B-A4B (xing4_0: DeepSeek-V3 MLA + mHC + MoE)
+
+Runs on the NPU (2026-11-08) from our own pure Q4_0 GGUF (the publisher's BF16 through llama.cpp `7d7f0287`'s converter,
+`--no-mtp`, `llama-quantize --pure`, Q8_0 head; every scale bf16-exact; sha256 `81efe121...`) in
+`/home/cyrus/models/Xing4.0-29B-A4B-Q4pure-NPU2`, registry `xing4.0:29b-a4b`, through its own recipe `recipes/xing.py`.
+The NPU streams the weights as four dispatches a layer that are streams of one image (q_a | kv_a, q_b, o, and Nemotron-H's
+expert program with a gated up phase: 5 slots for the top 4 + shared expert, 9 for the dense MLP's 1024-wide slices); the
+host runs DeepSeek's mHC (four f32 residual streams, the Sinkhorn mixing around every sublayer), the MLA glue and the
+absorbed attention over f32 latent KV rows, and the router (`xg_*` steps of `xing-runtime.patch`, over the Nemotron-H
+chain). The Hub has no tokenizer.json; the generated one encodes exactly as the publisher's SentencePiece tokenizer, and
+phlegm's template + tokenizer match transformers byte for byte. Against an fp64 reference over the GGUF the whole model is
+599/610 on a 610-token prompt (KL median 2.5e-4; the runtime-arithmetic control 9e-5) and 16/16 on a chat prompt;
+`phlegm run` / `serve` answer (reasoning split, thinking off, streamed). llama.cpp's own xing4_0 path sits ~6e-3 from the
+fp64 reference (532/610), misses in-context copies the reference makes and scores a worse prompt likelihood; the cause is
+not found and a Vulkan control was not run. Decode ~104-119 ms a token, sequential prefill ~90 ms a token (development, loaded host). Open: block prefill, an NPU kernel for the absorbed
+attention, fewer host round trips, the MTP drafter, the llama.cpp gap. Plan: [.plans/xing.md](.plans/xing.md); spec
+`OPEN-FAMILY-XING`.
+
 ## Qwen3.5 MoE 35B-A3B (Ornith 1.5, Nex N2.5 mini, KAT Coder V2.5 Dev)
 
 KAT Coder V2.5 Dev runs on the NPU from bartowski's unmodified Q4_0 GGUF. It uses the qwen36moe

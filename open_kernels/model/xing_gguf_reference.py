@@ -103,6 +103,22 @@ def f32(x: np.ndarray) -> np.ndarray:
     return np.asarray(x, dtype=np.float32).astype(np.float64)
 
 
+def q8(x: np.ndarray) -> np.ndarray:
+    """A row through llama.cpp's Q8_0 activation quantization (32-value blocks, d = absmax / 127, round half away)."""
+    a = np.asarray(x, np.float64)
+    shp = a.shape
+    b = a.reshape(-1, 32)
+    d = (np.abs(b).max(axis=1, keepdims=True) / 127.0).astype(np.float16).astype(np.float64)
+    q = np.where(d > 0, np.trunc(b / np.where(d > 0, d, 1) + np.copysign(0.5, b)), 0.0)
+    return (q * d).reshape(shp)
+
+
+# --diag-llama-act: the activation roundings a llama.cpp CPU build applies (Q8_0 for every Q4_0 / Q8_0 product's
+# input, bf16 for the BF16 hc_fn's); identity otherwise
+AQ = lambda v: v  # noqa: E731
+HQ = lambda v: v  # noqa: E731
+
+
 def rms(x: np.ndarray, w, eps: float) -> np.ndarray:
     y = x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps)
     return y if w is None else y * w
@@ -147,7 +163,7 @@ def hc_pre(S: np.ndarray, fn: np.ndarray, base: np.ndarray, scale: np.ndarray, e
     """S [T, hc, hidden] -> (collapsed [T, hidden], post [T, hc], comb [T, hc, hc]) (Xing4_0HyperConnection)."""
     T, hc, hid = S.shape
     flat = rms(S.reshape(T, hc * hid), None, eps)
-    m = flat @ fn.T.astype(np.float64)                               # [T, (2 + hc) hc]
+    m = HQ(flat) @ fn.T.astype(np.float64)                               # [T, (2 + hc) hc]
     pre = sigmoid(m[:, :hc] * scale[0] + base[:hc])
     post = 2.0 * sigmoid(m[:, hc:2 * hc] * scale[1] + base[hc:2 * hc])
     cl = (m[:, 2 * hc:] * scale[2] + base[2 * hc:]).reshape(T, hc, hc)
@@ -168,9 +184,9 @@ def mla(g: Gguf, p: str, h: np.ndarray, pos: np.ndarray, cfg: dict) -> np.ndarra
     T = h.shape[0]
     nh, nope, rot, vd, kvr = cfg["heads"], cfg["nope"], cfg["rope"], cfg["vdim"], cfg["kv_lora"]
     eps = cfg["eps"]
-    qa = rms(h @ g.w(p + "attn_q_a.weight").T, g.w(p + "attn_q_a_norm.weight").astype(np.float64), eps)
-    q = (qa @ g.w(p + "attn_q_b.weight").T).reshape(T, nh, nope + rot)
-    kv = h @ g.w(p + "attn_kv_a_mqa.weight").T                       # [T, kv_lora + rope]
+    qa = rms(AQ(h) @ g.w(p + "attn_q_a.weight").T, g.w(p + "attn_q_a_norm.weight").astype(np.float64), eps)
+    q = (AQ(qa) @ g.w(p + "attn_q_b.weight").T).reshape(T, nh, nope + rot)
+    kv = AQ(h) @ g.w(p + "attn_kv_a_mqa.weight").T                       # [T, kv_lora + rope]
     c = rms(kv[:, :kvr], g.w(p + "attn_kv_a_norm.weight").astype(np.float64), eps)
     kr = rope_pairs(kv[:, None, kvr:], pos, cfg["inv"])[:, 0, :]     # [T, rope], shared by every head
     qr = rope_pairs(q[:, :, nope:], pos, cfg["inv"])
@@ -186,7 +202,7 @@ def mla(g: Gguf, p: str, h: np.ndarray, pos: np.ndarray, cfg: dict) -> np.ndarra
         pr = np.exp(s)
         pr /= pr.sum(axis=1, keepdims=True)
         out[:, hh, :] = pr @ v
-    return out.reshape(T, nh * vd) @ g.w(p + "attn_output.weight").T
+    return AQ(out.reshape(T, nh * vd)) @ g.w(p + "attn_output.weight").T
 
 
 def mla_absorbed(g: Gguf, p: str, h: np.ndarray, pos: np.ndarray, cfg: dict) -> np.ndarray:
@@ -229,7 +245,9 @@ def moe(g: Gguf, p: str, m: np.ndarray, cfg: dict, npu: bool = False) -> np.ndar
     out = np.zeros((T, hid))
     if npu:                                         # xm bf16, weights f32, h f32 rounded to bf16 for down
         m, wts = bf(m), f32(wts)
-    r = bf if npu else (lambda v: v)
+    r = bf if npu else AQ
+    if not npu:
+        m = AQ(m)
     for e in np.unique(idx):
         rows, slot = np.nonzero(idx == e)
         x = m[rows]
@@ -244,9 +262,9 @@ def moe(g: Gguf, p: str, m: np.ndarray, cfg: dict, npu: bool = False) -> np.ndar
 
 def dense(g: Gguf, p: str, m: np.ndarray, npu: bool = False, ff: int = 1024) -> np.ndarray:
     if not npu:
-        gt = m @ g.w(p + "ffn_gate.weight").T
-        up = m @ g.w(p + "ffn_up.weight").T
-        return (silu(gt) * up) @ g.w(p + "ffn_down.weight").T
+        gt = AQ(m) @ g.w(p + "ffn_gate.weight").T
+        up = AQ(m) @ g.w(p + "ffn_up.weight").T
+        return AQ(silu(gt) * up) @ g.w(p + "ffn_down.weight").T
     # --npu-like: the 1024-wide slices the runtime runs as slots, each h rounded to bf16 for its down part
     m = bf(m)
     G, U, D = g.w(p + "ffn_gate.weight"), g.w(p + "ffn_up.weight"), g.w(p + "ffn_down.weight")
@@ -296,7 +314,15 @@ def main() -> int:
     ap.add_argument("--gguf-py", default=None)
     ap.add_argument("--npu-like", action="store_true",
                     help="the runtime's arithmetic: absorbed MLA, bf16 GEMV inputs, f32 streams / KV rows / outputs")
+    ap.add_argument("--diag-comb-transpose", action="store_true",
+                    help="diagnostic only: mix the streams with comb^T (llama.cpp's fused-op orientation question)")
+    ap.add_argument("--diag-llama-act", action="store_true",
+                    help="diagnostic only: llama.cpp CPU's activation roundings (Q8_0 into the Q4_0 / Q8_0 products, "
+                         "bf16 into hc_fn), on the HF form")
     a = ap.parse_args()
+    if a.diag_llama_act:
+        global AQ, HQ
+        AQ, HQ = q8, bf
     g = Gguf(a.gguf, a.gguf_py)
     cfg = config(g)
     N = a.layers or cfg["layers"]
@@ -316,6 +342,8 @@ def main() -> int:
         p = f"blk.{l}."
         h, post, comb = hc_pre(S, g.w(p + "hc_attn_fn.weight"), g.w(p + "hc_attn_base.weight").astype(np.float64),
                                g.w(p + "hc_attn_scale.weight").astype(np.float64), eps, cfg["hc_iters"], cfg["hc_eps"])
+        if a.diag_comb_transpose:
+            comb = comb.transpose(0, 2, 1)
         att = mla_absorbed if a.npu_like else mla
         y = att(g, p, rms(h, g.w(p + "attn_norm.weight").astype(np.float64), eps), pos, cfg)
         S = hc_post(y, S, post, comb)
@@ -323,6 +351,8 @@ def main() -> int:
             S = f32(S)
         h, post, comb = hc_pre(S, g.w(p + "hc_ffn_fn.weight"), g.w(p + "hc_ffn_base.weight").astype(np.float64),
                                g.w(p + "hc_ffn_scale.weight").astype(np.float64), eps, cfg["hc_iters"], cfg["hc_eps"])
+        if a.diag_comb_transpose:
+            comb = comb.transpose(0, 2, 1)
         m = rms(h, g.w(p + "ffn_norm.weight").astype(np.float64), eps)
         y = (dense(g, p, m, a.npu_like, int(g.meta(f"{ARCH}.expert_feed_forward_length"))) if l < cfg["dense_lead"]
              else moe(g, p, m, cfg, a.npu_like))
@@ -344,10 +374,15 @@ def main() -> int:
     W = g.w("output.weight")
     logits = np.empty((len(ps), W.shape[0]))
     for r0 in range(0, W.shape[0], 16384):
-        logits[:, r0:r0 + 16384] = hn @ W[r0:r0 + 16384].T
+        logits[:, r0:r0 + 16384] = AQ(hn) @ W[r0:r0 + 16384].T
     for i, pp in enumerate(ps):
         logits[i].astype(np.float32).tofile(out / f"ref_logits_p{pp}.bin")
     am = logits.argmax(axis=1)
+    if a.positions == "all" and T > 1:
+        lse = logits.max(axis=1) + np.log(np.exp(logits - logits.max(axis=1, keepdims=True)).sum(axis=1))
+        nll = lse[:-1] - logits[np.arange(T - 1), ids[1:]]
+        print(f"prompt NLL (positions 0..{T - 2} predicting the next prompt token): mean {nll.mean():.4f} nats, "
+              f"ppl {np.exp(nll.mean()):.3f}")
     print(f"logits at {len(ps)} positions ({time.time() - t0:.0f} s); argmax {am[:8].tolist()} ... last {int(am[-1])}")
     return 0
 

@@ -263,11 +263,18 @@ CATALOGUE: dict[str, Template] = {t.name: t for t in [
              {"ff": values(512), "experts": values(256), "topk": values(8), "shared_expert": values(True),
               "hidden": values(2048), "n_cores": values(8)}),
     Template("lm_head_q8", "designs/lm_head_q8/lm_head_q8.h",
-             {"K": values(1024, 2048, 2560, 4096, 5120, 7168), "vocab": multiple_of(128)},
+             {"K": values(1024, 2048, 2560, 3584, 4096, 5120, 7168), "vocab": multiple_of(128)},
              note="K is LMHEAD_K, a compile-time knob of the kernel and of the pool's supertile "
                   "order (pack.py lmhead_q8 reads it as in_dim); 2560 entered with OPEN-FAMILY-QWEN35, "
                   "then 4096 (the 9B) and 1024 (the 0.8B) with the rest of that family, 5120 with "
-                  "the 27B, 7168 (one chunk a call) with OPEN-FAMILY-NANBEIGE's whole-model pass"),
+                  "the 27B, 7168 (one chunk a call) with OPEN-FAMILY-NANBEIGE's whole-model pass, "
+                  "3584 (f32 scales) with OPEN-FAMILY-XING's whole-model pass"),
+    Template("xg", "designs/xing/xg.py",
+             combos=(combination((3584, 768, 576, 6144, 4096, 1024, 5, 9),
+                                 keys=("hidden", "q_lora", "kv_a", "q_b", "o_k", "ff", "moe_slots", "dense_slots")),),
+             note="Xing's one-image program (OPEN-FAMILY-XING): the three attention GEMVs and the gated expert "
+                  "streams. Xing4.0-29B-A4B's point passed the stream fixtures (designs/xing/check_xg.py), the "
+                  "1-, 3- and 8-layer cuts and the whole model against the fp64 GGUF reference (2026-11-08)"),
     Template("lm_head_q4", "designs/lm_head_q4/lm_head_q4.py",
              {"K": values(1024, 2048, 2560, 3072, 3840, 4096), "vocab": multiple_of(64)},
              note="the q4 head is the gemv_q4 kernel with lm_head_q8's uneven band split; validated per K"),

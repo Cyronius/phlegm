@@ -236,6 +236,11 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> Layout:
 
 
 def recipe(spec: ModelSpec, max_ctx: int = 4096) -> XingRecipe:
+    from .catalogue import require
+    G = geometry(spec)
+    require("xg", hidden=G.HID, q_lora=G.QL, kv_a=G.KV_DIM, q_b=G.QB_N, o_k=G.O_K, ff=G.FF, moe_slots=G.MSLOTS,
+            dense_slots=G.DSLOTS)
+    require("lm_head_q8", K=G.HID, vocab=lm_rows(spec))
     return XingRecipe(spec=spec, layout=layout(spec, max_ctx), geo=geometry(spec), max_ctx=max_ctx)
 
 

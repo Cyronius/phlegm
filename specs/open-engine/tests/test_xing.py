@@ -175,6 +175,15 @@ def test_the_programs_run_one_image_and_the_manifest_nests_its_gguf_view():
     assert m["hf_config_check"]["model_type"] == ["xing4_0"]
 
 
+def test_only_the_point_that_ran_on_hardware_is_catalogued(monkeypatch):
+    from recipes import xing as X
+    from recipes.catalogue import OpRangeError
+    monkeypatch.delenv("OPEN_KERNELS_UNVALIDATED", raising=False)
+    X.recipe(spec())
+    with pytest.raises(OpRangeError):
+        X.recipe(spec(q_lora_rank=1536))
+
+
 def test_the_family_is_registered():
     assert families.family_module("xing").__name__.endswith("xing")
     assert "xing" in families.FAMILIES

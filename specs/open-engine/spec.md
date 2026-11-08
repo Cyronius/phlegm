@@ -5314,6 +5314,124 @@ reproduces `kernels/lfm3-q40h-blk` (manifest equal apart from build keys; every 
 and `phlegm run` takes block prefill (prefill route `auto`) through a bridge built from the `lfm3-q40-runtime.patch` chain
 (`bridges/lfm3`): a ~700-token prompt plus load 6.8 s against 24 s with `--prefill-route sequential` (development, one run each).
 
+### OPEN-FAMILY-XING: Xing 4.0 (Xing4.0-29B-A4B), MLA + mHC + routed experts, derives its own spec and runs on its own recipe from the GGUF
+**Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_xing_hf` and the `mla` / `hyper` fields, `families.py`,
+`recipes/xing.py`, `recipes/catalogue.py` (`xg`, `lm_head_q8` K 3584), `designs/xing/{xg.py,xg_*.cc,check_xg.py}`,
+`model/xing_gguf_reference.py`, `model/xing_gguf_check.py`; runtime `upstream-patches/xing-runtime.patch` over the
+Nemotron-H chain; `phlegm-core/config/model_list.json` `xing4.0:29b-a4b`)
+**Test category:** unit (`tests/test_xing.py`); manual (the procedure below, which needs the NPU and the GGUF)
+
+A config whose `model_type` is `xing4_0` shall derive a `ModelSpec` with `family` `xing`. The architecture, read from the
+Hub's `modeling_xing4_0.py` (XingChen-AGI/Xing4.0-29B-A4B @ `ac0fc307`) and llama.cpp's `src/models/xing4-0.cpp` (PR
+#31589, merged as `45b6604b`; read at `7d7f0287`), which agree on every point below:
+
+- residual (DeepSeek's mHC, `hc_mult` 4): four streams S_i of [3584], each the token's embedding at the start. Around every
+  sublayer: f = the streams flattened stream-major / rms (eps 1e-6, no weight); m = f hc_fn^T (hc_fn [24, 14336], BF16 in
+  the GGUF); pre = sigmoid(m[0:4] s0 + b[0:4]), post = 2 sigmoid(m[4:8] s1 + b[4:8]), C = 20 Sinkhorn steps (rows / (sum +
+  1e-6), then columns) of exp(clamp(m[8:24] s2 + b[8:24], +-30) - row max), C[i][j] = flat index 4 i + j; the sublayer reads
+  rms(sum_i pre_i S_i) * its norm and writes S_i <- post_i y + sum_j C_ij S_j (`matmul(comb, S)`). After the last layer the
+  streams are AVERAGED, then `output_norm` and an untied head [131072, 3584];
+- attention (DeepSeek-V2/V3 MLA, 32 heads): q = q_b(rms(q_a h) * q_a_norm) -> per head 128 nope + 64 rope; kv_a_mqa h ->
+  latent c [512] (rms * kv_a_norm) | one shared rope key [64]; per head K = [c k_b[h] | rope(kr)], V = v_b[h] c (the
+  converter splits kv_b into attn_k_b [32][512][128] and attn_v_b [32][128][512]); RoPE turns the pairs (2i, 2i + 1)
+  (`rope_interleave`) at YaRN's frequencies (factor 64, original 4096, beta 32 / 1, theta 1e4; cos / sin unscaled since
+  mscale = mscale_all_dim = 1); score scale 192^-0.5 (0.1 ln 64 + 1)^2 = 0.14468; causal, no window;
+- FFN: layers 0-1 a SiLU MLP of 9216; layers 2-39 64 routed SiLU experts of 1024 plus one gated shared expert of 1024 at
+  weight 1; router s = sigmoid(x Wr) (F32 [64, 3584]); the top 4 of s + e_score_correction_bias (GGUF `exp_probs_b`;
+  n_group 1), weights the unbiased s renormalised x 2.0;
+- the MTP layer (`num_nextn_predict_layers` 1, model.layers.40) is not part of the decoder; the converter drops it
+  (`--no-mtp`). It stays an option for speculative decode (llama.cpp can export it alone with `--mtp`).
+
+The derivation carries the latent ranks in `mla` and the hyper-connection constants in `hyper` (two optional ModelSpec
+fields, absent from `to_dict()` at None like `hadamard`, so no other spec's hash moves), head_dim 192 / rotary_dim 64, the
+score scale in `attn_scale`, layer types `dense` (the MLP layers) and `moe`. It refuses grouped expert selection, softmax
+routing, no renormalisation, attention bias, a tied head, a q without the lora bottleneck, `rope_interleave` false, rope
+scaling other than YaRN and other activations, by key.
+
+**The recipe (2026-11-08), from the GGUF.** The file is our own pure Q4_0 (llama.cpp `7d7f0287` `convert_hf_to_gguf.py
+--outtype bf16 --no-mtp`, then `llama-quantize --pure --output-tensor-type q8_0 ... Q4_0`): every matrix Q4_0 including
+attn_k_b / attn_v_b and the embedding, the head Q8_0; hc_fn stays BF16 and the router, its bias, hc_base / hc_scale and the
+norms F32 (the quantizer excludes `hc_` for this arch, `ffn_gate_inp`, `_norm`, 1-D tensors). All 906 223 616 Q4_0 scales
+are bf16-exact (none fp16-subnormal), so the Q4_0-native pool law (`nh_q40`, 4608-B chunks) holds every matrix exactly.
+The NPU streams the weights, the host does everything between them, and a layer is a program of host steps around four
+dispatches that are streams of ONE image (only the head changes context):
+
+- `xg_pre` (mHC pre + attn_norm -> f32 x) | `xg_qkva` q_a | kv_a_mqa GEMV [1344, 3584] | `xg_qnorm` (q_a_norm -> x; kv_a_norm,
+  RoPE on the rope key -> the layer's KV row [latent 512 | rope 64], f32, 2304 B, its `kv` state) | `xg_qb` q_b GEMV [6144,
+  768] | `xg_mla` (RoPE on q's rope part; q_nope absorbed through attn_k_b into the latent; scores (q_lat . c_t + q_rope .
+  r_t) * scale over the rows; ctx = sum p c; out = attn_v_b ctx -> x [4096]) | `xg_o` o GEMV [3584, 4096] | `xg_post` |
+  `xg_pre` (mHC pre + ffn_norm -> bf16 xm with the slots' weights f32[16]; moe: the router, slot 4 = the shared expert as
+  pool expert 64, the gate|up and down fills re-pointed by `nhroute`; dense: the MLP as nine 1024-wide slots at weight 1)
+  | `xg_moe` (5 slots) / `xg_dense` (9 slots) | `xg_post`; tail: `xg_final` (stream mean, output_norm -> bf16) | `lm`
+  (lm_head_q8, f32 scales, K 3584).
+- The program is Nemotron-H's one-image expert program with a GATED up phase: per band, the gate band -> ms @64, the up band
+  -> ms @0, h = w silu(g) u; the pool interleaves each 64-row gate band with its up band (`nh_q40` `band_stride`, added by
+  the patch), so a core's slot fill is one run. Nothing is padded: hidden 3584 is 14 k-tiles / 56 bands, q_lora 768 3
+  k-tiles, the attention output 4096, the expert width 1024.
+- Why mHC and MLA run on the host: mHC is ~344 K MACs a sublayer (the 24 mixes), a 4 x 4 Sinkhorn and 4 x 3584 updates
+  on a 57 KB f32 residual the host already holds (in this chain the residual never goes to the device); an NPU version
+  would add a dispatch a sublayer or a resident 57 KB state in a 64 KB L1 beside the GEMV's buffers. The absorbed attention
+  is an MQA-like shape new to the attention family (32 q heads sharing one 576-wide K and one 512-wide V); its products are
+  ~0.15 GMAC a layer at context 4096, host f32 for now, like Nemotron-H's. The non-absorbed form would read 32 x (192 + 128)
+  values a row (~84 MB a layer at 4096) against 576.
+
+Budgets: the five xg builds share identical core ELFs and CDOs (checked); every core 7568 / 16384 B program, 50544 / 65536
+B data with the 6 KB stack; lm_head_q8 K 3584 2544 / 57216. Pools: 67 MiB a dense layer, 397 MiB a moe layer (15.4 GiB for
+40 layers), head 504 MiB. Catalogue: `xg` (hidden 3584, q_lora 768, kv_a 576, q_b 6144, o_k 4096, ff 1024, slots 5 / 9) and
+`lm_head_q8` K 3584 entered with this family's hardware pass below.
+
+**Tokenizer.** The Hub ships only `tokenizer.model` (SentencePiece BPE, identity normalizer, add_dummy_prefix,
+byte_fallback, split_digits, 116 USER_DEFINED and 23 CONTROL pieces) and a slow tokenizer whose `_tokenize` is
+`sp.encode` on every segment between its added tokens, so every segment gets the dummy prefix. The model dir's
+`tokenizer.json` is generated (`target/npu-dev/xing/scripts/make_tokenizer_json.py`): normalizer Prepend("▁") +
+Replace(" ", "▁") (per segment), a Split pre-tokenizer isolating the USER_DEFINED pieces, BPE over the NORMAL +
+USER_DEFINED pieces' merges with `ignore_merges` and byte fallback, the slow tokenizer's 12 added tokens as special. It
+encodes 3711 texts (342 k characters: code, prose, Chinese, emoji, digit / underscore / whitespace runs, inline special
+tokens, the template's `<_observation>`, which is not an added token) exactly as the slow tokenizer. phlegm's own template
++ tokenizer on the model dir reproduce transformers' rendered text and ids byte-for-byte on four chat prompts (short, a
+610-token one, Chinese, multi-turn with a system message and an earlier reasoning turn), thinking on and off. The
+generation prompt is `<_bot><think>\n` (thinking) or `<_bot></think>`; eos {2} (`<_end>`), think end 10.
+
+**Acceptance (2026-11-08; development runs on a machine shared with other sessions, not a benchmark):**
+
+1. Weights: all 12 BF16 shards and tokenizer.model equal the Hub LFS sha256. `model.gguf` 16 905 629 440 B, sha256
+   `81efe121ffde3f6e0d7f10117e86c18aa76095e16f014bbd7a6c922b3ef549aa` (reproduced by a second quantization).
+2. Pack: `xing_pack_check` (patch file, no NPU) reads 244 000 sampled weights of layers 0, 1 (dense), 2, 21, 39 (moe) and the
+   head back through the chunk laws (gate | up interleave, shared expert, dense slices and their down column windows):
+   PACK-CHECK OK; `model/xing_gguf_check.py`: the same samples equal gguf-py's dequantization, 0 differ.
+3. References on the file: `model/xing_gguf_reference.py` (fp64, the HF non-absorbed form) and its `--npu-like` control (the
+   runtime's absorbed form, bf16 GEMV inputs, f32 streams / KV rows). Control vs fp64: the 16-token chat prompt 16/16, KL
+   median 8.4e-5; the 610-token prompt 602/610, 9.3e-5. llama.cpp `7d7f0287` (CPU, teacher-forced top-20) vs fp64: 14/16
+   (partial KL median 3.5e-3) and 532/610 (5.6e-3, p95 0.18, max 8.4); llama.cpp CPU with an f32 KV cache and no flash
+   attention, the second llama.cpp configuration, agrees with the default CPU run at 585/610 (5.9e-4) and sits as far from
+   fp64 (530/610, 6.0e-3). That distance is ~8x Nanbeige's, and its worst positions are in-context copies fp64 makes and
+   llama.cpp misses ("GGU" -> F, "Phleg" -> m, "baseline-read" -> iness); on the 610-token prompt fp64's next-token NLL is
+   1.82 nats against llama.cpp's 1.92 over the 390 positions llama.cpp's top 20 cover (4.19 nats over all 609). Two
+   diagnostics rule out the obvious causes on our side: mixing the streams with C^T moves fp64 far from llama.cpp (311/610)
+   and raises the NLL to 5.24; rounding the reference's activations as llama.cpp CPU does (Q8_0 into every Q4_0 / Q8_0
+   product, bf16 into hc_fn) leaves it 530/610 from llama.cpp (6.0e-3). The gap is NOT explained; llama.cpp is the weaker
+   reference here. A Vulkan control was not run (the GPU was held by other sessions).
+4. NPU (`open_qwen36_cli --prefill-logits --dump-logits`, sequential prefill): the stream fixtures (`designs/xing/check_xg.py`,
+   synthetic weights through every stream of the image) rel L2 7.6e-6 / 8.0e-6 / 8.4e-6 (q_a | kv_a, q_b, o), 7.1e-5 (moe, 5
+   slots) and 5.6e-5 (dense, 9 slots), h per slot 1.2e-5: XG-UNIT OK. The 56-token multi-turn prompt cut to 1 layer (dense)
+   and 3 (through the first moe layer): 56/56 vs fp64, KL median 3.4e-5 / 3.6e-5; 8 layers: 56/56, 5.3e-5 (the control 3.3e-5).
+   The whole model: the 16-token prompt 16/16 vs fp64 (8.9e-5), 14/16 vs llama.cpp (fp64's own score); the 610-token prompt
+   599/610 vs fp64 (KL median 2.5e-4, max 4.1e-2), 601/610 vs the control, 529/610 vs llama.cpp (fp64: 532). Greedy: the
+   short prompt answers "The capital of France is Paris." then EOS where llama.cpp writes ", which has served ..." (fp64
+   ranks "." first there, -0.27 against -1.45); the long prompt's 48 tokens equal llama.cpp's for 21, then a near tie
+   (fp64: " and" -0.978, " (" -1.012; the NPU took " and").
+5. phlegm (this branch's release build, `bridges/xing`, the model dir's kernels, max-ctx 4096): `phlegm run` answers "The
+   capital of France is Paris." after its reasoning (split out as reasoning) and, with `--think false`, a one-sentence
+   Chinese answer on the Great Wall; `phlegm serve` answers health and /v1/models, a non-streamed completion (1000 tokens of
+   coherent reasoning on primary colours, cut at max_tokens) and a streamed one with thinking off ("sum(x**2 for x in
+   range(1, 11))", [DONE]).
+6. Timing (development): development, host load 11-30 from other sessions, not a benchmark (`xing/scripts/timing.sh`, `open_qwen36_cli`, 3 rounds of the 610-token prompt + 128 decoded tokens): weights resident in ~11 s; sequential prefill 52-56 s (86-91 ms a token; 372 ms a token when every position also runs and dumps the head, as the gate does); decode 104-119 ms a token in rounds 2 and 3 (522 in round 1, under host contention), of which ~69 ms is dispatches (four a layer, the head 13-15 ms with its context change) and 40-52 ms the host steps (mHC, the absorbed attention, the router). llama.cpp CPU on the same host: 21 ms a token prefill, 228 ms decode.
+
+Open: the whole-model distance to fp64 (2.5e-4) is ~2.7x the control's (9e-5) -- not yet attributed; the llama.cpp gap above
+and a Vulkan control; block prefill (prefill runs at decode speed); an NPU attention kernel for the absorbed shape and host
+attention cost past ~4k (the registry default context is 4096); mHC on the device to cut the host round trips (four
+dispatches and seven host steps a layer); the MTP layer as a drafter; a clean benchmark.
+
 ### OPEN-WIDTH-PAD: the padded width a recipe may derive, and what it does not settle
 **Applies to:** openflowlm-next (`open_kernels/recipes/qwen36moe.py`,
 `open_kernels/recipes/pack.py`)
