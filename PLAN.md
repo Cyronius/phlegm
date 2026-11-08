@@ -338,8 +338,14 @@ phlegm's template + tokenizer match transformers byte for byte. Against an fp64 
 599/610 on a 610-token prompt (KL median 2.5e-4; the runtime-arithmetic control 9e-5) and 16/16 on a chat prompt;
 `phlegm run` / `serve` answer (reasoning split, thinking off, streamed). llama.cpp's own xing4_0 path sits ~6e-3 from the
 fp64 reference (532/610), misses in-context copies the reference makes and scores a worse prompt likelihood; the cause is
-not found and a Vulkan control was not run. Decode ~104-119 ms a token, sequential prefill ~90 ms a token (development, loaded host). Open: block prefill, an NPU kernel for the absorbed
-attention, fewer host round trips, the MTP drafter, the llama.cpp gap. Plan: [.plans/xing.md](.plans/xing.md); spec
+not found and a Vulkan control was not run. Decode ~104-119 ms a token, sequential prefill ~90 ms a token (development, loaded host).
+Block prefill (2026-11-08 evening, the default): the projections as q4_0 GEMMs and the routed experts on `xmb` (mbl on
+the Q4_0-native pool), both reading the layer pools in place, the whole prompt through each layer, the host's mHC /
+router with the sequential route's sums and the MLA attention as f32 GEMMs. 601/610 against fp64 (1.5e-4) and 16/16;
+greedy decode after it equals the sequential route's; 610 tokens in 6.2 s against 62 s (10x), 2020 in 18-19 s against
+250 s (13-14x; development, loaded host). Open: the expert
+stream (xmb's 8 token lanes a visit are now most of a prefill), an NPU kernel for the absorbed attention, fewer host
+round trips in decode, the MTP drafter, the llama.cpp gap. Plan: [.plans/xing.md](.plans/xing.md); spec
 `OPEN-FAMILY-XING`.
 
 ## Qwen3.5 MoE 35B-A3B (Ornith 1.5, Nex N2.5 mini, KAT Coder V2.5 Dev)

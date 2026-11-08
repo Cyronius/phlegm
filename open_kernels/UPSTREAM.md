@@ -485,7 +485,8 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   `gemm_q4_prefill` GEMMs and the routed experts on `designs/xing_batch/xmb.py` (mbl on the Q4_0-native
   pool), both reading the layer pool in place (each GEMM's weight fills re-pointed per dispatch, the xmb
   slots by the `xgbatch` table), the host's mHC, norms and router per token with `xg_pre`'s sums, and the
-  MLA attention over the call as AVX2 f32 GEMMs in the absorbed or the expanded arrangement. The decode
+  MLA attention over the call as AVX2 f32 GEMMs in the absorbed or the expanded arrangement (calls under 16
+  tokens step one token at a time on the sequential program, the measured crossover). The decode
   step now reads `attn_k_b` / `attn_v_b` from one transposed f32 copy made at load (the same sums; its
   logits are bit-identical). The block clone is `target/npu-dev/xing-blk-runtime`; the patch is still one
   diff over the Nemotron-H clone, and a round trip reproduces the block clone's tree.

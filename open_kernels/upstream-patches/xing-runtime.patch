@@ -1,6 +1,6 @@
 diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/CMakeLists.txt patch-b/src/open_qwen36/CMakeLists.txt
---- a/src/open_qwen36/CMakeLists.txt	2026-11-08 15:47:20.744879209 -0600
-+++ b/src/open_qwen36/CMakeLists.txt	2026-11-08 15:47:20.745879199 -0600
+--- a/src/open_qwen36/CMakeLists.txt	2026-11-08 16:36:22.036585459 -0600
++++ b/src/open_qwen36/CMakeLists.txt	2026-11-08 16:36:22.037585450 -0600
 @@ -43,7 +43,9 @@
  add_executable(gguf_pack_test gguf_pack_test.cpp gguf_file.cpp pools.cpp manifest.cpp q4nx_file.cpp)
  # nemotronh_pack_check (no XRT, needs the model and its kernel set): Nemotron-H's packing read back (OPEN-FAMILY-NEMOTRONH)
@@ -13,8 +13,8 @@ diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/CMakeLists.txt patch-b/
  endforeach()
  target_include_directories(manifest_test PRIVATE ${_inc})
 diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/core.cpp patch-b/src/open_qwen36/core.cpp
---- a/src/open_qwen36/core.cpp	2026-11-08 15:47:20.746879190 -0600
-+++ b/src/open_qwen36/core.cpp	2026-11-08 15:47:20.748879171 -0600
+--- a/src/open_qwen36/core.cpp	2026-11-08 16:36:22.039585430 -0600
++++ b/src/open_qwen36/core.cpp	2026-11-08 16:36:22.040585421 -0600
 @@ -357,6 +357,7 @@
          for (const auto& [rows, k] : types_[l]->gemm_block.attn_block.kernels_s) wanted[k] = true;
          for (const auto& [rows, k] : types_[l]->gemm_block.attn_block.kernels_pv) wanted[k] = true;
@@ -72,7 +72,7 @@ diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/core.cpp patch-b/src/op
      else route(kerns_.at(s.kernel), layer, s.act_off);
  }
 
-@@ -2218,6 +2236,1227 @@
+@@ -2218,6 +2236,1247 @@
      k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
  }
 
@@ -517,6 +517,9 @@ diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/core.cpp patch-b/src/op
 +// ============================================================================
 +
 +namespace {
++
++/// The shortest call xg_prefill runs on the block route; shorter ones step one token at a time (OFLM_OPEN_XG_BLOCK_MIN)
++constexpr size_t XG_BLOCK_MIN = 16;    // measured: 8 tokens 0.69 s stepped vs 1.33 s blocked, 16: 1.47 vs 1.41
 +
 +/// C[4][8 NV] = (or +=) A[4][K] B[K][8 NV]: one register tile, AVX2 FMA
 +template <int NV>
@@ -1109,6 +1112,23 @@ diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/core.cpp patch-b/src/op
 +                                 " is past the context capacity of " + std::to_string(cfg_.max_ctx));
 +    for (size_t t = 0; t < n; ++t)
 +        if (ids[t] < 0 || static_cast<size_t>(ids[t]) >= w_->vocab) throw std::runtime_error("open_qwen36: token id out of range");
++    // A call costs its full-width GEMMs and a context change into xmb and back a layer however few tokens it holds,
++    // so a short prompt -- or a short continuation, as prompt reuse hands the bridge -- runs one token at a time on
++    // the sequential program (the same KV rows). The crossover is measured (.plans/xing.md, run-blk/crossover);
++    // OFLM_OPEN_XG_BLOCK_MIN overrides it (1: always the block route).
++    static const size_t min_block = [] {
++        const char* e = std::getenv("OFLM_OPEN_XG_BLOCK_MIN");
++        return e ? static_cast<size_t>(std::strtoul(e, nullptr, 10)) : static_cast<size_t>(XG_BLOCK_MIN);
++    }();
++    if (n < min_block) {
++        std::vector<std::vector<float>> all;
++        for (size_t t = 0; t < n; ++t) {
++            step(ids[t], (want_logits && t + 1 == n) || block_logits_all_);
++            if (block_logits_all_) all.push_back(logits_host_);
++        }
++        block_logits_ = std::move(all);
++        return;
++    }
 +    auto t0 = std::chrono::steady_clock::now();
 +    timing_ = StepTiming{};
 +    const size_t hid = w_->hidden, hc = 4, sw = hc * hid;
@@ -1300,7 +1320,7 @@ diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/core.cpp patch-b/src/op
  Core::G4Moe& Core::g4moe(const Step& s, int layer) {
      auto it = g4moe_.find(layer);
      if (it != g4moe_.end() && !(s.op == "gemma4_route" ? it->second.router.empty() : it->second.post_norm.empty()))
-@@ -2642,7 +3881,7 @@
+@@ -2642,7 +3901,7 @@
              first = 1;
          }
          for (size_t i = first; i < w_->tail.size(); ++i) {
@@ -1309,7 +1329,7 @@ diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/core.cpp patch-b/src/op
              timing_.dispatch_ms += run(kerns_.at(w_->tail[i].kernel), w_->tail[i].args, 0);
          }
          xrt::bo& lg = buffer("logits", 0);
-@@ -2867,7 +4106,7 @@
+@@ -2867,7 +4126,7 @@
      std::memcpy(xres1.map<uint8_t*>(), row, w_->hidden * 4);
      xres1.sync(XCL_BO_SYNC_BO_TO_DEVICE, w_->hidden * 4, 0);
      for (const Step& s : w_->tail) {
@@ -1318,7 +1338,7 @@ diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/core.cpp patch-b/src/op
          else run(kerns_.at(s.kernel), s.args, 0);
      }
      xrt::bo& lg = buffer("logits", 0);
-@@ -3630,6 +4869,10 @@
+@@ -3630,6 +4889,10 @@
                                   std::to_string(cfg_.max_ctx));
      for (int tok : ids)
          if (tok < 0 || static_cast<size_t>(tok) >= w_->vocab) throw std::runtime_error("open_qwen36: token id out of range");
@@ -1329,7 +1349,7 @@ diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/core.cpp patch-b/src/op
      if (types_[0]->gemm_block.kind != "dense") {
          step_block_moe(ids, t_real, want_logits);
          return;
-@@ -4306,6 +5549,11 @@
+@@ -4306,6 +5569,11 @@
 
  void Core::step_gemm_prompt(const std::vector<int>& ids, bool want_logits) {
      apply_thread_budget();
@@ -1342,8 +1362,8 @@ diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/core.cpp patch-b/src/op
          step_gemm_prompt_dense(ids, want_logits);
          return;
 diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/core.hpp patch-b/src/open_qwen36/core.hpp
---- a/src/open_qwen36/core.hpp	2026-11-08 15:47:20.749879161 -0600
-+++ b/src/open_qwen36/core.hpp	2026-11-08 15:47:20.750879152 -0600
+--- a/src/open_qwen36/core.hpp	2026-11-08 16:36:22.041585411 -0600
++++ b/src/open_qwen36/core.hpp	2026-11-08 16:36:22.042585401 -0600
 @@ -593,6 +593,44 @@
      const std::vector<float>& nh_tensor(const std::string& pattern, int layer, size_t n);
      std::map<std::string, std::vector<float>> nh_w_;   ///< the tensors nh_tensor has read, by name
@@ -1390,8 +1410,8 @@ diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/core.hpp patch-b/src/op
 
      // ---- the block route's helpers (core.cpp)
 diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/manifest.cpp patch-b/src/open_qwen36/manifest.cpp
---- a/src/open_qwen36/manifest.cpp	2026-11-08 15:47:20.751879142 -0600
-+++ b/src/open_qwen36/manifest.cpp	2026-11-08 15:47:20.752879133 -0600
+--- a/src/open_qwen36/manifest.cpp	2026-11-08 16:36:22.044585382 -0600
++++ b/src/open_qwen36/manifest.cpp	2026-11-08 16:36:22.045585372 -0600
 @@ -59,6 +59,7 @@
      p.elem = j.value("elem", 0ull);
      p.dst_rows = j.value("dst_rows", 0ull);
@@ -1510,8 +1530,8 @@ diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/manifest.cpp patch-b/sr
      const json& pack = need(j, "pack", where);
      const json& embed = need(pack, "embed", where);
 diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/manifest.hpp patch-b/src/open_qwen36/manifest.hpp
---- a/src/open_qwen36/manifest.hpp	2026-11-08 15:47:20.754879114 -0600
-+++ b/src/open_qwen36/manifest.hpp	2026-11-08 15:47:20.755879104 -0600
+--- a/src/open_qwen36/manifest.hpp	2026-11-08 16:36:22.046585362 -0600
++++ b/src/open_qwen36/manifest.hpp	2026-11-08 16:36:22.047585353 -0600
 @@ -55,6 +55,9 @@
                                                                          ///< many values, tail zeroed
                                                                          ///< (0 = rows, no padding)
@@ -1542,8 +1562,8 @@ diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/manifest.hpp patch-b/sr
 
  struct LayerType {
 diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/pools.cpp patch-b/src/open_qwen36/pools.cpp
---- a/src/open_qwen36/pools.cpp	2026-11-08 15:47:20.756879094 -0600
-+++ b/src/open_qwen36/pools.cpp	2026-11-08 15:47:20.757879085 -0600
+--- a/src/open_qwen36/pools.cpp	2026-11-08 16:36:22.048585343 -0600
++++ b/src/open_qwen36/pools.cpp	2026-11-08 16:36:22.049585334 -0600
 @@ -911,7 +911,11 @@
              fail("nh_q40 " + name + ": rows [" + std::to_string(op.row0) + ", +" + std::to_string(op.rows) + ") of " +
                   std::to_string(E) + " x " + std::to_string(op.n_total) + " (file " + std::to_string(frows) +
@@ -1568,7 +1588,7 @@ diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/pools.cpp patch-b/src/o
                      const uint64_t prow = 64 * band + 32 * part + r;
 diff -ruN --suppress-blank-empty patch-a/src/open_qwen36/xing_pack_check.cpp patch-b/src/open_qwen36/xing_pack_check.cpp
 --- a/src/open_qwen36/xing_pack_check.cpp	1969-12-31 18:00:00.000000000 -0600
-+++ b/src/open_qwen36/xing_pack_check.cpp	2026-11-08 15:47:20.759879066 -0600
++++ b/src/open_qwen36/xing_pack_check.cpp	2026-11-08 16:36:22.050585324 -0600
 @@ -0,0 +1,152 @@
 +// xing_pack_check: Xing 4.0's packing on the CPU, no NPU (OPEN-FAMILY-XING, xing-runtime.patch). Loads the kernel
 +// set's manifest (its gguf view), checks the model's config against it, packs the layers named and the head, and

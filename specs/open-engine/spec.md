@@ -5316,10 +5316,12 @@ and `phlegm run` takes block prefill (prefill route `auto`) through a bridge bui
 
 ### OPEN-FAMILY-XING: Xing 4.0 (Xing4.0-29B-A4B), MLA + mHC + routed experts, derives its own spec and runs on its own recipe from the GGUF
 **Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_xing_hf` and the `mla` / `hyper` fields, `families.py`,
-`recipes/xing.py`, `recipes/catalogue.py` (`xg`, `lm_head_q8` K 3584), `designs/xing/{xg.py,xg_*.cc,check_xg.py}`,
+`recipes/xing.py`, `recipes/catalogue.py` (`xg`, `xmb`, `lm_head_q8` K 3584), `designs/xing/{xg.py,xg_*.cc,check_xg.py}`,
+`designs/xing_batch/{xmb.py,xmb.h,xmb_*.cc,check_xmb.py}`, `designs/gemm_q4_prefill` (GQP_FMT q4_0),
 `model/xing_gguf_reference.py`, `model/xing_gguf_check.py`; runtime `upstream-patches/xing-runtime.patch` over the
 Nemotron-H chain; `phlegm-core/config/model_list.json` `xing4.0:29b-a4b`)
-**Test category:** unit (`tests/test_xing.py`); manual (the procedure below, which needs the NPU and the GGUF)
+**Test category:** unit (`tests/test_xing.py`, `tests/test_xing_block.py`); manual (the procedure below, which needs the
+NPU and the GGUF)
 
 A config whose `model_type` is `xing4_0` shall derive a `ModelSpec` with `family` `xing`. The architecture, read from the
 Hub's `modeling_xing4_0.py` (XingChen-AGI/Xing4.0-29B-A4B @ `ac0fc307`) and llama.cpp's `src/models/xing4-0.cpp` (PR
@@ -5427,10 +5429,85 @@ generation prompt is `<_bot><think>\n` (thinking) or `<_bot></think>`; eos {2} (
    range(1, 11))", [DONE]).
 6. Timing (development): development, host load 11-30 from other sessions, not a benchmark (`xing/scripts/timing.sh`, `open_qwen36_cli`, 3 rounds of the 610-token prompt + 128 decoded tokens): weights resident in ~11 s; sequential prefill 52-56 s (86-91 ms a token; 372 ms a token when every position also runs and dumps the head, as the gate does); decode 104-119 ms a token in rounds 2 and 3 (522 in round 1, under host contention), of which ~69 ms is dispatches (four a layer, the head 13-15 ms with its context change) and 40-52 ms the host steps (mHC, the absorbed attention, the router). llama.cpp CPU on the same host: 21 ms a token prefill, 228 ms decode.
 
-Open: the whole-model distance to fp64 (2.5e-4) is ~2.7x the control's (9e-5) -- not yet attributed; the llama.cpp gap above
-and a Vulkan control; block prefill (prefill runs at decode speed); an NPU attention kernel for the absorbed shape and host
-attention cost past ~4k (the registry default context is 4096); mHC on the device to cut the host round trips (four
-dispatches and seven host steps a layer); the MTP layer as a drafter; a clean benchmark.
+
+**Block prefill (2026-11-08 evening).** The sequential program streams every weight once a token (prefill ran at decode
+speed). The block route streams the projections once for up to 256 tokens and every routed expert once for up to 8 of
+its tokens, and the runtime runs the whole prompt through each layer before the next (`Core::xg_prefill`; the bridge's
+`layer-major` / CLI `--gemm-block`; `--block-major` and the bridge's `gemm-block` run 256-token blocks through every
+layer instead). `recipes/xing.py` `block_route` emits one `gemm_block` of kind `xing` per layer kind; `XING_BLOCK=0`
+drops it and gives the pre-block manifest byte for byte; at run time `OFLM_OPEN_GEMM_BLOCK=0`, the bridge's
+`prefill_route: sequential` or the CLI without `--gemm-block` prefill sequentially on the same set.
+
+- Projections: `gemm_q4_prefill` with `GQP_FMT q4_0` (two 4608-B Q4_0-native chunks a band-k-group: the pool's own law),
+  T 256, one xclbin (context `gemm`) and six streams: q_a | kv_a [1536, 3584] (1344 rows rounded up to 256-row blocks;
+  the last 192 rows read q_b's bytes and are never read back -- every output row is its own weight row's product),
+  q_b [6144, 768], o [3584, 4096], the FFN's gate | up as the pool interleaves it (64 gate rows then the band's 64 up
+  rows; the shared expert [2048, 3584], the dense MLP's nine slices at once [18432, 3584]) and the down [3584, 1024]
+  (the shared expert's, or each dense slice's, 9 dispatches `stride` DNS apart). The GEMMs read the LAYER POOL in place:
+  each stream's weight fills are compiled from offset 0 and re-pointed at the step's `pool_off` per dispatch (one word
+  per fill and an instruction-BO sync when the offset changes). No weight is copied.
+- Routed experts: `designs/xing_batch/xmb.py`, LFM2.5's `mbl` (SwiGLU, 8 token lanes a slot, gate | up then down) with
+  `mb4`'s Q4_0-native chunk (m = -8 d on the core) and the experts from `POOL_EXP`; slot s compiled at pool expert s and
+  re-pointed by the `xgbatch` table (the pool law's `pool_exp` / `ups` / `pool_down` / `dns`); streams of 8, 16, 32
+  and 64 slots on one xclbin (context `xmb`), the shortest that holds the visits still owed. The pool needs no second
+  copy (mbl's EXP_UG / UP_BYTES are Xing's UPS / DNS). The shared expert runs as the two GEMMs above over every token
+  (as an xmb slot it would stream 6.2 MB per 8 tokens). The xmb core sets `conv_even` before its first dequantised band:
+  mbl rounds only from its silu step on, so the first gate / up band of a dispatch on a fresh core (the first after a
+  context change) rounded in the core's default mode (probe: that dispatch's h 3.2e-3 from fp64 against 2.8e-3 after;
+  y always consistent with its own h).
+- Host, per token with `xg_pre`'s sums in its order (mHC pre, the router; four tokens a pass over hc_fn and the router
+  so each streams once for four), `xg_post`, the q / kv norms and the KV row; over the call the MLA attention as AVX2
+  f32 GEMMs, in the absorbed arrangement (xg_mla's: 576-wide scores, 512-wide context, every head sharing the rows) or
+  the expanded one (K_nope = k_b^T c and V = v_b c once a row, 192-wide scores, 128-wide output), whichever needs fewer
+  multiply-adds (expanded from position 0; absorbed for a short continuation of a long context;
+  `OFLM_OPEN_XG_ATTN=absorbed|expanded`). Both are exact rearrangements; in f32 they differ at the rounding level. The
+  route writes the same f32 KV rows [latent 512 | rope 64] the decode step reads. GEMM chunks and xmb passes are
+  double-buffered (the next chunk tiled, the last untiled, while one runs; one run of a stream in flight at a time).
+  attn_k_b / attn_v_b are widened and transposed once at load (the decode step reads the same copies, walking them with
+  the same sums: its logits are bit-identical to the pre-block runtime's).
+
+Budgets: xmb 12192 / 16384 B program and 49152 / 65536 B data (placed, 4 KB stack; the largest frame 0x280 B)
+on all 32 cores, the four streams with identical core ELFs and CDOs; the q4_0 GEMM 5344 / 16384 and 55368 / 65536, the
+six streams with identical core ELFs. xmb shim taps: d0 2304 B, outer dimension at most 14, strides under 2^20 words.
+Device memory added: the GEMM x / y globals (largest y 18.9 MB) and xmb's x / h / y (12 MB) with their twins; no weight.
+
+Acceptance (2026-11-08, NPU; development runs on a shared host, load 10-50):
+
+| gate | result | sequential route |
+|---|---|---|
+| kernel fixtures (`designs/xing_batch/check_xmb.py`, synthetic Q4_0-native weights) | six GEMM shapes rel L2 1.46e-3 (worst token 1.6e-3); xmb s8 / s16 / s64 y 1.47e-3, h 2.7-2.8e-3: XMB-UNIT OK | GEMVs 7.6-8.4e-6 |
+| 1 / 3 / 8 layers, 56-token prompt, vs fp64 | 56/56, 56/56, 56/56; KL median 3.4e-5, 3.9e-5, 7.0e-5 | 56/56 each; 3.4e-5, 3.6e-5, 5.3e-5 |
+| 16-token prompt vs fp64 / llama.cpp CPU | 16/16 (KL median 4.2e-5) / 14/16 | 16/16 (8.9e-5) / 14/16 |
+| 610-token prompt vs fp64 / llama.cpp CPU | 601/610 (1.5e-4, max 2.1e-2) / 530/610; 256-token blocks 600/610 / 529 | 599/610 (2.5e-4) / 529 |
+| greedy after a block prefill | 16-token: 64/64 tokens equal to the sequential route; 610-token: 48/48 (both schedules) | -- |
+| schedules | 256-token blocks = whole prompt bit for bit while both use the same attention arrangement (16-token prompt; positions 0-511 of the 610-token prompt; every position at 3 and 8 layers with the absorbed form); the 98-token third block takes the absorbed form, the whole prompt the expanded: argmax 609/610, KL max 1.4e-3, the 48 greedy tokens equal | -- |
+| determinism | two runs bit-identical (3 and 8 layers, 610 tokens) | -- |
+| sequential route on the new runtime | bit-identical to the pre-block runtime (16- and 610-token prompts, every prompt position and decoded token) | -- |
+| phlegm (`bridges/xing-blk`, the model dir's kernels) | `run` (reasoning, then "The capital of France is Paris."), `run --think false` (Chinese), `serve` health / models / full / stream, and the 610-token prompt through serve (block route, 200 tokens, 30 s); repeated with the final runtime (calls under 16 tokens stepped) | -- |
+
+The shipped set (the model dir's `open_kernels`, re-exported with `--check`: instruction streams byte-identical,
+xclbins apart from build stamps) reproduces the gated run's logits bit for bit on both prompts.
+
+Timing (development, not a benchmark; `open_qwen36_cli`, separate processes alternating sequential / block, each
+request twice in one process, the second warm; host load noted per run under `target/npu-dev/xing/run-blk/timing`):
+host load 9-21 throughout.
+
+| prompt | sequential, warm (first) | block, warm (first) | ratio per round (warm) |
+|---|---|---|---|
+| 610 tokens, 3 rounds | 66.0 / 60.1 / 62.8 s (61.2 / 60.7 / 61.8): 99-108 ms a token | 6.23 / 6.15 / 6.16 s (6.53 / 6.45 / 6.38): 10.1 ms a token | 10.6 / 9.8 / 10.2, median 10.2x |
+| 2020 tokens, 2 rounds | 249.9 / 255.5 s (252.4 / 254.5): 124-126 ms a token | 18.9 / 18.1 s (19.5 / 18.3): 9.0-9.4 ms a token | 13.2 / 14.1x |
+
+Every process reproduced its first request's tokens on the second. Where the time goes (610 tokens, warm,
+OFLM_OPEN_XG_PROF): xmb 2.7 s (4.4 ms a token: each routed expert streams 6.2 MB per 8 of its tokens), the GEMMs
+1.7 s (each 256-token chunk ~12 ms a layer; 3 chunks for 610 tokens), the host attention 0.65 s (expanded), mHC and
+the router 0.49 s, tiling / untiling 0.59 s (mostly under the GEMMs), the post 0.08 s. A call costs its full-width
+GEMMs and two context changes a layer however few tokens it holds; prefixes of the 610-token prompt (warm, same
+binary, `run-blk/crossover`): 8 tokens 0.69 s stepped against 1.33 s blocked, 16: 1.47 / 1.41, 32: 2.98 / 1.53, 64:
+5.92 / 1.67, 128: 11.6 / 2.04. So `xg_prefill` steps calls under 16 tokens one token at a time on the sequential
+program (the same KV rows; `OFLM_OPEN_XG_BLOCK_MIN` overrides), which also covers the short continuations prompt reuse
+hands the bridge. An 8-token prompt through `--gemm-block` then equals the sequential route bit for bit.
+
+Open: the sequential route's distance to fp64 (2.5e-4) is ~2.7x the control's (9e-5) -- not yet attributed (the block route sits at 1.5e-4); the llama.cpp gap above and a Vulkan control; xmb's 8 token lanes a visit (the routed experts are ~45% of a block prefill; wider slots need a native-shape mmul, mbl.h's notes); the GEMMs' bf16-rounded dequantised weights (rel 1.5e-3 a product, against the GEMVs' 8e-6); mbl / mb4's first-dispatch rounding in the other families' block routes (UPSTREAM.md); an NPU attention kernel for the absorbed shape; mHC on the device to cut decode's host round trips (four dispatches and seven host steps a layer); the MTP layer as a drafter; a clean benchmark.
 
 ### OPEN-WIDTH-PAD: the padded width a recipe may derive, and what it does not settle
 **Applies to:** openflowlm-next (`open_kernels/recipes/qwen36moe.py`,
