@@ -31,7 +31,7 @@ working log is `.plans/flux2-klein-native.md`.
   `[seed, 1]`. With the text-to-image stream, editing an image generated with the same
   seed reproduced the reference unchanged (measured below).
 
-## Results (2026-11-08, Strix Point XDNA2, Fedora 44, XRT 2.27.0 a29919c)
+## Results (2026-11-08, Strix Halo XDNA2 (Ryzen AI MAX+ 395), Fedora 44, XRT 2.27.0 a29919c)
 
 Native runs with the reference's exact initial latents, 4 steps, against the bf16
 published pipeline. Pixel PSNR/MAE are on 8-bit RGB.
@@ -52,6 +52,28 @@ not measured here). NPU times are single runs under Dibs, not benchmarks.
 `phlegm image` and `phlegm serve-images` each completed text-to-image and one-reference
 edits at 512 and 1024 on hardware (HTTP 200; `/v1/models` lists
 `black-forest-labs/FLUX.2-klein-4B`; `guidance_scale` -> 400).
+
+## Swapped text encoder (2026-11-08)
+
+The route takes any text encoder with Qwen3-4B's exact geometry: build a checkpoint
+directory whose `text_encoder/` is the replacement and whose other entries link to the
+published checkpoint, and point the config's `model` at it. Give it its own `kernels`
+directory (links to the kernel set plus its own `packed/`), or the packed-weight cache
+repacks every time the two are swapped. `embed_rows` rounds a non-BF16 embedding table to
+bf16 (it used to copy the raw bits, which is wrong for an F16 file);
+`specs/open-engine/tests/test_flux2_embed_rows.py` covers both.
+
+Measured: `ponpoke/flux2-klein-4b-uncensored-text-encoder` at `633217e5`
+(`model.safetensors` sha256 `3d6f27fd...`, matches the Hub). It is an F16 re-save of the
+published encoder: same 398 tensors and shapes; layers 0-13 equal the published weights
+after an f16 round trip; `o_proj` and `down_proj` changed in layers 14-35 (2.0-3.1%
+relative L2 each). Its prompt embeddings for "A red fox in fresh snow" differ from the
+published encoder's by 0.79/0.78/0.80% at taps 9/18/27. 512 text-to-image, 4 steps, the
+reference's noise, against the unchanged diffusers pipeline with the same encoder:
+latents 38.9% rel L2 / cosine 0.9238, pixels MAE 11.04 / 21.56 dB (published encoder:
+34.2% / 21.97 dB, table above). `phlegm image` t2i and a "Make the fox blue" edit at 512
+both produced the expected images. Edits and 1024 were not compared against the
+reference. License per its card: flux-non-commercial-v2.1.
 
 ## Open
 

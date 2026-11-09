@@ -158,10 +158,15 @@ def packed_coder(cache: Path, model: Path, coder):
 
 
 def embed_rows(st: SafeTensors, ids: np.ndarray) -> np.ndarray:
-    """model.embed_tokens rows for ids (bf16 bits), zero-padded to TE_PAD: XT."""
-    table = st.raw("model.embed_tokens.weight")
+    """model.embed_tokens rows for ids (bf16 bits), zero-padded to TE_PAD: XT. A BF16 table
+    is copied bit for bit; any other dtype (an F16 re-save) is rounded to bf16, not
+    reinterpreted."""
+    name = "model.embed_tokens.weight"
+    rows = st.raw(name)[ids]
+    if st._where[name][1]["dtype"] != "BF16":
+        rows = rows.astype(np.float32).astype(bfloat16).view(np.uint16)
     x = np.zeros((len(ids), kp.TE_PAD), np.uint16)
-    x[:, :table.shape[1]] = table[ids]
+    x[:, :rows.shape[1]] = rows
     return x
 
 
