@@ -15,6 +15,8 @@ use tiny_http::{Header, Method, Request, Response, Server};
 pub const MOSS_ID: &str = "OpenMOSS-Team/MOSS-Image-SFT";
 pub const FLUX3_ID: &str = "black-forest-labs/flux-3-image-klein";
 pub const QWEN21_ID: &str = "Qwen/Qwen-Image-2.1";
+pub const FLUX2_KLEIN_IDS: [&str; 2] = ["black-forest-labs/FLUX.2-klein-4B",
+                                         "black-forest-labs/FLUX.2-klein-9B"];
 static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Deserialize)]
@@ -381,11 +383,103 @@ impl Qwen21ImageConfig {
     }
 }
 
+/// FLUX.2 [klein] (distilled) through `open_kernels/flux2_native_generate.py`: the klein
+/// schedule on the pyxrt host, weights read from the published diffusers checkpoint.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Flux2ImageConfig {
+    pub backend: String,
+    /// One of FLUX2_KLEIN_IDS; the runner checks the checkpoint's geometry against the
+    /// compiled schedule.
+    pub model_id: String,
+    #[serde(default)]
+    pub dibs: Option<PathBuf>,
+    pub python: PathBuf,
+    pub repo_root: PathBuf,
+    #[serde(default)]
+    pub env_script: Option<PathBuf>,
+    pub model: PathBuf,
+    pub kernels: PathBuf,
+    pub output_root: PathBuf,
+}
+
+impl Flux2ImageConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.backend != "flux2" {
+            return Err("FLUX.2 klein config requires backend=flux2".into());
+        }
+        if !FLUX2_KLEIN_IDS.contains(&self.model_id.as_str()) {
+            return Err(format!("unsupported FLUX.2 model_id {}; expected one of {FLUX2_KLEIN_IDS:?}",
+                               self.model_id));
+        }
+        if let Some(dibs) = &self.dibs {
+            if !dibs.is_absolute() || !dibs.is_file() {
+                return Err(format!("invalid Dibs launcher: {}", dibs.display()));
+            }
+        }
+        for path in [Some(&self.python), Some(&self.repo_root), self.env_script.as_ref(),
+                     Some(&self.model), Some(&self.kernels), Some(&self.output_root)]
+            .into_iter().flatten() {
+            if !path.is_absolute() {
+                return Err(format!("FLUX.2 image config path must be absolute: {}", path.display()));
+            }
+        }
+        for file in [Some(&self.python), self.env_script.as_ref(),
+                     Some(&self.model.join("model_index.json")),
+                     Some(&self.model.join("transformer/config.json")),
+                     Some(&self.model.join("tokenizer/tokenizer.json")),
+                     Some(&self.kernels.join("final.xclbin")),
+                     Some(&self.kernels.join("fa/dit_fa.json")),
+                     Some(&self.kernels.join("ew/dit_ew.json")),
+                     Some(&self.repo_root.join("open_kernels/flux2_native_generate.py"))]
+            .into_iter().flatten() {
+            if !file.is_file() {
+                return Err(format!("missing FLUX.2 image asset: {}", file.display()));
+            }
+        }
+        let index = read_manifest(&self.model.join("model_index.json"))?;
+        if index["is_distilled"].as_bool() != Some(true) {
+            return Err("only distilled FLUX.2 klein checkpoints are supported (Base needs CFG)".into());
+        }
+        let (resolutions, _) = self.kernel_sizes()?;
+        if resolutions.is_empty() {
+            return Err("FLUX.2 kernel set lists no resolutions".into());
+        }
+        fs::create_dir_all(&self.output_root)
+            .map_err(|e| format!("creating FLUX.2 image output root: {e}"))?;
+        Ok(())
+    }
+
+    /// (text-to-image resolutions, edit resolutions) from the dit_gemm set's marker.
+    fn kernel_sizes(&self) -> Result<(Vec<u64>, Vec<u64>), String> {
+        let marker = read_manifest(&self.kernels.join("dit_kernels.json"))?;
+        if marker["complete"].as_bool() != Some(true) {
+            return Err(format!("incomplete FLUX.2 kernel set: {}", self.kernels.display()));
+        }
+        let list = |key: &str| marker[key].as_array().map(|v| v.iter()
+            .filter_map(Value::as_u64).collect::<Vec<_>>()).unwrap_or_default();
+        Ok((list("resolutions"), list("edits")))
+    }
+
+    pub fn supports_resolution(&self, resolution: u32) -> bool {
+        self.kernel_sizes().is_ok_and(|(r, _)| r.contains(&(resolution as u64)))
+    }
+
+    pub fn supports_edit(&self, resolution: u32) -> bool {
+        self.kernel_sizes().is_ok_and(|(_, e)| e.contains(&(resolution as u64)))
+    }
+
+    fn model_id(&self) -> &'static str {
+        FLUX2_KLEIN_IDS.iter().copied().find(|id| *id == self.model_id).unwrap_or(FLUX2_KLEIN_IDS[0])
+    }
+}
+
 #[derive(Clone)]
 pub enum ImageConfig {
     Moss(MossImageConfig),
     Flux3(Flux3ImageConfig),
     Qwen21(Qwen21ImageConfig),
+    Flux2(Flux2ImageConfig),
 }
 
 impl ImageConfig {
@@ -404,6 +498,11 @@ impl ImageConfig {
                 qwen.validate()?;
                 Self::Qwen21(qwen)
             }
+            Some("flux2") => {
+                let flux: Flux2ImageConfig = serde_json::from_value(value).map_err(|e| e.to_string())?;
+                flux.validate()?;
+                Self::Flux2(flux)
+            }
             None => {
                 let moss: MossImageConfig = serde_json::from_value(value).map_err(|e| e.to_string())?;
                 moss.validate()?;
@@ -416,12 +515,12 @@ impl ImageConfig {
 
     pub fn model_id(&self) -> &'static str {
         match self { Self::Moss(_) => MOSS_ID, Self::Flux3(_) => FLUX3_ID,
-            Self::Qwen21(_) => QWEN21_ID }
+            Self::Qwen21(_) => QWEN21_ID, Self::Flux2(c) => c.model_id() }
     }
 
     pub fn output_root(&self) -> &Path {
         match self { Self::Moss(c) => &c.output_root, Self::Flux3(c) => &c.output_root,
-            Self::Qwen21(c) => &c.output_root }
+            Self::Qwen21(c) => &c.output_root, Self::Flux2(c) => &c.output_root }
     }
 
     pub fn supports_resolution(&self, resolution: u32) -> Result<(), String> {
@@ -431,6 +530,8 @@ impl ImageConfig {
             Self::Flux3(_) => Err(format!("this FLUX 3 configuration has no native {resolution}-pixel kernels")),
             Self::Qwen21(_) if resolution == 512 => Ok(()),
             Self::Qwen21(_) => Err("Qwen Image 2.1 currently supports 512x512 on the native NPU".into()),
+            Self::Flux2(c) if c.supports_resolution(resolution) => Ok(()),
+            Self::Flux2(_) => Err(format!("this FLUX.2 klein configuration has no native {resolution}-pixel kernels")),
         }
     }
 
@@ -447,10 +548,30 @@ impl ImageConfig {
                 }
                 Self::Flux3(flux) if flux.supports_edit() => {}
                 Self::Flux3(_) => return Err("this FLUX 3 configuration has no native editing kernels".into()),
-                _ => return Err(format!("{} editing has no native NPU route yet", self.model_id())),
+                // The published MOSS pipeline takes no reference image; editing is not
+                // part of the model (user decision 2026-11-08: reject, no img2img stand-in).
+                Self::Moss(_) => return Err(format!(
+                    "{} does not support editing: its published pipeline takes no reference image",
+                    self.model_id())),
+                Self::Qwen21(_) => return Err(format!("{} editing has no native NPU route yet",
+                                                      self.model_id())),
+                Self::Flux2(flux) if flux.supports_edit(resolution) => {}
+                Self::Flux2(_) => return Err(format!(
+                    "this FLUX.2 klein configuration has no native {resolution}-pixel editing kernels")),
             }
             if !image.is_absolute() || !image.is_file() {
                 return Err("reference image must be an existing absolute path".into());
+            }
+        }
+        if matches!(self, Self::Flux2(_)) {
+            if request.steps.is_some_and(|steps| steps > 50) {
+                return Err("FLUX.2 klein steps must be between 1 and 50".into());
+            }
+            if request.guidance_scale.is_some() {
+                return Err("FLUX.2 klein is step-distilled and does not use guidance_scale".into());
+            }
+            if !request.negative_prompt.is_empty() {
+                return Err("FLUX.2 klein does not support negative_prompt".into());
             }
         }
         if matches!(self, Self::Flux3(_) | Self::Qwen21(_)) {
@@ -538,6 +659,7 @@ pub fn generate(cfg: &ImageConfig, request: &ImageRequest, out: &Path) -> Result
         ImageConfig::Moss(moss) => generate_moss(moss, request, out, resolution),
         ImageConfig::Flux3(flux) => generate_flux3(flux, request, out, resolution),
         ImageConfig::Qwen21(qwen) => generate_qwen21(qwen, request, out, resolution),
+        ImageConfig::Flux2(flux) => generate_flux2(flux, request, out, resolution),
     }
 }
 
@@ -697,6 +819,44 @@ fn generate_qwen21(cfg: &Qwen21ImageConfig, request: &ImageRequest,
     Ok(image)
 }
 
+fn generate_flux2(cfg: &Flux2ImageConfig, request: &ImageRequest,
+                  out: &Path, resolution: u32) -> Result<PathBuf, String> {
+    let steps = request.steps.unwrap_or(4);
+    let mut process = if let Some(dibs) = &cfg.dibs {
+        let mut wrapped = Command::new(dibs);
+        wrapped.args(["run", "npu", "cpu", "--label", "Phlegm native FLUX.2 klein generation",
+                      "--eta"])
+            .arg(format!("{}m", (steps * if resolution > 512 { 2 } else { 1 } + 15).min(120)))
+            .arg("--").arg("bash");
+        wrapped
+    } else {
+        Command::new("bash")
+    };
+    let script = if cfg.env_script.is_some() { "source \"$1\" && shift && exec \"$@\"" }
+                 else { "shift && exec \"$@\"" };
+    process.arg("-c").arg(script).arg("phlegm-flux2-image")
+        .arg(cfg.env_script.clone().unwrap_or_default())
+        .arg(&cfg.python).arg("-m").arg("open_kernels.flux2_native_generate")
+        .arg("--prompt").arg(&request.prompt)
+        .arg("--model").arg(&cfg.model)
+        .arg("--kernels").arg(&cfg.kernels)
+        .arg("--size").arg(resolution.to_string())
+        .arg("--steps").arg(steps.to_string())
+        .arg("--seed").arg(request.seed.to_string())
+        .arg("--out").arg(out)
+        .current_dir(&cfg.repo_root);
+    if let Some(image) = &request.image {
+        process.arg("--image").arg(image);
+    }
+    let status = process.status().map_err(|e| format!("starting native FLUX.2 sampler: {e}"))?;
+    if !status.success() { return Err(format!("native FLUX.2 sampler exited with {status}")); }
+    let summary = read_manifest(&out.join("summary.json"))?;
+    let image = summary["image"].as_str().map(PathBuf::from)
+        .unwrap_or_else(|| out.join("image.png"));
+    if !image.is_file() { return Err("native FLUX.2 sampler did not produce a PNG".into()); }
+    Ok(image)
+}
+
 fn respond(request: Request, status: u16, value: Value) {
     let bytes = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
     let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
@@ -714,7 +874,8 @@ fn handle(mut request: Request, cfg: &ImageConfig) {
     }
     if request.method() == &Method::Get && request.url() == "/v1/models" {
         let owner = match cfg { ImageConfig::Moss(_) => "openmoss",
-            ImageConfig::Flux3(_) => "black-forest-labs", ImageConfig::Qwen21(_) => "Qwen" };
+            ImageConfig::Flux3(_) | ImageConfig::Flux2(_) => "black-forest-labs",
+            ImageConfig::Qwen21(_) => "Qwen" };
         respond(request, 200, json!({"object":"list","data":[{"id":cfg.model_id(),
             "object":"model","created":now_unix(),"owned_by":owner}]}));
         return;
@@ -742,7 +903,7 @@ fn handle(mut request: Request, cfg: &ImageConfig) {
     }
     let serial = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let prefix = match cfg { ImageConfig::Moss(_) => "moss", ImageConfig::Flux3(_) => "flux3",
-        ImageConfig::Qwen21(_) => "qwen21" };
+        ImageConfig::Qwen21(_) => "qwen21", ImageConfig::Flux2(_) => "flux2" };
     let name = format!("{prefix}{}-{}-{serial}", if edit { "-edit" } else { "" }, now_unix());
     let stem = cfg.output_root().join(format!("{name}-reference"));
     let parsed = if edit {
@@ -991,14 +1152,68 @@ mod tests {
             block_kernels: path.clone(), kernel_probes: path.clone(),
             vae_weights: path.clone(), vae_conv_kernels: path.clone(),
             vae_ew_kernels: path.clone(), vae_attention_kernel: path.clone(),
-            harness: path.clone(), output_root: path,
+            harness: path.clone(), output_root: path.clone(),
         });
         let mut edit = request;
         edit.model = None;
         edit.steps = Some(40);
         assert!(qwen.validate_request(&edit).unwrap_err().contains("editing"));
+        let kernels = root.join("moss-kernels");
+        fs::create_dir_all(&kernels).unwrap();
+        fs::write(kernels.join("manifest.json"), br#"{"resolution":512,"resolutions":[512]}"#).unwrap();
+        let moss = ImageConfig::Moss(MossImageConfig {
+            dibs: None, python: path.clone(), repo_root: path.clone(), env_script: path.clone(),
+            model: path.clone(), dit_weights: path.clone(), vae_weights: path.clone(),
+            tokenizer_dir: path.clone(), text_model: path.clone(), text_kernels: path.clone(),
+            text_binary: path.clone(), refine_kernels: String::new(),
+            condition_kernels: path.clone(), block_kernels: String::new(),
+            edge_kernels: kernels.clone(), vae_kernels: kernels, harness: path.clone(),
+            output_root: path.clone(),
+        });
+        let mut moss_edit = edit.clone();
+        moss_edit.steps = Some(50);
+        assert!(moss.validate_request(&moss_edit).unwrap_err().contains("does not support editing"));
         edit.image = None;
         assert!(qwen.validate_request(&edit).is_ok());
+        moss_edit.image = None;
+        assert!(moss.validate_request(&moss_edit).is_ok());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn flux2_sizes_and_edits_follow_the_kernel_marker() {
+        let root = std::env::temp_dir().join(format!("phlegm-flux2-test-{}", std::process::id()));
+        let kernels = root.join("kernels");
+        fs::create_dir_all(&kernels).unwrap();
+        fs::write(kernels.join("dit_kernels.json"),
+                  br#"{"complete":true,"resolutions":[512,1024],"edits":[512]}"#).unwrap();
+        let path = PathBuf::from("/unused");
+        let flux = Flux2ImageConfig {
+            backend: "flux2".into(), model_id: FLUX2_KLEIN_IDS[0].into(), dibs: None,
+            python: path.clone(), repo_root: path.clone(), env_script: None,
+            model: path.clone(), kernels, output_root: root.clone(),
+        };
+        let cfg = ImageConfig::Flux2(flux);
+        assert_eq!(cfg.model_id(), "black-forest-labs/FLUX.2-klein-4B");
+        let reference = root.join("ref.png");
+        fs::write(&reference, b"\x89PNG").unwrap();
+        let mut request = ImageRequest { prompt: "fox".into(), model: None,
+            negative_prompt: String::new(), size: "1024x1024".into(), steps: None,
+            guidance_scale: None, seed: 1, n: 1, response_format: default_response_format(),
+            image: None };
+        assert_eq!(cfg.validate_request(&request).unwrap(), 1024);
+        request.image = Some(reference.clone());
+        assert!(cfg.validate_request(&request).unwrap_err().contains("1024-pixel editing"));
+        request.size = default_size();
+        assert_eq!(cfg.validate_request(&request).unwrap(), 512);
+        request.guidance_scale = Some(4.0);
+        assert!(cfg.validate_request(&request).unwrap_err().contains("guidance_scale"));
+        request.guidance_scale = None;
+        request.steps = Some(51);
+        assert!(cfg.validate_request(&request).is_err());
+        request.steps = Some(4);
+        request.model = Some(FLUX2_KLEIN_IDS[1].into());
+        assert!(cfg.validate_request(&request).unwrap_err().contains("unsupported image model"));
         fs::remove_dir_all(&root).unwrap();
     }
 }

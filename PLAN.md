@@ -383,7 +383,21 @@ prompt upsampler and the published reference inference behavior. Acquisition,
 architecture differences, validation gates and current blockers are tracked
 in [the native image model plan](.plans/native-image-models.md). Do not register
 Qwen Image 2.1 or FLUX 3 as supported until actual NPU generation and editing
-pass. MOSS's pinned checkpoint, DiT weight packer, SiTU and q/k RoPE kernel
+pass.
+
+2026-11-08 scope (user): FLUX.2 [klein] 4B and 9B (distilled first; Base variants
+later) through Phlegm's own `phlegm image` / `serve-images`, ported from the
+existing klein schedule and validated against the published diffusers pipeline,
+not the external OFLM engine; Qwen Image 2.1 editing; 1024 px for every image
+model and mode. MOSS editing is rejected: its published pipeline takes no
+reference image, and the server says so. The 9B checkpoints are gated under a
+non-commercial licence. Plan: [FLUX.2 klein and image follow-ups](.plans/flux2-klein-native.md).
+2026-11-08 result: FLUX.2 [klein] 4B runs natively through `phlegm image` and
+`serve-images` (`backend=flux2`): text-to-image and one-reference edits at 512 and
+1024 on hardware, edits at 39 dB PSNR against the published pipeline; FLUX 3's
+1024 API request also passed. Details: [the klein spec](specs/open-engine/flux2-klein-native.md).
+
+MOSS's pinned checkpoint, DiT weight packer, SiTU and q/k RoPE kernel
 checks are recorded in [the MOSS plan](.plans/moss-image-native.md). Its
 headless Qwen3.5 text package, matching 40-set NPU kernel export, and
 all-token encoder path are implemented. A 17-token native NPU run agrees with
