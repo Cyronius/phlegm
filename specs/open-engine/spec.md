@@ -4876,6 +4876,18 @@ Timing (loaded host, load 6-11; development): see `.plans/flint-native.md`; thro
 tokens takes 132 s (sequential: 1009 s), passphrase found. Open: the host attention (scalar reference; the dominant host cost
 past ~1k tokens), NPU attention products, the shared expert as GEMMs instead of mbl visits, the tail error.
 
+**mbl rounding mode (2026-11-08; OPEN-FAMILY-LFM2MOE's paragraph has the fix).** Rebuilt mb_s256 ... mb_s8 (insts.bin
+unchanged; program 13616 / 16384, data 43008 / 65536). Harness at FF 512, one dispatch after the context load: y rel
+2.25e-3, h 3.95e-3 before (a core holds two gate / up bands here, so the first is half of them), 4.65e-4 / 3.00e-3 after
+= the later dispatches', bit for bit. The 815-token prompt plus its 32 greedy tokens: positions 768-814 differed from
+the 815-token run by up to 6.97 in a logit before, all 815 are bit-identical after. Gate, paired on today's binary (whose
+pre-fix numbers already differ from 11-04's: 756 / 815, median 9.19e-3, mean .042): short 64 / 64 and long 32 / 32 greedy
+tokens unchanged; long vs fp32 741 / 815, 1.07e-2, .061 after; three more prompts (745-860 tokens, own fp32 references)
+691 -> 678, 775 -> 772, 762 -> 763, medians 4.73e-3 -> 5.11e-3, 5.68e-3 -> 5.29e-3, 8.93e-3 -> 7.88e-3; the four pooled
+2984 -> 2954 / 3256 argmax-equal, median 7.06e-3 -> 7.13e-3, mean .065 -> .078 (single positions). Before vs after is
+as far apart as either is from fp32, as on LFM2.5: no direction beyond one perturbation's spread. Shipped in the model
+dir (old set kept as `open_kernels.prefix-rnd`).
+
 ### OPEN-FAMILY-HYV3: Tencent HY V3 (Hy-Memory-30B-A3B) derives its own spec and runs on its own recipe from the GGUF
 **Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_hyv3_hf`, `families.py`, `hyv3.py`,
 `designs/hyv3/{hy.py,gen_kernels.py,check_layer.py}`, `model/hyv3_gguf_reference.py`; runtime
@@ -5097,6 +5109,25 @@ route unless `LFM2MOE_BLOCK=0`, a default export's manifest equals `kernels/lfm2
 `open_kernels/` is that set (the sequential set kept as `open_kernels.seq`), and `phlegm run` (prefill route `auto`) takes it through
 a bridge built from the block runtime (`bridges/lfm2moe-blk`): a ~700-token prompt plus load 33 s against 133 s with
 `--prefill-route sequential`; the short chat prompt answers "The capital of France is Paris."
+
+**mbl rounding mode (2026-11-08).** `mbl` set the core's rounding mode only in its silu step, so on the first dispatch
+after a context change -- every layer's first `mb` dispatch of a block, in this route -- each core's first gate and up
+band rounded its dequantised weights to bf16 in the core's reset mode, not conv_even (OPEN-FAMILY-XING found it in `xmb`).
+`mbl_zero_ug.cc` now sets conv_even first; the core ELFs differ by that one `mov crrnd, #0xc`, the instruction streams
+are unchanged. Measured: the harness at LFM's widths (16 slots, random q4_1 blocks), one dispatch after the context load:
+y rel 6.70e-4, h 3.37e-3 before, 3.05e-4 / 3.12e-3 after, which is bit for bit the later dispatches' result (unchanged);
+a token's block-route logits no longer depend on the other tokens of its block (the 843-token prompt against itself plus
+its 32 greedy tokens, 107 real tokens in the 4th block instead of 75: positions 768-842 differed by up to 3.97 in a logit
+before, all 843 positions are bit-identical after; OPEN-FAMILY-HYV3's open item). The gate, paired on one binary: short
+and 843-token greedy tokens unchanged (16 / 16, 32 / 32); the before run reproduces the 11-03 dumps bit for bit; every
+prompt position changes, since the network is rounding-chaotic on these prompts (before vs after KL median 2.3e-2, as
+large as either's distance from fp32). The 843-token prompt moved the wrong way against fp32 (argmax 735 -> 707, median
+2.75e-2 -> 3.60e-2, mean .129 -> .160) and the right way against llama.cpp (682 -> 688, 3.68e-2 -> 2.96e-2); five more
+~800-1200-token prompts with their own fp32 references went both ways (median better on three, argmax on three), and the
+six pooled are 5039 -> 5013 of 5745 argmax-equal, median 2.26e-2 -> 2.37e-2, mean .136 -> .132: no direction beyond the
+spread one perturbation produces. Cut to 3 layers (one MoE layer) the change is confined to the first dispatches' tokens
+(171 positions) and is ~0.3 % of their KL either way. The model dir's set is the rebuilt one (old set kept as
+`open_kernels.prefix-rnd`).
 
 ### OPEN-FAMILY-NEMOTRONH: NVIDIA Nemotron-H MoE (Nemotron 3.5 Lightning 30B-A3B) derives its own spec and runs on its own recipe from the GGUF
 **Applies to:** openflowlm-next (`open_kernels/recipes/spec.py` `_nemotronh_hf`, `families.py`, `nemotronh.py`,
