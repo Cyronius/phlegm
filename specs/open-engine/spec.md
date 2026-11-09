@@ -2497,6 +2497,20 @@ keys aside); that set is the model dir's `open_kernels/` (the 10-31 set kept as
 built from the block runtime (`bridges/gemma4moe-blk`): a ~700-token prompt plus load 37 s against
 105 s with `--prefill-route sequential` (development, one run each).
 
+mb4 rounding mode (2026-11-08): mb4 set the core's rounding mode only in its gelu step, so on the first dispatch after a
+context change (every layer's first `mb` dispatch of a block) each core's first gate and up bands rounded their
+dequantised weights to bf16 in the core's reset mode (OPEN-FAMILY-XING found it in `xmb`). `mb4_zero_ug.cc` now sets
+conv_even first; the core ELFs differ by that one `mov crrnd, #0xc` (program 14400 / 16384, data 53248 / 65536), the
+instruction streams are unchanged. The harness (16 slots, random Q4_0 blocks), one dispatch after the context load: y rel
+3.89e-3, h 3.44e-3 before, 3.24e-3 / 2.92e-3 after = the later dispatches', bit for bit. A token's logits no longer depend on
+the other tokens of its block (the 1450-token prompt against the 1482-token forced one: positions 1283-1449 differed by up
+to 11.8 in a logit before, all 1450 bit-identical after). The gate, paired on one binary (the before run reproduces the
+11-03 `blkgate` dumps bit for bit): short 32 / 32 greedy = llama.cpp, prompt KL(ref32 || npu) median 6.4e-4 -> 5.4e-4, max
+.68 -> .17, flips 1 -> 0; long prompt KL median 1.35e-2 -> 1.24e-2 (the bf16 control 1.26e-2), mean .0639 -> .0641, flips
+147 -> 138 (control 136), and the 32 greedy tokens now equal llama.cpp's all the way (17 / 32 before, the 0.374 / 0.371
+near tie); the 1482 tokens prefilled whole: median 1.27e-2 -> 1.17e-2 (control 1.19e-2), flips 143 -> 138 (control 137).
+The model dir's set is the rebuilt one (old set kept as `open_kernels.prefix-rnd`).
+
 **Procedure (manual):** greedy tokens against llama.cpp on the same GGUF; every prefill
 position's log-KL against an independent fp32 reference and against a BF16-rounding
 control; a prompt past the 1024-row window; `phlegm run` and `phlegm serve`.
