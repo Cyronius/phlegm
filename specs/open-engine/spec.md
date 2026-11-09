@@ -4991,12 +4991,22 @@ on 10-31 (four candidates within .64 nats); teacher-forced over llama.cpp's 32 g
 32/33 positions agree, partial KL median 2.4e-5 (sequential: 32/33, 1.4e-5). Prefixes of 256 / 257 / 300 tokens (one
 block, one block + 1, a tail): 8/8 greedy equal to sequential. Kept open: a token's block-route logits depend at rounding
 level on the other real tokens of its block (the same 68 positions prefilled in a block of 68 and of 100 real tokens
-differ; both sit at the control's distance from fp32); the host stages are per token, so mbl or the GEMM is suspected. Paired timing, 836 tokens: block 17.6 / 17.9 s (21 ms a token), sequential 186 / 145 s; a
+differ; both sit at the control's distance from fp32); the host stages are per token, so mbl or the GEMM is suspected
+(closed 2026-11-08, below: it was mbl's first-dispatch rounding mode). Paired timing, 836 tokens: block 17.6 / 17.9 s (21 ms a token), sequential 186 / 145 s; a
 full block is ~2.3 s of experts, ~0.5 s of GEMMs and host attention growing with position (1.0 / 1.8 / 3.4 s at blocks
 0 / 256 / 512).
 Through `phlegm serve` (bridge `bridges/hyv3-blk`, the model dir's default kernels) at a 32768-token capacity: a
 2938-token prompt 93.6 s (the sequential set: 656.7 s) and a 4621-token needle prompt answered correctly in 183 s
 (sequential: 1211 s).
+
+**mbl rounding mode (2026-11-08; OPEN-FAMILY-LFM2MOE's paragraph has the fix).** Rebuilt mb_s8 ... mb_s64 (insts.bin
+unchanged; program 14384 / 16384, data 47104 / 65536). Harness at FF 768 (16 slots, random q4_1 blocks), one dispatch after
+the context load: y rel 1.16e-3, h 3.46e-3 before, 3.90e-4 / 2.96e-3 after = the later dispatches', bit for bit. The
+block-composition item above is closed: the 836-token prompt against the 868-token teacher-forced one, positions 768-835
+differed by up to 2.08 in a logit before and are bit-identical after. Gate, paired on today's binary: short 64 / 64 and
+long 32 / 32 greedy unchanged; long vs fp32 815 -> 818 / 836, median 2.09e-3 -> 2.14e-3, mean 5.27e-3 -> 5.15e-3, max .49 ->
+.21; vs the bf16 control 805 -> 815; vs llama.cpp 797 -> 801; short vs fp32 26 -> 27 / 27; teacher-forced continuation vs
+llama.cpp 33 / 33 both, median 2.1e-5 -> 1.8e-5. Shipped in the model dir (old set kept as `open_kernels.prefix-rnd`).
 
 Not established: a clean benchmark, NPU attention products for the block (host attention dominates past ~1k tokens), one
 context per layer.
