@@ -494,9 +494,10 @@ Two more standalone diffs against #225's head `beccd46`, recorded in `sources.js
   `gemma4_moe_batch/mb4.h` set the core's rounding mode only in their silu / gelu step, so the first gate /
   up band of a dispatch on a fresh core (the first after a context change) rounds its dequantised weights
   in the core's default mode. On Xing's copy the first dispatch's h differed from every later one's for
-  the first 8 slots (3.2e-3 against 2.8e-3 from fp64); `xmb_zero_ug.cc` sets `conv_even` first. Flint,
-  LFM2.5, Hy-Memory and Gemma 4 run the unchanged kernels and would want the same one-line fix and their
-  own gates.
+  the first 8 slots (3.2e-3 against 2.8e-3 from fp64); `xmb_zero_ug.cc` sets `conv_even` first.
+  Fixed the same way on 2026-11-08 in `mbl_zero_ug.cc` (Flint, LFM2.5, Hy-Memory), `mb4_zero_ug.cc`
+  (Gemma 4) and `moe_batch/mb_zero_ug.cc` (the eight 35B-A3B GGUF folders; it had the same `mb_silu`-only
+  setting), each re-gated (OPEN-FAMILY-LFM2MOE, OPEN-FAMILY-GEMMA4-MOE, OPEN-MOE-BATCH).
 
 `designs/dense/dx_attn.py` now takes its recipe module from `for_spec` and its flags from the
 recipe's `attn_flags`, and gained `dx.py`'s ATTN_QLOCAL q loop. It emits byte-identical MLIR

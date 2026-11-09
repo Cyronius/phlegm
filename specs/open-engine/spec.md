@@ -1619,6 +1619,9 @@ The 491-token prompt, against llama.cpp CPU on the same file:
 - `phlegm run` and `serve` (streamed and not) answer correctly for both.
 - Development timing equals KAT's paired control in the same window. No BF16 comparison was made
   for these two. Evidence: `.plans/qwen35moe-gguf.md`.
+- Since the 2026-11-08 moe_batch rounding-mode fix (OPEN-MOE-BATCH, which has the re-gate of all eight
+  folders) Nex Q4pure's block route departs from llama.cpp CPU at short token 22, a near tie (CPU -1.03 /
+  -1.14, the NPU -1.049 / -1.051), and matches llama.cpp Vulkan for all 64.
 
 ### OPEN-FAMILY-CLOVER: Clover-35B-A3B-Preview's causal path on the qwen35moe GGUF route
 **Applies to:** OPEN-FAMILY-QWEN36MOE-GGUF's view and kernels, unchanged; the model directory's
@@ -1663,7 +1666,8 @@ Halo):** [meas] unless marked.
 | NPU block vs mainline e4b6c8ca (`clover_moe`) | 465/491 | 5.1e-3 / 1.6e-2 / 7.6e-2 |
 
 - Greedy, 32-token prompt: sequential 64/64 with llama.cpp CPU and Vulkan; block route departs at token 6
-  on a near tie. 491-token prompt, 48 greedy: block 48/48; sequential departs at 23 on a near tie.
+  on a near tie (64/64 since the 2026-11-08 moe_batch rounding-mode fix, OPEN-MOE-BATCH). 491-token prompt,
+  48 greedy: block 48/48; sequential departs at 23 on a near tie.
   llama.cpp's greedy has to be requested with `repeat_penalty 1.0`, because the converter copies
   generation_config's 1.05 into `general.sampling.penalty_repeat`.
 - `phlegm run` and `serve` (streamed and not) answer, the thinking going to `reasoning_content`.
@@ -7870,6 +7874,29 @@ the nibbles. 30.4 ms against 16.3. It is ~24x more accurate (rel_fro 2.0e-05
 against 4.7e-04) and is recorded in `.claude/plans/moe-stream-rate.md` in case
 the register pressure is ever solved. 14.21 ms still stands against an 11.55 ms
 DMA floor; the remaining ~2.3 ms is the scale application.
+
+**Result 2026-11-08 (rounding mode).** The core set its rounding mode only in `mb_silu`, so on the first dispatch after
+a context change (every layer's MoE pass, in the layer-major block route) each core's first gate and up bands rounded
+their dequantised weights to bf16 in the core's reset mode, not conv_even (OPEN-FAMILY-XING found it in `xmb`; mbl and
+mb4 had it too). `mb_zero_ug.cc` now sets conv_even first. The core ELFs differ by that one `mov crrnd, #0xc`, in a
+slot that held a `nopm` (program 12752 / 16384), and the six insts.bin are unchanged. Harness (16 slots), one dispatch
+after the context load: y rel_fro 4.28e-3, h 4.80e-3 before; 4.74e-4 / 3.01e-3 after, which is the later dispatches'
+result bit for bit (unchanged). A token's logits no longer depend on the rest of the prompt's routing: the 491-token
+prompt against itself plus its 32 greedy tokens differed at 473 / 490 / 487 of 491 positions before (KAT Q4pure / Nex Q4K /
+Clover, up to 2.1 / 11.9 / 16.3 in a logit) and is bit-identical after. The eight 35B-A3B folders were re-gated on one
+CLI (`--gemm-block`), before / after paired, and every before run reproduced its folder's recorded figures. Long prompt
+against llama.cpp CPU on the same file, argmax and median partial KL, before -> after: KAT Q4pure 461 -> 463, 2.10e-3 ->
+1.70e-3 (max 1.02 -> .29); KAT Q4K 452 -> 454, 5.0e-3 -> 3.3e-3; KAT bartowski 430 -> 429, 1.86e-2 -> 1.88e-2; Nex Q4pure
+451 -> 453, 5.7e-3 -> 4.9e-3 (max 2.38 -> 1.15); Nex Q4K 439 -> 438, 7.3e-3 -> 6.9e-3 (max 2.84 -> .68); Ornith Q4pure 413
+-> 418, 1.32e-3 -> 1.37e-3; Ornith Q4K 403 -> 408, 1.23e-2 -> 1.29e-2; Clover 464 -> 460, 4.9e-3 -> 4.2e-3 (max 1.12 ->
+.41). Against llama.cpp Vulkan the argmax counts went 454 -> 460 (KAT Q4K), 459 -> 454 (Nex Q4pure), 443 -> 446 (Nex Q4K),
+408 -> 411 (Ornith Q4pure), 420 -> 430 (Ornith Q4K) and 466 -> 464 (Clover). The moves are mixed in sign and small
+against llama.cpp's own CPU-vs-Vulkan gap on these files (450 / 491 Nex Q4pure, 411 Ornith Q4pure, 407 Ornith Q4K). Greedy changes: Clover short 6 / 64 -> 64 / 64 (block now equals sequential); Ornith Q4pure
+long 25 / 48 -> 48 / 48. Two short-prompt decodes departed from their old reference at near ties: Nex Q4pure at token 22
+(llama.cpp CPU -1.03 / -1.14, after -1.049 / -1.051; after now matches llama.cpp Vulkan 64 / 64 where it had matched CPU),
+and Nex Q4K at token 43 (no longer BF16's 64 / 64 but 42; the NPU went from -0.48 / -0.96 to -0.72 / -0.67, llama.cpp Q4_K
+on that path gives -0.49 / -0.95). Ornith Q4K long greedy 8 -> 3 / 48 against llama.cpp CPU. The other greedy runs are
+unchanged. Every folder's `open_kernels/` is the rebuilt set; the old set is kept as `open_kernels.prefix-rnd`.
 
 ### OPEN-PREFILL-ATTN: the block attention's products on the NPU
 **Applies to:** openflowlm-next (`open_kernels/designs/attn_block/`, `open_kernels/recipes/{qwen36moe,dense}.py`, `src/open_qwen36/{manifest,block_host,core}.cpp`, `utilities/dense-decode-probe/attn_route_check.py`)
