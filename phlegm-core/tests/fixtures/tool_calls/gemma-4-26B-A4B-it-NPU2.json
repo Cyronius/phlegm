@@ -1,0 +1,64 @@
+{
+  "model": "gemma-4-26B-A4B-it-NPU2",
+  "command": [
+    "/home/cyrus/.local/bin/llama",
+    "serve",
+    "-m",
+    "/home/cyrus/models/gemma-4-26B-A4B-it-NPU2/model.gguf",
+    "--device",
+    "none",
+    "-ngl",
+    "0",
+    "-t",
+    "8",
+    "-c",
+    "2048",
+    "-np",
+    "1",
+    "--port",
+    "8415",
+    "--host",
+    "127.0.0.1",
+    "--jinja",
+    "--chat-template-file",
+    "/home/cyrus/models/gemma-4-26B-A4B-it-NPU2/chat_template.jinja"
+  ],
+  "build": "0.8.0-dev build 12015 commit a34de8618 Clang 22.1.8 Linux x86_64",
+  "request": {
+    "model": "gemma-4-26B-A4B-it-NPU2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Call get_weather for Paris now. Do not answer from memory. Do not explain."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "chat_template_kwargs": {
+      "enable_thinking": false,
+      "reasoning_effort": "low"
+    }
+  },
+  "prompt": "<|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Get the weather for a city.<|\"|>,parameters:{properties:{city:{type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nCall get_weather for Paris now. Do not answer from memory. Do not explain.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+  "output": "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>",
+  "tokens_predicted": 15,
+  "source": "CPU model output"
+}

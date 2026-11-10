@@ -1,0 +1,64 @@
+{
+  "model": "gpt-oss-20b-NPU2",
+  "command": [
+    "/home/cyrus/.local/bin/llama",
+    "serve",
+    "-m",
+    "/home/cyrus/models/gpt-oss-20b-NPU2/model.gguf",
+    "--device",
+    "none",
+    "-ngl",
+    "0",
+    "-t",
+    "8",
+    "-c",
+    "2048",
+    "-np",
+    "1",
+    "--port",
+    "8415",
+    "--host",
+    "127.0.0.1",
+    "--jinja",
+    "--chat-template-file",
+    "/home/cyrus/models/gpt-oss-20b-NPU2/chat_template.jinja"
+  ],
+  "build": "0.8.0-dev build 12015 commit a34de8618 Clang 22.1.8 Linux x86_64",
+  "request": {
+    "model": "gpt-oss-20b-NPU2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Call get_weather for Paris now. Do not answer from memory. Do not explain."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "chat_template_kwargs": {
+      "enable_thinking": false,
+      "reasoning_effort": "low"
+    }
+  },
+  "prompt": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-11-09\n\nReasoning: low\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Tools\n\n## functions\n\nnamespace functions {\n\n// Get the weather for a city.\ntype get_weather = (_: {\ncity: string,\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>Call get_weather for Paris now. Do not answer from memory. Do not explain.<|end|><|start|>assistant",
+  "output": "<|channel|>analysis<|message|>We need to call function.<|end|><|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"city\":\"Paris\"}",
+  "tokens_predicted": 30,
+  "source": "CPU model output"
+}

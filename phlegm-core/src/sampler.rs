@@ -75,6 +75,7 @@ pub struct Sampler {
     counts: std::collections::HashMap<u32, u32>,
     produced: usize,
     rng: Rng,
+    constraint: Option<Box<crate::structured_output::Constraint>>,
 }
 
 impl Sampler {
@@ -94,12 +95,22 @@ impl Sampler {
             counts: Default::default(),
             produced: 0,
             rng: Rng::new(seed),
+            constraint: None,
         }
     }
 
     pub fn with_penalties(mut self, penalties: Penalties) -> Sampler {
         self.penalties = penalties;
         self
+    }
+
+    pub fn with_constraint(mut self, constraint: crate::structured_output::Constraint) -> Self {
+        self.constraint = Some(Box::new(constraint));
+        self
+    }
+
+    pub fn is_constrained(&self) -> bool {
+        self.constraint.is_some()
     }
 
     pub fn greedy(&self) -> bool {
@@ -192,19 +203,68 @@ impl Sampler {
     /// `logits`: `[VOCAB]` f32. `history`: prior token ids (for repetition
     /// penalty). Returns the next token id, which the sampler counts as the reply's next token.
     pub fn sample(&mut self, logits: &[f32], history: &[i64]) -> usize {
-        let id = self.choose(logits, history);
-        *self.counts.entry(id as u32).or_default() += 1;
-        self.produced += 1;
-        id
+        if self.constraint.is_none() {
+            let id = self.choose::<false>(logits, history, &[]);
+            *self.counts.entry(id as u32).or_default() += 1;
+            self.produced += 1;
+            return id;
+        }
+        self.try_sample(logits, history).expect("sampling failed")
     }
 
-    fn choose(&mut self, logits: &[f32], history: &[i64]) -> usize {
+    pub fn try_sample(&mut self, logits: &[f32], history: &[i64]) -> Result<usize, String> {
+        if self.constraint.is_none() {
+            return Ok(self.sample(logits, history));
+        }
+        let allowed = self.constraint.as_mut().unwrap().allowed(logits.len());
+        if !allowed.iter().any(|v| *v) {
+            return Err("structured output has no valid token in the backend vocabulary".into());
+        }
+        let id = self.choose::<true>(logits, history, &allowed);
+        if let Some(c) = &mut self.constraint {
+            if !c.advance(id) {
+                return Err("structured output rejected sampled token".into());
+            }
+        }
+        *self.counts.entry(id as u32).or_default() += 1;
+        self.produced += 1;
+        Ok(id)
+    }
+
+    fn choose<const MASKED: bool>(
+        &mut self,
+        logits: &[f32],
+        history: &[i64],
+        allowed: &[bool],
+    ) -> usize {
+        // With no transforms, greedy decoding can read the original logits. In particular,
+        // adding a dormant constraint must not add a full-vocabulary allocation/copy.
+        if !MASKED
+            && self.greedy()
+            && self.repetition_penalty == 1.0
+            && self.penalties.presence == 0.0
+            && self.penalties.frequency == 0.0
+            && self.penalties.ramps.iter().all(|r| r.strength == 0.0)
+        {
+            assert!(
+                logits.iter().all(|v| v.is_finite()),
+                "non-finite logits (interval-3 blowup?)"
+            );
+            return argmax(logits);
+        }
         let mut lg = logits.to_vec();
         assert!(lg.iter().all(|v| v.is_finite()), "non-finite logits (interval-3 blowup?)");
 
         self.apply_reply_penalties(&mut lg);
         self.apply_repetition_penalty(&mut lg, history);
         self.apply_ramps(&mut lg);
+        if MASKED {
+            for (v, keep) in lg.iter_mut().zip(allowed) {
+                if !keep {
+                    *v = f32::NEG_INFINITY;
+                }
+            }
+        }
 
         if self.greedy() {
             return argmax(&lg);
@@ -218,7 +278,7 @@ impl Sampler {
         // top-p 0.95: 1.1 ms a token instead of 4.2, release build, loaded host, 2026-11-04). The
         // draws are those of masking the full vector: masked tokens have probability exactly 0
         // and add nothing to the running sum. Top-p alone still sorts the whole vocabulary.
-        let idx: Vec<usize> = match self.top_k {
+        let mut idx: Vec<usize> = match self.top_k {
             k if k > 0 && k < lg.len() => {
                 let mut scratch = lg.clone();
                 let kth = *scratch.select_nth_unstable_by(k - 1, |a, b| b.partial_cmp(a).unwrap()).1;
@@ -226,6 +286,9 @@ impl Sampler {
             }
             _ => (0..lg.len()).collect(),
         };
+        if MASKED {
+            idx.retain(|&i| lg[i].is_finite());
+        }
         let mut cand: Vec<f32> = idx.iter().map(|&i| lg[i]).collect();
         self.apply_top_p(&mut cand);
         let probs = softmax(&cand);
@@ -279,6 +342,51 @@ fn softmax(x: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constraints_win_over_logits_penalties_and_sampled_candidate_lists() {
+        use crate::structured_output::{Constraint, Vocabulary};
+        for (t, k, p) in [(0., 0, 1.), (1., 64, 0.95), (1., 0, 0.95)] {
+            let vocab = std::sync::Arc::new(Vocabulary::new(
+                (0..256)
+                    .map(|b| Some(vec![b as u8]))
+                    .chain([None])
+                    .collect(),
+                [256].into_iter().collect(),
+            ));
+            let c = Constraint::new(&serde_json::json!({"const":"ok"}), vocab).unwrap();
+            let mut sampler = Sampler::new(t, k, p, 1.1, Some(7))
+                .with_constraint(c)
+                .with_penalties(Penalties {
+                    presence: 2.,
+                    frequency: 2.,
+                    ramps: vec![Ramp {
+                        ids: vec![b'x' as u32, 256],
+                        strength: 20.,
+                        start: 0,
+                        window: 1,
+                        until_seen: false,
+                    }],
+                    ..Default::default()
+                });
+            let mut history = vec![];
+            for expected in [
+                b'"' as usize,
+                b'o' as usize,
+                b'k' as usize,
+                b'"' as usize,
+                256,
+            ] {
+                let mut logits = vec![-100.; 257];
+                logits[b'x' as usize] = 1000.;
+                logits[256] = 999.;
+                logits[expected] = 900.;
+                let got = sampler.try_sample(&logits, &history).unwrap();
+                assert_eq!(got, expected);
+                history.push(got as i64);
+            }
+        }
+    }
 
     // Mirrors sampler.py's __main__ self-test.
     fn synthetic_logits(seed: u64, v: usize, peak: usize, peak_val: f32) -> Vec<f32> {

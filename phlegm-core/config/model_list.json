@@ -6,6 +6,23 @@
     "prefill_route": "auto"
   },
   "models": {
+    "qwen3": {
+      "0.6b-q4km": {
+        "name": "Qwen3-0.6B-Q4_K_M",
+        "published_gguf": {
+          "repo": "unsloth/Qwen3-0.6B-GGUF",
+          "file": "Qwen3-0.6B-Q4_K_M.gguf",
+          "revision": "50968a4468ef4233ed78cd7c3de230dd1d61a56b"
+        },
+        "details": {
+          "family": "qwen3",
+          "parameter_size": "0.6B",
+          "quantization_level": "Q4_K_M",
+          "npu_ready": false,
+          "status": "Tokenizer verified; NPU kernels and model gates pending P5 S4"
+        }
+      }
+    },
     "clover": {
       "35b-a3b-q4pure": {
         "name": "Clover-35B-A3B-Preview-Q4pure-NPU2",

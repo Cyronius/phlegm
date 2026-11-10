@@ -1,0 +1,13 @@
+{
+  "qwen36moe": "qwen35moe",
+  "qwen35": "saluki",
+  "flint": "flint-blk",
+  "gemma4": "gemma4moe-blk",
+  "gptoss": "gptoss",
+  "hyv3": "hyv3-blk",
+  "lfm2moe": "lfm2moe-blk",
+  "lfm3": "lfm3",
+  "nemotronh": "nemotronh",
+  "llama3": "nanbeige",
+  "xing": "xing-blk"
+}

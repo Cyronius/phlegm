@@ -90,7 +90,11 @@ mod tests {
     #[test]
     fn chat_template_flattens_turns() {
         let t = PlaceholderTokenizer::new();
-        let msgs = vec![ChatMessage { role: "user".into(), content: "hi".into() }];
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            ..Default::default()
+        }];
         assert_eq!(t.apply_chat_template(&msgs), "user: hi\nassistant:");
     }
 }

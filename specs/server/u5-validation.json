@@ -1,0 +1,103 @@
+{
+  "date": "2026-11-09",
+  "item": "U5 follow-up",
+  "kind": "offline correctness and mock SDK evidence; no performance measurement or NPU execution",
+  "base_revision": "7742985b53e464a1a8171321fe4e33281905ec8a",
+  "dependencies": "no new crates or downloads",
+  "checks": [
+    {
+      "command": "dibs run build --label 'U5 follow-up: compile and focused server tests' --eta 5m -- cargo test -p phlegm-core --offline server::tests -- --nocapture > /tmp/u5-focused.log 2>&1",
+      "result": "compile failed: malformed decode_stream callback signature; fixed",
+      "log": "/tmp/u5-focused.log",
+      "sha256": "a8724c013e1496fa9a11edd2bc53b1534c4349d028364c895354234e952b8fdf"
+    },
+    {
+      "command": "dibs run build --label 'U5 follow-up: focused server tests' --eta 5m -- cargo test -p phlegm-core --offline server::tests -- --nocapture > /tmp/u5-focused2.log 2>&1",
+      "result": "20 passed, 1 ignored",
+      "log": "/tmp/u5-focused2.log",
+      "sha256": "2e7172ca0cccda3053fce39f55bee9b5232aaaf0d2a463f5e3e12b4c80109597"
+    },
+    {
+      "command": "dibs run build --label 'U5 follow-up: focused regression tests' --eta 5m -- cargo test -p phlegm-core --offline --lib > /tmp/u5-lib.log 2>&1",
+      "result": "115 passed, 5 ignored",
+      "log": "/tmp/u5-lib.log",
+      "sha256": "49f8d14dc22d532167cbe9f23e18ac117764299195f354042b9c0f83e0e45154"
+    },
+    {
+      "command": "dibs run build --label 'U5 follow-up: UTF-8 and constraint regressions' --eta 5m -- cargo test -p phlegm-core --offline server::tests -- --nocapture > /tmp/u5-focused3.log 2>&1",
+      "result": "compile failed: add_tokens takes owned AddedToken; fixed",
+      "log": "/tmp/u5-focused3.log",
+      "sha256": "d043d19994784467b7b1c084c5c96603b77c490a14c23a12d8ed3ec6e3c9e79a"
+    },
+    {
+      "command": "dibs run build --label 'U5 follow-up: server and fake-bridge checks' --eta 5m -- cargo test -p phlegm-core --offline --lib > /tmp/u5-lib2.log 2>&1",
+      "result": "118 passed, 1 failed, 5 ignored; test fixture allowed leading JSON whitespace; fixed",
+      "log": "/tmp/u5-lib2.log",
+      "sha256": "b5984bcc207f92d55bc6fa20714e8491072fb108bacef3b107b488ff6a548a80"
+    },
+    {
+      "command": "dibs run build --label 'U5 follow-up: build mock SDK server' --eta 5m -- cargo build -p phlegm-cli --offline > /tmp/u5-build.log 2>&1",
+      "result": "passed after dibs wait --pressure (initial build launch blocked at CPU 92%)",
+      "log": "/tmp/u5-build.log",
+      "sha256": "c84ab1b670ad4cbf87f7434a1b944844fcdfc3fbc8875a7f506c8b8e04c73e3d"
+    },
+    {
+      "command": "dibs run build --label 'U5 follow-up: full core and CLI regression' --eta 5m -- cargo test -p phlegm-core -p phlegm-cli --offline > /tmp/u5-full.log 2>&1",
+      "result": "core 120 passed, 5 ignored; integration 1+1 passed, 2 ignored; CLI 4 passed",
+      "log": "/tmp/u5-full.log",
+      "sha256": "ce93d95c635ac55785f710b6182c523c05253f6a1a025e5bc511468722b4691d"
+    },
+    {
+      "command": "/tmp/phlegm-u5-sdk-venv/bin/python -I phlegm-core/tests/check_u5_sdk.py > /tmp/u5-sdk.log 2>&1",
+      "result": "24 passed; openai 3.48.0",
+      "log": "/tmp/u5-sdk.log",
+      "sha256": "ac26ad5efe04b293f7d80d591f10274f34c41680ef0c035bbbe0abfd379283d2"
+    },
+    {
+      "command": "dibs run build --label 'U5 follow-up: legacy Unicode logprobs' --eta 5m -- cargo test -p phlegm-core --offline server::tests::legacy_unicode_offsets_and_bytes_preserve_split_characters -- --nocapture > /tmp/u5-unicode.log 2>&1",
+      "result": "1 passed",
+      "log": "/tmp/u5-unicode.log",
+      "sha256": "69f7b473f13677d88da4b8151ab6e842c4c6f433fc83c71d24ec99f2e7ffc6fc"
+    },
+    {
+      "command": "dibs run build --label 'U5 follow-up: final tests and SDK binary' --eta 5m -- sh -c 'cargo test -p phlegm-core -p phlegm-cli --offline && cargo build -p phlegm-cli --offline' > /tmp/u5-final.log 2>&1",
+      "result": "core 121 passed, 5 ignored; integration 1+1 passed, 2 ignored; CLI 4 passed; CLI build passed",
+      "log": "/tmp/u5-final.log",
+      "sha256": "658d45a072c1b3df034abbbaacc18dd16c1f0181b9465b3d607b7b85b083b74e"
+    },
+    {
+      "command": "/tmp/phlegm-u5-sdk-venv/bin/python -I phlegm-core/tests/check_u5_sdk.py > /tmp/u5-sdk-final.log 2>&1",
+      "result": "24 passed again against final rebuilt binary; openai 3.48.0",
+      "log": "/tmp/u5-sdk-final.log",
+      "sha256": "ac26ad5efe04b293f7d80d591f10274f34c41680ef0c035bbbe0abfd379283d2"
+    }
+  ],
+  "retained_failures": [
+    {
+      "verbatim": "error: expected one of `!`, `+`, `,`, `::`, or `>`, found `->`",
+      "resolution": "mechanical callback migration accidentally touched decoder signature; restored decoder FnMut(u32); compiler cascades retained in /tmp/u5-focused.log"
+    },
+    {
+      "verbatim": "error[E0271]: type mismatch resolving `<&[AddedToken; 1] as IntoIterator>::Item == AddedToken`",
+      "resolution": "test fixture now passes owned AddedToken array"
+    },
+    {
+      "verbatim": "assertion `left == right` failed\n  left: String(\"\\r\\t \\n\\\"A\\\"\")\n right: \"\\\"A\\\"\"",
+      "resolution": "test logits now prefer the next valid token while leaving the invalid x as the raw top logit"
+    }
+  ],
+  "untested": [
+    "All hardware inference and hardware SDK loops: task prohibits NPU use",
+    "Ignored native/model/tokenizer/performance prerequisite tests retain their original prerequisites"
+  ],
+  "additional_checks": [
+    "git diff --check: passed",
+    "rustup run 1.99.1 rustfmt --edition 2021 phlegm-core/src/server_generation.rs phlegm-core/src/server_generation_tests.rs phlegm-core/src/backend.rs phlegm-core/src/mock_backend.rs: passed",
+    "rustup run 1.99.1 rustfmt --edition 2021 phlegm-core/src/tool_calls.rs: passed",
+    "python -I AST parse of phlegm-core/tests/check_u5_sdk.py: passed"
+  ],
+  "mock_servers": [
+    "dibs run port-8767 --label 'U5 follow-up: mock SDK server' --eta 10m -- target/debug/phlegm serve --mock --port 8767",
+    "dibs run port-8767 --label 'U5 follow-up: final mock SDK server' --eta 5m -- target/debug/phlegm serve --mock --port 8767"
+  ]
+}

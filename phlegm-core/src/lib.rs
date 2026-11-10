@@ -1,5 +1,7 @@
 pub mod backend;
+pub mod embeddings;
 pub mod bench;
+pub mod bridge_resolver;
 pub mod gguf;
 pub mod image;
 pub mod mock_backend;
@@ -12,3 +14,6 @@ pub mod tokenizer;
 pub mod npu_lock;
 #[cfg(feature = "npu")]
 pub mod xrt;
+
+pub mod tool_calls;
+pub mod structured_output;

@@ -16,9 +16,11 @@ mod bench;
 const USAGE: &str = "usage: phlegm <command>
 
 commands:
-  run --model-dir DIR --kernels DIR --bridge EXE --prompt TEXT [--max-tokens N (0 or -1: until the context is full)] [--seed N] [--turbo]
-  serve --model-dir DIR --kernels DIR --bridge EXE [--turbo] [--host 127.0.0.1] [--port 52625]
-  serve --mock [--host H] [--port N]   (--host / --port override PHLEGM_HOST / PHLEGM_PORT)
+  run --model-dir DIR [--kernels DIR] [--bridge EXE] --prompt TEXT [--max-tokens N (0 or -1: until the context is full)] [--seed N] [--turbo]
+  serve --model-dir DIR [--kernels DIR] [--bridge EXE] [--turbo] [--host 127.0.0.1] [--port 52625]
+  serve --embed-model DIR [--embed-python PYTHON] [--embed-source DIR] [--embed-model-name NAME]
+  serve --mock [--host H] [--port N]
+  every serve: [--api-key KEY] [--allowed-origins ORIGINS]   (--host / --port override PHLEGM_HOST / PHLEGM_PORT)
   config show [--model-dir DIR | --config-model TAG] [--json]   the settings in effect, and where each comes from
   config set [--model-dir DIR | --config-model TAG] --config-key KEY --config-value VALUE
   config unset [--model-dir DIR | --config-model TAG] --config-key KEY
@@ -35,7 +37,7 @@ run and serve take the model's settings (phlegm config show --model-dir DIR), ea
   --presence-penalty P  --frequency-penalty F  --repetition-penalty-scope context|response
   --length-bias B --length-bias-start N --length-bias-window N  --think-end-bias B --think-end-start N --think-end-window N
 --turbo selects experimental lower-precision kernels from DIR/turbo; requires a matching bundle.
-Build the resident NPU bridge with benchmarks/reference/build.ps1 first.";
+--kernels defaults to DIR/open_kernels; --bridge selects a reference bridge explicitly.";
 
 fn flags(args: &[String]) -> Result<HashMap<String, String>, String> {
     let mut out = HashMap::new();
@@ -92,11 +94,14 @@ fn npu_options(map: &HashMap<String, String>, settings: &Resolved) -> Result<Npu
             .map(|v| v.parse().map_err(|_| format!("invalid {key}")))
             .unwrap_or(Ok(default))
     };
+    let model_dir = PathBuf::from(required(map, "--model-dir")?);
+    let kernel_dir = map.get("--kernels").map(PathBuf::from).unwrap_or_else(|| model_dir.join("open_kernels"));
+    let bridge = phlegm_core::bridge_resolver::resolve_bridge(map.get("--bridge").map(std::path::Path::new), &kernel_dir)?;
     Ok(NpuOptions {
-        model_dir: PathBuf::from(required(map, "--model-dir")?),
-        kernel_dir: PathBuf::from(required(map, "--kernels")?),
+        model_dir,
+        kernel_dir,
         turbo: map.contains_key("--turbo"),
-        bridge: PathBuf::from(required(map, "--bridge")?),
+        bridge,
         context_capacity: settings.usize("ctx_len"),
         threads: number("--threads", default_threads())?,
         prefill_route: settings.str("prefill_route"),
@@ -130,6 +135,7 @@ fn run(args: &[String]) -> Result<(), String> {
         &[ChatMessage {
             role: "user".into(),
             content: prompt,
+            ..Default::default()
         }],
         true,
         &kwargs,
@@ -164,7 +170,7 @@ fn run(args: &[String]) -> Result<(), String> {
         stop_ids: tokenizer.stop_ids(),
         reuse_mark: None,
     };
-    backend.generate(&ids, &mut params, &mut |id| output.push(id))?;
+    backend.generate(&ids, &mut params, &mut |event| { output.push(event.id); std::ops::ControlFlow::Continue(()) })?;
     let reply = tokenizer.decode(&output)?;
     // A reasoning model (harmony, Gemma 4's thought channel, Qwen's <think>) thinks before it
     // answers: the reasoning on stderr, the answer alone on stdout.
@@ -191,11 +197,31 @@ fn run(args: &[String]) -> Result<(), String> {
 fn serve(args: &[String]) -> Result<(), String> {
     let opts = flags(args)?;
     let mut cfg = ServerConfig::from_env();
+    if let Some(key) = opts.get("--api-key") {
+        if key.is_empty() { return Err("--api-key must not be empty".into()); }
+        cfg.api_key = Some(key.clone());
+    }
+    if let Some(origins) = opts.get("--allowed-origins") {
+        cfg.allowed_origins = origins.clone();
+    }
     if let Some(host) = opts.get("--host") {
         cfg.host = host.clone();
     }
     if let Some(port) = opts.get("--port") {
         cfg.port = port.parse().map_err(|_| "invalid --port".to_string())?;
+    }
+    if let Some(dir) = opts.get("--embed-model") {
+        if ["--mock", "--model-dir", "--kernels", "--bridge", "--turbo"].iter().any(|k| opts.contains_key(*k)) {
+            return Err("--embed-model serves an embedding model alone; do not combine with chat backend options".into());
+        }
+        let model_dir = PathBuf::from(dir);
+        let model_id = opts.get("--embed-model-name").cloned().or_else(|| model_dir.file_name().and_then(|v| v.to_str()).map(str::to_owned)).ok_or("invalid embedding model name")?;
+        if model_id.is_empty() { return Err("embedding model name must not be empty".into()); }
+        let python = opts.get("--embed-python").cloned().or_else(|| std::env::var("PHLEGM_EMBED_PYTHON").ok()).unwrap_or_else(|| "python3".into());
+        let source = opts.get("--embed-source").map(PathBuf::from).or_else(|| std::env::var_os("PHLEGM_EMBED_SOURCE").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../open_kernels/designs/trit_embed"));
+        let embedder = phlegm_core::embeddings::TritEmbeddingBackend::load(model_id, std::path::Path::new(&python), &source, &model_dir)?;
+        return server::serve_embeddings(Box::new(embedder), cfg);
     }
     let settings = model_settings(&opts)?;
     cfg.default_max_tokens = settings.usize("max_tokens");
@@ -384,6 +410,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embedding_mode_rejects_a_second_backend_before_loading() {
+        for extra in [vec!["--mock", "--embed-model", "model"], vec!["--model-dir", "chat", "--embed-model", "model"]] {
+            let args: Vec<String> = extra.into_iter().map(str::to_owned).collect();
+            assert!(serve(&args).unwrap_err().contains("embedding model alone"));
+        }
+    }
+
+    #[test]
     fn turbo_is_a_boolean_and_cannot_silently_select_mock() {
         assert!(flags(&["--turbo".into()]).unwrap().contains_key("--turbo"));
         assert!(flags(&["--turbo".into(), "--turbo".into()]).is_err());
@@ -391,7 +425,7 @@ mod tests {
         let mut map = HashMap::from([
             ("--model-dir".into(), "model".into()),
             ("--kernels".into(), "kernels".into()),
-            ("--bridge".into(), "bridge".into()),
+            ("--bridge".into(), std::env::current_exe().unwrap().to_string_lossy().into_owned()),
             ("--turbo".into(), "true".into()),
         ]);
         let resolve = |map: &HashMap<String, String>| {

@@ -16,10 +16,22 @@ pub struct GenParams {
     pub reuse_mark: Option<usize>,
 }
 
+/// A verified output token. Logits are the raw, untransformed model distribution
+/// before penalties, constraints, temperature or sampling filters. Borrowed only
+/// during the callback; consumers compute log probabilities only on demand.
+pub struct TokenEvent<'a> {
+    pub id: u32,
+    pub logits: Option<&'a [f32]>,
+}
+
 pub trait Backend {
     /// Generate up to `params.max_tokens` tokens from `prompt_ids`, calling
     /// `on_token` for each one (in order) as it's produced. Stops early on a
-    /// stop id (not passed to `on_token`). `Err` is a hard failure the caller
+    /// stop id (not passed to `on_token`) or callback `Break`. On `Break`, do
+    /// not decode that token or issue another bridge command. Kept context must
+    /// describe only tokens actually run by the bridge (the last output token
+    /// need not be in it). Only verified tokens may reach this callback, including
+    /// in a future speculative implementation. `Err` is a hard failure the caller
     /// should surface (e.g. NPU device busy/unavailable) — mirrors Python's
     /// `DeviceBusyError` distinction (HTTP 503 vs 500).
     ///
@@ -32,7 +44,7 @@ pub trait Backend {
         &mut self,
         prompt_ids: &[u32],
         params: &mut GenParams,
-        on_token: &mut dyn FnMut(u32),
+        on_token: &mut dyn FnMut(TokenEvent<'_>) -> std::ops::ControlFlow<()>,
     ) -> Result<(), String>;
 
     /// Tokens the backend can hold (prompt plus output), when it has a fixed context. The

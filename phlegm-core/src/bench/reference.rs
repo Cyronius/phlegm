@@ -230,7 +230,7 @@ fn parse_power_mode(report: &str) -> Result<String, String> {
 /// (PR_SET_PDEATHSIG), so spawn it from a thread that lives as long as the backend (`load` runs
 /// on the caller's thread: main, for `run` and `serve`).
 #[cfg(target_os = "linux")]
-fn die_with_parent(command: &mut Command) {
+pub(crate) fn die_with_parent(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     extern "C" {
         fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
@@ -255,7 +255,7 @@ fn die_with_parent(command: &mut Command) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn die_with_parent(_: &mut Command) {}
+pub(crate) fn die_with_parent(_: &mut Command) {}
 
 struct Process {
     child: Child,
@@ -846,7 +846,7 @@ impl Backend for NpuBackend {
         &mut self,
         prompt_ids: &[u32],
         params: &mut GenParams,
-        on_token: &mut dyn FnMut(u32),
+        on_token: &mut dyn FnMut(crate::backend::TokenEvent<'_>) -> std::ops::ControlFlow<()>,
     ) -> Result<(), String> {
         self._lock.ensure_held()?;
         if prompt_ids.is_empty()
@@ -905,11 +905,11 @@ impl Backend for NpuBackend {
         }
         let mut history: Vec<i64> = prompt_ids.iter().map(|&id| i64::from(id)).collect();
         for index in 0..params.max_tokens {
-            let next = params.sampler.sample(&logits, &history) as u32;
+            let next = params.sampler.try_sample(&logits, &history)? as u32;
             if params.stop_ids.contains(&next) {
                 break;
             }
-            on_token(next);
+            if on_token(crate::backend::TokenEvent { id: next, logits: Some(&logits) }).is_break() { break; }
             history.push(i64::from(next));
             if index + 1 < params.max_tokens {
                 let context = std::mem::take(&mut self.context);
@@ -1009,7 +1009,7 @@ for line in sys.stdin:
             };
             let mut output = Vec::new();
             backend
-                .generate(&[0, 1], &mut params, &mut |id| output.push(id))
+                .generate(&[0, 1], &mut params, &mut |event| { output.push(event.id); std::ops::ControlFlow::Continue(()) })
                 .unwrap();
             assert_eq!(output, vec![2]);
         }
@@ -1097,7 +1097,7 @@ for line in sys.stdin:
                 reuse_mark: Some(mark),
             };
             let mut output = Vec::new();
-            backend.generate(prompt, &mut params, &mut |id| output.push(id)).unwrap();
+            backend.generate(prompt, &mut params, &mut |event| { output.push(event.id); std::ops::ControlFlow::Continue(()) }).unwrap();
             assert_eq!(output, vec![5, 5, 5]);
             backend.cached_tokens()
         };
@@ -1136,6 +1136,38 @@ for line in sys.stdin:
                 json!({"command":"prefill_logits", "prompt":3, "mark":2}),
             ]
         );
+        // Stop after the second callback: only the first token was run. The
+        // callback's final verified token must not be added to the kept context.
+        let before = fs::read_to_string(&log).unwrap().lines().count();
+        let early = vec![3, 3, 3, 5, 5, 1, 2];
+        let mut params = GenParams {
+            max_tokens: 8,
+            sampler: crate::sampler::Sampler::new(0.0, 0, 1.0, 1.0, None),
+            stop_ids: Default::default(), reuse_mark: Some(6),
+        };
+        let mut seen = 0;
+        backend.generate(&early, &mut params, &mut |event| {
+            assert_eq!(event.id, 5);
+            assert_eq!(event.logits.unwrap(), &[0., 0., 0., 0., 0., 10.]);
+            seen += 1;
+            if seen == 2 { std::ops::ControlFlow::Break(()) } else { std::ops::ControlFlow::Continue(()) }
+        }).unwrap();
+        assert_eq!(seen, 2);
+        assert_eq!(backend.context, [early.clone(), vec![5]].concat());
+        assert_eq!(backend.mark, Some(5)); // mark rounded by the bridge relative to reuse start
+        let follow = [early.clone(), vec![5, 5, 1]].concat();
+        params.max_tokens = 1;
+        params.reuse_mark = Some(follow.len());
+        backend.generate(&follow, &mut params, &mut |_| std::ops::ControlFlow::Break(())).unwrap();
+        assert_eq!(backend.cached_tokens(), early.len() + 1);
+        assert_eq!(backend.context, follow);
+        let added: Vec<Value> = fs::read_to_string(&log).unwrap().lines().skip(before)
+            .map(|s| serde_json::from_str(s).unwrap()).collect();
+        assert_eq!(added, vec![
+            json!({"command":"prefill_logits", "prompt":[1,2], "mark":6}),
+            json!({"command":"decode_logits", "token":5}),
+            json!({"command":"prefill_logits", "prompt":[5,1], "mark":10}),
+        ]);
         drop(backend);
         fs::remove_dir_all(dir).unwrap();
     }

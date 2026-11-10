@@ -6,6 +6,170 @@ has no independent spec requirements beyond calling this API.
 
 Requirement prefix: `SERVER`.
 
+## SERVER-HTTP: Browser access, authentication and chat usage
+
+The chat server accepts browser preflight `OPTIONS` requests and sends CORS
+headers with JSON and event-stream responses. `PHLEGM_ALLOWED_ORIGINS` or
+`--allowed-origins` defaults to `loopback`: HTTP or HTTPS origins on `localhost`,
+`127.0.0.1`, or `[::1]`, with any port. `*` and a comma-separated list of exact
+origins are opt-in. CORS is not authentication.
+`PHLEGM_API_KEY` or `--api-key` enables `Authorization: Bearer <key>` on all
+non-preflight routes except GET `/health`; it is disabled by default. An invalid or missing key
+returns 401. The command-line value takes precedence over the environment.
+
+Chat requests accept `max_completion_tokens` in preference to `max_tokens`.
+With `stream_options.include_usage: true`, the final event before `[DONE]`
+has an empty `choices` array and the prompt, completion, total and cached
+token counts. These HTTP behaviors are covered by the server's mock tests;
+they do not establish hardware inference correctness.
+
+## SERVER-GENERATION: Stop, legacy completions and log probabilities (U5)
+
+Both `/v1/chat/completions` and `/v1/completions` accept `stop`: one nonempty
+string or an array of up to four nonempty strings (null/omitted/empty array disable
+it). Invalid shapes and more than four entries are HTTP 400. Matching runs on the
+decoded generated text, before reasoning splitting and tool parsing, including
+matches inside a token and across token/UTF-8 boundaries. The earliest match ends
+generation, removes the stop string and everything after it, and sets
+`finish_reason: "stop"`, even at the output budget. Streaming holds the longest
+suffix that is a prefix of any stop string, and flushes it when generation ends
+without a match. Thus a stop can truncate reasoning or a call; a truncated call
+retains the existing plain-text fallback. Usage counts actual generated tokens,
+including those withheld to recognize a stop; it does not retokenize visible text.
+
+`POST /v1/completions` takes a raw `prompt`, without applying a chat template:
+a string, token IDs, a single-element string array or a single-element array of
+token-ID arrays. Empty inputs, invalid/out-of-vocabulary IDs, and multiple prompts
+return 400 (batching is out of scope). It accepts `max_tokens`, the same sampling
+fields/penalties/seed as chat, `stop`, `stream`, and `stream_options.include_usage`.
+Responses use `object: "text_completion"` and `choices[].text`, including SSE
+frames, followed by `[DONE]`. Only `n=1` and `best_of=1` are supported. `echo=true`
+and non-null `suffix` return explicit 400 errors; omit them or use `echo=false`.
+Invalid token budgets, stream options and logprob options also return 400.
+
+Chat accepts boolean `logprobs`, with `top_logprobs` an integer from 0 to 20 that
+requires `logprobs=true`. `choices[].logprobs.content` entries contain `token`,
+`bytes`, `logprob`, and `top_logprobs` (each candidate also has decoded bytes).
+Legacy completions accept integer `logprobs` from 0 to 5 and return the legacy
+`tokens`, `token_logprobs`, `top_logprobs` maps and `text_offset` arrays. The chosen
+token is always included in a legacy top map, even if outside the requested top
+set. As a Phlegm extension, legacy logprobs also include parallel `bytes` arrays.
+Offsets count Unicode characters in the decoded output; tokens splitting one
+UTF-8 character share its offset. Standalone token strings can contain replacement
+characters; their exact bytes, rather than those strings, reconstruct split UTF-8.
+Special control tokens have null bytes. Output shapes and limits follow the official
+[Chat Completions reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+and [legacy Completions reference](https://developers.openai.com/api/reference/resources/completions/methods/create).
+
+Distribution choice: normalize the backend's raw model logits at temperature 1,
+before temperature scaling and top-k/top-p filtering. Phlegm also excludes all
+presence/frequency/repetition penalties, length/think-end ramps and the U4 mask
+from *reported* probabilities. These still affect token selection, so a constrained
+or penalized chosen token can be absent from `top_logprobs`. This is an explicit
+Phlegm choice for penalties and masking, not a claim about undocumented OpenAI
+implementation details. Logprobs describe verified generated tokens before the
+reasoning/tool split (including their protocol tokens), rather than rescoring
+rendered content. Stop-matched tokens and tokens overlapping the removed suffix
+are omitted from logprobs; a token cut in its middle therefore has no score for its
+visible fragment. SSE may deliver logprobs in separate empty-content chunks;
+probabilities held for a possible stop or call marker are released only when safe.
+No log-softmax or logprob vocabulary is constructed when logprobs are not requested.
+
+`Backend::generate` passes `TokenEvent { id, logits }` to a callback returning
+`ControlFlow<()>`. The callback receives only verified tokens (also the contract
+for future P4 speculation). Raw logits are borrowed during the callback, and a
+backend without logits reports an explicit generation error when they are requested.
+On `Break`, the backend issues no further decode; kept context and reuse marks
+continue to describe what the bridge actually ran, excluding the last output token
+unless it was already fed back. The fake-bridge regression checks early cancellation
+and a follow-up that reuses the exact prefix, with the bridge command log asserted.
+
+Offline verification, 2026-11-09: new HTTP tests in `server_generation_tests.rs`
+cover both routes, stop validation/overlap/partial suffixes, stops inside tokens,
+UTF-8 bytes and offsets, usage, error shapes, raw probabilities under penalties
+and a schema mask, reasoning, tool truncation, and all six CPU tool fixtures.
+A socket handshake test requires content to reach the client while the backend
+is blocked waiting to continue; it proves tool-enabled content is streamed during
+generation. No model timing claim is made. The ordinary Rust suite and the SDK
+smoke test use no NPU and add no crate dependencies.
+
+Final Rust checks: 121 core unit tests passed, five ignored; two enabled core
+integration tests passed, two integration prerequisites ignored; all four CLI tests
+passed. `cargo build -p phlegm-cli --offline` and `git diff --check` passed.
+Commands, raw-log paths/hashes and corrected development failures:
+[u5-validation.json](u5-validation.json).
+
+Mock SDK acceptance (OpenAI Python 3.48.0, 24 checks, repeated against the final binary):
+
+```sh
+dibs run build --label 'U5 follow-up: build mock SDK server' --eta 5m -- cargo build -p phlegm-cli --offline
+dibs run port-8767 --label 'U5 follow-up: mock SDK server' --eta 10m -- target/debug/phlegm serve --mock --port 8767
+# In another shell while the server holds the port:
+/tmp/phlegm-u5-sdk-venv/bin/python -I phlegm-core/tests/check_u5_sdk.py
+```
+
+The mock has a deterministic no-argument tool fixture when required/named tools
+are supplied, and echoes tool results on the follow-up. Its logits are synthetic;
+this SDK pass establishes client/API compatibility, not model-quality evidence.
+
+Hardware loops remain untested (this task explicitly prohibited NPU execution).
+For each of `KAT-Coder-V2.5-Dev-Q4pure-NPU2`, `gemma-4-26B-A4B-it-NPU2` and
+`gpt-oss-20b-NPU2`, run later, replacing `MODEL` with that directory basename:
+
+```sh
+dibs run npu port-8767 --label 'U5: hardware SDK server' --eta 20m -- /home/cyrus/code/phlegm/target/npu-dev/npu-run.sh target/debug/phlegm serve --model-dir /home/cyrus/models/MODEL --port 8767
+# In another shell while that server holds the port:
+/tmp/phlegm-u5-sdk-venv/bin/python -I phlegm-core/tests/check_tools_sdk.py --base-url http://127.0.0.1:8767/v1 --model MODEL
+```
+
+The mock-specific `check_u5_sdk.py` intentionally asserts mock text and is not a
+hardware quality gate. Hardware stop/logprob/completion checks should use the same
+API calls with model-independent assertions, followed by the tool loop above.
+
+## SERVER-EMBEDDINGS: Trit embeddings
+
+`phlegm serve --embed-model DIR` runs the named model as an embedding-only
+server and lists it in `/v1/models`. The default model name is the directory
+basename; `--embed-model-name` overrides it. `--embed-python` (or
+`PHLEGM_EMBED_PYTHON`) selects a Python interpreter with the model's PyTorch,
+Transformers, safetensors and NumPy dependencies. `--embed-source` (or
+`PHLEGM_EMBED_SOURCE`) selects the directory containing `trit_npu.py`; the
+default is the source tree used to build Phlegm. The model directory must
+contain the packed model, tokenizer, CPU reference, and compatible NPU bundle.
+The resident Python worker uses the existing `TritNpu` implementation; Rust
+holds the shared NPU lock for the worker's lifetime. The embedding-only mode
+avoids loading two exclusive NPU models at once; U7 covers model switching.
+
+`POST /v1/embeddings` requires the served `model` and `input`: a string, an
+array of strings, token IDs, or an array of token-ID arrays. Token IDs must
+include the model's own special tokens and form nonempty sequences of at most
+128 in-vocabulary IDs; text is tokenized and truncated by `TritNpu` at 128.
+Each request accepts at most 2048 inputs and a 16 MB JSON body.
+`encoding_format` is `float` (default) or `base64` (little-endian float32).
+`dimensions` is unsupported and returns 400. The response contains ordered
+`data[].embedding` values and the actual input-token count in `usage`.
+
+Mock HTTP tests cover request shapes, batching, usage, errors, model listing,
+and base64. An opt-in CPU test compares route vectors from a CPU-reference
+backend with independent CPU-reference calls:
+
+```sh
+dibs run build cpu --label 'U6: CPU reference route test' --eta 10m -- env PHLEGM_TRIT_CPU_PYTHON=/home/cyrus/code/model-experiments/ternary-embedder/.venv/bin/python PHLEGM_TRIT_MODEL=/home/cyrus/models/trit-embed-3l cargo test -p phlegm-core --offline embeddings_route_matches_trit_cpu_reference -- --ignored --nocapture
+```
+
+The device acceptance test remains unrun: after setting a
+Python environment with the dependencies and building the CLI, run, from the
+checkout (replace the Python path as needed):
+
+```sh
+dibs run build --label 'U6: build embedding server' --eta 10m -- cargo build -p phlegm-cli --offline
+dibs run npu port-8767 --label 'U6: trit embeddings hardware acceptance' --eta 15m -- /home/cyrus/code/phlegm/target/npu-dev/npu-run.sh /home/cyrus/code/model-experiments/ternary-embedder/.venv/bin/python -I phlegm-core/tests/trit_embeddings_hardware.py --model-dir /home/cyrus/models/trit-embed-3l --server "$PWD/target/debug/phlegm" --port 8767
+```
+
+It compares the server's text and pretokenized results, binary32 value for
+value, with direct `TritNpu.encode_ids` for the same inputs. This is a pending
+hardware check, not evidence that the route passed on a device.
+
 ## SERVER-VISION: Vision-understanding API
 
 **Applies to:** phlegm-server
@@ -270,6 +434,12 @@ follow-ups, greedy, 400 reply tokens): turns 2 and 3 reuse 2816 tokens and take 
 1117 / 1103 / 1188 characters, the text itself was not recorded). KAT Coder: 3328 and 3584 of
 3600 / 3624 tokens reused (its no-reuse round was cut short to free the machine).
 
+`phlegm run` and `phlegm serve` default `--kernels` to `<model-dir>/open_kernels`.
+Their bridge selection checks `--bridge`, `PHLEGM_REFERENCE_BRIDGE`, an adjacent
+`phlegm-reference-bench` executable, then `bridges/index.json` beside the executable
+using the kernel manifest family, then the build-time developer checkout's bridge tree.
+Explicit paths must exist. `phlegm bench` continues to require `--reference-engine`.
+
 ## SERVER-SETTINGS: Per-model runtime defaults
 
 `phlegm run` and `phlegm serve` take their sampling, template, context and prefill defaults from
@@ -405,3 +575,150 @@ no shipped model uses it.
   268 / 210 / 199 tokens (seeds 1-3) at the model's settings against 1254 greedy without the
   penalty (that request's override reproduces the earlier greedy run token count exactly);
   `enable_thinking: false` answered in 5 tokens.
+
+## SERVER-TOOLS: Chat Completions tool calling (U3)
+
+`/v1/chat/completions` accepts OpenAI function `tools` and `tool_choice` (`auto`,
+`none`, `required`, or `{"type":"function","function":{"name":"..."}}`). Bad choices,
+unknown named functions, duplicate names and malformed tool lists are HTTP 400.
+`none` hides the definitions and disables output parsing. A named choice exposes
+only that function. Required/named choices also add a system instruction because
+publisher templates generally do not inspect `tool_choice`; this is prompting,
+not a guarantee that the model will obey. Invalid model output remains plain text.
+
+Tool definitions and the choice reach the Jinja context. Assistant `tool_calls`,
+call IDs, tool messages' `tool_call_id`/`name`, and `reasoning_content` survive the
+request. JSON-string arguments are deserialized into objects before rendering;
+invalid argument JSON is HTTP 400. GPT-OSS additionally receives `thinking` as
+its template's alias for `reasoning_content`.
+
+The model's template selects one of six parsers (`tool_calls.rs`): function XML;
+JSON/key-value tool tags; Gemma's `call:name{...}`; Hy-Memory's tool list (including
+DeepSeek tokens); LFM2.5's function list; or harmony recipient headers. Installed
+Flint and Xing templates actually use `arg_key` and `param_key` tags respectively,
+although the November roadmap described this group as JSON. Both are supported.
+LFM2.5 also emits a bare function list in the recorded CPU fixture.
+
+Successful calls receive opaque `call_...` IDs, a function name and JSON-string
+arguments, and finish with `tool_calls`. Text preceding a call stays in `content`;
+reasoning remains in `reasoning_content`. An empty content beside calls is null.
+SSE emits indexed `delta.tool_calls` entries and the same finish reason. Tool-enabled
+requests stream ordinary content and reasoning as they arrive. Each parser holds
+back a suffix that could start its call marker, then buffers from the first call
+marker through final validation (one delta per validated complete call). LFM's
+recorded bare-list variant treats `[` as a possible opener. Harmony holds incomplete
+headers until it knows their recipient, and streams commentary as well as final
+content. Malformed, truncated or unknown calls fall back to content, including the
+held marker; already streamed prefixes are not duplicated. Text and reasoning
+before a call therefore remain available during generation.
+Unknown function names also fall back to content. No model output is evaluated.
+
+Verification (2026-11-09): six small CPU-generated fixtures, with exact prompts,
+llama.cpp identity and command, live in `phlegm-core/tests/fixtures/tool_calls/`.
+They cover KAT Coder, Gemma 4 26B-A4B, GPT-OSS 20B, Flint, Hy-Memory and LFM2.5.
+The parser suite additionally exercises documented JSON and DeepSeek variants.
+`server::tests::tool_loop_streaming_and_full_and_malformed` covers two-step HTTP
+loops, `none` and malformed output in both modes. The ignored local-files test
+`installed_templates_round_trip_tools` exercises the installed templates; the
+six protocol groups exclude K2's separate, unsupported protocol. Hardware SDK
+loops remain untested; offline tests do not establish hardware acceptance.
+
+## SERVER-STRUCTURED-OUTPUT: JSON and schema token constraints (U4)
+
+`response_format` accepts `{"type":"json_object"}` and the OpenAI
+`{"type":"json_schema","json_schema":{"name":"...","strict":true,"schema":{...}}}`
+shape. `strict` must be boolean when supplied. Both strict and non-strict schema
+requests enforce the supported schema constraints; strict never silently relaxes
+one. Omitted/null `response_format` and `{"type":"text"}` follow the ordinary
+sampler path without constructing a vocabulary, grammar, or mask.
+
+`structured_output.rs` compiles a byte grammar into incremental parser stacks.
+A cached vocabulary trie uses the tokenizer's inverse ByteLevel mapping or
+SentencePiece replacement/byte-fallback mapping; it preserves partial UTF-8 bytes,
+rather than decoding individual tokens with replacement characters. Traversing
+that trie against the current parser stacks computes which complete tokens keep
+a valid prefix. The sampler masks other logits after penalties and before greedy
+selection or temperature/top-k/top-p. EOS is allowed only when a complete value
+has been accepted. Invalid UTF-8, unpaired escaped surrogates, special control
+tokens and IDs outside the tokenizer vocabulary are excluded. An empty candidate
+set is a generation error, never an unconstrained fallback.
+
+Supported schema keywords: `type` (also type arrays), `properties`, `required`,
+`enum`, `const`, `items`, `anyOf`, and boolean/schema `additionalProperties`.
+Types: object, array, string, number, integer, boolean and null. Nested boolean
+schemas are supported. Annotations `title`, `description`, `default`, `examples`,
+`$schema`, `$id` are accepted without changing validation. Other features,
+including `$ref`, `oneOf`, `allOf`, numeric bounds and string patterns, are HTTP 400
+with the offending feature's schema path. Invalid/unsatisfiable schemas are also
+HTTP 400. Current construction limits: depth 48, 256 properties per object,
+64 alternatives per `anyOf`.
+
+Generation uses a valid subset of the schema language: declared object keys are
+emitted in sorted order, optional properties may be omitted, and permitted extra
+properties need not be emitted when declared properties exist. Generic objects
+have arbitrary keys. Unconstrained numeric productions use finite decimal values
+(up to 15 integral and 9 fractional digits); enum/const use their exact JSON
+literals. This avoids numeric overflow in consumers. These choices restrict
+representation without allowing values outside the requested schema.
+
+Structured responses constrain the entire generated reply and disable reasoning
+splitting (and request `enable_thinking: false` from templates). They can coexist
+with `tools` in auto/none mode: plain JSON remains content. Argument-only tool
+constraints and mixing mandatory tool calls with whole-reply JSON constraints
+are not implemented. As for any finite output budget, `finish_reason: length`
+can leave an incomplete prefix; clients must not treat a truncated reply as a
+complete JSON value.
+
+Verification: grammar tests cover nested objects/arrays, unions, enums/constants,
+UTF-8 and escapes, spanning tokens, EOS, invalid schemas and unsupported features;
+`constraints_win_over_logits_penalties_and_sampled_candidate_lists` covers greedy
+and stochastic sampling. The fake-logits HTTP test exercises both response modes
+and tools in auto mode. The ignored `every_registry_tokenizer_random_walks` test
+uses all 18 registry entries' actual tokenizer files, samples random valid prefixes,
+completes them, parses the result with serde_json, and independently validates it
+against the schema; it also checks the actual IDs' decoded output. Run it offline
+with the local models installed. Hardware validation remains separate.
+
+### U3/U4 offline evidence, 2026-11-09
+
+Core checks: 96 unit tests passed, four prerequisite tests ignored; the release-report
+and CPU tool-fixture integration tests passed. CLI: three tests passed. Explicit
+local-files checks passed for all 18 tool-capable installed templates and all 18
+registry tokenizers (five schemas, two random walks each, with grammar completion).
+Two hardware/native bridge checks remain ignored. The SDK client is
+`phlegm-core/tests/check_tools_sdk.py`; its Python syntax was checked, its hardware
+loop was not run. No NPU execution or new dependency crate was used.
+
+Dibs-isolated CPU development microbenchmark, CLEAN before and after, Gemma's
+262,144-token vocabulary, required `city` string property, parser positioned just
+inside the string: the first mask at that state took 87.65–101.12 ms (three samples,
+median 95.95 ms); cached repeated-state masks took 0.1223–0.1449 ms (nine samples,
+median 0.1278 ms). These timings include applying the mask to a full logit vector,
+exclude tokenizer/vocabulary loading, and are not end-to-end HTTP or NPU timings.
+New parser states pay a cache miss; this is not a universal per-token latency.
+The vocabulary is shared per tokenizer, transitions are memoized per request,
+and up to 32 completed masks are cached per request.
+
+Retained negative experiment: the first, uncached implementation spent
+2194.38–2287.69 ms constructing the string-state mask (nine samples, median
+2231.03 ms, without the subsequent logits mask). It was replaced after measurement.
+An initial timing attempt never reached CLEAN because host CPU stayed at 76–91%;
+it was canceled and its reservation released. All completed measurement series
+reported CLEAN before and after. Host: Strix Halo Ryzen AI MAX+ 395, Linux
+7.2.13-200.fc44.x86_64, `powersave` CPU governor, rustc 1.99.1, optimized Rust build;
+base revision `7742985b53e464a1a8171321fe4e33281905ec8a` with these uncommitted changes.
+The pre-fast-path sampler comparison exposed a greedy regression, retained as a
+failed development experiment; the final unconstrained path is separately compiled
+and stores the inactive constraint behind an optional pointer.
+
+The final paired sampler comparison also reported CLEAN before and after. Both
+samplers were called through identical out-of-line wrappers, with black-boxed
+state and logits, one warmup pair discarded, and 14 retained alternating pairs
+of 100 tokens each. On the same 262,144 logits, unconstrained greedy took a median
+0.132 ms/token versus the pre-change sampler's 0.170; temperature 1 / top-k 64 /
+top-p 0.95 took 0.407 versus 0.443 ms/token. Every retained final pair favored the
+new sampler. No slowdown was observed in these two sampler cases. The bare greedy
+path avoids copying logits when penalties are inactive; non-greedy and penalized
+paths retain their transformations. These are CPU component measurements, not an
+end-to-end HTTP performance or hardware acceptance claim. Raw samples, provenance,
+commands and retained failures: [u3-u4-validation.json](u3-u4-validation.json).
