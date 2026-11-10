@@ -47,6 +47,8 @@ def native(tmp_path_factory):
     if (platform.system() != 'Linux' or platform.machine() != 'x86_64'
             or not shutil.which('g++') or 'avx2' not in Path('/proc/cpuinfo').read_text()):
         pytest.skip('native host test needs Linux x86_64, g++ and AVX2')
+    if 'conv_f32' not in (ROOT/'src/open_qwen36/block_host.hpp').read_text():
+        pytest.skip('in-tree block_host lacks the PR #213 fp32-conv / paired-KV ABI')
     os.environ.setdefault('OMP_NUM_THREADS','2')
     os.environ.setdefault('OMP_WAIT_POLICY','PASSIVE')
     return m.native_library(m.build(tmp_path_factory.mktemp('prefill-host')))
