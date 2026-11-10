@@ -58,7 +58,7 @@ struct CoreConfig {
     size_t max_ctx = 4096;   ///< KV rows per attention layer and RoPE records: the context capacity
     unsigned timeout_ms = 60000;  ///< per dispatch; 0 blocks
     bool verbose = true;
-    std::string prefill_mode = "fast";  ///< OPEN-PREFILL-MODE: fast | lean
+    std::string prefill_mode = "fast";  ///< OPEN-PREFILL-MODE: fast | lean (accurate is lean)
     bool draft = false;      ///< pack the model's draft adapter (uno.q4nx) if it has one; off unless asked (OPEN-UNO-DECODE)
 };
 
@@ -252,10 +252,12 @@ public:
     /// (at 2582 tokens: ~81 of its tokens a layer instead of ~8, so the visits an
     /// expert costs fall by the same factor). The caller passes the prompt unpadded;
     /// the tail block is padded here with the last id, exactly as the caller did.
-    /// Only for the MoE kinds (linear / full) -- layer_major_ok() says so.
+    /// The MoE kinds (linear / full) here; the dense kind goes to step_gemm_prompt_dense --
+    /// layer_major_ok() says whether either can run.
     void step_gemm_prompt(const std::vector<int>& ids, bool want_logits);
     /// Whether step_gemm_prompt() can run this kernel set: a block route whose every
-    /// layer is a MoE kind, and OFLM_OPEN_LAYER_MAJOR not set to 0.
+    /// layer is a MoE kind, or the dense kind where dense_layer_major_ok() says so, and
+    /// OFLM_OPEN_LAYER_MAJOR not set to 0.
     bool layer_major_ok() const;
     /// Validation: logits for EVERY real token of the next blocks (one lm_head pass each),
     /// read back with block_logits() -- what a position-for-position diff against the
@@ -280,6 +282,8 @@ public:
     size_t max_ctx() const { return cfg_.max_ctx; }
     int num_layers() const { return nl_; }
     bool is_attention_layer(int l) const { return types_[l]->state_kind == "kv"; }
+    /// Bring-up: the size of a layer's `act` scratch, for whole-buffer dumps.
+    size_t act_bytes(int l) const { return types_[l]->act_bytes; }
     const StepTiming& last_timing() const { return timing_; }
     const Manifest& manifest() const { return man_; }
     /// The selected weights view: the manifest itself (q4nx) or its GGUF-direct twin.
@@ -377,6 +381,9 @@ private:
     bool attn_block_on_ = true;  ///< the attention products on the NPU where the set carries them (OFLM_OPEN_ATTN_BLOCK=0 off)
     bool layer_major_on_ = true; ///< the whole prompt through each layer before the next (OFLM_OPEN_LAYER_MAJOR=0 off)
     bool stage_major_on_ = true; ///< each GEMM step over every block, overlapping the host (OFLM_OPEN_STAGE_MAJOR=0 off)
+    bool attn_shl_on_ = true;    ///< the staged attention's hi / lo scores as one stacked product where the set has it (OFLM_OPEN_ATTN_SHL=0 off)
+    bool gelu32_on_ = true;      ///< the bfp16 route's GELU-tanh FFN act in fp32 (gelu_bfp16_a; OFLM_OPEN_GELU32=0 keeps act_fp64)
+    int dense_layer_major_ = -1; ///< OFLM_OPEN_DENSE_LAYER_MAJOR: -1 auto (Gemma 4's set), 0 off, 1 on
     bool dispatch_log_ = false;  ///< OFLM_OPEN_DISPATCH_LOG: keep per-kernel dispatch times
     int omp_threads_ = 0;        ///< OFLM_OPEN_OMP_THREADS, or 0 for the runtime's own count
     /// Put omp_threads_ in force for the CALLING thread: omp_set_num_threads sets a
@@ -437,7 +444,10 @@ private:
         std::vector<float> s_hi;        ///< attention_npu at prep rope: the scores summed over both halves
         /// the dense route's token rows: o / gate / up / down outputs, silu(gate) * up, the residual
         std::vector<float> d_o, d_gate, d_up, d_down, d_h;
-        std::vector<double> d_res, d_row;
+        std::vector<double> d_res;
+        std::vector<float> d_xn, d_xm, d_w;   ///< the entry and FFN norms' rows; a sandwich norm's f32 weight
+        std::vector<double> d_act;      ///< a whole block's act(gate) [ff, T] (c-tiled on bfp16), between gate and up
+        std::vector<float> d_un;        ///< a short block's bfp16 output untiled to [N, t] (OPEN-PREFILL-BFP16)
         std::vector<size_t> pos;        ///< attention_npu: each product row's absolute position
         /// `v` grown to at least `n` (never shrunk) and its data pointer.
         template <class T>
@@ -452,6 +462,15 @@ private:
         std::vector<float> xn, og, h, q, gate;
     };
     StageScratch ss_;
+    /// dense_layer_staged's rows: every block's queries and attention output, and a pair of
+    /// blocks' FFN input, residual, up output and down projection input.
+    struct DenseStaged {
+        std::vector<std::vector<float>> q, og;
+        std::vector<float> xm[2], up[2], s_hi, w_post;
+        std::vector<double> res[2];
+        std::vector<uint8_t> a[2];
+    };
+    DenseStaged ds_;
     bool block_logits_all_ = false;
     std::vector<std::vector<float>> block_logits_;     ///< per real token of the last block, when asked
 
@@ -600,11 +619,60 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     /// (T dxB dispatches, or the products when the set declares attn_block.prep) -> GEMM o ->
     /// residual + post-attn RMSNorm -> GEMM gate, up -> host SwiGLU -> GEMM down -> residual.
     /// `xres` is T*hidden fp64, updated in place; t_real (0 = T) is how many of the T are real.
-    void step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, size_t t_real = 0);
+    /// `stages` picks which of the three parts run -- the qkv3 GEMM (into *y_io), the attention
+    /// (*y_io -> *og_io, at position pos_) and the rest (*og_io -> xres) -- so a layer-major
+    /// prompt can run each over every block in turn; all three (the default) keep both local.
+    static constexpr int kStageQkv = 1, kStageAttn = 2, kStageRest = 4, kStageAll = 7;
+    void step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, size_t t_real = 0, int stages = kStageAll,
+                               std::vector<float>* y_io = nullptr, std::vector<float>* og_io = nullptr);
+    /// step_gemm_prompt for the dense kind: the whole prompt through each layer, stage by stage
+    /// (every block's qkv3 GEMM, then every block's attention in order, then the rest), so a
+    /// layer pays its two context switches -- GEMM to attention and back -- once, not per block.
+    void step_gemm_prompt_dense(const std::vector<int>& ids, bool want_logits);
+    /// Whether the dense layer-major schedule runs: every layer the dense kind, and
+    /// OFLM_OPEN_DENSE_LAYER_MAJOR (default: on where every layer's attention is the NPU
+    /// products with Gemma 4's qkvnorm_rope host half, the only family gated on it; 1 forces it
+    /// for the other dense families, 0 turns it off) and OFLM_OPEN_LAYER_MAJOR not 0.
+    bool dense_layer_major_ok() const;
+    /// The MoE kinds' half of layer_major_ok().
+    bool moe_layer_major_ok() const;
     /// The dense route's attention as the two NPU products (OPEN-PREFILL-ATTN), for a layer
     /// whose attn_block.prep is "qknorm_rope": y_qkv3 [n_qkv3, T] in, og [T, qw] out, the
     /// layer's KV rows [pos_, pos_ + t_real) written on the host and synced to the device.
     void dense_attention_block(int l, const std::vector<float>& y_qkv3, size_t T, size_t t_real, std::vector<float>& og);
+    /// One NPU job of a pipeline(): the kernel, its arguments, the output synced back before
+    /// the job's post, and the job whose post its inputs come from (-1: none).
+    struct PipeJob {
+        Kern* k = nullptr;
+        std::vector<std::string> args;
+        std::string out;
+        size_t out_bytes = 0;
+        long dep = -1;
+        const char* tag = "";    ///< the step it is, for OFLM_OPEN_PIPE_LOG's table
+    };
+    /// OFLM_OPEN_PIPE_LOG: per step, the host's stage / post time and how long it waited on the NPU
+    /// (elapsed is start() to the wait's return, so it includes any host work done meanwhile)
+    struct PipeStat {
+        size_t n = 0;
+        double stage_ms = 0, post_ms = 0, blocked_ms = 0, elapsed_ms = 0;
+    };
+    std::map<std::string, PipeStat> pipe_stats_;
+    bool pipe_log_ = false;
+    /// The jobs in order, one run outstanding: job j + 1's inputs are staged while j runs and
+    /// j's outputs read while j + 1 runs, unless j + 1 reads what post(j) writes (dep == j),
+    /// when the two take turns. Neighbours alternate "#1" twins of their buffers. The host's
+    /// time blocked on the NPU, submits included, adds to wait_ms.
+    void pipeline(int l, const std::vector<PipeJob>& jobs, const std::function<void(size_t)>& stage,
+                  const std::function<void(size_t)>& post, double& wait_ms);
+    /// Whether step_gemm_prompt_dense runs dense_layer_staged: the dense layer-major schedule
+    /// with every layer's attention the NPU products, and OFLM_OPEN_STAGE_MAJOR not 0.
+    bool dense_staged_ok() const;
+    /// The dense layer-major prompt's layer l, step-major (OFLM_OPEN_STAGE_MAJOR): the qkv3
+    /// GEMM over every block with each block's attention host half after it, the attention
+    /// products over every (block, kv head), then o, up, gate and down over the blocks in pairs,
+    /// each through pipeline(). Every block sees step_gemm_block_layer's operations on the
+    /// same data, so the bits are the same; x[b] is block b's residual, updated in place.
+    void dense_layer_staged(int l, std::vector<std::vector<double>>& x, size_t B, size_t T, size_t N, size_t pos0);
     /// Stage 2.6 Gate B: one decode step on the host route (see
     /// host_attn_decode_on_). The layer = step_gemm_block_layer at T=1 with
     /// host attention forced; the residual rides the xres global between

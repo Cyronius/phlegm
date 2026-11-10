@@ -21,6 +21,7 @@
 
 #include "open_qwen36/gguf_file.hpp"
 #include "open_qwen36/pools.hpp"
+#include "open_qwen36/q4nx_file.hpp"
 
 namespace fs = std::filesystem;
 
@@ -385,6 +386,105 @@ int main() {
         }
         std::printf("%s std_perm_gguf Q4_0 (%zu values differ)\n", bad0 ? "FAIL" : "ok", bad0);
         if (bad0) return 1;
+
+        // The q4_1 law (5120 B, the compact GGUF view): the same codes, and each f32 scale
+        // plane value RNE-rounded to bf16 -- what the f32-scale kernels narrow it to on the core.
+        std::vector<uint8_t> pc(static_cast<size_t>(op.nch) * 5120, 0);
+        pools::apply(op, g0, 0, pc.data(), pc.size(), 5120);
+        size_t badc = 0;
+        for (size_t c = 0; c < op.nch; ++c) {
+            const uint8_t* w = p0.data() + c * 6144;
+            const uint8_t* n = pc.data() + c * 5120;
+            for (size_t j = 0; j < 512; ++j) {          // 256 d then 256 m
+                float f;
+                std::memcpy(&f, w + 4 * j, 4);
+                uint32_t u;
+                std::memcpy(&u, &f, 4);
+                const uint16_t want = static_cast<uint16_t>((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
+                uint16_t got;
+                std::memcpy(&got, n + 2 * j, 2);
+                badc += got != want;
+            }
+            badc += std::memcmp(w + 2048, n + 1024, 4096) != 0;
+        }
+        std::printf("%s std_perm_gguf Q4_0 into the q4_1 law (%zu mismatches)\n", badc ? "FAIL" : "ok", badc);
+        if (badc) return 1;
+
+        // The Q4_0-native law (4608 B): the q4_1 law's d plane and codes with no m plane, and
+        // that m plane is exactly -8 d (the value the cores form), so both views compute alike.
+        std::vector<uint8_t> pq(static_cast<size_t>(op.nch) * 4608, 0);
+        pools::apply(op, g0, 0, pq.data(), pq.size(), 4608);
+        size_t badq = 0;
+        for (size_t c = 0; c < op.nch; ++c) {
+            const uint8_t* n = pc.data() + c * 5120;
+            const uint8_t* q = pq.data() + c * 4608;
+            badq += std::memcmp(n, q, 512) != 0;                 // d
+            badq += std::memcmp(n + 1024, q + 512, 4096) != 0;   // codes
+            for (size_t j = 0; j < 256; ++j) {                   // m == -8 d, in bf16
+                uint16_t d16, m16;
+                std::memcpy(&d16, n + 2 * j, 2);
+                std::memcpy(&m16, n + 512 + 2 * j, 2);
+                const float df = bf16_to_f32(d16), mf = bf16_to_f32(m16);
+                badq += mf != -8.0f * df;
+            }
+        }
+        std::printf("%s std_perm_gguf Q4_0 into the Q4_0-native law (%zu mismatches)\n", badq ? "FAIL" : "ok", badq);
+        if (badq) return 1;
+        bool q41_refused = false;                                // a Q4_1 block's min is not -8 d
+        try {
+            pools::apply(op, g, 0, pq.data(), pq.size(), 4608);
+        } catch (const std::exception&) {
+            q41_refused = true;
+        }
+        std::printf("%s std_perm_gguf refuses a Q4_1 tensor in the Q4_0-native law\n", q41_refused ? "ok   " : "FAIL");
+        if (!q41_refused) return 1;
+        std::vector<uint8_t> odd(static_cast<size_t>(op.nch) * 4736, 0);
+        bool refused = false;
+        try {
+            pools::apply(op, g0, 0, odd.data(), odd.size(), 4736);
+        } catch (const std::exception&) {
+            refused = true;
+        }
+        std::printf("%s std_perm_gguf refuses a pool chunk of neither law\n", refused ? "ok   " : "FAIL");
+        if (!refused) return 1;
+
+        // bfp16_gemm (OPEN-PREFILL-BFP16) from the GGUF's own Q4_0 blocks: the [64, 512] tensor at row 256 of a
+        // 1024-row B operand. Checked against pack.py's order (pack_b's reshape / transpose written out) and a
+        // frexp encoder: every written block is the GGUF values' encoding, every other block zero.
+        PackOp bo;
+        bo.op = "bfp16_gemm";
+        bo.tensor = op.tensor;
+        bo.in_dim = 512;
+        bo.nch = op.nch;
+        bo.row0 = 256;
+        bo.n_total = 1024;
+        std::vector<uint8_t> bb(bo.n_total * bo.in_dim / 8 * 9, 0);
+        pools::apply(bo, g0, 0, bb.data(), bb.size(), 5120);
+        const size_t n = 128, kt = 64, cols = 8, nk = bo.in_dim / kt, ntg = bo.n_total / (n * cols);
+        size_t badb = 0, nonzero = 0;
+        for (size_t R = 0; R < bo.n_total; ++R)
+            for (size_t cb = 0; cb < bo.in_dim / 8; ++cb) {
+                const size_t t = R / (n * cols), c = (R / n) % cols, rr = R % n;
+                const size_t blk = (((((c * ntg + t) * nk + cb / (kt / 8)) * (n / 16) + rr / 16) * (kt / 8) + cb % (kt / 8)) * 2 +
+                                    (rr % 16) / 8) * 8 + rr % 8;
+                const uint8_t* b = bb.data() + blk * 9;
+                uint8_t want[9] = {0};
+                if (R >= bo.row0 && R < bo.row0 + 64) {
+                    const float* v = mm0.values.data() + (R - bo.row0) * mm0.cols + cb * 8;
+                    int e = 0;
+                    for (int i = 0; i < 8; ++i) e = std::max(e, static_cast<int>((f32_bits(v[i]) >> 23) & 0xFF));
+                    want[0] = static_cast<uint8_t>(e);
+                    for (int i = 0; i < 8; ++i) {
+                        const double q = std::nearbyint(static_cast<double>(v[i]) * std::ldexp(1.0, 133 - e));
+                        want[1 + i] = static_cast<uint8_t>(static_cast<int8_t>(std::min(127.0, std::max(-128.0, q))));
+                    }
+                }
+                badb += std::memcmp(b, want, 9) != 0;
+                for (int i = 0; i < 9; ++i) nonzero += b[i] != 0;
+            }
+        std::printf("%s bfp16_gemm from GGUF Q4_0 (%zu of %zu blocks differ; %zu nonzero bytes)\n", badb ? "FAIL" : "ok",
+                    badb, static_cast<size_t>(bo.n_total * bo.in_dim / 8), nonzero);
+        if (badb || !nonzero) return 1;
     }
 
     // ---- pack_norm: f32 -> bf16 (RNE)

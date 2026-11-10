@@ -60,6 +60,8 @@ PackOp parse_op(const json& j, const std::string& where) {
     p.dst_rows = j.value("dst_rows", 0ull);
     p.split = j.value("split", "");
     p.via = j.value("via", "");
+    p.row0 = j.value("row0", 0ull);
+    p.n_total = j.value("n_total", 0ull);
     p.div_running = j.value("div_running", "");
     if (!p.div_running.empty() && (p.op != "put" || p.div_running.find("{j}") == std::string::npos))
         fail(where, p.op + " " + p.tensor + ": div_running names a per-layer {j} tensor, on a put");
@@ -73,7 +75,7 @@ PackOp parse_op(const json& j, const std::string& where) {
         for (const auto& [name, v] : fs)
             if (v == 0) fail(where, p.op + " " + (p.tensor.empty() ? p.up : p.tensor) + " without " + name);
     };
-    if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm" ||
+    if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm" || p.op == "bfp16_gemm" ||
         p.op == "put" || p.op == "expert_down" || p.op == "conv_transpose" || p.op == "lmhead_q8" ||
         p.op == "transpose" || p.op == "transpose_banked") {
         if (p.tensor.empty()) fail(where, p.op + " without a tensor");
@@ -84,6 +86,7 @@ PackOp parse_op(const json& j, const std::string& where) {
     }
     if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm")
         need_all({{"nch", p.nch}, {"in_dim", p.in_dim}});
+    else if (p.op == "bfp16_gemm") need_all({{"nch", p.nch}, {"in_dim", p.in_dim}, {"n_total", p.n_total}});
     else if (p.op == "std_fuse") need_all({{"nch", p.nch}, {"in_dim", p.in_dim}, {"src_dim", p.src_dim}, {"rg", p.rg}});
     else if (p.op == "transpose" || p.op == "transpose_banked")
         need_all({{"rows", p.rows}, {"cols", p.cols}, {"elem", p.elem}});
@@ -106,6 +109,11 @@ std::vector<Step> parse_program(const json& j, const std::string& where) {
             st.args = get<std::vector<std::string>>(s, "args", where);
             if (st.args.empty() || st.args.size() > 8) fail(where, "run " + st.kernel + ": " + std::to_string(st.args.size()) + " buffer args (1..8)");
             st.split = s.value("split", false);
+            st.fmt = s.value("fmt", "");
+            st.n_pad = s.value("n_pad", 0ull);
+            if (!st.fmt.empty() && st.fmt != "bfp16") fail(where, "run " + st.kernel + ": fmt '" + st.fmt + "' (bfp16 or nothing)");
+            if (st.fmt == "bfp16" && (st.n_pad == 0 || st.split))
+                fail(where, "run " + st.kernel + ": a bfp16 step needs n_pad and cannot be split");
         } else if (st.op == "moeroute2") {
             st.act_off = get<uint64_t>(s, "act_off", where);
         } else {
@@ -149,8 +157,9 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
     // ignore `split` and use the hi half of each such weight, so the recipe writes 2 exactly when
     // a step is split, and an older engine refuses the set by name instead of misreading it.
     // 3 adds the bf16_gemm pack op, which an engine that reads 2 cannot pack.
-    if (m.version < 1 || m.version > 3)
-        fail(where, "manifest_version " + std::to_string(m.version) + " (this engine reads 1 to 3)");
+    // 4 adds the bfp16_gemm pack op and the `bfp16` step format (OPEN-PREFILL-BFP16).
+    if (m.version < 1 || m.version > 4)
+        fail(where, "manifest_version " + std::to_string(m.version) + " (this engine reads 1 to 4)");
     m.family = get<std::string>(j, "family", where);
     m.spec_hash = j.value("spec_hash", "");
     m.build_key = j.value("build_key", "");
@@ -212,6 +221,11 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
             fail(where, "kernel " + k + ": rb " + std::to_string(d.rb) + " is not 1, 2 or 4");
         if (d.rb > 1 && d.patch != "attnpos")
             fail(where, "kernel " + k + ": rb " + std::to_string(d.rb) + " needs the attnpos patch table");
+        d.kvslice = v.value("kvslice", 0ull);
+        // attn_stepw.cc takes blocks of 2 or 4 rows, and the padding is its own (attn_kvslice_rows), not rb's
+        if (d.kvslice && ((d.kvslice != 2 && d.kvslice != 4) || d.patch != "attnpos" || d.rb != 1))
+            fail(where, "kernel " + k + ": kvslice " + std::to_string(d.kvslice) +
+                            " needs 2 or 4 rows, the attnpos patch table and rb 1");
         if (!m.contexts.count(d.context)) fail(where, "kernel " + k + " names unknown context " + d.context);
         if (!d.patch.empty() && d.patch != "moeroute2" && d.patch != "attnpos" && d.patch != "moebatch" &&
             d.patch != "attnrows")
@@ -285,8 +299,8 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                         // one format per weight: the q4_1 band law, or one GEMM pool the kernel was built for
                         const std::string& kind = w.pack.front().op;
                         for (const auto& o : w.pack)
-                            if (o.op != "std_perm" && o.op != "bf16_gemm")
-                                fail(gw, "weight " + name + ": a packed weight is std_perm or bf16_gemm ops, not " + o.op);
+                            if (o.op != "std_perm" && o.op != "bf16_gemm" && o.op != "bfp16_gemm")
+                                fail(gw, "weight " + name + ": a packed weight is std_perm, bf16_gemm or bfp16_gemm ops, not " + o.op);
                         for (const auto& o : w.pack)
                             if (o.op != kind)
                                 fail(gw, "weight " + name + " mixes " + kind + " and " + o.op + " ops; the GEMM reads one format");
@@ -315,8 +329,23 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                 a.args = get<std::vector<std::string>>(aj, "args", aw);
                 if (dense_ab) {
                     a.prep = get<std::string>(aj, "prep", aw);
-                    if (a.prep != "qknorm_rope" && a.prep != "rope")
-                        fail(aw, "prep " + a.prep + " is not one this engine computes (qknorm_rope, rope)");
+                    if (a.prep != "qknorm_rope" && a.prep != "rope" && a.prep != "qkvnorm_rope")
+                        fail(aw, "prep " + a.prep + " is not one this engine computes (qknorm_rope, rope, qkvnorm_rope)");
+                    if (a.prep == "qkvnorm_rope") {
+                        a.scale = aj.value("scale", 0.0);
+                        a.window = aj.value("window", uint64_t{0});
+                        a.rot = get<uint64_t>(aj, "rot", aw);
+                        a.rope_pair = aj.value("rope_pair", uint64_t{0});
+                        a.inv_freq = get<std::vector<double>>(aj, "inv_freq", aw);
+                        a.qsplit = aj.value("qsplit", false);
+                        a.cd_qnorm = get<int64_t>(aj, "cd_qnorm", aw);
+                        a.cd_knorm = get<int64_t>(aj, "cd_knorm", aw);
+                        const size_t half = a.rot / 2, dist = a.rope_pair ? a.rope_pair : half;
+                        if (a.rot == 0 || a.rot % 2 || a.inv_freq.size() != half || dist < half || dist + half > a.hd ||
+                            a.cd_qnorm < 0 || a.cd_knorm < 0 || a.scale < 0)
+                            fail(aw, "qkvnorm_rope wants rot / 2 inv_freq values, a pair distance inside the head, "
+                                     "the consts offsets of both norms and a non-negative scale");
+                    }
                 }
                 // the products tile K^T by (64, 32) and V by (64, 32): a dense head dim of 64 or
                 // 128 is a narrower product, the full layers' 256 the widest
@@ -341,6 +370,13 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                 for (const auto& kv : a.kernels_s) ks.push_back(kv.first);
                 for (const auto& kv : a.kernels_pv) kpv.push_back(kv.first);
                 if (ks != kpv) fail(aw, "kernels_s and kernels_pv cover different windows");
+                if (aj.contains("kernels_shl")) {
+                    streams("kernels_shl", a.kernels_shl);
+                    std::vector<size_t> kshl;
+                    for (const auto& kv : a.kernels_shl) kshl.push_back(kv.first);
+                    if (!a.qsplit || kshl != ks) fail(aw, "kernels_shl stacks qsplit's two scores products: it wants qsplit "
+                                                          "and the windows of kernels_s");
+                }
             }
             if (g.kind == "dense") {
                 if (g.program.size() != 5)
@@ -356,6 +392,10 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                 g.attn_kernel = gj.value("attn_kernel", std::string("dxB"));
                 g.attn_args = gj.value("attn_args", std::vector<std::string>{"pool", "xres", "consts", "state", "act", "ptab"});
                 g.sandwich = gj.value("sandwich", false);
+                g.cd_preffn = gj.value("cd_preffn", int64_t{-1});
+                g.cd_postffn = gj.value("cd_postffn", int64_t{-1});
+                if ((g.cd_preffn >= 0 || g.cd_postffn >= 0) && !g.sandwich)
+                    fail(gw, "cd_preffn / cd_postffn name sandwich norms, but sandwich is false");
                 g.act = gj.value("act", std::string("silu"));
                 if (g.attn_args.size() != 6) fail(gw, "attn_args wants exactly 6 buffer names, has " + std::to_string(g.attn_args.size()));
                 auto ak = m.kernels.find(g.attn_kernel);
@@ -537,6 +577,31 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
             check_split(g.program, g.weights, "program");
             check_split(g.shared_program, g.shared_weights, "shared");
             check_split(g.ffn_program, g.ffn_weights, "ffn");
+            // OPEN-PREFILL-BFP16: a bfp16 step reads a bfp16_gemm weight and nothing else does (the q4 GEMMs
+            // would read its 9-byte blocks as q4_1 chunks); only the dense route's chain packs its x and
+            // reads its c-tiled y
+            auto check_bfp16 = [&](const std::vector<Step>& prog, const std::map<std::string, GemmWeight>& ws,
+                                   const char* what) {
+                for (const auto& s : prog) {
+                    const GemmWeight& w = ws.at(s.args[0]);
+                    const bool packed = w.from == "pack" && !w.pack.empty() && w.pack.front().op == "bfp16_gemm";
+                    if ((s.fmt == "bfp16") != packed)
+                        fail(gw, std::string(what) + " step " + s.kernel + (packed ? " reads the bfp16_gemm weight " + s.args[0] +
+                                                                                       " without fmt bfp16"
+                                                                                 : " is fmt bfp16, but its weight " + s.args[0] +
+                                                                                       " is not packed by bfp16_gemm"));
+                    if (s.fmt == "bfp16" && g.kind != "dense")
+                        fail(gw, std::string(what) + " step " + s.kernel + ": only the dense route runs bfp16 steps");
+                    if (packed)
+                        for (const auto& o : w.pack)
+                            if (o.n_total != s.n_pad)
+                                fail(gw, std::string(what) + " step " + s.kernel + ": n_pad " + std::to_string(s.n_pad) +
+                                             ", but " + o.tensor + " packs into a " + std::to_string(o.n_total) + "-row weight");
+                }
+            };
+            check_bfp16(g.program, g.weights, "program");
+            check_bfp16(g.shared_program, g.shared_weights, "shared");
+            check_bfp16(g.ffn_program, g.ffn_weights, "ffn");
         };
         if (v.contains("gemm_block")) parse_gemm_block(v["gemm_block"], tw + " gemm_block", t.gemm_block);
         // OPEN-PREFILL-MODE: whole routes the engine may load in place of gemm_block
@@ -561,7 +626,10 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
             for (const auto& [name, w] : *ws) {
                 if (w.from == "pack") {
                     for (const auto& o : w.pack)
-                        if (o.op == "bf16_gemm" && m.version < 3)
+                        if (o.op == "bfp16_gemm" && m.version < 4)
+                            fail(tw, "gemm_block weight " + name + " packs " + o.op + " in a manifest_version " +
+                                         std::to_string(m.version) + " manifest; an engine that reads 3 cannot pack it, so it needs version 4");
+                        else if (o.op == "bf16_gemm" && m.version < 3)
                             fail(tw, "gemm_block weight " + name + " packs " + o.op + " in a manifest_version " +
                                          std::to_string(m.version) + " manifest; an engine that reads 2 cannot pack it, so it needs version 3");
                     continue;

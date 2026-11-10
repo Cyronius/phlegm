@@ -57,10 +57,16 @@ endif()
 # block_host_test (no XRT): the block prefill's host stages against replica_block.py's fixture
 add_executable(block_host_test block_host_test.cpp block_host.cpp)
 target_include_directories(block_host_test PRIVATE ${_inc})
+# attn_window_test (no XRT, no fixture): the block attention's host half with Gemma 4's options
+add_executable(attn_window_test attn_window_test.cpp block_host.cpp)
+target_include_directories(attn_window_test PRIVATE ${_inc})
+# kvslice_patch_test (no XRT): attnpos over per-core window fills (OPEN-ATTN-KVSLICE)
+add_executable(kvslice_patch_test kvslice_patch_test.cpp)
+target_include_directories(kvslice_patch_test PRIVATE ${_inc})
 
 # block_host.cpp uses AVX2/FMA intrinsics in both targets. The parent app and
 # Windows build.cmd already enable them; the standalone CMake build must too.
-foreach(t open_qwen36_cli block_host_test)
+foreach(t open_qwen36_cli block_host_test attn_window_test)
     target_link_libraries(${t} PRIVATE OpenMP::OpenMP_CXX)
     if(MSVC)
         target_compile_options(${t} PRIVATE /arch:AVX2)
@@ -69,7 +75,8 @@ foreach(t open_qwen36_cli block_host_test)
     endif()
 endforeach()
 
-foreach(t open_qwen36_cli manifest_test gguf_pack_test vit_test block_host_test)
+foreach(t open_qwen36_cli manifest_test gguf_pack_test vit_test block_host_test attn_window_test
+          kvslice_patch_test)
     if(MSVC)
         target_compile_options(${t} PRIVATE /EHsc /Zc:__cplusplus /bigobj)
         target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -81,6 +88,8 @@ add_test(NAME OPEN-VISION-VIT-CONFIG COMMAND vit_test --configs
          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures")
 add_test(NAME OPEN-VISION-VIT-WINDOWED COMMAND vit_test --window-index)
 add_test(NAME GGUF-PACK COMMAND gguf_pack_test)
+add_test(NAME OPEN-PREFILL-ATTN-WINDOW COMMAND attn_window_test)
+add_test(NAME OPEN-ATTN-KVSLICE-PATCH COMMAND kvslice_patch_test)
 add_test(NAME OPEN-MANIFEST COMMAND manifest_test
          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures/manifest_qwen36.json"
          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures/manifest_qwen3_4b.json"

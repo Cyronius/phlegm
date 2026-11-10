@@ -44,6 +44,8 @@ struct PackOp {
                                                                         ///< "lo", one half of its exact q4_1
                                                                         ///< split ("" = the whole tensor)
     std::string via;                                                    ///< bf16_gemm: "q4_1" reads a q8 source as the q4 ops do
+    uint64_t row0 = 0, n_total = 0;                                     ///< bfp16_gemm: this tensor's first row in the stacked
+                                                                        ///< weight, and the weight's padded row count
     std::string div_running;                                            ///< put: divide the values by the product,
                                                                         ///< over the layers BEFORE this one, of this
                                                                         ///< one-value tensor ("{j}" = that layer) --
@@ -60,6 +62,9 @@ struct Step {
     std::string kernel;
     std::vector<std::string> args;           ///< run: buffer names (per-layer: pool consts act state; else globals)
     uint64_t act_off = 0;                    ///< moeroute2: the router record's offset in `act`
+    std::string fmt;                         ///< run, dense block route: "" = the q4_1 GEMMs, "bfp16" = gemm_bfp16
+                                             ///< (x packed bfp16, y c-tiled with `n_pad` rows; OPEN-PREFILL-BFP16)
+    uint64_t n_pad = 0;                      ///< fmt bfp16: the weight's rows padded to a whole number of tile groups
     bool split = false;                      ///< run, block route: the weight is a q8 projection's exact q4_1
                                              ///< split, [hi | lo]; the GEMM runs twice the rows and the halves add
 };
@@ -110,12 +115,23 @@ struct MoeBatch {
 /// window up to l_max on one xclbin; the host chunks a longer window and merges the softmax.
 struct AttnBlock {
     std::map<size_t, std::string> kernels_s, kernels_pv;   ///< window rows -> the stream for that width
+    /// qsplit's scores of Q's hi and lo halves stacked as one product of 2 m rows (optional): one
+    /// dispatch where kernels_s takes two, each row the same dot product
+    std::map<size_t, std::string> kernels_shl;
     std::vector<std::string> args;                         ///< the a / b / c globals
     size_t m = 0, hd = 0, l_max = 0;                       ///< rows per product (heads per kv head x T), head dim
     /// A dense layer's host half before the products: "qknorm_rope" (q/k RMSNorm, then the
-    /// half-split rotation; no bias, no gate) or "rope" (the rotation alone). Empty on a
-    /// full-attention layer, whose is fixed.
+    /// half-split rotation; no bias, no gate), "rope" (the rotation alone) or "qkvnorm_rope"
+    /// (Gemma 4: q/k RMSNorm with the consts' weights, a weightless V norm, then the fields
+    /// below). Empty on a full-attention layer, whose is fixed.
     std::string prep;
+    // qkvnorm_rope's own geometry, per layer type (each has its own rotation and window)
+    double scale = 0;                 ///< the score scale; 0 = 1 / sqrt(hd)
+    size_t window = 0;                ///< a sliding window's rows; 0 = every cached row
+    size_t rot = 0, rope_pair = 0;    ///< rotated dims and the pair distance (0 = rot / 2)
+    std::vector<double> inv_freq;     ///< rot / 2 frequencies (empty = the layout's)
+    bool qsplit = false;              ///< Q as a bf16 hi / lo pair, as the decode kernel takes it
+    int64_t cd_qnorm = -1, cd_knorm = -1;   ///< the q / k norms' bf16 [hd] in the consts
     bool present() const { return !kernels_s.empty(); }
 };
 
@@ -134,6 +150,11 @@ struct GemmBlockProgram {
     std::string attn_kernel = "dxB";
     std::vector<std::string> attn_args = {"pool", "xres", "consts", "state", "act", "ptab"};
     bool sandwich = false;
+    // sandwich: where the consts hold the FFN-side norms (pre_feedforward / post_feedforward
+    // layernorm), or -1 to read them from the file by name (Gemma 3). Gemma 4 needs the consts
+    // copy: its packer folds layer_output_scale into the post norms (div_running), and the
+    // file's post_feedforward weight is not folded.
+    int64_t cd_preffn = -1, cd_postffn = -1;
     std::string act = "silu";
     // >1: the route's HOST norms split each row into `norm_groups` equal groups and
     // RMS each group separately (K2's GroupRMSNorm(2)), the same split the `ln`
@@ -196,6 +217,9 @@ struct KernelDesc {
     /// layer types have different attention geometry (Gemma 4: head dim 256 and 512) builds a
     /// kernel per type, each patched with its own; absent in the manifest = the layout's.
     uint64_t kv_row = 0, ptab_row = 0;
+    /// attnpos: rows of one per-core window element (OPEN-ATTN-KVSLICE: each attention core reads its own
+    /// kv heads of the window on a fill of its own); 0 = the one window fill of every other kernel.
+    uint64_t kvslice = 0;
 };
 
 // OPEN-DECODE-ROWS: `kernel` reuses each layer's pool / consts / state / ptab; l == 0 means no rows pass.

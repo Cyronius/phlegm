@@ -16,6 +16,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "open_qwen36/bfp16.hpp"
+
 namespace open_qwen36 {
 namespace host {
 
@@ -36,6 +38,41 @@ void transpose_parts(const float* y, size_t T, const TransposePart* parts, size_
 /// x [T, K] fp32 -> the GEMM's tiled bf16 activation layout ([K, T] "k,n" order, 64 x 32
 /// tiles of 8 x 8 MAC sub-tiles, gemm_q4_prefill.py); out holds K * T bf16 bits.
 void tile_x(const float* x, size_t T, size_t K, uint16_t* out);
+/// The gated FFN in two halves, so the first can run while the up projection does:
+/// act[i] = silu(gate[i]) or gelu_tanh(gate[i]) in fp64, over n elements in any layout ...
+void act_fp64(const float* gate, size_t n, bool gelu_tanh, double* act);
+/// ... and h = act * up rounded to fp32, from both as the GEMM wrote them ([K, T]), straight
+/// into tile_x's layout for the down projection: tile_x over the [T, K] h, bit for bit,
+/// without the two transposes or h itself.
+void act_tile(const double* act, const float* up, size_t T, size_t K, uint16_t* out);
+/// A sandwich join a token row at a time (Gemma): res = x + rms(y) * w_post, rounded to fp32
+/// before it joins, and, where w_next is given, next = rms(res) * w_next -- the reductions and
+/// products the separate rmsnorm and residual passes make, in their order, so the same bits.
+/// Each row of `hid` splits into `groups` norm groups.
+void sandwich_rows(const float* y, const double* x, size_t T, size_t hid, size_t groups, const float* w_post,
+                   const float* w_next, double eps, double* res, float* next);
+
+/// OPEN-PREFILL-BFP16, gemm_bfp16's operands (bfp16.hpp). x [T, K] fp32 -> the A operand, T * K / 8 * 9
+/// bytes. T a multiple of m * rows, K of k.
+void bfp16_pack_a(const float* x, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out);
+/// The kernel's c-tiled fp32 output of an M x N product -> y [n_real, M] (the q4 GEMM's own [N, T] order).
+void bfp16_untile_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t n_real, float* y);
+/// ... -> y [rows, n_real], token rows: the first `rows` of the M, the first n_real of the N (padding dropped).
+void bfp16_rows_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t rows, size_t n_real, float* y);
+/// bfp16_rows_c into the ranges the caller reads them as: columns [off, off + width) of each of the first `rows`
+/// rows land in dst as [rows, width], as transpose_parts does from [N, T]. Every off and width a multiple of t.n.
+void bfp16_rows_parts(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t rows, const TransposePart* parts,
+                      size_t n_parts);
+/// act_tile for the bfp16 route: act (act_fp64 of the gate) and up, both c-tiled T x K outputs, give
+/// h = act * up rounded to fp32, encoded as the down projection's A operand -- bfp16_pack_a of the [T, K] h,
+/// byte for byte, without untiling either input or holding h.
+void act_bfp16_a(const double* act, const float* up, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out);
+/// act_fp64 and act_bfp16_a in one pass with the act in fp32 on the vector unit, for the bfp16 route only,
+/// whose A operand keeps eight bits of each value: h = gelu_tanh(gate) * up from the c-tiled gate and up,
+/// gelu_tanh(g) = g / (1 + exp(-2z)) with z = sqrt(2/pi) (g + 0.044715 g^3) -- 0.5 g (1 + tanh z) without
+/// its cancellation at large negative g -- and exp good to about an ulp. An encoded mantissa differs from
+/// act_bfp16_a's by at most one, and only where h sits on a rounding boundary.
+void gelu_bfp16_a(const float* gate, const float* up, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out);
 
 struct DeltaGeom {
     size_t T = 0, t_real = 0, hid = 0;
@@ -87,7 +124,17 @@ struct AttnGeom {
     size_t T = 0, t_real = 0, nh = 0, kvh = 0, hd = 0, rot = 0;
     size_t pos0 = 0;        ///< the block's first position (and KV row)
     double eps = 1e-6;      ///< the q / k norms' eps
+    // Gemma 4's attention (attention_prep / softmax_chunk); the defaults are every other family's
+    double scale = 0;       ///< the score scale folded into Q; 0 = 1 / sqrt(hd)
+    size_t pair = 0;        ///< the rotation's pair distance (dim i turns with i + pair); 0 = rot / 2
+    size_t window = 0;      ///< a sliding window's rows: position p reads rows (p - window, p]; 0 = all
+    bool vnorm = false;     ///< a weightless RMSNorm on V before it is cached
 };
+
+/// The first cached row any query of the block reads: 0, or pos0 + 1 - window under a window.
+inline size_t attn_first_row(const AttnGeom& g) {
+    return g.window && g.pos0 + 1 > g.window ? g.pos0 + 1 - g.window : 0;
+}
 
 /// The full-attention layer's middle over a block. q / gate [T, nh*hd], k / v [T, kvh*hd]
 /// are the fused projection's outputs; qn / kn [hd]; inv_freq [rot/2]. kv is the layer's
@@ -103,7 +150,9 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
 /// normed and roped with 1/sqrt(hd) folded in (a power of two at every head dim here, so the
 /// bf16 the kernel sees rounds exactly as the unscaled value would); the block's k / v normed,
 /// roped and written to the cache rows [pos0, pos0 + t_real) in bf16. Rows of Q past t_real are zero.
-/// A null qn / kn skips that norm (a family with no q/k norm, prep "rope").
+/// A null qn / kn skips that norm (a family with no q/k norm, prep "rope"). g.scale, g.pair and
+/// g.vnorm give Gemma 4's unit score scale, its proportional rotation (rot / 2 pairs at distance
+/// hd / 2 on the global layers) and its weightless V norm.
 void attention_prep(const AttnGeom& g, const float* q, const float* k, const float* v, const float* qn,
                     const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems, float* Q);
 
@@ -116,11 +165,14 @@ void tile_rows_as_b(const uint16_t* rows, size_t stride, size_t k_real, size_t k
 
 /// One window chunk of the causal row softmax, with the running (max, sum) carried across chunks:
 /// s [M, L] fp32 scores whose column 0 is window row c0; row r's query sits at pos[r], so columns
-/// c0 + j > pos[r] are masked. Writes p [M, L] bf16 = exp(s - m_new) (zero where masked), scales
+/// c0 + j > pos[r] are masked, and under a sliding window (window > 0) so are c0 + j <= pos[r] - window. Writes p [M, L] bf16 = exp(s - m_new) (zero where masked), scales
 /// acc [M, hd] and l [M] by exp(m_old - m_new), and folds the bf16-rounded p into l -- what the
 /// kernel will multiply is what the denominator counts. Start with m = -inf, l = 0, acc = 0.
 void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, const size_t* pos, float* m, float* l,
-                   float* acc, uint16_t* p);
+                   float* acc, uint16_t* p, size_t window = 0);
+/// softmax_chunk of s = hi + lo (each [M, L]), the f32 sum taken as each score is read, never stored
+void softmax_chunk_sum(size_t M, size_t L, size_t hd, size_t c0, const float* hi, const float* lo, const size_t* pos,
+                       float* m, float* l, float* acc, uint16_t* p, size_t window = 0);
 
 /// The MoE router over a block: softmax of xm [T, hid] @ Wr [hid, E] into probs [T, E], the
 /// top-k by probability (lowest index on a tie, as the kernel's router_fin picks) into

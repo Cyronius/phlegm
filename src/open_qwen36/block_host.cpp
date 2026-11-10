@@ -13,6 +13,7 @@
 #include <omp.h>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -43,6 +44,26 @@ void rms_vec(const float* x, size_t d, const float* w, double eps, float* out) {
     for (size_t j = 0; j < d; ++j) ss += static_cast<double>(x[j]) * x[j];
     const float r = static_cast<float>(1.0 / std::sqrt(ss / static_cast<double>(d) + eps));
     for (size_t j = 0; j < d; ++j) out[j] = x[j] * r * w[j];
+}
+
+// one position's rotation: pair i (dim i with dim i + dist, Gemma 4's proportional rotation turning
+// rot / 2 pairs at distance hd / 2) by pos * inv_freq[i], its cos and sin rounded to f32. Every head
+// at the position turns by the same angles, so they are taken once a position
+void rope_angles(size_t pairs, const double* inv_freq, double pos, float* c, float* s) {
+    for (size_t i = 0; i < pairs; ++i) {
+        const double a = pos * inv_freq[i];
+        c[i] = static_cast<float>(std::cos(a));
+        s[i] = static_cast<float>(std::sin(a));
+    }
+}
+
+// the `pairs` rotations from rope_angles' tables; rope() below is the half-split case, dist == pairs
+void rope_pairs_cs(float* x, size_t pairs, size_t dist, const float* c, const float* s) {
+    for (size_t i = 0; i < pairs; ++i) {
+        const float x1 = x[i], x2 = x[dist + i];
+        x[i] = x1 * c[i] - x2 * s[i];
+        x[dist + i] = x2 * c[i] + x1 * s[i];
+    }
 }
 
 // the partial rotation over the first 2 * half dims, half-split (Qwen's layout)
@@ -219,6 +240,194 @@ void tile_x(const float* x, size_t T, size_t K, uint16_t* out) {
                         for (size_t t = 0; t < MAC; ++t)
                             *w++ = f32_to_bf16(x[(nb * TN + ti * MAC + t) * K + kb * TK + si * MAC + s]);
         }
+}
+
+void act_fp64(const float* gate, size_t n, bool gelu_tanh, double* act) {
+#pragma omp parallel for
+    for (long long i = 0; i < static_cast<long long>(n); ++i) {
+        const double g = static_cast<double>(gate[i]);
+        // tanh-approximate GELU (HF's "gelu_pytorch_tanh"): sqrt(2/pi) = 0.7978845608028654
+        act[i] = gelu_tanh ? 0.5 * g * (1.0 + std::tanh(0.7978845608028654 * (g + 0.044715 * g * g * g)))
+                           : (g / (1.0 + std::exp(-g)));
+    }
+}
+
+void act_tile(const double* act, const float* up, size_t T, size_t K, uint16_t* out) {
+    // tile_x's walk, reading [K, T] where tile_x reads [T, K]: a sub-tile's eight tokens are
+    // contiguous here, one row of the GEMM output each
+    constexpr size_t TK = 64, MAC = 8, TN = 32;
+    if (K % TK || T % TN) throw std::runtime_error("open_qwen36: act_tile: K or T does not tile by (64, 32)");
+    const size_t NB = T / TN;
+#pragma omp parallel for
+    for (long long kb = 0; kb < static_cast<long long>(K / TK); ++kb)
+        for (size_t nb = 0; nb < NB; ++nb) {
+            uint16_t* w = out + (kb * NB + nb) * TK * TN;
+            for (size_t si = 0; si < TK / MAC; ++si)
+                for (size_t ti = 0; ti < TN / MAC; ++ti)
+                    for (size_t s = 0; s < MAC; ++s) {
+                        const size_t i = (kb * TK + si * MAC + s) * T + nb * TN + ti * MAC;
+                        for (size_t t = 0; t < MAC; ++t)
+                            *w++ = f32_to_bf16(static_cast<float>(act[i + t] * static_cast<double>(up[i + t])));
+                    }
+        }
+}
+
+namespace {
+// An A operand's blocks in the order they sit in memory -- tile by tile, a tile's 16-row groups by
+// block column, then the group's rows -- so the writes run sequentially and no offset is divided out
+// per block. fill(r0, col, h) puts columns [col, col + 8) of rows r0 .. r0 + 15 into h[16][8].
+template <class Fill>
+void encode_a_tiles(size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out, const Fill& fill) {
+    const size_t nk = K / t.k, tkb = t.k / 8;
+#pragma omp parallel for
+    for (long long ti = 0; ti < static_cast<long long>(T / t.m * nk); ++ti) {
+        const size_t rt = static_cast<size_t>(ti) / nk, kt = static_cast<size_t>(ti) % nk;
+        uint8_t* w = out + static_cast<size_t>(ti) * t.m * tkb * BFP16_BLOCK_BYTES;
+        alignas(32) float h[16 * 8];
+        for (size_t g = 0; g < t.m / 16; ++g)
+            for (size_t cb = 0; cb < tkb; ++cb) {
+                fill(rt * t.m + g * 16, kt * t.k + cb * 8, h);
+                for (size_t i = 0; i < 16; ++i, w += BFP16_BLOCK_BYTES) bfp16_encode_block(h + 8 * i, w);
+            }
+    }
+}
+}  // namespace
+
+void bfp16_pack_a(const float* x, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out) {
+    if (T % (t.m * t.rows) || K % t.k || t.m % 16) throw std::runtime_error("open_qwen36: bfp16_pack_a: T or K does not tile");
+    encode_a_tiles(T, K, t, out, [&](size_t r0, size_t col, float* h) {
+        for (size_t i = 0; i < 16; ++i) std::memcpy(h + 8 * i, x + (r0 + i) * K + col, 32);
+    });
+}
+
+void bfp16_untile_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t n_real, float* y) {
+    const size_t rb = t.m * t.rows, blk = rb * t.n, J = N / (t.n * t.cols);
+#pragma omp parallel for
+    for (long long nn = 0; nn < static_cast<long long>(n_real); ++nn) {
+        const size_t n = static_cast<size_t>(nn), ct = n / t.n, j = n % t.n;
+        const float* base = c + (ct % t.cols) * (M * N / t.cols) + (ct / t.cols) * blk + j;
+        float* o = y + n * M;
+        for (size_t r = 0; r < M; ++r) o[r] = base[(r / rb) * J * blk + (r % rb) * t.n];
+    }
+}
+
+void bfp16_rows_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t rows, size_t n_real, float* y) {
+    if (rows > M || n_real > N) throw std::runtime_error("open_qwen36: bfp16_rows_c: more rows or columns than C has");
+#pragma omp parallel for
+    for (long long rr = 0; rr < static_cast<long long>(rows); ++rr) {
+        const size_t r = static_cast<size_t>(rr);
+        for (size_t n0 = 0; n0 < n_real; n0 += t.n)
+            std::memcpy(y + r * n_real + n0, c + bfp16_c_offset(r, n0, M, N, t), std::min(t.n, n_real - n0) * 4);
+    }
+}
+
+void bfp16_rows_parts(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t rows, const TransposePart* parts,
+                      size_t n_parts) {
+    if (rows > M) throw std::runtime_error("open_qwen36: bfp16_rows_parts: more rows than C has");
+    for (size_t i = 0; i < n_parts; ++i)
+        if (parts[i].off % t.n || parts[i].width % t.n || parts[i].off + parts[i].width > N)
+            throw std::runtime_error("open_qwen36: bfp16_rows_parts: a part is not whole c-tiles of C");
+#pragma omp parallel for
+    for (long long rr = 0; rr < static_cast<long long>(rows); ++rr) {
+        const size_t r = static_cast<size_t>(rr);
+        for (size_t i = 0; i < n_parts; ++i) {
+            const TransposePart& pt = parts[i];
+            for (size_t n0 = 0; n0 < pt.width; n0 += t.n)
+                std::memcpy(pt.dst + r * pt.width + n0, c + bfp16_c_offset(r, pt.off + n0, M, N, t), t.n * 4);
+        }
+    }
+}
+
+void act_bfp16_a(const double* act, const float* up, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out) {
+    if (T % (t.m * t.rows) || K % (t.n * t.cols) || t.n % 8 || t.m % 16)
+        throw std::runtime_error("open_qwen36: act_bfp16_a: T or K does not tile");
+    encode_a_tiles(T, K, t, out, [&](size_t r0, size_t col, float* h) {
+        // 16 rows of one c-tile (r0 is a multiple of 16, inside one m * rows block): t.n floats apart
+        const size_t o0 = bfp16_c_offset(r0, col, T, K, t);
+        for (size_t i = 0; i < 16; ++i)
+            for (size_t j = 0; j < 8; ++j) {
+                const size_t o = o0 + i * t.n + j;
+                h[8 * i + j] = static_cast<float>(act[o] * static_cast<double>(up[o]));
+            }
+    });
+}
+
+namespace {
+// exp of eight floats, Cephes' expf: n = round(x / ln 2), r = x - n ln 2 in two parts, a degree-5
+// polynomial, times 2^n. About an ulp over [-87, 88]; +inf above it, 0 below (no subnormals).
+inline __m256 exp8(__m256 x) {
+    const __m256 hi = _mm256_set1_ps(88.0f), lo = _mm256_set1_ps(-87.0f);
+    const __m256 over = _mm256_cmp_ps(x, hi, _CMP_GT_OQ), under = _mm256_cmp_ps(x, lo, _CMP_LT_OQ);
+    x = _mm256_min_ps(_mm256_max_ps(x, lo), hi);
+    const __m256 n = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.44269504088896341f)),
+                                     _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 r = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.693359375f), x);
+    r = _mm256_fnmadd_ps(n, _mm256_set1_ps(-2.12194440e-4f), r);
+    __m256 p = _mm256_set1_ps(1.9875691500e-4f);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.3981999507e-3f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(8.3334519073e-3f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.1665795894e-2f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.6666665459e-1f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(5.0000001201e-1f));
+    p = _mm256_fmadd_ps(_mm256_mul_ps(p, r), r, _mm256_add_ps(r, _mm256_set1_ps(1.0f)));
+    const __m256i e = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23);
+    p = _mm256_mul_ps(p, _mm256_castsi256_ps(e));
+    p = _mm256_blendv_ps(p, _mm256_set1_ps(std::numeric_limits<float>::infinity()), over);
+    return _mm256_andnot_ps(under, p);
+}
+}  // namespace
+
+void gelu_bfp16_a(const float* gate, const float* up, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out) {
+    if (T % (t.m * t.rows) || K % (t.n * t.cols) || t.n % 8 || t.m % 16)
+        throw std::runtime_error("open_qwen36: gelu_bfp16_a: T or K does not tile");
+    const __m256 c = _mm256_set1_ps(-2.0f * 0.7978845608028654f), c3 = _mm256_set1_ps(0.044715f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    encode_a_tiles(T, K, t, out, [&](size_t r0, size_t col, float* h) {
+        const size_t o0 = bfp16_c_offset(r0, col, T, K, t);
+        for (size_t i = 0; i < 16; ++i) {
+            const size_t o = o0 + i * t.n;
+            const __m256 g = _mm256_loadu_ps(gate + o);
+            // -2z = -2 sqrt(2/pi) g (1 + 0.044715 g^2)
+            const __m256 m2z = _mm256_mul_ps(_mm256_mul_ps(c, g), _mm256_fmadd_ps(c3, _mm256_mul_ps(g, g), one));
+            const __m256 act = _mm256_div_ps(g, _mm256_add_ps(one, exp8(m2z)));
+            _mm256_store_ps(h + 8 * i, _mm256_mul_ps(act, _mm256_loadu_ps(up + o)));
+        }
+    });
+}
+
+void sandwich_rows(const float* y, const double* x, size_t T, size_t hid, size_t groups, const float* w_post,
+                   const float* w_next, double eps, double* res, float* next) {
+    if (!groups || hid % groups) throw std::runtime_error("open_qwen36: sandwich_rows: groups does not divide the row");
+    const size_t gw = hid / groups;
+#pragma omp parallel for
+    for (long long tt = 0; tt < static_cast<long long>(T); ++tt) {
+        const size_t t = static_cast<size_t>(tt);
+        const float* yr = y + t * hid;
+        const double* xr = x + t * hid;
+        double* rr = res + t * hid;
+        for (size_t gi = 0; gi < groups; ++gi) {
+            const size_t o = gi * gw;
+            double ss = 0;
+            for (size_t k = 0; k < gw; ++k) {
+                const double v = static_cast<double>(yr[o + k]);
+                ss += v * v;
+            }
+            const double rms = std::sqrt(ss / static_cast<double>(gw) + eps);
+            for (size_t k = 0; k < gw; ++k) {
+                const float n = static_cast<float>((static_cast<double>(yr[o + k]) / rms) * static_cast<double>(w_post[o + k]));
+                rr[o + k] = xr[o + k] + static_cast<double>(n);
+            }
+        }
+        if (!next) continue;
+        float* nr = next + t * hid;
+        for (size_t gi = 0; gi < groups; ++gi) {
+            const size_t o = gi * gw;
+            double ss = 0;
+            for (size_t k = 0; k < gw; ++k) ss += rr[o + k] * rr[o + k];
+            const double rms = std::sqrt(ss / static_cast<double>(gw) + eps);
+            for (size_t k = 0; k < gw; ++k) nr[o + k] = static_cast<float>((rr[o + k] / rms) * static_cast<double>(w_next[o + k]));
+        }
+    }
 }
 
 void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const float* xn, const float* convw,
@@ -458,33 +667,44 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
 void attention_prep(const AttnGeom& g, const float* q, const float* k, const float* v, const float* qn,
                     const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems, float* Q) {
     const size_t qw = g.nh * g.hd, kvw = g.kvh * g.hd, half = g.rot / 2, R = g.t_real;
-    if (g.nh % g.kvh || g.t_real > g.T || g.rot > g.hd || kv_row_elems < 2 * kvw)
+    const size_t dist = g.pair ? g.pair : half;
+    if (g.nh % g.kvh || g.t_real > g.T || g.rot > g.hd || kv_row_elems < 2 * kvw || dist < half || dist + half > g.hd)
         throw std::runtime_error("open_qwen36: attention_prep: inconsistent geometry");
-    const float scale = 1.0f / std::sqrt(static_cast<float>(g.hd));
+    const float scale = g.scale > 0 ? static_cast<float>(g.scale) : 1.0f / std::sqrt(static_cast<float>(g.hd));
     std::fill(Q, Q + g.T * qw, 0.f);
 #pragma omp parallel
     {
-    std::vector<float> kh(kvw);                 // once a thread, not once a token
+    std::vector<float> kh(kvw), cs(2 * half);  // once a thread, not once a token
 #pragma omp for
     for (long long tt = 0; tt < static_cast<long long>(R); ++tt) {
         const size_t t = static_cast<size_t>(tt), p = g.pos0 + t;
+        rope_angles(half, inv_freq, static_cast<double>(p), cs.data(), cs.data() + half);
         for (size_t h = 0; h < g.nh; ++h) {
             float* dst = Q + t * qw + h * g.hd;
             const float* src = q + t * qw + h * g.hd;
             if (qn) rms_vec(src, g.hd, qn, g.eps, dst);
             else std::copy(src, src + g.hd, dst);
-            rope(dst, half, inv_freq, static_cast<double>(p));
-            for (size_t j = 0; j < g.hd; ++j) dst[j] *= scale;
+            rope_pairs_cs(dst, half, dist, cs.data(), cs.data() + half);
+            if (scale != 1.0f)
+                for (size_t j = 0; j < g.hd; ++j) dst[j] *= scale;
         }
         for (size_t h = 0; h < g.kvh; ++h) {
             const float* src = k + t * kvw + h * g.hd;
             if (kn) rms_vec(src, g.hd, kn, g.eps, kh.data() + h * g.hd);
             else std::copy(src, src + g.hd, kh.data() + h * g.hd);
-            rope(kh.data() + h * g.hd, half, inv_freq, static_cast<double>(p));
+            rope_pairs_cs(kh.data() + h * g.hd, half, dist, cs.data(), cs.data() + half);
         }
-        for (size_t j = 0; j < kvw; ++j) {
-            kv[p * kv_row_elems + j] = f32_to_bf16(kh[j]);
-            kv[p * kv_row_elems + kvw + j] = f32_to_bf16(v[t * kvw + j]);
+        for (size_t j = 0; j < kvw; ++j) kv[p * kv_row_elems + j] = f32_to_bf16(kh[j]);
+        for (size_t h = 0; h < g.kvh; ++h) {
+            const float* src = v + t * kvw + h * g.hd;
+            uint16_t* dst = kv + p * kv_row_elems + kvw + h * g.hd;
+            float r = 1.f;
+            if (g.vnorm) {                       // x / sqrt(mean(x^2) + eps), no weight
+                double ss = 0;
+                for (size_t j = 0; j < g.hd; ++j) ss += static_cast<double>(src[j]) * src[j];
+                r = static_cast<float>(1.0 / std::sqrt(ss / static_cast<double>(g.hd) + g.eps));
+            }
+            for (size_t j = 0; j < g.hd; ++j) dst[j] = f32_to_bf16(g.vnorm ? src[j] * r : src[j]);
         }
     }
     }
@@ -494,18 +714,19 @@ void tile_rows_as_bt(const uint16_t* rows, size_t stride, size_t n_real, size_t 
     constexpr size_t TK = 64, MAC = 8, TN = 32;
     if (k % TK || n % TN) throw std::runtime_error("open_qwen36: tile_rows_as_bt: k or n does not tile by (64, 32)");
     const size_t NB = n / TN;
+    // over every tile, not every k block: a head of 256 is four k blocks, four threads' work
 #pragma omp parallel for
-    for (long long kb = 0; kb < static_cast<long long>(k / TK); ++kb)
-        for (size_t nb = 0; nb < NB; ++nb) {
-            uint16_t* w = out + (kb * NB + nb) * TK * TN;
-            for (size_t si = 0; si < TK / MAC; ++si)
-                for (size_t ti = 0; ti < TN / MAC; ++ti)
-                    for (size_t s = 0; s < MAC; ++s)
-                        for (size_t t = 0; t < MAC; ++t) {
-                            const size_t r = nb * TN + ti * MAC + t;
-                            *w++ = r < n_real ? rows[r * stride + kb * TK + si * MAC + s] : 0;
-                        }
-        }
+    for (long long ib = 0; ib < static_cast<long long>(k / TK * NB); ++ib) {
+        const size_t kb = static_cast<size_t>(ib) / NB, nb = static_cast<size_t>(ib) % NB;
+        uint16_t* w = out + (kb * NB + nb) * TK * TN;
+        for (size_t si = 0; si < TK / MAC; ++si)
+            for (size_t ti = 0; ti < TN / MAC; ++ti)
+                for (size_t s = 0; s < MAC; ++s)
+                    for (size_t t = 0; t < MAC; ++t) {
+                        const size_t r = nb * TN + ti * MAC + t;
+                        *w++ = r < n_real ? rows[r * stride + kb * TK + si * MAC + s] : 0;
+                    }
+    }
 }
 
 void tile_rows_as_b(const uint16_t* rows, size_t stride, size_t k_real, size_t k, size_t n, uint16_t* out) {
@@ -513,33 +734,38 @@ void tile_rows_as_b(const uint16_t* rows, size_t stride, size_t k_real, size_t k
     if (k % TK || n % TN) throw std::runtime_error("open_qwen36: tile_rows_as_b: k or n does not tile by (64, 32)");
     const size_t NB = n / TN;
 #pragma omp parallel for
-    for (long long kb = 0; kb < static_cast<long long>(k / TK); ++kb)
-        for (size_t nb = 0; nb < NB; ++nb) {
-            uint16_t* w = out + (kb * NB + nb) * TK * TN;
-            for (size_t si = 0; si < TK / MAC; ++si)
-                for (size_t ti = 0; ti < TN / MAC; ++ti)
-                    for (size_t s = 0; s < MAC; ++s) {
-                        const size_t r = kb * TK + si * MAC + s;
-                        for (size_t t = 0; t < MAC; ++t)
-                            *w++ = r < k_real ? rows[r * stride + nb * TN + ti * MAC + t] : 0;
-                    }
-        }
+    for (long long ib = 0; ib < static_cast<long long>(k / TK * NB); ++ib) {
+        const size_t kb = static_cast<size_t>(ib) / NB, nb = static_cast<size_t>(ib) % NB;
+        uint16_t* w = out + (kb * NB + nb) * TK * TN;
+        for (size_t si = 0; si < TK / MAC; ++si)
+            for (size_t ti = 0; ti < TN / MAC; ++ti)
+                for (size_t s = 0; s < MAC; ++s) {
+                    const size_t r = kb * TK + si * MAC + s;
+                    for (size_t t = 0; t < MAC; ++t)
+                        *w++ = r < k_real ? rows[r * stride + nb * TN + ti * MAC + t] : 0;
+                }
+    }
 }
 
-void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, const size_t* pos, float* m, float* l,
-                   float* acc, uint16_t* p) {
+namespace {
+// softmax_chunk's rows with the score of (row r, column j) read through `score`
+template <class Score>
+void softmax_rows(size_t M, size_t L, size_t hd, size_t c0, const Score& score, const size_t* pos, float* m, float* l,
+                  float* acc, uint16_t* p, size_t window) {
 #pragma omp parallel for
     for (long long rr = 0; rr < static_cast<long long>(M); ++rr) {
         const size_t r = static_cast<size_t>(rr);
-        const float* sr = s + r * L;
         uint16_t* pr = p + r * L;
         const size_t valid = pos[r] >= c0 ? std::min(L, pos[r] - c0 + 1) : 0;
-        if (valid == 0) {                       // the whole chunk is past this row's position
+        // under a sliding window the row reads (pos - window, pos]: columns before j0 are masked too
+        const size_t lo = window && pos[r] + 1 > window ? pos[r] + 1 - window : 0;
+        const size_t j0 = lo > c0 ? std::min(lo - c0, valid) : 0;
+        if (valid == j0) {                      // the whole chunk is outside this row's window
             std::fill(pr, pr + L, uint16_t{0});
             continue;
         }
         float mc = -std::numeric_limits<float>::infinity();
-        for (size_t j = 0; j < valid; ++j) mc = std::max(mc, sr[j]);
+        for (size_t j = j0; j < valid; ++j) mc = std::max(mc, score(r, j));
         const float m_new = std::max(m[r], mc);
         if (m[r] != m_new && l[r] != 0.f) {    // an earlier chunk's max is beaten: rescale what it accumulated
             const float a = std::exp(m[r] - m_new);
@@ -548,8 +774,9 @@ void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, con
             for (size_t j = 0; j < hd; ++j) ar[j] *= a;
         }
         double sum = 0;
-        for (size_t j = 0; j < valid; ++j) {
-            const uint16_t b = f32_to_bf16(std::exp(sr[j] - m_new));
+        std::fill(pr, pr + j0, uint16_t{0});
+        for (size_t j = j0; j < valid; ++j) {
+            const uint16_t b = f32_to_bf16(std::exp(score(r, j) - m_new));
             pr[j] = b;
             sum += bf16_to_f32(b);
         }
@@ -557,6 +784,18 @@ void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, con
         l[r] += static_cast<float>(sum);
         m[r] = m_new;
     }
+}
+}  // namespace
+
+void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, const size_t* pos, float* m, float* l,
+                   float* acc, uint16_t* p, size_t window) {
+    softmax_rows(M, L, hd, c0, [s, L](size_t r, size_t j) { return s[r * L + j]; }, pos, m, l, acc, p, window);
+}
+
+void softmax_chunk_sum(size_t M, size_t L, size_t hd, size_t c0, const float* hi, const float* lo, const size_t* pos,
+                       float* m, float* l, float* acc, uint16_t* p, size_t window) {
+    softmax_rows(M, L, hd, c0, [hi, lo, L](size_t r, size_t j) { return hi[r * L + j] + lo[r * L + j]; }, pos, m, l, acc, p,
+                 window);
 }
 
 void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, const float* Wr, float* probs,

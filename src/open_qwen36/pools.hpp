@@ -51,6 +51,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 #include "open_qwen36/manifest.hpp"
 #include "open_qwen36/weight_file.hpp"
@@ -60,6 +62,9 @@ namespace pools {
 
 /// One op of a plan into `dst` (a buffer of `dst_bytes`).
 void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_t dst_bytes, size_t chunk_bytes);
+/// The byte ranges of a `bytes`-long buffer that none of `ops` writes, which the caller zeroes: the
+/// row groups no op covers when every op is a whole-group bfp16_gemm; otherwise all of it.
+std::vector<std::pair<size_t, size_t>> unwritten(const std::vector<PackOp>& ops, size_t bytes);
 
 /// `nch` q8 chunks (8704 B each) -> `nch` q4_1 chunks (5120 B each), block for block, in
 /// the SAME chunk order (both formats are 32 rows x 256 K, so no permutation happens here).
@@ -81,6 +86,10 @@ void requant_q4_1_chunks(const uint8_t* src, size_t nch, uint8_t* dst);
 void split_q4_1_chunks(const uint8_t* src, size_t nch, bool hi, uint8_t* dst);
 /// q8 (code * scale) or q4_1 (m + n * d) chunks, 32-row blocks major -> the bf16 GEMM pool (twin: recipes/pack.py)
 void bf16_gemm_pack(const uint8_t* src, bool q8, size_t rows, size_t cols, uint16_t* dst);
+/// q4_1 chunks ([rows, cols], 32-row blocks major) -> rows [row0, row0 + rows) of the B operand of gemm_bfp16, an
+/// `n_total`-row weight in bfp16ebs8 (bfp16.hpp; twin: open_kernels/designs/gemm_bfp16/pack.py). Rows it does not
+/// write stay as `dst` holds them: zero blocks are a zero weight.
+void bfp16_gemm_pack(const uint8_t* src, size_t rows, size_t cols, size_t row0, size_t n_total, uint8_t* dst);
 /// Bytes `op` writes at its dst: `nch` chunks of the pool's format, or of the GEMM pool it builds.
 uint64_t op_bytes(const PackOp& op, size_t chunk_bytes);
 /// `nch` Q4_K chunks (4736 B each) -> `nch` q4_1 chunks (5120 B each), in the SAME chunk

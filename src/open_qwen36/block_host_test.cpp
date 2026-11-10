@@ -423,6 +423,116 @@ int main(int argc, char** argv) {
         check(ok, "transpose: [N, T] -> [T, N]");
     }
 
+    // ---- OPEN-PREFILL-BFP16: the activation packer matches the NumPy one, the output untiles invert the kernel's
+    // order, and the fused act * up encode is the packer over the untiled product
+    {
+        const size_t T2 = 256, K2 = 128;
+        std::vector<float> x(T2 * K2);
+        for (size_t r = 0; r < T2; ++r)
+            for (size_t c = 0; c < K2; ++c) x[r * K2 + c] = static_cast<float>(static_cast<int>((r * 37 + c * 11) % 251) - 125) / 16.f * (1 + (c / 8) % 5);
+        std::vector<uint8_t> a(T2 * K2 / 8 * BFP16_BLOCK_BYTES);
+        host::bfp16_pack_a(x.data(), T2, K2, Bfp16Tiling{}, a.data());
+        uint64_t h = 1469598103934665603ull;
+        for (uint8_t b : a) h = (h ^ b) * 1099511628211ull;
+        std::printf("      bfp16_pack_a fnv1a = 0x%016llx\n", static_cast<unsigned long long>(h));
+        check(h == 0x8b24e0b36ad1f427ull, "bfp16_pack_a: byte-identical to the NumPy packer");
+
+        const size_t M = 512, N = 2048, rb = 256, J = N / 1024;
+        std::vector<float> c(M * N), un(N * M), rows(M * N);
+        for (size_t col = 0; col < 8; ++col)
+            for (size_t rbi = 0; rbi < M / rb; ++rbi)
+                for (size_t t = 0; t < J; ++t)
+                    for (size_t rr = 0; rr < rb; ++rr)
+                        for (size_t j = 0; j < 128; ++j)
+                            c[((col * (M / rb) + rbi) * J + t) * rb * 128 + rr * 128 + j] =
+                                static_cast<float>((rbi * rb + rr) * N + (col + 8 * t) * 128 + j);
+        host::bfp16_untile_c(c.data(), M, N, Bfp16Tiling{}, 1920, un.data());
+        bool ok = true;
+        for (size_t n = 0; n < 1920; ++n)
+            for (size_t r = 0; r < M; ++r) ok = ok && un[n * M + r] == static_cast<float>(r * N + n);
+        check(ok, "bfp16_untile_c: the c-tiled output back to [N, T], padding rows dropped");
+        host::bfp16_rows_c(c.data(), M, N, Bfp16Tiling{}, 300, 1920, rows.data());
+        ok = true;
+        for (size_t r = 0; r < 300; ++r)
+            for (size_t n = 0; n < 1920; ++n) ok = ok && rows[r * 1920 + n] == static_cast<float>(r * N + n);
+        check(ok, "bfp16_rows_c: the c-tiled output back to token rows, padding rows and columns dropped");
+        std::vector<float> p0(300 * 1024), p1(300 * 768);
+        const host::TransposePart parts[2] = {{p0.data(), 0, 1024}, {p1.data(), 1152, 768}};
+        host::bfp16_rows_parts(c.data(), M, N, Bfp16Tiling{}, 300, parts, 2);
+        ok = true;
+        for (size_t r = 0; r < 300; ++r) {
+            for (size_t n = 0; n < 1024; ++n) ok = ok && p0[r * 1024 + n] == static_cast<float>(r * N + n);
+            for (size_t n = 0; n < 768; ++n) ok = ok && p1[r * 768 + n] == static_cast<float>(r * N + 1152 + n);
+        }
+        check(ok, "bfp16_rows_parts: column ranges of the token rows, each into its own [rows, width]");
+
+        // act and up c-tiled as gate | up come off the kernel: [T, ff] = [256, 2048]
+        const size_t TT = 256, FF = 2048;
+        std::vector<double> act(TT * FF);
+        std::vector<float> up(TT * FF), hrow(TT * FF);
+        for (size_t r = 0; r < TT; ++r)
+            for (size_t f = 0; f < FF; ++f) {
+                const size_t o = bfp16_c_offset(r, f, TT, FF, Bfp16Tiling{});
+                act[o] = std::sin(0.37 * static_cast<double>(r * FF + f)) * (1 + (f / 8) % 7);
+                up[o] = static_cast<float>(std::cos(0.11 * static_cast<double>(r + 3 * f)) * 3.0);
+                hrow[r * FF + f] = static_cast<float>(act[o] * static_cast<double>(up[o]));
+            }
+        std::vector<uint8_t> fused(TT * FF / 8 * BFP16_BLOCK_BYTES), ref(fused.size());
+        host::act_bfp16_a(act.data(), up.data(), TT, FF, Bfp16Tiling{}, fused.data());
+        host::bfp16_pack_a(hrow.data(), TT, FF, Bfp16Tiling{}, ref.data());
+        check(fused == ref, "act_bfp16_a: bfp16_pack_a of the untiled act * up, byte for byte");
+
+        // gelu_bfp16_a against the fp64 pair it replaces on the bfp16 route: gate over [-24, 24] with the
+        // extremes and both zeros, decoded values at most one quantum of the coarser block apart, and few
+        std::vector<float> gate(TT * FF);
+        for (size_t i = 0; i < gate.size(); ++i)
+            gate[i] = static_cast<float>(std::sin(0.731 * static_cast<double>(i)) * (i % 3 ? 3.0 : 24.0));
+        const float special[] = {0.f, -0.f, -24.f, 24.f, -12.6f, -9.f, 1e-30f, -1e-30f};
+        for (size_t i = 0; i < 8; ++i) gate[i * 997] = special[i];
+        std::vector<double> act64(TT * FF);
+        host::act_fp64(gate.data(), gate.size(), true, act64.data());
+        host::act_bfp16_a(act64.data(), up.data(), TT, FF, Bfp16Tiling{}, ref.data());
+        host::gelu_bfp16_a(gate.data(), up.data(), TT, FF, Bfp16Tiling{}, fused.data());
+        size_t blocks_diff = 0, vals_diff = 0;
+        double worst = 0;
+        for (size_t b = 0; b < fused.size() / BFP16_BLOCK_BYTES; ++b) {
+            const uint8_t* p = fused.data() + b * BFP16_BLOCK_BYTES;
+            const uint8_t* q = ref.data() + b * BFP16_BLOCK_BYTES;
+            if (!std::memcmp(p, q, BFP16_BLOCK_BYTES)) continue;
+            ++blocks_diff;
+            const double quantum = std::ldexp(1.0, std::max(p[0], q[0]) - 133);
+            for (size_t i = 1; i < BFP16_BLOCK_BYTES; ++i) {
+                const double d = std::fabs(std::ldexp(static_cast<int8_t>(p[i]), p[0] - 133) -
+                                           std::ldexp(static_cast<int8_t>(q[i]), q[0] - 133));
+                vals_diff += d != 0;
+                worst = std::max(worst, d / quantum);
+            }
+        }
+        std::printf("      gelu_bfp16_a: %zu of %zu blocks, %zu of %zu values differ from act_fp64 + act_bfp16_a, "
+                    "worst %.2f quanta\n", blocks_diff, fused.size() / BFP16_BLOCK_BYTES, vals_diff, TT * FF, worst);
+        check(worst <= 1.0 && vals_diff * 1000 < TT * FF,
+              "gelu_bfp16_a: within one quantum of the fp64 act's encode, on under 0.1% of the values");
+    }
+
+    // ---- the stacked scores' softmax: hi + lo as it reads them, the bits of the softmax over the stored sum
+    {
+        const size_t M = 64, L = 512, hd = 32, c0 = 256, window = 300;
+        std::vector<float> hi(M * L), lo(M * L), sum(M * L);
+        for (size_t i = 0; i < M * L; ++i) {
+            hi[i] = static_cast<float>(std::sin(0.37 * static_cast<double>(i)) * 9.0);
+            lo[i] = static_cast<float>(std::cos(0.11 * static_cast<double>(i)) * 3e-3);
+            sum[i] = hi[i] + lo[i];
+        }
+        std::vector<size_t> pos(M);
+        for (size_t r = 0; r < M; ++r) pos[r] = 400 + r * 5;
+        std::vector<float> m1(M, -INFINITY), l1(M, 0.f), m2(M, -INFINITY), l2(M, 0.f), acc(M * hd, 0.f);
+        std::vector<uint16_t> pa(M * L), pb(M * L);
+        host::softmax_chunk(M, L, hd, c0, sum.data(), pos.data(), m1.data(), l1.data(), acc.data(), pa.data(), window);
+        host::softmax_chunk_sum(M, L, hd, c0, hi.data(), lo.data(), pos.data(), m2.data(), l2.data(), acc.data(), pb.data(), window);
+        check(pa == pb && std::memcmp(m1.data(), m2.data(), M * 4) == 0 && std::memcmp(l1.data(), l2.data(), M * 4) == 0,
+              "softmax_chunk_sum: softmax_chunk of the stored hi + lo, bit for bit (window and causal mask)");
+    }
+
     std::printf("%s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

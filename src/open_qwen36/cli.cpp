@@ -112,6 +112,7 @@ struct Args {
     bool block_major = false;       // --block-major: force the old block-at-a-time schedule
     bool prefill_logits = false;    // 0167/#32: logits (dump_pos) at every prefill position reached
     std::string dump_act;           // bring-up: "<layer>:<off>:<bytes>:<path>"
+    std::string dump_kv;            // bring-up: every attention layer's KV rows [0, pos) -> <prefix>_L<j>.bin
     int bench = 0;                  // --bench N[:LAYER]: time the route's dispatches instead of running a prompt
     int bench_layer = 0;            // which layer's route -- the 35B's two types run different GEMM shapes
     int bench_decode = 0;           // --bench-decode N: the same for the per-token program
@@ -150,6 +151,20 @@ void set_power_mode(const std::string& mode) {
 /// Write a slice of a layer's act scratch to a file, so a bring-up run can compare one
 /// stage's output against the reference instead of inferring it from the logits.
 void dump_act_slice(Core& core, const std::string& spec) {
+    if (spec.rfind("all:", 0) == 0) {                     // "all:<prefix>": every layer's whole act -> <prefix>_L<j>.bin
+        const std::string pre = spec.substr(4);
+        for (int l = 0; l < core.num_layers(); ++l) {
+            std::vector<uint8_t> buf(core.act_bytes(l));
+            core.read_act(l, 0, buf.size(), buf.data());
+            const std::string path = pre + "_L" + std::to_string(l) + ".bin";
+            std::FILE* f = std::fopen(path.c_str(), "wb");
+            if (!f) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); return; }
+            std::fwrite(buf.data(), 1, buf.size(), f);
+            std::fclose(f);
+        }
+        std::fprintf(stderr, "wrote every layer's act -> %s_L*.bin\n", pre.c_str());
+        return;
+    }
     int layer = 0; long long off = 0, n = 0;
     char path[512] = {0};
     if (std::sscanf(spec.c_str(), "%d:%lld:%lld:%511s", &layer, &off, &n, path) != 4 || n <= 0) {
@@ -192,6 +207,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--repeat") a.repeat = std::atoi(val().c_str());
         else if (k == "--at-position") a.at_position = std::atoi(val().c_str());
         else if (k == "--dump-act") a.dump_act = val();            // "<layer>:<off>:<n>:<path>"
+        else if (k == "--dump-kv") a.dump_kv = val();
         else if (k == "--quiet") a.cfg.verbose = false;
         else if (k == "--gemm-block") a.gemm_block = true;
         else if (k == "--block-major") a.block_major = true;
@@ -224,7 +240,7 @@ Args parse(int argc, char** argv) {
         std::fprintf(stderr, "usage: open_qwen36_cli --model <dir> --kernels <dir> --ids 1,2,3 [--max-tokens N] "
                              "[--layers N] [--max-ctx N] [--dump-logits <prefix>] [--twice] [--at-position P] "
                              "[--gemm-block] [--block-major] [--prefill-logits] [--bench N[:LAYER]] [--bench-decode N] "
-                             "[--bench-step N] [--bench-kernel NAME:REPS[:LAYER]] [--pmode MODE] [--prefill-mode fast|lean]\n");
+                             "[--bench-step N] [--bench-kernel NAME:REPS[:LAYER]] [--pmode MODE] [--prefill-mode fast|lean|accurate]\n");
         std::exit(2);
     }
     return a;
@@ -569,6 +585,19 @@ int main(int argc, char** argv) {
         if (a.uno) return uno(core, a, a.uno);
         std::vector<int> first = request(core, a);
         if (!a.dump_act.empty()) dump_act_slice(core, a.dump_act);
+        if (!a.dump_kv.empty()) {
+            const auto snap = core.checkpoint();
+            for (size_t i = 0, l = 0; l < static_cast<size_t>(core.num_layers()); ++l) {
+                if (!core.is_attention_layer(static_cast<int>(l))) continue;
+                const std::string path = a.dump_kv + "_L" + std::to_string(l) + ".bin";
+                if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                    std::fwrite(snap.kv[i].data(), 1, snap.kv[i].size(), f);
+                    std::fclose(f);
+                }
+                ++i;
+            }
+            std::fprintf(stderr, "wrote KV rows [0, %d) -> %s_L*.bin\n", snap.pos, a.dump_kv.c_str());
+        }
         int reps = a.twice ? 2 : a.repeat;
         for (int r = 1; r < reps; ++r) {
             // The app checkpoints after the prompt and restores before the next
