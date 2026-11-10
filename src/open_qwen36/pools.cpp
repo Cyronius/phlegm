@@ -511,6 +511,36 @@ void transpose_bytes(const uint8_t* src, uint64_t rows, uint64_t cols, uint64_t 
             std::memcpy(dst + (c * dst_rows + r) * elem, src + (r * cols + c) * elem, elem);
 }
 
+namespace {
+
+// llama.cpp stores a Llama-arch GGUF's q/k rows paired for interleaved RoPE; the kernels rotate half-split pairs.
+struct QkRows {
+    size_t heads = 0, rows = 0;
+    uint64_t operator()(uint64_t row) const {
+        if (!heads || row >= rows) return row;
+        const size_t hd = rows / heads, half = hd / 2, r = row % hd;
+        return (row / hd) * hd + (r % half) * 2 + r / half;
+    }
+};
+
+QkRows llama_qk_rows(const GgufFile& g, const std::string& name, const GgufFile::TensorInfo& t) {
+    QkRows q;
+    if (g.kv_str("general.architecture") != "llama" || t.dims.size() < 2) return q;
+    const auto ends = [&](const char* sfx) {
+        const size_t n = std::strlen(sfx);
+        return name.size() >= n && name.compare(name.size() - n, n, sfx) == 0;
+    };
+    const char* key = ends("q_proj.weight") || ends("attn_q.weight")   ? "llama.attention.head_count"
+                      : ends("k_proj.weight") || ends("attn_k.weight") ? "llama.attention.head_count_kv"
+                                                                       : nullptr;
+    if (!key || !g.kv_has(key)) return q;
+    const size_t heads = g.kv_u64(key), rows = t.dims[1];
+    if (heads && rows % (2 * heads) == 0) q = {heads, rows};
+    return q;
+}
+
+}  // namespace
+
 void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_t dst_bytes, size_t ch) {
     if (op.op == "std_perm") {
         const std::string name = with_layer(op.tensor, layer);
@@ -598,6 +628,7 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
         if (op.nch == 0 || op.in_dim == 0) fail("std_perm_gguf " + name + " without nch / in_dim");
         const GgufFile& g = dynamic_cast<const GgufFile&>(m);
         const GgufFile::TensorInfo& t = g.tensor(name);
+        const QkRows qk = llama_qk_rows(g, name, t);
         // Q8_0 / K-quant tensors (typical GGUF lm_head / tied embeddings) are
         // dequantized per row and re-quantized here to the pool's q4 layout
         // with fp16 scales -- the same conversion q4nx-build does offline. The
@@ -652,8 +683,8 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
             const size_t row0 = 32 * (perm[c] / ncol);           // rows
             const size_t blk0 = (perm[c] % ncol) * 8;            // k blocks (32 values each)
             for (size_t r = 0; r < 32; ++r) {
-                const uint64_t row = row0 + r;
-                if (row >= out_dim) break;                       // padded rows: zeroed scales/codes
+                if (row0 + r >= out_dim) break;                  // padded rows: zeroed scales/codes
+                const uint64_t row = qk(row0 + r);
                 const uint8_t* srow = src + row * nb * blk;
                 const uint8_t rb = static_cast<uint8_t>(r / 16), rl = static_cast<uint8_t>(r % 16);
                 if (kq) g.embed_row(name, row, op.in_dim, rd.data());   // exact f32 row, once
@@ -756,6 +787,7 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
         if (const auto* g = dynamic_cast<const GgufFile*>(&m)) {
             const GgufFile::TensorInfo& ti = g->tensor(name);
             const uint64_t nrows = ti.dims.size() >= 2 ? ti.dims[1] : 1u;
+            const QkRows qk = llama_qk_rows(*g, name, ti);
             if (ti.dims.empty() || ti.dims[0] != op.in_dim || src_row0 + rows > nrows)
                 fail("bfp16_gemm " + name + ": rows [" + std::to_string(src_row0) + ", " + std::to_string(src_row0 + rows) +
                      ") of " + std::to_string(op.in_dim) + " columns are not in the GGUF tensor");
@@ -765,7 +797,7 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
 #pragma omp for
                 for (long long rr = 0; rr < static_cast<long long>(rows); ++rr) {
                     const size_t r = static_cast<size_t>(rr);
-                    g->embed_row(name, src_row0 + r, op.in_dim, w.data());
+                    g->embed_row(name, qk(src_row0 + r), op.in_dim, w.data());
                     uint8_t* row = out + bfp16_b_offset(op.row0 + r, 0, op.n_total, op.in_dim, t);
                     for (size_t cb = 0; cb < op.in_dim / 8; ++cb)
                         bfp16_encode_block(w.data() + cb * 8, row + bfp16_b_row_block(0, cb, t));

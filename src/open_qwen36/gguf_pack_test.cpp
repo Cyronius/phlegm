@@ -172,14 +172,20 @@ std::string write_gguf_q6k(const fs::path& dir, const BlocksQ6K& b) {
     return out.string();
 }
 
-std::string write_gguf(const fs::path& dir, const Blocks& mm, const Blocks& emb, const std::vector<float>& norm) {
+std::string write_gguf(const fs::path& dir, const Blocks& mm, const Blocks& emb, const std::vector<float>& norm,
+                       uint32_t heads = 0) {
     std::vector<uint8_t> f;
     f.insert(f.end(), {'G', 'G', 'U', 'F'});
     put_u32(f, 3);                                   // v3: no alignment field, fixed 32
     put_u64(f, 3);                                   // tensors
-    put_u64(f, 2);                                   // kv pairs
+    const int n_kv = heads ? 4 : 2;
+    put_u64(f, static_cast<uint64_t>(n_kv));         // kv pairs
     put_kv_str(f, "general.architecture", "llama");
     put_kv_u32(f, "llama.embedding_length", 512);
+    if (heads) {
+        put_kv_u32(f, "llama.attention.head_count", heads);
+        put_kv_u32(f, "llama.attention.head_count_kv", heads);
+    }
     // tensor infos with placeholder offsets (patched once the data layout is known)
     const auto put_tensor = [&](const std::string& name, const std::vector<uint64_t>& dims, uint32_t type) {
         put_str(f, name);
@@ -210,7 +216,7 @@ std::string write_gguf(const fs::path& dir, const Blocks& mm, const Blocks& emb,
         // the t-th tensor info's offset field: walk the header
         size_t p = 4 + 4 + 8 + 8;
         // skip the kv pairs
-        for (int kv = 0; kv < 2; ++kv) {
+        for (int kv = 0; kv < n_kv; ++kv) {
             uint64_t ln;
             std::memcpy(&ln, f.data() + p, 8);
             p += 8 + ln;                             // key
@@ -251,7 +257,7 @@ std::string write_gguf(const fs::path& dir, const Blocks& mm, const Blocks& emb,
         const uint8_t* b = reinterpret_cast<const uint8_t*>(&v);
         f.insert(f.end(), b, b + 4);
     }
-    const fs::path out = dir / ("test-" + std::to_string(mm.type) + ".gguf");
+    const fs::path out = dir / ("test-" + std::to_string(mm.type) + (heads ? "-h" + std::to_string(heads) : "") + ".gguf");
     std::ofstream of(out, std::ios::binary);
     of.write(reinterpret_cast<const char*>(f.data()), static_cast<std::streamsize>(f.size()));
     return out.string();
@@ -485,6 +491,36 @@ int main() {
         std::printf("%s bfp16_gemm from GGUF Q4_0 (%zu of %zu blocks differ; %zu nonzero bytes)\n", badb ? "FAIL" : "ok",
                     badb, static_cast<size_t>(bo.n_total * bo.in_dim / 8), nonzero);
         if (badb || !nonzero) return 1;
+    }
+
+    // ---- std_perm_gguf on a Llama-arch q/k tensor: llama.cpp's paired rows come out half-split
+    {
+        const uint32_t heads = 2;
+        GgufFile gh(write_gguf(dir, mm, emb, norm, heads));
+        std::vector<uint8_t> ph(static_cast<size_t>(op.nch) * 6144, 0);
+        pools::apply(op, gh, 0, ph.data(), ph.size(), 6144);
+        const size_t hd = 64 / heads, half = hd / 2;
+        size_t badh = 0;
+        for (size_t c = 0; c < op.nch; ++c) {
+            const uint8_t* d = ph.data() + c * 6144;
+            const size_t per_band = 4;
+            const size_t rows0 = 64 * (c / per_band) + 32 * (c % 2), cols0 = 256 * ((c % per_band) / 2);
+            for (size_t r = 0; r < 32; ++r) {
+                const size_t o = rows0 + r;
+                const size_t stored = (o / hd) * hd + (o % half) * 2 + (o % hd) / half;
+                for (size_t k = 0; k < 256; ++k) {
+                    const size_t kb = k / 32;
+                    const float df = *reinterpret_cast<const float*>(d + 4 * (kb * 32 + r));
+                    const float mf = *reinterpret_cast<const float*>(d + 1024 + 4 * (kb * 32 + r));
+                    const size_t p = (r / 16) * 4096 + k * 16 + (r % 16);
+                    const uint8_t byte = d[2048 + (p >> 1)];
+                    const uint8_t nib = (p & 1) ? byte >> 4 : byte & 0xF;
+                    if (f32_bits(nib * df + mf) != f32_bits(mm.values[stored * mm.cols + cols0 + k])) ++badh;
+                }
+            }
+        }
+        std::printf("%s std_perm_gguf llama q rows un-permuted (%zu values differ)\n", badh ? "FAIL" : "ok", badh);
+        if (badh) return 1;
     }
 
     // ---- pack_norm: f32 -> bf16 (RNE)
