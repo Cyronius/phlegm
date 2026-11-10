@@ -107,6 +107,17 @@ python -m pytest specs/viz/tests
 
 Open `decode.html` in a browser to play the step and inspect its tiles and streams.
 
+## CI
+
+Pushes and pull requests check changed whitespace, test the Rust core and CLI
+without the `npu` feature, and run `pytest.ini`'s offline suite with Python 3.12,
+NumPy, ml-dtypes, SciPy and pytest. Optional upstream runtime, model, PyTorch and
+AIE checks may skip; the test output lists their reasons. The tray is excluded:
+its Tauri build needs a built frontend and Linux GTK/WebKit development packages. Pushed `v*`
+tags build the Linux x86_64 CLI and publish it with SHA256SUMS; the external C++
+bridge and NPU hardware are not covered. Benchmark publication additionally
+requires the clean, exact version tag described in [the benchmark spec](specs/bench/spec.md).
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE). Third-party parts and FastFlowLM's terms: [`NOTICE.md`](NOTICE.md).
