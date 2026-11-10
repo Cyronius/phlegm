@@ -208,8 +208,8 @@ def pool_quant(spec: ModelSpec) -> str:
 
 
 def gguf_q8_head(spec: ModelSpec) -> bool:
-    """Opt-in Llama head avoiding the ordinary GGUF path's Q4 requantization."""
-    return (spec.family == "llama3" and spec.quant == "q4_1_f32"
+    """Opt-in dense head avoiding the ordinary GGUF path's Q4 requantization."""
+    return (spec.family in DENSE_FAMILIES and spec.quant == "q4_1_f32"
             and os.environ.get("DENSE_GGUF_HEAD_Q8") == "1")
 
 
@@ -1098,7 +1098,7 @@ def f32_twin_fits(spec: ModelSpec) -> bool:
 
 # Families whose split-FF GGUF runs as the q4_1-law view: there is no f32-scale twin at a split FF
 # (f32_twin_fits), so GGUF.section emits nothing, and without this a model.gguf would not load.
-GGUF_Q41_VIEW_FAMILIES = ("llama3",)
+GGUF_Q41_VIEW_FAMILIES = DENSE_FAMILIES
 
 
 def gguf_q41_view(spec: ModelSpec) -> bool:
@@ -1153,9 +1153,9 @@ def finalize_gguf_manifest(spec: ModelSpec, manifest: dict) -> None:
         manifest["gguf"] = _gguf_q41_section(spec, manifest)
     if os.environ.get("DENSE_GGUF_COMPACT") != "1" or spec.quant == "q4_1_f32":
         return
-    if (spec.family != "llama3" or spec.quant != "q4_1" or spec.q8_roles
+    if (spec.family not in DENSE_FAMILIES or spec.quant != "q4_1" or spec.q8_roles
             or "gguf" not in manifest):
-        raise OpRangeError("DENSE_GGUF_COMPACT needs a pure-Q4 Llama GGUF twin")
+        raise OpRangeError("DENSE_GGUF_COMPACT needs a pure-Q4 dense GGUF twin")
     if (os.environ.get("DENSE_GGUF_GEMM") != "1"
             or os.environ.get("DENSE_GGUF_HEAD_Q8") != "1"):
         raise OpRangeError("DENSE_GGUF_COMPACT requires DENSE_GGUF_GEMM=1 and DENSE_GGUF_HEAD_Q8=1")

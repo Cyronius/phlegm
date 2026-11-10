@@ -9322,6 +9322,12 @@ P5 S0's per-tensor selector and compile-only V1 resource evidence are recorded
 in [the dense fit probe](dense-tensor-fit.md), including padded-q8 carriage and
 the pre-existing shim-drain planning discrepancy.
 
+P5 S1's code-preserving Q4_K packer, GGUF int8 projection carriage, family-neutral
+view switches and independent offline checks are recorded in
+[the dense carriage report](dense-gguf-s1.md). Mixed-file runtime export stays
+refused until S2 supplies per-layer variant dispatch and q8 block prefill. The
+runtime patch is on the PR 209 + Nanbeige lineage; hardware gates remain open.
+
 ### OPEN-TURBO-PREFILL
 
 `run` and `serve` accept an explicit boolean `--turbo`. This opts into a

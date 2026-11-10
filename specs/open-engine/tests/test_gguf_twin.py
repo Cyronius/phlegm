@@ -116,7 +116,8 @@ def test_gguf_section_is_the_f32_program(spec_path: Path):
                     walk(v)
 
         walk(section.get("pack", {}))
-        if m["family"] == "llama3":
+        from recipes.dense import DENSE_FAMILIES
+        if m["family"] in DENSE_FAMILIES:
             # A split-FF Llama (OPEN-FAMILY-NANBEIGE, recipes/dense.py gguf_q41_view): the q4_1 program
             # with std_perm_gguf writing the q4_1 law's chunks and the Q8_0 head kept as codes.
             pool = {o["op"] for lt in section["layer_types"].values() for o in lt["pack"]["pool"]}

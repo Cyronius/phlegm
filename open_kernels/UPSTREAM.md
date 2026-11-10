@@ -505,3 +505,13 @@ for the 15 shipped dense specs with a block route that emit at all; `qwen3-14b` 
 `lm_head_q4` K=5120 before and after. The full offline suite gives 1954 passed, 53 skipped and
 8 deselected. The 12 GPT-OSS and Qwen3.5-glue failures also fail at clean HEAD in this
 environment.
+
+- `upstream-patches/dense-gguf-carriage-runtime.patch` (2026-11-09, P5 S1,
+  OPEN-GGUF-DENSE) applies after the PR 209 + Nanbeige chain, in the isolated
+  `target/npu-dev/p5/runtime` reflink copy. `std_perm_gguf` keeps Q4_K codes and
+  rounds its f32 scale products once; higher-precision inputs to a q4 slot are
+  refused. `q8_perm` accepts GGUF in its existing padded half-tile law, preserving
+  Q8_0 codes and requantizing Q6_K to int8. The head arithmetic is unchanged.
+  Native and gguf-py pack checks are offline; per-layer export remains guarded
+  for S2. Patch bases, hashes and a byte-exact round trip are in `sources.json`;
+  [the S1 report](../specs/open-engine/dense-gguf-s1.md) records results and limits.
