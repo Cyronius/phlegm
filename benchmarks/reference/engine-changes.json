@@ -7,6 +7,14 @@
       "files": {
         "src/open_qwen36/manifest_test.cpp": "7bae7aea4173c2faa3d2a974801bca195df2fc7d902a95850b8ec7046afe0097"
       }
+    },
+    {
+      "id": "llama-gguf-qk-rows",
+      "origin": "phlegm:minicpm5-2b-kv2 (MiniCPM5-2B; undo llama.cpp's paired q/k rows for arch llama)",
+      "files": {
+        "src/open_qwen36/pools.cpp": "c5950f3715077fa28f3431361b2fd6d67f5cf3030764d3b387852d531619736c",
+        "src/open_qwen36/gguf_pack_test.cpp": "4fa0fd3c9190f2ef824b1b236cea134da2f0bdf6eb257b4fc44b35d5ed876200"
+      }
     }
   ]
 }

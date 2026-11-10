@@ -1787,6 +1787,26 @@ the `llama_npu` DLL for both.
 
 **Result 2026-09-06 (Llama-3.2-3B-NPU2 and Llama-3.2-1B-NPU2):** both 3.2 shapes' first hardware run, and both containers materialise `lm_head.weight` despite `tie_word_embeddings: true`, as the acceptance criteria above assume. **3B** (3072 / 28 / 8192, 24 query heads over 8 kv heads -- GQA group 3, the first odd group, `OG_AOUT_ELEMS` 3): step 2 logits corr 0.999998 / 0.999995, argmax 2 / 2 matching the fp64 replica with top-5 identical at both positions, residual corr 1.000000 in all four layers at t0 and >= 0.999996 at t1, maxrel <= 5.3e-3; step 3 through the engine bit-identical to step 2 and reproduced; step 4 a coherent answer ending in `<|eot_id|>` at token 72 (334 ms/token). **1B** (2048 / 16 / 8192, head_dim 64 -- `E_A` 1024, `KV_ROW` 2048, `PTAB_ROW` 1024, one KV band per core, a 768-byte RoPE record in a 1024-byte position row): step 2 logits corr 0.999999 / 0.999994, argmax 1757 / 1757 matching, top-5 identical at both positions, residual corr 1.000000 in all four layers at t0 and >= 0.999996 at t1, maxrel <= 2.4e-3; step 3 bit-identical and reproduced; step 4 `<|eot_id|>` at token 92 (262 ms/token). The 1B is the run that decides head dim 64, since a wrong q/k rotation there gives fluent nonsense rather than a crash: position 0 does not rotate and position 1 does, and both are clean in every layer, so the rotation is right. Together these admit `gemv_q4` K = 3072 and K = 8192, `ln` width 3072, `lm_head_q4` K = 3072 and the attention combinations (128, 24, 8, 128, False, False, False) and (64, 32, 8, 64, False, False, False). Note `chat.py`'s default `--max-tokens 64` truncates both models mid-sentence; 200 is enough. Details: `.claude/plans/k-new-points-results.md`.
 
+**MiniCPM5-2B (2026-11-10).** `openbmb/MiniCPM5-2B` is a plain `LlamaForCausalLM`: 2048 / 42 / 6144, 16 query heads
+over **2** kv heads at head_dim 128 (GQA group 8), theta 5e6, eps 1e-6, no scaling, an untied 130560-row head. #85's spec
+said 8 kv heads, a shape the checkpoint does not have; the spec now says 2 and the attention tuple
+`(128, 16, 2, 128, False, False, False)` is new in the catalogue (the kv-8 tuple stays, #85's pass validated it).
+**Q/k row order:** llama.cpp's converter stores a Llama-arch GGUF's q and k rows paired for
+interleaved RoPE (`reshape(h, 2, hd/2).swapaxes`); the kernels rotate half-split pairs. `std_perm_gguf` undoes the
+pairing for `general.architecture == "llama"` q and k tensors, per head (`head_count` for q, `head_count_kv` for k), at
+pack time, in both GGUF row readers (`std_perm_gguf` and `bfp16_gemm`). Without it the model is fluent and wrong ("We need to be careful with our environment." for "What is the capital
+of France?", then a loop). The change is in the in-tree engine, `src/open_qwen36/pools.cpp`, recorded in
+`benchmarks/reference/engine-changes.json` (`gguf_pack_test` case: row-for-row against the permutation). Other archs are untouched; Granite's GGUF is not changed.
+
+**Result 2026-11-10 (MiniCPM5-2B, bartowski Q4_1, Strix Point, Windows, mlir-aie 1.4.2):** `dx` program memory 14192 of
+16384 B; spec hash `sha256:cb630a529a48`. Stock GGUF, one request: `<think>` block, then "The capital of France is Paris."
+and `<|im_end|>`, identical to llama.cpp (`-ngl 0 --temp 0`) for the whole 221-character answer; decode 19-21 tok/s (47-52 ms
+a token, development machine). A second prompt (a Fibonacci function) is coherent on both but diverges at the first token
+("The user asks" against "We need to respond"), a tie not investigated. **Not run:** the fp64 replica slice
+(`make_decode.py` reads only a q4nx container) and `flm-test`; the new attention tuple is in the catalogue on the strength of the
+two-request llama.cpp match and the unit test, not the OPEN-FAMILY-QWEN3 slice procedure. `chat.py` does not know MiniCPM's
+`<|im_start|>` template; the runs above pass token ids to `open_qwen36_cli`.
+
 **Nanbeige4.1-3B (2026-09-10).** Declares `model_type: llama` and is one for the
 recipe: 2560 / 32 / 10752, 20 query heads over 4 kv heads at head_dim 128 (GQA group
 5, two q heads per attention element), theta 7e7 with no scaling, eps 1e-5, an

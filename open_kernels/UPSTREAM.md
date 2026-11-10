@@ -51,6 +51,7 @@ reader changes. Phlegm keeps the C++ engine permanently; Rust owns its applicati
 | 2026-10-28 | `dx.py` streams o's og elements only when they outnumber the norms' x depth (`OG_STREAM`), not at og > 2 as #225 does: phlegm's x fifo already holds og elements, so #225's condition moved Qwen3-14B (og 3, from #223) onto the new path. At depth 4 Gemma 4's global layer would also overflow its main cores. Upstream needs the same condition once #223 lands. |
 | 2026-10-28 | `OPEN-FAMILY-GEMMA4` is defined in `specs/open-engine/spec.md`; #225's test traces the ID, but the PR does not add it. |
 | 2026-11-01 | `designs/trit_embed/`: the trit-embed-3l sentence-embedder encoder, moved here from an unversioned experiment. It is standalone, with its own build and host library, and uses no recipe, manifest or runtime ABI. |
+| 2026-11-10 | MiniCPM5-2B: spec kv heads 8 -> 2 (the checkpoint's value), catalogue tuple `(128, 16, 2, 128, False, False, False)`, and an in-tree engine change (`src/open_qwen36/pools.cpp`, `gguf_pack_test.cpp`; recorded in `benchmarks/reference/engine-changes.json`) that undoes llama.cpp's paired q/k rows in `std_perm_gguf` and `bfp16_gemm` for arch llama. Upstream needs the spec and catalogue lines with the engine change. |
 
 ## Pushed out to openflowlm-next
 
