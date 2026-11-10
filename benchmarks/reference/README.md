@@ -56,7 +56,9 @@ python3 benchmarks/reference/build.py \
 different engine hashes can be used directly by `ab.py`, but the Rust verifier
 accepts only its compiled-in engine tree.
 
-Check the pristine import (before S4 changes) with:
+Every engine file must match OFLM trunk `38ae3d2` unless
+`engine-changes.json` records the change (its origin and the file's new
+sha256). Add an entry there with each engine change; check with:
 
 ```bash
 python3 benchmarks/reference/check_import.py --upstream /path/to/trunk-checkout

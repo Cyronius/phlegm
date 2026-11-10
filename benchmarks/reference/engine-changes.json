@@ -1,0 +1,12 @@
+{
+  "base": "38ae3d2643e87ea34e83ec6c0e72274e0bbd411d",
+  "changes": [
+    {
+      "id": "pr226-manifest-move-only",
+      "origin": "oflm:PR226 f566a1d6f93c43f1f3de5e1b7dccb52177191fcf",
+      "files": {
+        "src/open_qwen36/manifest_test.cpp": "7bae7aea4173c2faa3d2a974801bca195df2fc7d902a95850b8ec7046afe0097"
+      }
+    }
+  ]
+}
