@@ -2,7 +2,8 @@
 
 phlegm is the canonical home of `open_kernels/` and `specs/open-engine/`. openflowlm-next
 (https://github.com/Atomic-Germ/openflowlm-next) receives the work as pull requests. Both trees use the same paths, so a
-sync is a plain diff of these two directories.
+sync is a plain diff of these directories and the matching `src/open_qwen36/`
+reader changes. Phlegm keeps the C++ engine permanently; Rust owns its application.
 
 ## Rules
 
@@ -83,7 +84,7 @@ records their source and licensing. The companion reference, replay and build
 tools are listed with source commits and hashes in
 `utilities/kernel-sync-sources.json`.
 
-Phlegm's Rust engine port is still pending. The corresponding OFLM C++ changes
+Phlegm keeps its C++ engine in `src/open_qwen36/`. The corresponding OFLM C++ changes
 for #193/#194/#207/#213/#223 are preserved as `upstream-patches/kernel-sync-*.patch`,
 with exact bases in `upstream-patches/sources.json`. These are separate upstream
 branch diffs, **not** a patch series or a ready-made combined C++ runtime. A
@@ -116,8 +117,8 @@ modified or deleted.
 - The OFLM q4nx-build converter is intentionally excluded. openflowlm-k2conv
   changes only that converter, so none of its files are imported. Phlegm's own
   converter is unchanged.
-- Phlegm does not vendor OFLM's C++ engine or model registry. Their companion
-  changes are retained as upstream-patches/bonsai-runtime.patch and
+- Phlegm now keeps the C++ engine in `src/open_qwen36/`; the OFLM model registry
+  is excluded. Historical companion changes are retained as upstream-patches/bonsai-runtime.patch and
   upstream-patches/issue212-runtime.patch; exact source heads and file lists
   are in upstream-patches/sources.json. The patches are separate alternatives
   against those source heads, not a series to apply blindly one after the other.

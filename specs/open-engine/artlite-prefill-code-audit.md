@@ -13,7 +13,7 @@ flash attention handles the whole prompt per layer. It is not sequential GEMV
 prefill. The current C++ path still prepares/packs activations on the host and
 usually reads projection results back for host processing. Some stages retain
 device outputs; inspect the `y_dev` branch rather than assuming every result
-returns to the host. Source: external runtime `Core::gemm_phase`, core.cpp
+returns to the host. Source: the recorded reference checkout's `Core::gemm_phase`, core.cpp
 around 4413–4505, base OFLM 478dbea3 plus the tracked standalone PR209 patch.
 
 ## Reusable techniques proved by ArtLite source

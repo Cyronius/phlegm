@@ -97,7 +97,7 @@ impl Fixture {
         fs::write(bridge.with_extension("build.json"), json!({
             "protocol":config["protocol"].as_u64().unwrap_or(2), "engine":BACKEND_NAME,
             "source_commit":"0".repeat(40), "source_dirty":false,
-            "source_tree_sha256":manifest_hash(&files), "adapter_sha256":adapter,
+            "source_tree_sha256":manifest_hash(&files), "engine_tree_sha256":ENGINE_TREE_SHA256, "adapter_sha256":adapter,
             "binary_sha256":hash_file(&bridge).unwrap(), "compiler_flags":"fake protocol 2 test", "source_files":files
         }).to_string()).unwrap();
         Self { dir }

@@ -6,12 +6,10 @@ the benchmark protocol is `phlegm-bench-v1`, schema version 1.
 
 ## Availability
 
-The harness, validator, and C++ reference adapter are implemented. C++ remains
-the current inference engine; the native Rust engine port is the final phase.
-`phlegm bench --reference-engine ...` drives a resident process built against an
-external OpenFlowLM reference checkout. These reports are explicitly labeled
-`openflowlm-cpp-reference`; they do not represent the future native Rust engine.
-The Rust engine still has only a mock generate backend. Mock benchmark reports
+The harness, validator and resident C++ adapter are implemented. Phlegm keeps
+its engine in C++; Rust owns the application, tokenizer and sampling.
+`phlegm bench --reference-engine ...` drives the bridge built from this repository.
+Reports retain the label `openflowlm-cpp-reference`. Mock benchmark reports
 remain rejected. No benchmark scores are checked into this repository.
 
 Available now:
@@ -92,8 +90,10 @@ Nondefault configurations remain recorded and must be compared separately.
 - Detected accelerators and driver versions; power profile when available.
 - Actual backend/device, runtime driver version, kernel/artifact manifest SHA-256,
   and allocated context capacity.
-- For reference runs: engine commit, dirty-source flag, source/dependency manifest
-  hash, binary hash, compiler flags, actual prefill route/mode, NPU decode route,
+- For reference runs: Phlegm source commit, release tag when present, dirty flag
+  over build-input paths, machine-independent `engine_tree_sha256`, full
+  source/dependency manifest hash, binary hash, compiler version/flags, recorded
+  XRT rpath (null on the loader path), actual prefill route/mode, NPU decode route,
   observed NPU power mode, OpenMP settings and selected weight filename.
 - Model ID, source revision, quantization, weight artifact SHA-256, and tokenizer
   SHA-256. For multiple weight/kernel files, hash a documented canonical manifest
@@ -141,14 +141,24 @@ nonfinite logit, incomplete output, changed power mode, or changed model/kernel
 artifact aborts publication. Inherited OFLM/OMP probe and tuning variables are
 cleared; OpenMP passive waiting and the requested thread count are explicit.
 
-The temporary adapter supports the reference engine's `model.gguf` and
-`model.q4nx` directories, recording which artifact was actually loaded (q4nx wins
-if both exist, matching Core). This exception is limited to reference runs; the
-native Rust engine's GGUF-only plan is unchanged. No C++ engine source is vendored.
+The adapter supports the in-tree C++ engine's `model.gguf` and `model.q4nx`
+directories, recording which artifact was loaded (q4nx wins if both exist).
+The engine derives from OpenFlowLM; its MIT notice ships in `LICENSE_OPEN_RUNTIME.md`.
 
-The Phlegm release guard still applies. The separately built C++ reference may
-have local source edits; those are identified by its dirty flag and content hash.
-Such measurements must be compared under the reference label and fingerprints.
+The bridge sidecar records `source_commit` as Phlegm HEAD and `source_dirty`
+over engine/build inputs only. `engine_tree_sha256` hashes sorted relative
+`bridge/`, `engine/`, `json/` and `harness/` entries: each contributes its name,
+a NUL, lowercase file SHA-256 and newline. It excludes machine paths, XRT and
+the compiler. Rust compares it with the constant emitted by `build.rs` and
+rejects mismatches, including bridges from a different family-patch tree.
+`source_tree_sha256` additionally covers build tools, compiler and XRT inputs.
+Older sidecars must be rebuilt. Keep the binary and sidecar together.
+The [S3 integration record](../open-engine/in-tree-engine-s3.md) lists the
+pristine import, host-test limitation and outstanding hardware gate.
+
+The Phlegm release guard still applies. Development bridge edits are identified
+by the dirty flag and content hashes; published reports need the clean release
+build described above. Hardware equivalence remains a separate gate.
 
 ## Publishing
 

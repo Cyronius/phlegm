@@ -37,7 +37,7 @@ operation. Full-model acceptance and parity measurements remain open.
 The model scan covered `~/.cache/huggingface`, `~/.flm`, `~/models`,
 `~/code/model-experiments`, `/opt` and `/usr/local`. Other GGUF files exist
 (Qwen3.8-27B, Bonsai 2 4B and a titler model); their compatibility was not
-validated. The external runtime contains shipped xclbins, which are not fresh
+validated. The recorded 2026-10-24 runtime checkout contains shipped xclbins, which are not fresh
 combined-tree builds. Absence claims above are scoped to these searches.
 
 ## Reproduction commands and results
@@ -144,7 +144,7 @@ passed hardware/model-quality gates.
 
 The development source diff is `target/npu-dev/baseline-runtime.patch`, SHA-256
 `4b5e57d0f92ec27f8b74e4132d477a006a7bec8ca93eef22fe43c1ad99600313`.
-The original external runtime checkout remains unchanged. Do not interpret the
+The original runtime checkout remains unchanged. Do not interpret the
 retained companion patches as a sequential series or these builds as acceptance.
 
 Built the bridge with `benchmarks/reference/build.py`. The default output is

@@ -8,8 +8,8 @@ entries before resuming: several older plan headers predate completed work.
 
 ## Direction and priority
 
-Keep C++ as the inference engine while completing normal generation, model
-onboarding and the tray. The native Rust inference engine port comes last.
+Keep the inference engine in C++ permanently, in `src/open_qwen36/`. Rust owns
+the CLI, server, tokenizer, sampling and tray.
 The CLI/server now use the resident C++ process adapter for NPU inference.
 The next milestone is a real hardware run with a compatible combined kernel set,
 followed by fixing the resulting integration or performance failures. Hardware
@@ -61,7 +61,7 @@ that they all block CLI/server integration.
 
 Completion: real prompts work through both CLI and server, including sampled,
 streamed and multi-turn requests; the mock backend is no longer the normal
-inference path. Preserve C++ as the reference for the later Rust port.
+inference path. Keep the C++ engine as the inference implementation.
 
 Sources: [current direction](.claude/plans/phlegm-monorepo.md),
 [adapter build/protocol notes](benchmarks/reference/README.md),
@@ -89,7 +89,7 @@ artificial zero-history failure remains, so the route stays opt-in. Decode
 compute/DMA and core-layout experiments are next. Every accepted parity cell remains
 open; these development measurements are not clean-release benchmark results.
 
-- [ ] Prepare an external C++ reference checkout at a recorded revision.
+- [x] Import the pristine C++ trunk at `38ae3d2` into `src/open_qwen36/`.
 - [ ] Reconcile the required companion changes against that checkout. Use
   [sources.json](open_kernels/upstream-patches/sources.json) for patch bases.
 - [ ] Ensure the runtime implements every selected manifest feature, including
@@ -388,7 +388,7 @@ pass.
 2026-11-08 scope (user): FLUX.2 [klein] 4B and 9B (distilled first; Base variants
 later) through Phlegm's own `phlegm image` / `serve-images`, ported from the
 existing klein schedule and validated against the published diffusers pipeline,
-not the external OFLM engine; Qwen Image 2.1 editing; 1024 px for every image
+through Phlegm's image engine; Qwen Image 2.1 editing; 1024 px for every image
 model and mode. MOSS editing is rejected: its published pipeline takes no
 reference image, and the server says so. The 9B checkpoints are gated under a
 non-commercial licence. Plan: [FLUX.2 klein and image follow-ups](.plans/flux2-klein-native.md).
@@ -628,16 +628,12 @@ score with the CPU reference (four-task nDCG@10 33.81 against 33.85).
 
 Source: [design README](open_kernels/designs/trit_embed/README.md).
 
-## 6. Port inference to Rust last
+## 6. Keep the C++ engine and Rust application
 
-- [ ] Port container reads/packing, manifest handling, XRT dispatch and stream
-  patches, kernel lookup, decode and block prefill in testable slices.
-- [ ] Match reference packing bytes and greedy tokens on the MoE model and a
-  dense family before broadening coverage.
-- [ ] Verify request isolation, state reset, errors and performance against C++.
-- [ ] Switch user-facing flows after the required parity and performance gates.
-
-This work does not gate the C++-backed CLI, server, onboarding or tray milestones.
+The C++ engine stays in `src/open_qwen36/`, with upstream paths preserved.
+Rust owns the CLI, server, tokenizer, sampling and tray. There is no planned
+Rust inference port. Kernel changes and their matching C++ reader changes
+continue to go upstream as described in `open_kernels/UPSTREAM.md`.
 
 ## Resume on another machine
 
@@ -645,7 +641,7 @@ This work does not gate the C++-backed CLI, server, onboarding or tray milestone
    candidate; creating it locally does not commit or push it.
 2. Read this plan, the latest sync ledger and the result entries for the chosen
    workstream. Do not treat old "not built" headers as authoritative status.
-3. For C++/NPU work, obtain the external reference checkout, model weights and
+3. For C++/NPU work, use the in-tree engine and obtain model weights and
    compatible XRT/toolchain dependencies. Generated binaries and model data are
    not included in the source import.
 4. Start with CLI/server integration and combined-tree hardware validation.

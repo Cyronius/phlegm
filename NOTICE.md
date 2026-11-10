@@ -26,11 +26,26 @@ and `utilities/kernel-sync-sources.json` for source revisions and file hashes.
 Headers from **Xilinx/XRT** (https://github.com/Xilinx/XRT), Apache-2.0. phlegm-core uses them to build its C-ABI
 shim over XRT.
 
-## FastFlowLM
+## C++ engine and JSON
 
-`benchmarks/reference/bridge.cpp` can be built against the caller's external
-OpenFlowLM open engine (MIT, OpenFlowLM Community contributors). The engine is
-not vendored here; its sources retain the license and notices in that checkout.
+Phlegm's permanent C++ engine in `src/open_qwen36/` derives from OpenFlowLM-Next
+trunk `38ae3d2643` (base `beccd46` plus nine Gemma 4 patches). Copyright (c)
+OpenFlowLM Community, MIT; the full notice ships in `LICENSE_OPEN_RUNTIME.md`.
+The import preserves the upstream paths and source bytes. The engine was written as
+OpenFlowLM's open engine (OFLM PR 6, Cyrus Attoun) and developed there by several
+contributors; `specs/open-engine/engine-provenance.md` records the origin, author and
+upstream status of every engine change. It does not include FastFlowLM's host headers
+or any FastFlowLM binary. `src/open_qwen36/bfp16.hpp` credits ggml-xdna's MIT BFP16
+packing (Cyrus Attoun).
+
+`src/include/nlohmann/` is **nlohmann/json 3.12.0**, MIT, copyright
+2013–2025 Niels Lohmann. Its SPDX notices remain in each header.
+
+The GGUF reader and quantization layouts in `src/open_qwen36/gguf_file.*`
+follow **llama.cpp / ggml** (MIT). The Saluki IQ tables are not part of this
+trunk import. The third-party MIT terms below cover JSON and llama.cpp-derived code.
+
+## FastFlowLM
 
 phlegm began as an open host for FastFlowLM's (https://github.com/FastFlowLM/FastFlowLM) kernels, and its findings
 about FastFlowLM's file formats and kernels are in `xdna-dump/`. FastFlowLM's source is MIT (Copyright © 2026
@@ -41,3 +56,28 @@ libraries. Those are proprietary and governed by FastFlowLM's own terms. The cap
 `xdna-dump/tools/seq-capture/` run against a FastFlowLM install that you provide.
 
 (The name is a joke: it *derives from FLM*, and its author had a cold at the time.)
+
+## Third-party MIT notices
+
+MIT License
+
+Copyright (c) 2013–2025 Niels Lohmann
+Copyright (c) 2023–2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

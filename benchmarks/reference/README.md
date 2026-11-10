@@ -1,43 +1,49 @@
 # C++ reference benchmarks
 
-This adapter measures the external OpenFlowLM `open_qwen36::Core`, with the open
-NPU kernels supplied by the caller. C++ remains the current inference engine;
-the native Rust engine port is deferred until the final implementation phase.
-Every result and console table is labeled
-`openflowlm-cpp-reference`. The reference engine's sources are not copied here.
-
-## Build on Windows
-
-Requires MSVC Build Tools, the XRT headers/import library already used by
-`phlegm-core`, and a reference checkout containing `src/open_qwen36/core.cpp`,
-`gguf_file.cpp`, and the Core APIs this bridge calls. Older checkouts without
-these APIs fail compilation. No automatic checkout, download, or source patching
-is performed.
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File benchmarks/reference/build.ps1 `
-  -ReferenceRoot C:/code/OpenFlowLM-Next2
-```
-
-The default output is `target/reference-bench/phlegm-reference-bench.exe`, with
-`phlegm-reference-bench.build.json` beside it. Optional build parameters are
-`-OutDir`, `-XrtInclude`, `-XrtLib`, and `-Vcvars`. If the import library is missing,
-run `phlegm-core/xrt-shim/build_import_lib.cmd` first.
-
-The build records the reference commit and dirty-source flag; hashes the engine,
-adapter, JSON/XRT headers, stream patch helper and import library; and fingerprints
-the final executable. Inputs are checked again after compilation. Phlegm verifies
-this sidecar and the bridge source embedded in its own build before executing it.
-Keep the binary and sidecar together. This is provenance, not a signature proving
-an untrusted executable safe: use your own reference build.
+This adapter runs Phlegm's in-tree `open_qwen36::Core`, derived from OpenFlowLM.
+The engine stays C++; Rust owns the CLI, server, tokenizer, sampling and tray.
+Results retain the label `openflowlm-cpp-reference`.
 
 ## Build on Linux
 
-Requires Python 3.11+, a C++17 compiler with OpenMP/AVX2/FMA, matching XRT
-headers and `libxrt_coreutil.so.2`, and the XDNA userspace plugin for device
-access. The external reference checkout must implement the selected manifest
-features; the retained companion patches have different bases and need manual
-reconciliation. Building the bridge does not establish kernel compatibility.
+Requires Python 3.11+, a C++17 compiler with OpenMP/AVX2/FMA, and matching XRT
+headers and `libxrt_coreutil.so.2`. Device access also needs the XDNA plugin.
+
+```bash
+cargo build -p phlegm-cli --features npu --offline
+```
+
+This builds `target/debug/phlegm` and the adjacent `phlegm-reference-bench`
+with its `.build.json` sidecar. `--release` puts them in `target/release`.
+No external engine checkout is needed. A build without `npu` needs neither XRT
+nor a C++ compiler. Cargo invokes `build.py` so its flag list remains the single
+definition: `-O3 -DNDEBUG -std=c++17 -fopenmp -mavx2 -mfma`, with
+`-ffp-contract=off` on `block_host.cpp` alone. The imported CMake file is retained
+for host tests; it does not build the shipped bridge.
+
+The system compiler is the default; `CXX` overrides it and `PYTHON` selects Python.
+XRT defaults to the system installation, then `/opt/xilinx/xrt`;
+`XILINX_XRT`, `XRT_INCLUDE_DIR` and `XRT_LIB_DIR` override discovery.
+Linking uses `-l:libxrt_coreutil.so.2`. XRT on the loader path needs no rpath;
+otherwise only its selected library directory is recorded as `xrt_rpath` and
+embedded. Conda GCC's injected environment rpath is suppressed by a generated
+link-only specs override, recorded in the full source manifest. Compilation
+flags stay unchanged. No conda rpath is added.
+
+The sidecar records Phlegm HEAD, a dirty flag over engine/build inputs, an exact
+release tag when present, source/dependency hashes, compiler version/commands,
+XRT rpath and the binary hash. `engine_tree_sha256` hashes sorted relative
+`bridge/`, `engine/`, `json/`, `harness/` inputs independently of machine paths,
+XRT and compiler. Rust compares it with the constant emitted by `build.rs`.
+An engine-tree mismatch is rejected; old sidecars need rebuilding. Keep the
+binary and sidecar together. Provenance is not a signature for untrusted code.
+
+The trunk import does not yet contain the later family patch chains or the
+PR 209 manifest versions 5–7. Compilation and handshake do not establish
+model compatibility or logit equivalence. `bridges/index.json` remains a stopgap;
+the in-tree bridge takes precedence, including for developer test executables.
+
+External A/B builds remain available until migration stage S8:
 
 ```bash
 python3 benchmarks/reference/build.py \
@@ -46,14 +52,27 @@ python3 benchmarks/reference/build.py \
   --xrt-lib /path/to/xrt/lib/libxrt_coreutil.so.2
 ```
 
-The output is `target/reference-bench/phlegm-reference-bench` with a
-`.build.json` sidecar accepted by the same Rust provenance verifier as Windows.
-`--out-dir` and `--cxx` override the destination and compiler; `CXX` supplies the
-compiler default. Arguments are passed without a shell. The builder hashes the
-engine, adapter, helper, headers, selected link library, compiler executable and
-build script, and checks inputs and Git identity again after compilation. A
-failed build invalidates the previous sidecar. The runtime library directory is
-embedded as an rpath; keep the matching plugin and dependent libraries available.
+`--out-dir` and `--cxx` override destination and compiler. External trees with
+different engine hashes can be used directly by `ab.py`, but the Rust verifier
+accepts only its compiled-in engine tree.
+
+Check the pristine import (before S4 changes) with:
+
+```bash
+python3 benchmarks/reference/check_import.py --upstream /path/to/trunk-checkout
+```
+
+## Windows migration
+
+`build.ps1` and `--reference-root` are retained for migration. The Windows Cargo
+path still builds the XRT shim only; the in-tree bridge and updated Windows
+provenance are stage S10, untested here. The old PowerShell sidecar lacks the
+required engine hash and must be updated before Rust will accept it.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File benchmarks/reference/build.ps1 `
+  -ReferenceRoot C:/code/OpenFlowLM-Next2
+```
 
 For Linux hardware runs, check `/dev/accel/accel0` access and both soft and hard
 memlock limits. The current local XRT stack needs a 64 MiB locked heap at device
