@@ -1,0 +1,288 @@
+/// \file manifest.hpp
+/// \brief manifest.json: everything the open engine knows about a kernel set.
+///
+/// Written by open_kernels/export_qwen36_kernels.py from the family recipe
+/// (open_kernels/recipes/manifest.py) beside the xclbins. The engine derives
+/// every layout constant, context, kernel, per-layer program and packing law
+/// from it -- there is no HID, no POOL_*, no "lx0" in the C++ -- and refuses
+/// a model whose config.json disagrees with the manifest's `hf_config_check`.
+///
+/// Traces: OPEN-MANIFEST (specs/open-engine/spec.md).
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "nlohmann/json.hpp"
+#include "stream_patch.hpp"
+
+namespace open_qwen36 {
+
+/// One packing-plan op: which tensor lands at which byte offset in which
+/// chunk order (open_kernels/recipes/pack.py is the same interpreter in NumPy).
+struct PackOp {
+    std::string op;                          ///< std_perm | std_perm_gguf | std_fuse | q8_perm | expert_stripes | expert_down | put | conv_transpose | lmhead_q8 | transpose | transpose_banked
+    std::string tensor, up, gate;            ///< tensor names; "{l}" stands for the layer index
+    uint64_t dst = 0;
+    uint64_t cap = 0;                        ///< put: the slot's capacity
+    uint64_t nch = 0, in_dim = 0, chunk0 = 0;                          ///< std_perm / q8_perm; in_dim also:
+                                                                       ///< lmhead_q8, the hidden width
+                                                                       ///< (q8_perm: nch counts POOL half-tiles,
+                                                                       ///<  chunk0 counts SOURCE file chunks)
+    uint64_t src_dim = 0, rg = 0;            ///< std_fuse: the CONTAINER's own K (the pool's is
+                                             ///< in_dim, and may be padded above it), and the
+                                             ///< supertile height of the file raster
+    uint64_t experts = 0, stripes = 0, stripe_bytes = 0, expert_bytes = 0;   ///< expert_stripes / expert_down
+    uint64_t taps = 0, groups = 0, width = 0;                           ///< conv_transpose
+    uint64_t chunk_bytes = 0;                                           ///< lmhead_q8 (the SOURCE chunk)
+    uint64_t rows = 0, cols = 0, elem = 0;                              ///< transpose
+    std::string split;                                                  ///< std_perm of a q8 source: "hi" |
+                                                                        ///< "lo", one half of its exact q4_1
+                                                                        ///< split ("" = the whole tensor)
+    std::string via;                                                    ///< bf16_gemm: "q4_1" reads a q8 source as the q4 ops do
+    std::string div_running;                                            ///< put: divide the values by the product,
+                                                                        ///< over the layers BEFORE this one, of this
+                                                                        ///< one-value tensor ("{j}" = that layer) --
+                                                                        ///< Gemma 4's layer_output_scale, folded
+    uint64_t dst_rows = 0;                                              ///< transpose: pad the
+                                                                        ///< destination row to this
+                                                                        ///< many values, tail zeroed
+                                                                        ///< (0 = rows, no padding)
+};
+
+/// One verb of a layer type's (or the tail's) program.
+struct Step {
+    std::string op;                          ///< run | moeroute2
+    std::string kernel;
+    std::vector<std::string> args;           ///< run: buffer names (per-layer: pool consts act state; else globals)
+    uint64_t act_off = 0;                    ///< moeroute2: the router record's offset in `act`
+    bool split = false;                      ///< run, block route: the weight is a q8 projection's exact q4_1
+                                             ///< split, [hi | lo]; the GEMM runs twice the rows and the halves add
+};
+
+/// The block prefill route (OPEN-PREFILL-BATCH): T tokens through a layer's
+/// projections as whole-array bf16 GEMM dispatches (q4_1 dequantised on-core,
+/// open_kernels/designs/gemm_q4_prefill), with the stages between them on the
+/// host. Special-purpose per layer-type KIND, not a generalized interpreter:
+///
+///   dense  (0167/#32, Granite): 5 steps in FIXED order -- qkv3, o_proj,
+///          gate_proj, up_proj, down_proj -- with T single-token attention
+///          dispatches ("dxB", attnpos-patched, through a GLOBAL T-wide "gact")
+///          between the first two, and RMSNorm / residual / SwiGLU on the host.
+///   linear (the 35B's DeltaNet layers): 2 steps -- qkv|z fused, out_proj --
+///          with the conv + gated delta rule + gated norm on the host between
+///          them, then the norm and router on the host and the MoE block one
+///          token at a time on the sequential kernel (lx1).
+///   full   (the 35B's attention layers): 2 steps -- q|k|v|gate fused, o_proj --
+///          with the q/k norms, RoPE, attention over the KV rows and the gate
+///          on the host, then the same MoE tail on ax1.
+///
+/// Each step is a plain "run" of a GEMM kernel against three buffers: a
+/// per-layer weight buffer (named in `weights`, built once at load_weights()
+/// out of a contiguous run of the layer type's pack ops -- see core.cpp),
+/// a global x (bf16, tiled) and a global y (f32), both sized by the
+/// manifest's `globals` like every other global.
+struct GemmWeight {
+    std::string from;             ///< "pool" | "consts": which packed plan the ops index; "pack": its own
+    std::vector<size_t> ops;      ///< indices into LayerType::pool / consts, in order, byte-contiguous
+    std::vector<PackOp> pack;     ///< from "pack": std_perm ops that pack this buffer alone -- the hi and
+                                  ///< lo halves of a projection the sequential kernel streams at q8
+};
+
+/// The token-batched expert kernel (OPEN-MOE-BATCH, open_kernels/designs/moe_batch):
+/// one dispatch streams every slot's expert once for up to `nt` of its tokens.
+/// `kernels` maps a slot count to its instruction stream (one xclbin for all); the
+/// driver takes the shortest stream that holds the experts still owed tokens,
+/// patches the slots' expert offsets (moebatch) and runs it against pool, x, h, y.
+struct MoeBatch {
+    std::map<size_t, std::string> kernels;   ///< slots -> kernel name
+    std::vector<std::string> args;           ///< pool, then the x / h / y globals
+    size_t nt = 0;                           ///< token slots per expert visit
+    bool present() const { return !kernels.empty(); }
+};
+
+/// Block attention as two bf16 GEMMs per kv head (OPEN-PREFILL-ATTN, open_kernels/designs/attn_block):
+/// scores Q K^T then P V, the row softmax on the host between them. One stream per 256 rows of
+/// window up to l_max on one xclbin; the host chunks a longer window and merges the softmax.
+struct AttnBlock {
+    std::map<size_t, std::string> kernels_s, kernels_pv;   ///< window rows -> the stream for that width
+    std::vector<std::string> args;                         ///< the a / b / c globals
+    size_t m = 0, hd = 0, l_max = 0;                       ///< rows per product (heads per kv head x T), head dim
+    /// A dense layer's host half before the products: "qknorm_rope" (q/k RMSNorm, then the
+    /// half-split rotation; no bias, no gate) or "rope" (the rotation alone). Empty on a
+    /// full-attention layer, whose is fixed.
+    std::string prep;
+    bool present() const { return !kernels_s.empty(); }
+};
+
+struct GemmBlockProgram {
+    uint64_t t = 0;               ///< 0 = no route for this layer type
+    std::string kind;             ///< dense | linear | full
+    std::vector<Step> program;
+    std::map<std::string, GemmWeight> weights;
+    double eps = 0;               ///< RMSNorm eps for the host norms
+    // dense: the q/k/v widths, the FFN width, the T=1 "act" byte offsets the attention
+    // dispatch reads, which kernel and buffer args run it (a layer type with its own sliding
+    // window names its own kernel and position table, e.g. Gemma 3's dxB_local / ptab_local;
+    // everyone else defaults to dxB / ptab), the residual/norm chain ("plain" or Gemma's
+    // sandwich, OPEN-PREFILL-BATCH) and the FFN activation ("silu" | "gelu_tanh")
+    uint64_t qw = 0, kvw = 0, ff = 0, ad_q = 0, ad_kvn = 0, ad_og = 0;
+    std::string attn_kernel = "dxB";
+    std::vector<std::string> attn_args = {"pool", "xres", "consts", "state", "act", "ptab"};
+    bool sandwich = false;
+    std::string act = "silu";
+    // >1: the route's HOST norms split each row into `norm_groups` equal groups and
+    // RMS each group separately (K2's GroupRMSNorm(2)), the same split the `ln`
+    // design's LN_GROUPS bakes into the NPU kernel -- 1 is the plain whole-row
+    // RMSNorm every pre-2.2 manifest computed (also the default when the field
+    // is absent, so old kernel sets keep their behaviour byte for byte).
+    uint64_t norm_groups = 1;
+    // linear: the fused qkv width, the value width, the DeltaNet geometry, the state layout
+    uint64_t qkv_dim = 0, vw = 0, key_heads = 0, value_heads = 0, head_dim = 0, conv_kernel = 0;
+    // linear: the out projection's GEMM returns 2 x hidden rows, the hi and lo halves of a q8
+    // weight's exact q4_1 split, and the host adds them (OPEN-PREFILL-BATCH)
+    bool out_split = false;
+    uint64_t state_s_off = 0, s_head_bytes = 0, s_rows = 0;
+    // full: heads, kv heads, head dim, rotary dim (qw / kvw as above)
+    uint64_t nh = 0, kvh = 0, hd = 0, rot = 0;
+    // linear and full: the per-token MoE dispatch (moeroute2-patched, its own xclbin), its
+    // buffer args, and where in act it reads xm, the router record and the residual
+    std::string moe_kernel;
+    std::vector<std::string> moe_args;
+    uint64_t a_xm = 0, a_rout = 0, a_res = 0;
+    // linear and full: the shared expert, lifted out of the per-token dispatch and run once
+    // over the block -- up|gate (contiguous in the pool) then down, with silu and the sigmoid
+    // gate on the host, folded into the residual mx is handed. mx closes on xres + acc.
+    std::vector<Step> shared_program;
+    std::map<std::string, GemmWeight> shared_weights;
+    uint64_t shared_ff = 0;
+    // linear and full: the routed experts batched over the block (absent: mx per token)
+    MoeBatch moe_batch;
+    // linear and full, in place of all of the MoE fields above: a dense FFN (Qwen3.5) --
+    // up|gate then down over the block, silu on the host, ungated, added to the residual.
+    // `ff` is its width. Present => the layer type has no MoE block (has_dense_ffn()).
+    std::vector<Step> ffn_program;
+    std::map<std::string, GemmWeight> ffn_weights;
+    bool has_dense_ffn() const { return !ffn_program.empty(); }
+    // full: the attention products on the NPU (absent: attention on the host)
+    AttnBlock attn_block;
+};
+
+struct LayerType {
+    std::string name;
+    uint64_t consts_bytes = 0, act_bytes = 0;
+    std::string state_kind;                  ///< "linear" (a fixed-size state BO) | "kv" (max_ctx x state_row)
+    uint64_t state_bytes = 0, state_row = 0;
+    std::vector<Step> program;
+    GemmBlockProgram gemm_block;
+    std::map<std::string, GemmBlockProgram> gemm_block_variants;   ///< OPEN-PREFILL-MODE: routes loadable in its place
+    std::vector<PackOp> pool, consts;
+};
+
+struct KernelDesc {
+    std::string context;                     ///< name in Manifest::contexts
+    std::string insts;                       ///< relative path of insts.bin
+    std::string patch;                       ///< "" | moeroute2 | attnpos | attnrows
+    uint64_t window = 0;                     ///< attnpos: the sliding window (rows; 0 = every cached row)
+    /// attnpos: cached rows this kernel takes per call when it walks them in whole blocks
+    /// (attn.h ATTN_RB with ATTN_BLOCK_ONLY). The kernel derives its own block count from
+    /// the position record, so the two must agree or the fifo deadlocks; 1 = unblocked.
+    uint64_t rb = 1;
+    /// attnpos / attnrows: this kernel's KV row and position record, in bytes. A model whose
+    /// layer types have different attention geometry (Gemma 4: head dim 256 and 512) builds a
+    /// kernel per type, each patched with its own; absent in the manifest = the layout's.
+    uint64_t kv_row = 0, ptab_row = 0;
+};
+
+// OPEN-DECODE-ROWS: `kernel` reuses each layer's pool / consts / state / ptab; l == 0 means no rows pass.
+struct RowsDesc {
+    uint64_t l = 0;
+    std::string kernel, head;
+    uint64_t act_bytes = 0;          ///< the L-row scratch
+    uint64_t head_act_bytes = 0;     ///< the head's normed rows (bf16 [L][hidden])
+    uint64_t head_cores = 0;         ///< cores whose [value L | row L] argmax elements end the head's output
+    uint64_t head_out_floats = 0;    ///< logits [L][vocab] then head_cores elements of L * 64
+    // OPEN-UNO-LORA: `lora_kernel` is another stream for the same core programs; empty means no draft pass.
+    std::string lora_kernel, lora_file;
+    uint64_t lora_pool_bytes = 0;
+    std::vector<PackOp> lora_pack;
+};
+
+/// A global sized max_ctx x row: the position record table(s).
+struct RowGlobal {
+    uint64_t per_row = 0;
+    std::vector<double> inv_freq;            ///< its RoPE frequencies (rotary_dim / 2)
+    /// the pairs its record carries x 2; 0 = the layout's rotary_dim. Gemma 4's global table
+    /// rotates 128 dims of a 512-dim head while the sliding one rotates all 256.
+    uint64_t rotary_dim = 0;
+    double scale = 1.0;                      ///< on cos and sin (longrope's attention factor)
+    uint64_t window = 0;                     ///< the row counts follow this window
+    /// Phi-3's longrope: row r takes `long_inv_freq` once r >= switch_row, `inv_freq` before
+    /// it -- HF's own per-call `seq_len = pos + 1 > original_max_position_embeddings` rule,
+    /// applied per row since this engine computes one row per token as the context grows.
+    /// Empty / kSwitchNever for every other family (row always takes `inv_freq`).
+    std::vector<double> long_inv_freq;
+    static constexpr uint64_t kSwitchNever = ~uint64_t{0};
+    uint64_t switch_row = kSwitchNever;
+};
+
+struct Manifest {
+    int version = 0;
+    std::string family, spec_hash, build_key;
+    size_t max_ctx_default = 0;
+    // layout
+    size_t hidden = 0, vocab = 0, real_vocab = 0;
+    size_t chunk_bytes = 0, pool_bytes = 0, lmhead_pool_bytes = 0, lmhead_chunk_bytes = 0;
+    size_t kv_row = 0, ptab_row = 0, rotary_dim = 0, rout_idx_off = 1024;
+    double rope_theta = 0;
+    std::vector<double> rope_inv_freq;       ///< per rotary pair (rotary_dim / 2 values; Llama 3's scaling is in here)
+    double final_logit_softcapping = 0;      ///< logits = c * tanh(logits / c) on the host (Gemma 4: 30); 0 = none
+    bool has_moe = false;                    ///< layout.moe present (a family with routed experts)
+    stream_patch::MoeGeometry moe;
+    stream_patch::AttnGeometry attn;
+    // the model and its programs
+    std::vector<std::string> layers;         ///< per layer: a key of layer_types
+    std::map<std::string, std::string> contexts;      ///< name -> relative path of final.xclbin
+    std::map<std::string, KernelDesc> kernels;
+    std::map<std::string, LayerType> layer_types;
+    std::vector<Step> tail;
+    RowsDesc rows;
+    std::map<std::string, uint64_t> globals;          ///< fixed-size global buffers (bytes)
+    std::map<std::string, RowGlobal> per_row_globals; ///< globals sized max_ctx x row (the ptab(s))
+    std::string embed_tensor, norm_tensor;
+    double embed_scale = 1.0;                 ///< applied to token lookup only; never the tied lm_head
+    std::vector<PackOp> lmhead_ops;          ///< pack.lm_head.ops into the lmpool global
+    size_t norm_bytes = 0;
+    nlohmann::json hf_config_check;
+    /// What a key ABSENT from config.json means, for the keys of hf_config_check a config
+    /// may omit (Phi-3's head_dim, partial_rotary_factor, rope_scaling, ...): check_model
+    /// compares the expected value against this instead of refusing for the missing key.
+    nlohmann::json hf_config_defaults = nlohmann::json::object();
+    /// The same kernel set for GGUF-direct weight files (f32-scale pool chunks,
+    /// open_kernels/gguf_pool.py): a complete manifest of its own, parsed with
+    /// this same code; the engine swaps it in when the model ships a .gguf.
+    std::unique_ptr<Manifest> gguf;
+
+    static Manifest load(const std::string& path);
+    static Manifest parse(const nlohmann::json& j, const std::string& where);
+
+    /// Throws naming the first key of config.json that disagrees with the manifest. A key
+    /// config.json lacks takes its hf_config_defaults value when there is one, and is
+    /// refused as lacking otherwise.
+    void check_model(const nlohmann::json& config, const std::string& where) const;
+    const LayerType& layer_type(size_t layer) const;
+    /// Why the host attention (OPEN-HOST-ATTN-GUARD) cannot compute this model, or "" when it can.
+    /// It implements K2's attention only; any other family is refused by name.
+    std::string host_attention_refusal() const;
+    /// OPEN-PREFILL-MODE: gemm_block becomes variant `name` ("" keeps it), and the other routes and the
+    /// globals only they name are dropped. False when no layer type has a variant `name`.
+    bool select_prefill_route(const std::string& name);
+    /// Every file (relative to the kernel dir) the manifest names.
+    std::vector<std::string> files() const;
+};
+
+}  // namespace open_qwen36
