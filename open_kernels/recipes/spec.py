@@ -125,6 +125,10 @@ class ModelSpec:
     mla: dict | None = None           # {"q_lora_rank", "kv_lora_rank", "qk_nope_dim", "qk_rope_dim", "v_head_dim"}
     hyper: dict | None = None         # {"mult", "sinkhorn_iters", "eps", "clamp"}
 
+    # Optional GGUF-named per-tensor carriage, e.g. blk.3.attn_v.weight -> q8.
+    # Absent on legacy specs so their serialization and hashes stay unchanged.
+    tensor_quant: dict[str, str] = field(default_factory=dict)
+
     # ---- derived
     @property
     def lin_qkv_dim(self) -> int:
@@ -196,6 +200,9 @@ class ModelSpec:
         names carry it so a q8 variant is a different kernel set without renaming the
         directories every shipped model already builds into."""
         q = self.canonical_quant()
+        if self.tensor_quant:
+            key = {"quant": q, "tensor_quant": self.tensor_quant}
+            return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:8]
         if self.hadamard:
             # a rotated-basis model is a different kernel set at either weight format
             # (OPEN-HADAMARD): its preps carry the transform and the og sign table
@@ -286,6 +293,8 @@ class ModelSpec:
         for k in ("mla", "hyper"):
             if d.get(k) is None:
                 d.pop(k, None)     # Xing's, likewise
+        if not d["tensor_quant"]:
+            del d["tensor_quant"]
         return d
 
     def to_json(self) -> str:
@@ -314,6 +323,8 @@ class ModelSpec:
             raise SpecError(f"layer_types has {len(kw['layer_types'])} entries, num_layers is {kw['num_layers']}")
         if kw.get("norm_groups", 1) not in NORM_GROUPS:
             raise SpecError(f"norm_groups {kw['norm_groups']!r}: only 1 (a single RMS), 2 or 4 (K2's groups) exist")
+        from .dense_precision import validate_selector
+        validate_selector(kw.get("tensor_quant", {}), kw["num_layers"])
         return cls(**kw)
 
     @classmethod

@@ -9318,6 +9318,10 @@ for supported metadata, pinned sources, independent reference limitations and
 publisher disagreements. This tokenizer stage does not establish NPU model
 support; faithful dense carriage and hardware gates remain separate work.
 
+P5 S0's per-tensor selector and compile-only V1 resource evidence are recorded
+in [the dense fit probe](dense-tensor-fit.md), including padded-q8 carriage and
+the pre-existing shim-drain planning discrepancy.
+
 ### OPEN-TURBO-PREFILL
 
 `run` and `serve` accept an explicit boolean `--turbo`. This opts into a

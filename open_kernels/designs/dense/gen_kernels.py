@@ -17,6 +17,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))          # open_kernels/
 from recipes.load import current_spec  # noqa: E402
 from recipes.families import for_spec  # noqa: E402
+from recipes.dense_precision import q8_projections  # noqa: E402
 
 
 
@@ -83,6 +84,8 @@ PROJ_ROLES = ("attn", "ffn")
 def mixed(R) -> bool:
     """The spec's roles mix formats on one main core: something is q8, something is still
     q4_1, and the q4_1 side is the `gy` + `gms` pair the fold replaces."""
+    if R.spec.tensor_quant:
+        return False  # V1 keeps the q4 pair; measure its actual program fit.
     q8 = R.spec.q8_roles
     return bool(q8) and "ffn" not in q8 and any(r not in q8 for r in PROJ_ROLES)
 
@@ -95,7 +98,7 @@ FOLD_FILES = ("gemv_q4_gyms.cc",)
 
 def files(R) -> dict[str, str]:
     G = R.geo
-    q8 = R.spec.q8_roles
+    q8 = q8_projections(R.spec) if R.spec.tensor_quant else R.spec.q8_roles
     hdr = f'''#define GEMV_PER_CALL {G.PER_CALL}
 #include "gemv_q4.h"
 '''
