@@ -4,6 +4,7 @@ fn frames(body: &str) -> Vec<Value> {
         .filter_map(|s| serde_json::from_str(s).ok())
         .collect()
 }
+
 fn text_and_finish(body: &str, stream: bool, legacy: bool) -> (String, String) {
     if stream {
         let f = frames(body);
@@ -312,6 +313,7 @@ fn scripted_request(text: &str, req: Value, reasoning: Option<Reasoning>) -> (St
                 &state,
                 vec![1],
                 GenParams {
+                    speculative: Default::default(),
                     max_tokens: 1000,
                     sampler: Sampler::new(0., 0, 1., 1., None),
                     stop_ids: Default::default(),
@@ -742,6 +744,7 @@ fn six_cpu_protocol_fixtures_stream_with_reasoning_and_validated_calls() {
                 &state,
                 vec![1],
                 GenParams {
+                    speculative: Default::default(),
                     max_tokens: 1000,
                     sampler: Sampler::new(0., 0, 1., 1., None),
                     stop_ids: Default::default(),

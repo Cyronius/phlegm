@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phlegm chat</title>
+<style>
+:root{color-scheme:dark; font:16px/1.5 system-ui,sans-serif; background:#101620;color:#edf3fa}*{box-sizing:border-box}body{margin:0}button,input,select,textarea{font:inherit;color:inherit;background:#202c3b;border:1px solid #718398;border-radius:6px;padding:.5rem}button{cursor:pointer}button:hover{background:#34465a}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid #80caff;outline-offset:2px}button:disabled{opacity:.5;cursor:default}header{padding:1rem;border-bottom:1px solid #415063;display:flex;align-items:center;gap:1rem}h1{font-size:1.3rem;margin:0}main{display:grid;grid-template-columns:17rem minmax(0,1fr);max-width:90rem;margin:auto;min-height:calc(100vh - 5rem)}aside{padding:1rem;border-right:1px solid #415063}aside label{display:block;margin-top:.8rem}aside input,aside select,aside textarea{width:100%}aside textarea{resize:vertical}.row{display:flex;gap:.5rem}.row>*{flex:1}.conversations{display:grid;gap:.4rem;margin:.6rem 0}.conversations button{text-align:left;overflow-wrap:anywhere}.active{border-color:#80caff;background:#30465a}.chat{display:flex;flex-direction:column;min-width:0;height:calc(100vh - 5rem)}#messages{overflow:auto;flex:1;padding:1rem}.message{max-width:55rem;margin:0 auto 1rem;padding:1rem;background:#1b2735;border-radius:8px;overflow-wrap:anywhere}.message.user{background:#263b4d}.message h2{font-size:.9rem;margin:0 0 .5rem;color:#aed8fa}.message p{margin:.5rem 0}.message pre{background:#0d141d;padding:.8rem;overflow:auto;white-space:pre}.message code{font-family:ui-monospace,monospace}.message :not(pre)>code{background:#344356;padding:.1rem .2rem}.message a{color:#9bd5ff}.message details{margin:.6rem 0;color:#cbd9e7}.message details pre{white-space:pre-wrap}.message .copy{font-size:.8rem}form{padding:1rem;border-top:1px solid #415063}form textarea{width:100%;resize:vertical;min-height:5rem}form .row{justify-content:flex-end}form .row button{flex:0 0 auto}#status{min-height:1.5em;color:#ffd89a}small{color:#c5d3e0}@media(max-width:700px){main{display:block}aside{border-right:0;border-bottom:1px solid #415063}.chat{height:70vh;min-height:28rem}header{padding:.7rem}}
+</style>
+</head>
+<body>
+<header><h1>Phlegm chat</h1><small>Local, on your server</small></header>
+<main><aside aria-label="Chat settings">
+<div class="row"><button id="new" type="button">New chat</button><button id="delete" type="button">Delete chat</button></div>
+<div id="conversations" class="conversations" aria-label="Conversations"></div>
+<label for="model">Model</label><select id="model"></select><button id="refresh" type="button">Refresh models</button>
+<label for="key">API key <small>(if configured; kept for this tab)</small></label><input id="key" type="password" autocomplete="off"><button id="connect" type="button">Connect</button>
+<label for="system">System prompt</label><textarea id="system" rows="3"></textarea>
+<div class="row"><div><label for="temperature">Temperature</label><input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7"></div><div><label for="maxTokens">Max tokens</label><input id="maxTokens" type="number" min="1" step="1" value="512"></div></div>
+</aside><section class="chat" aria-label="Chat"><div id="messages" aria-live="polite" aria-relevant="additions"></div><form id="form"><label for="prompt">Message</label><textarea id="prompt" required></textarea><div class="row"><button id="send" type="submit">Send</button><button id="stop" type="button" disabled>Stop</button></div><div id="status" role="status"></div></form></section></main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const storageKey = 'phlegm.chats.v1';
+let chats = [], current = null, controller = null;
+try { const saved = JSON.parse(localStorage.getItem(storageKey) || '[]'); if (Array.isArray(saved)) chats = saved.filter(c => c && typeof c.id === 'string' && Array.isArray(c.messages)); } catch (_) {}
+function save() { try { localStorage.setItem(storageKey, JSON.stringify(chats)); } catch (_) { $('status').textContent = 'Could not save chats in browser storage.'; } }
+function newChat() { const c = {id: Date.now().toString(36) + Math.random().toString(36).slice(2), messages: [], system: ''}; chats.unshift(c); current = c; save(); render(); }
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+// Deliberately small Markdown subset; escape HTML before adding markup and allow only HTTP(S) links.
+function inline(s) { return escapeHtml(s).replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>').replace(/\*([^*\n]+)\*/g, '<em>$1</em>').replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" rel="noopener noreferrer" target="_blank">$1</a>'); }
+function markdown(s) { const parts = String(s || '').split(/```[^\n]*\n([\s\S]*?)```/g); return parts.map((part,i) => i%2 ? '<pre><code>'+escapeHtml(part)+'</code></pre>' : part.split(/\n{2,}/).map(p => '<p>'+inline(p).replace(/\n/g,'<br>')+'</p>').join('')).join(''); }
+function render() {
+ $('system').value = current.system || '';
+ $('conversations').replaceChildren();
+ for (const c of chats) { const b = document.createElement('button'); b.type = 'button'; b.textContent = (c.messages.find(m => m.role === 'user')?.content || 'New chat').slice(0,60); b.className = c === current ? 'active' : ''; b.setAttribute('aria-pressed', String(c === current)); b.onclick = () => { current = c; render(); }; $('conversations').append(b); }
+ $('messages').replaceChildren();
+ for (const m of current.messages) { const article = document.createElement('article'); article.className = 'message ' + m.role; const title = document.createElement('h2'); title.textContent = m.role === 'user' ? 'You' : 'Assistant'; article.append(title);
+  if (m.reasoning) { const d = document.createElement('details'); d.open = !!m.reasoningOpen; d.ontoggle = () => { m.reasoningOpen = d.open; }; const summary = document.createElement('summary'); summary.textContent = 'Reasoning'; const text = document.createElement('div'); text.innerHTML = markdown(m.reasoning); d.append(summary,text); article.append(d); }
+  const content = document.createElement('div'); content.innerHTML = markdown(m.content); article.append(content);
+  if (m.tool_calls?.length) { const d = document.createElement('details'); const summary = document.createElement('summary'); summary.textContent = 'Tool calls'; const pre = document.createElement('pre'); pre.textContent = JSON.stringify(m.tool_calls, null, 2); d.append(summary,pre); article.append(d); }
+  const copy = document.createElement('button'); copy.type = 'button'; copy.className = 'copy'; copy.textContent = 'Copy message'; copy.onclick = async () => { try { await navigator.clipboard.writeText(m.content || ''); copy.textContent = 'Copied'; } catch (_) { $('status').textContent = 'Could not copy to clipboard.'; } }; article.append(copy);
+  for (const code of article.querySelectorAll('pre code')) { const b = document.createElement('button'); b.type = 'button'; b.className = 'copy'; b.textContent = 'Copy code'; b.onclick = async () => { try { await navigator.clipboard.writeText(code.textContent); b.textContent = 'Copied'; } catch (_) { $('status').textContent = 'Could not copy to clipboard.'; } }; code.parentNode.after(b); }
+  $('messages').append(article);
+ }
+}
+function headers() { const h = {'Content-Type':'application/json'}; if ($('key').value) h.Authorization = 'Bearer ' + $('key').value; return h; }
+async function models() { try { const response = await fetch('/v1/models', {headers: headers()}); if (response.status === 401) { $('status').textContent = 'Enter your API key and select Connect.'; $('key').focus(); return; } if (!response.ok) throw new Error('HTTP '+response.status); const data = await response.json(); const selected = $('model').value; $('model').replaceChildren(); for (const model of data.data) { const o = document.createElement('option'); o.value = model.id; o.textContent = model.id; $('model').append(o); } if (Array.from($('model').options).some(o => o.value === selected)) $('model').value = selected; $('status').textContent = data.data.length ? '' : 'No models available.'; } catch (e) { $('status').textContent = 'Could not load models: '+e.message; } }
+$('new').onclick = () => { if (!controller) newChat(); }; $('delete').onclick = () => { if (controller) return; chats = chats.filter(c => c !== current); current = chats[0]; if (!current) newChat(); else { save(); render(); } };
+$('system').oninput = () => { current.system = $('system').value; save(); }; $('refresh').onclick = models; $('connect').onclick = models; $('stop').onclick = () => controller?.abort();
+$('form').onsubmit = async event => {
+ event.preventDefault(); if (controller || !$('prompt').value.trim() || !$('model').value) return;
+ if (!$('temperature').reportValidity() || !$('maxTokens').reportValidity()) return;
+ const chat = current, prompt = $('prompt').value; chat.messages.push({role:'user',content:prompt}); $('prompt').value = '';
+ const messages = [...(chat.system ? [{role:'system',content:chat.system}] : []), ...chat.messages.map(m => ({role:m.role,content:m.content, ...(m.tool_calls?.length ? {tool_calls:m.tool_calls} : {})}))];
+ const answer = {role:'assistant',content:'',reasoning:'',tool_calls:[]}; chat.messages.push(answer); save(); render(); controller = new AbortController(); $('send').disabled = true; $('stop').disabled = false; $('status').textContent = 'Generating…';
+ try { const response = await fetch('/v1/chat/completions', {method:'POST', headers:headers(), signal:controller.signal, body:JSON.stringify({model:$('model').value,messages,temperature:Number($('temperature').value),max_tokens:Number($('maxTokens').value),stream:true})}); if (!response.ok) { const error = await response.json().catch(() => ({})); throw new Error(error.error?.message || 'HTTP '+response.status); }
+  const reader = response.body.getReader(), decoder = new TextDecoder(); let buffer = '', done = false;
+  while (!done) { const chunk = await reader.read(); buffer += decoder.decode(chunk.value || new Uint8Array(), {stream:!chunk.done}); buffer = buffer.replace(/\r\n/g,'\n'); let end; while ((end = buffer.indexOf('\n\n')) !== -1) { const frame = buffer.slice(0,end); buffer = buffer.slice(end+2); const data = frame.split('\n').filter(l => l.startsWith('data:')).map(l => l.slice(5).trimStart()).join('\n'); if (!data) continue; if (data === '[DONE]') { done = true; break; } const obj = JSON.parse(data); if (obj.error) throw new Error(obj.error.message || 'Stream error'); const delta = obj.choices?.[0]?.delta || {}; answer.content += delta.content || ''; answer.reasoning += delta.reasoning_content || ''; for (const call of delta.tool_calls || []) { const index = call.index ?? 0; const target = answer.tool_calls[index] ||= {id:'',type:'function',function:{name:'',arguments:''}}; if (call.id) target.id += call.id; if (call.type) target.type = call.type; if (call.function?.name) target.function.name += call.function.name; if (call.function?.arguments) target.function.arguments += call.function.arguments; } save(); render(); } if (chunk.done) { if (!done) throw new Error('Stream ended before completion.'); break; } }
+  $('status').textContent = '';
+ } catch (e) { $('status').textContent = e.name === 'AbortError' ? 'Stopped.' : 'Request failed: '+e.message; } finally { controller = null; $('send').disabled = false; $('stop').disabled = true; save(); render(); }
+};
+if (!chats.length) newChat(); else { current = chats[0]; render(); } models();
+</script></body></html>

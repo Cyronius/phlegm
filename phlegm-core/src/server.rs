@@ -6,19 +6,23 @@
 //!   GET  /v1/models              -> OpenAI model list
 //!   POST /v1/chat/completions    -> chat completion; stream=true gives SSE deltas
 //!   POST /v1/completions         -> raw prompt completion (no chat template)
+//!   POST /v1/embeddings          -> embeddings
+//!   POST /v1/images/generations  -> native image generation (multi-model mode)
+//!   POST /v1/images/edits        -> native image edits (multi-model mode)
 //!
 //! Backend-agnostic: `serve()` takes any `Box<dyn Backend + Send>` (a
 //! `NpuBackend` for normal serving, `MockBackend` for explicit tests).
 //! Generation is serialized behind a `Mutex` around the backend, mirroring
 //! Python's per-backend lock ("the NPU is a single shared device").
 //!
-//! Threading model: a single accept loop calls `Server::recv()` and handles
+//! Single-model threading: a single accept loop calls `Server::recv()` and handles
 //! each request to completion (including writing the full SSE stream) before
 //! looping back for the next one. tiny_http's own accept thread still queues
 //! new connections concurrently (see `Server::from_listener`'s internal
 //! `TaskPool`), so this isn't "one connection at a time on the wire" — it's
 //! "one *response body* being produced at a time", which is what the shared
-//! backend lock would force anyway.
+//! backend lock would force anyway. Lazy multimodal serving in `models` uses bounded
+//! concurrent handlers and one FIFO model lease; discovery stays available during generation.
 
 use crate::backend::{Backend, GenParams};
 use crate::placeholder_tokenizer::PlaceholderTokenizer;
@@ -33,6 +37,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tiny_http::{Header, Method, Request, Response};
 
+#[path = "server_model_slot.rs"]
+mod model_slot;
+#[path = "server_models.rs"]
+pub mod models;
 #[path = "server_embeddings.rs"]
 mod embeddings_route;
 #[path = "server_generation.rs"]
@@ -73,6 +81,7 @@ pub struct ServerConfig {
 /// table of the template's effort values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenDefaults {
+    pub speculative: crate::speculative::SpeculativeMode,
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
@@ -88,6 +97,7 @@ impl Default for GenDefaults {
     /// The settings' built-in defaults: greedy, the template's thinking on.
     fn default() -> Self {
         GenDefaults {
+            speculative: Default::default(),
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
@@ -102,6 +112,7 @@ impl Default for GenDefaults {
 impl GenDefaults {
     pub fn from_settings(r: &crate::settings::Resolved) -> Result<GenDefaults, String> {
         Ok(GenDefaults {
+            speculative: r.speculative()?,
             temperature: r.f32("temperature"),
             top_k: r.usize("top_k"),
             top_p: r.f32("top_p"),
@@ -427,31 +438,49 @@ fn loopback_origin(origin: &str) -> bool {
     })
 }
 
-fn handle_request(request: Request, state: &Arc<ServerState>) {
+fn authorize(request: &Request, cfg: &ServerConfig) -> bool {
     let origin = request.headers().iter().find(|h| h.field.equiv("Origin"))
         .map(|h| h.value.as_str());
-    let allowed = if state.cfg.allowed_origins.trim() == "*" {
+    let allowed = if cfg.allowed_origins.trim() == "*" {
         Some("*".to_string())
-    } else if state.cfg.allowed_origins.trim() == "loopback" {
+    } else if cfg.allowed_origins.trim() == "loopback" {
         origin.filter(|o| loopback_origin(o)).map(str::to_string)
     } else {
-        origin.filter(|o| state.cfg.allowed_origins.split(',').any(|a| a.trim() == *o))
+        origin.filter(|o| cfg.allowed_origins.split(',').any(|a| a.trim() == *o))
             .map(str::to_string)
     };
     CORS_ORIGIN.with(|slot| *slot.borrow_mut() = allowed);
+    let method = request.method().clone();
+    let url = request.url().to_string();
+    if method == Method::Options { return true; }
+    // `/health` and the chat page stay public; the page asks for the key itself.
+    if let Some(key) = cfg.api_key.as_ref().filter(|_| !(method == Method::Get && (url == "/health" || url == "/"))) {
+        return request.headers().iter().any(|h| h.field.equiv("Authorization")
+            && h.value.as_str().strip_prefix("Bearer ") == Some(key.as_str()));
+    }
+    true
+}
+
+/// The built-in chat page (U10), served at `/` by the single-model and multi-model servers.
+pub(crate) fn respond_chat_page(request: Request) {
+    let response = Response::from_string(include_str!("chat.html"))
+        .with_header(Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap());
+    let _ = request.respond(response);
+}
+
+fn handle_request(request: Request, state: &Arc<ServerState>) {
+    if !authorize(&request, &state.cfg) {
+        respond_json(request, 401, &json!({"error": {"message": "Invalid API key", "type": "authentication_error"}}));
+        return;
+    }
     let method = request.method().clone();
     let url = request.url().to_string();
     if method == Method::Options {
         respond_json(request, 200, &json!({}));
         return;
     }
-    if let Some(key) = state.cfg.api_key.as_ref().filter(|_| !(method == Method::Get && url == "/health")) {
-        let valid = request.headers().iter().any(|h| h.field.equiv("Authorization")
-            && h.value.as_str().strip_prefix("Bearer ") == Some(key.as_str()));
-        if !valid {
-            respond_json(request, 401, &json!({"error": {"message": "Invalid API key", "type": "authentication_error"}}));
-            return;
-        }
+    if method == Method::Get && url == "/" {
+        return respond_chat_page(request);
     }
     match (method, url.as_str()) {
         (Method::Get, "/health") => {
@@ -512,10 +541,14 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>, legac
         );
         return;
     }
+    handle_chat_body(request, state, legacy, &body);
+}
+
+fn handle_chat_body(request: Request, state: &Arc<ServerState>, legacy: bool, body: &[u8]) {
     let req_json: Value = if body.is_empty() {
         json!({})
     } else {
-        match serde_json::from_slice(&body) {
+        match serde_json::from_slice(body) {
             Ok(v) => v,
             Err(e) => {
                 let msg = format!("invalid JSON body: {e}");
@@ -544,6 +577,10 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>, legac
         .and_then(Value::as_str)
         .unwrap_or(&state.cfg.model_id)
         .to_string();
+    if model != state.cfg.model_id {
+        respond_json(request, 404, &json!({"error":{"message":"model not found","type":"not_found"}}));
+        return;
+    }
     let requested_max_tokens = req_json
         .get("max_completion_tokens").filter(|v| !v.is_null())
         .or_else(|| req_json.get("max_tokens"))
@@ -777,6 +814,7 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>, legac
         sampler
     };
     let params = GenParams {
+        speculative: state.cfg.defaults.speculative,
         max_tokens,
         sampler,
         stop_ids,
@@ -932,7 +970,7 @@ fn json_content_type() -> Header {
 
 thread_local! { static CORS_ORIGIN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
 
-fn respond_json(request: Request, status: u16, value: &Value) {
+pub(crate) fn respond_json(request: Request, status: u16, value: &Value) {
     let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
     let mut response = Response::from_data(body)
         .with_status_code(status)
@@ -981,6 +1019,7 @@ mod tests {
 
     include!("server_tools_tests.rs");
     include!("server_generation_tests.rs");
+    include!("server_speculative_tests.rs");
 
     #[test]
     fn stream_finalization_flushes_only_unemitted_text_and_rejects_rewrites() {
@@ -1095,7 +1134,7 @@ mod tests {
     /// Minimal blocking HTTP/1.1 client: send a raw request, return
     /// (status_code, headers, body_as_string). Reads the body either via
     /// Content-Length or by decoding a chunked transfer-encoding.
-    fn http_request(
+    pub(super) fn http_request(
         addr: &str,
         method: &str,
         path: &str,
@@ -1104,7 +1143,7 @@ mod tests {
         http_request_headers(addr, method, path, body, "")
     }
 
-    fn http_request_headers(addr: &str, method: &str, path: &str, body: Option<&str>, extra: &str) -> (u16, Vec<String>, String) {
+    pub(super) fn http_request_headers(addr: &str, method: &str, path: &str, body: Option<&str>, extra: &str) -> (u16, Vec<String>, String) {
         let mut stream = TcpStream::connect(addr).expect("connect");
         let body_bytes = body.unwrap_or("").as_bytes();
         let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
@@ -1182,6 +1221,17 @@ mod tests {
             headers,
             String::from_utf8_lossy(&body_out).to_string(),
         )
+    }
+
+    #[test]
+    fn chat_page_is_public_html_with_api_key_configured() {
+        let addr = spawn_test_server(|cfg| cfg.api_key = Some("secret".into()));
+        let (status, headers, body) = http_request(&addr, "GET", "/", None);
+        assert_eq!(status, 200);
+        assert!(headers.iter().any(|h| h.eq_ignore_ascii_case("content-type: text/html; charset=utf-8")));
+        assert!(body.contains("Phlegm chat"));
+        assert!(body.contains("/v1/chat/completions"));
+        assert_eq!(http_request(&addr, "GET", "/v1/models", None).0, 401);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::BTreeMap;
-use tiny_http::{Header, Method, Request, Response, Server};
+use tiny_http::{Method, Request, Server};
 
 pub const MOSS_ID: &str = "OpenMOSS-Team/MOSS-Image-SFT";
 pub const FLUX3_ID: &str = "black-forest-labs/flux-3-image-klein";
@@ -655,6 +655,7 @@ pub fn generate(cfg: &ImageConfig, request: &ImageRequest, out: &Path) -> Result
     if out.exists() {
         return Err(format!("image output directory already exists: {}", out.display()));
     }
+    let _lock = crate::npu_lock::NpuLock::acquire("phlegm images")?;
     match cfg {
         ImageConfig::Moss(moss) => generate_moss(moss, request, out, resolution),
         ImageConfig::Flux3(flux) => generate_flux3(flux, request, out, resolution),
@@ -702,6 +703,7 @@ fn generate_moss(cfg: &MossImageConfig, request: &ImageRequest,
         .arg("--guidance").arg(guidance.to_string())
         .arg("--seed").arg(request.seed.to_string())
         .current_dir(&cfg.repo_root);
+    crate::bench::reference::die_with_parent(&mut process);
     let status = process.status().map_err(|e| format!("starting native image sampler: {e}"))?;
     if !status.success() {
         return Err(format!("native image sampler exited with {status}"));
@@ -768,6 +770,7 @@ fn generate_flux3(cfg: &Flux3ImageConfig, request: &ImageRequest,
             .arg(serde_json::to_string(&cfg.edit_shared_block_kernels).map_err(|e| e.to_string())?)
             .arg("--discard-steps");
     }
+    crate::bench::reference::die_with_parent(&mut process);
     let status = process.status().map_err(|e| format!("starting native FLUX 3 sampler: {e}"))?;
     if !status.success() { return Err(format!("native FLUX 3 sampler exited with {status}")); }
     let summary = read_manifest(&out.join("summary.json"))?;
@@ -812,6 +815,7 @@ fn generate_qwen21(cfg: &Qwen21ImageConfig, request: &ImageRequest,
         .arg("--steps").arg(steps.to_string())
         .arg("--seed").arg(request.seed.to_string())
         .current_dir(&cfg.repo_root);
+    crate::bench::reference::die_with_parent(&mut process);
     let status = process.status().map_err(|e| format!("starting native Qwen sampler: {e}"))?;
     if !status.success() { return Err(format!("native Qwen sampler exited with {status}")); }
     let image = out.join("decode/native-qwen21.png");
@@ -848,6 +852,7 @@ fn generate_flux2(cfg: &Flux2ImageConfig, request: &ImageRequest,
     if let Some(image) = &request.image {
         process.arg("--image").arg(image);
     }
+    crate::bench::reference::die_with_parent(&mut process);
     let status = process.status().map_err(|e| format!("starting native FLUX.2 sampler: {e}"))?;
     if !status.success() { return Err(format!("native FLUX.2 sampler exited with {status}")); }
     let summary = read_manifest(&out.join("summary.json"))?;
@@ -858,9 +863,7 @@ fn generate_flux2(cfg: &Flux2ImageConfig, request: &ImageRequest,
 }
 
 fn respond(request: Request, status: u16, value: Value) {
-    let bytes = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
-    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-    let _ = request.respond(Response::from_data(bytes).with_status_code(status).with_header(header));
+    crate::server::respond_json(request, status, &value);
 }
 
 fn now_unix() -> u64 {
@@ -901,15 +904,39 @@ fn handle(mut request: Request, cfg: &ImageConfig) {
         respond(request, 413, json!({"error":{"message":"request too large","type":"invalid_request_error"}}));
         return;
     }
+    handle_body(request, cfg, &body, &content_type, edit);
+}
+
+/// Read only the model selector, including multipart edits, before selecting a backend.
+pub(crate) fn request_model(content_type: &str, body: &[u8]) -> Result<Option<String>, String> {
+    if content_type.to_ascii_lowercase().starts_with("multipart/form-data") {
+        let mut model = None;
+        for (name, _, bytes) in multipart(content_type, body)? {
+            if name == "model" {
+                if model.is_some() { return Err("duplicate model field".into()); }
+                model = Some(String::from_utf8(bytes).map_err(|_| "model must be UTF-8")?);
+            }
+        }
+        return Ok(model);
+    }
+    let value: Value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    match value.get("model") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        _ => Err("model must be a string".into()),
+    }
+}
+
+pub(crate) fn handle_body(request: Request, cfg: &ImageConfig, body: &[u8], content_type: &str, edit: bool) {
     let serial = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let prefix = match cfg { ImageConfig::Moss(_) => "moss", ImageConfig::Flux3(_) => "flux3",
         ImageConfig::Qwen21(_) => "qwen21", ImageConfig::Flux2(_) => "flux2" };
     let name = format!("{prefix}{}-{}-{serial}", if edit { "-edit" } else { "" }, now_unix());
     let stem = cfg.output_root().join(format!("{name}-reference"));
     let parsed = if edit {
-        parse_edit(&content_type, &body, &stem)
+        parse_edit(content_type, body, &stem)
     } else {
-        serde_json::from_slice::<ImageRequest>(&body).map_err(|e| e.to_string())
+        serde_json::from_slice::<ImageRequest>(body).map_err(|e| e.to_string())
     }.and_then(|r| cfg.validate_request(&r).map(|_| r));
     let image_request = match parsed {
         Ok(r) => r,

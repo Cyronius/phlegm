@@ -51,6 +51,9 @@ shipped registry `phlegm-core/config/model_list.json` under your `~/.config/phle
 overrides one, and every flag and request field still wins (SERVER-SETTINGS in
 [specs/server/spec.md](specs/server/spec.md)).
 
+Open `http://127.0.0.1:52625/` while `phlegm serve` is running to use the built-in chat;
+enter the API key there if one is configured.
+
 `phlegm serve --mock` explicitly selects the hardware-free demo. The model needs
 `tokenizer.json`, `tokenizer_config.json`, and a chat template (external
 `chat_template.jinja` or inline in the config). The bridge and its `.build.json`

@@ -1,0 +1,84 @@
+{
+  "date": "2026-11-09",
+  "item": "U7",
+  "base_revision": "fe32765f72c54f649fe4f8bba06190e1ea992001",
+  "source_state": "uncommitted worktree changes",
+  "checks": [
+    {
+      "command": "dibs run build --label \"U7: focused model serving tests\" --eta 10m -- cargo test -p phlegm-core --offline server::models --no-fail-fast",
+      "result": "failed before tests",
+      "details": "error[E0603]: function `respond_json` is private; fixed by making the shared responder pub(crate)"
+    },
+    {
+      "command": "dibs run build --label \"U7: fake loader and route tests\" --eta 5m -- cargo test -p phlegm-core --offline server::models --no-fail-fast",
+      "result": "pass",
+      "details": "8 passed, 0 failed; other tests filtered out"
+    },
+    {
+      "command": "dibs run build --label \"U7: core and CLI regression suite\" --eta 5m -- cargo test -p phlegm-core -p phlegm-cli --offline",
+      "result": "pass",
+      "details": "core 129 passed/5 ignored; integrations 2 passed/2 ignored; CLI 4 passed"
+    },
+    {
+      "command": "dibs wait --pressure",
+      "result": "pass",
+      "details": "Final suite launch initially deferred by PreToolUse: CPU 97% (limit 90%). Wait completed: FREE: CPU and memory have been under the limits for 30 s. Original launch retried without an override."
+    },
+    {
+      "command": "dibs run build --label \"U7: final core and CLI regression suite\" --eta 5m -- cargo test -p phlegm-core -p phlegm-cli --offline",
+      "result": "pass",
+      "details": "core 130 passed/5 ignored; integrations 2 passed/2 ignored; CLI 5 passed; doctests 0"
+    },
+    {
+      "command": "dibs run build --label \"U7: build CLI for read-only discovery smoke\" --eta 5m -- cargo build -p phlegm-cli --offline",
+      "result": "pass",
+      "details": "ran twice: first build and rebuild after final code changes"
+    },
+    {
+      "command": "rustfmt --edition 2021 --config skip_children=true phlegm-core/src/server_models.rs phlegm-core/src/server_model_slot.rs phlegm-core/src/server_models_tests.rs phlegm-cli/src/multi_model.rs",
+      "result": "tool unavailable",
+      "details": "error: 'rustfmt' is not installed for the toolchain 'stable-x86_64-unknown-linux-gnu'. Used the already-installed 1.99.1 toolchain formatter instead; no download."
+    },
+    {
+      "command": "/home/cyrus/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/bin/rustfmt --check --edition 2021 --config skip_children=true phlegm-core/src/server_models.rs phlegm-core/src/server_model_slot.rs phlegm-core/src/server_models_tests.rs phlegm-cli/src/multi_model.rs",
+      "result": "pass",
+      "details": "no formatting differences in new Rust modules"
+    },
+    {
+      "command": "python3 -I -c \"import ast,pathlib; ast.parse(pathlib.Path('phlegm-core/tests/check_u7_hardware.py').read_text()); print('hardware gate syntax: PASS')\"",
+      "result": "pass",
+      "details": "syntax only; no hardware gate execution"
+    },
+    {
+      "command": "python3 -I -c \"import ast,pathlib; files=['phlegm-core/tests/check_u7_hardware.py','phlegm-cli/tests/u7_discovery.py']; [ast.parse(pathlib.Path(p).read_text()) for p in files]; print('2 Python scripts: syntax PASS')\"",
+      "result": "pass",
+      "details": "both scripts parse; run again after script edits"
+    },
+    {
+      "command": "dibs run port-8767 --label \"U7: read-only installed model discovery smoke\" --eta 2m -- python3 -I phlegm-cli/tests/u7_discovery.py --server target/debug/phlegm --models-dir /home/cyrus/models --image-config /home/cyrus/Documents/ChatGPT/current/work/phlegm-image-models/phlegm-flux2-klein-4b-image.json,/home/cyrus/Documents/ChatGPT/current/work/phlegm-image-models/phlegm-flux3-image.json,/home/cyrus/Documents/ChatGPT/current/work/phlegm-image-models/phlegm-moss-image.json,/home/cyrus/Documents/ChatGPT/current/work/phlegm-image-models/phlegm-qwen21-image.json",
+      "result": "pass",
+      "details": "PASS: 26 models {'chat': 21, 'image': 4, 'embedding': 1}; all unloaded; 4 rejection routes; health. CLI child terminated/reaped by smoke finally block. No backend load."
+    },
+    {
+      "command": "git diff --check",
+      "result": "pass",
+      "details": "clean; repeated after final documentation edits"
+    },
+    {
+      "command": "python3 -I - <<'PY'\nfrom pathlib import Path\npaths=['phlegm-cli/src/multi_model.rs','phlegm-cli/tests/u7_discovery.py','phlegm-core/src/server_model_slot.rs','phlegm-core/src/server_models.rs','phlegm-core/src/server_models_tests.rs','phlegm-core/tests/check_u7_hardware.py','specs/server/u7-validation.json']\nfor name in paths:\n    data=Path(name).read_text()\n    assert data.endswith('\\n'), name\n    assert all(line == line.rstrip() for line in data.splitlines()), name\nprint('new files: trailing whitespace and final newlines PASS')\nPY",
+      "result": "pass",
+      "details": "all new files checked explicitly because git diff --check excludes untracked files"
+    }
+  ],
+  "npu_executed": false,
+  "new_dependencies": [],
+  "external_task_artifacts": [],
+  "untested": [
+    "real NPU model switching and numerical correctness",
+    "real image generation and edits",
+    "real bridge/embedding-worker/image-child cleanup and lock release under model switching",
+    "abrupt image process-tree teardown, Windows parent-death handling, real device failures",
+    "seven pre-existing ignored prerequisite tests (native bridge/model, optional CPU reference, local registry/header fixtures, release microbenchmark)"
+  ],
+  "hardware_commands_location": "specs/server/spec.md#server-model-switching-one-server-for-chat-images-and-embeddings-u7"
+}

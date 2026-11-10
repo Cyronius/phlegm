@@ -6,6 +6,13 @@ has no independent spec requirements beyond calling this API.
 
 Requirement prefix: `SERVER`.
 
+## SERVER-CHAT-PAGE: Built-in chat
+
+GET `/` serves a self-contained offline chat page. It lists models, streams chat and
+reasoning, shows tool calls, and keeps conversations in browser localStorage; the API
+key is entered in the page and is not stored. The page is public so it can prompt for
+the key; API endpoints retain their configured authentication.
+
 ## SERVER-HTTP: Browser access, authentication and chat usage
 
 The chat server accepts browser preflight `OPTIONS` requests and sends CORS
@@ -14,7 +21,7 @@ headers with JSON and event-stream responses. `PHLEGM_ALLOWED_ORIGINS` or
 `127.0.0.1`, or `[::1]`, with any port. `*` and a comma-separated list of exact
 origins are opt-in. CORS is not authentication.
 `PHLEGM_API_KEY` or `--api-key` enables `Authorization: Bearer <key>` on all
-non-preflight routes except GET `/health`; it is disabled by default. An invalid or missing key
+non-preflight routes except GET `/health` and GET `/`; it is disabled by default. An invalid or missing key
 returns 401. The command-line value takes precedence over the environment.
 
 Chat requests accept `max_completion_tokens` in preference to `max_tokens`.
@@ -126,6 +133,142 @@ The mock-specific `check_u5_sdk.py` intentionally asserts mock text and is not a
 hardware quality gate. Hardware stop/logprob/completion checks should use the same
 API calls with model-independent assertions, followed by the tool loop above.
 
+## SERVER-MODEL-SWITCHING: One server for chat, images and embeddings (U7)
+
+`phlegm serve` with no single-model selector starts a lazy model server. It exposes
+chat, legacy completions, embeddings, `/v1/images/generations` and
+`/v1/images/edits` on the same address with the same authentication/CORS policy.
+No backend, worker or NPU lock is acquired during discovery or GET requests.
+`serve --model-dir DIR`, `serve --embed-model DIR` and `serve --mock` retain their
+single-model modes. `PHLEGM_MODEL_DIR` selects the single-model mode unless an
+explicit `--models-dir` or `--image-config` selects discovery instead.
+
+**Discovery and model names.** `--models-dir DIR` overrides `PHLEGM_MODELS_DIR`,
+otherwise `$HOME/models` (`$USERPROFILE/models` on Windows). The registry contains
+names and settings, not installation paths; it does not supply another search
+root today. Discovery scans that root and its immediate child directories once
+at startup, including directory symlinks. Restart to discover additions/removals.
+Registry entries without local weights are excluded. Chat IDs are directory
+basenames: a GGUF of any filename qualifies, as does `model.q4nx` beside a
+tokenizer or matching a registry name. Bare GGUF tokenizers follow P5 S6;
+discovery does not certify kernels, bridge availability or model correctness.
+`config.json` with `architecture: "TritEmbed"` and `model.safetensors` identifies
+an embedding directory; its basename is its ID. Per-model chat settings and bridge
+selection are resolved again on each load using SERVER-SETTINGS and P1 S2.
+`--kernels` and `--config-model` require single-model mode; `--bridge` remains an
+explicit override for deployments with one compatible bridge.
+
+Image installations need their existing native pipeline configuration because
+weights alone do not describe the text encoder, kernels and VAE. Discovery reads
+`image_config.json` or `phlegm-*-image.json` in the same directories; external
+configurations can be added with `--image-config JSON[,JSON...]`. Images use the
+pipeline's existing public model ID. Duplicate IDs at different paths are a startup
+error rather than an arbitrary selection; choose one configuration for variants
+sharing a public ID. The same canonical config path can be named more than once.
+Config assets are validated when that image model is selected. Existing image
+installations outside `~/models` therefore need `--image-config` or a config in
+the discovery root. Do not copy model weights to expose an existing installation.
+
+`GET /v1/models` lists all catalog entries, sorted by ID, including unloaded
+models, with the OpenAI fields and the extensions `capabilities: ["chat"]`,
+`["embedding"]` or `["image"]`, `loaded: bool`, and
+`status: "unloaded" | "loading" | "loaded"`. `created: 0` means the installation
+time is unknown. A failed load leaves its entry installed and unloaded; it is
+retryable. For images, loaded means the pipeline config is selected; the existing
+sampler creates and releases device resources for each generation/edit.
+
+**Request lifetime.** The request's `model` selects an installed ID. It is required
+in discovery mode, except that a catalog containing just one image model accepts
+an omitted model for compatibility with `serve-images`. One FIFO lease serializes
+all inference, including same-model requests. A different model waits for the
+current response to finish, including the final SSE frames, then destroys the old
+backend before invoking the new loader. The chat bridge and embedding worker are
+killed and reaped before their NPU lock is released. No extra Arc to the old model
+is retained by the catalog. A load error returns 503 with its diagnostic, leaves
+no resident model, and does not prevent a later load. A stream already running is
+never canceled by another model request. Client disconnects follow the existing
+generation behavior; the lease remains held until its handler actually returns.
+
+`--queue-timeout SECONDS` defaults to 600, measured from entry to the model queue
+after reading the bounded request body. Timed-out waiters leave the queue. It
+does not cancel another request's load or generation, nor bound the selected
+loader's own startup/device-lock timeouts. There are at most 64 concurrent POST
+handlers (including body readers); excess requests return 503. GET discovery and
+health remain available while a worker loads or generates. Queue order is the
+order handlers enter the lease queue, not TCP connection order.
+
+`--keep-alive SECONDS` optionally unloads a resident model after that much idle
+time since its last handler completed; omitted means keep it until a switch or
+normal server teardown. A 250 ms sweep checks idle time. Zero releases it on the
+next sweep unless a request is active/queued. Single-model modes retain their
+existing lifetime; they reject these discovery-only options. Image samplers use
+the same `NpuLock` around generation as the resident backends, wait for their child
+to exit before replying, and set the existing parent-death behavior on the child.
+Images retain their existing size, edit-capability and response-format validation;
+JSON/base64 and multipart edits reuse the same parser as the image-only server.
+
+`serve-images --config JSON` is an alias using the same model server with one
+image entry and its existing default port 52626. It keeps optional `model`, both
+image endpoints, `--host`, and `--port`, and now also accepts the auth/CORS,
+keep-alive and queue-timeout options. `image::serve` remains available to callers
+of the core library.
+
+Errors: 404 for an unknown model/path; 400 for a model used on the wrong endpoint,
+a missing/invalid selector or invalid generation parameters; 401 for failed bearer
+authentication; 413 for an oversized body; 503 for queue timeout/full or load
+failure. Backend generation errors retain their endpoint's existing 500/SSE-error
+behavior. Body limits are 16 MB for chat/completions/embeddings, 64 KiB for image
+generations and 32 MiB for edits. Invalid endpoint parameters are checked by the
+existing handler after selection, so they may still cause a model switch.
+
+**Offline evidence, 2026-11-09.** `server_models_tests.rs` exercises two chat
+models, an embedder, reuse, load/unload order with an exclusive fake lock,
+concurrent streamed chat versus embedding, queue timeout/recovery, failed
+load/recovery, installed-versus-loaded listing, discovery/duplicates, idle
+unload, auth/CORS, and reuse of image generation/edit validation. The slot test
+also checks removal of a timed-out front waiter. These are CPU/fake-loader
+checks, not evidence of device inference or real worker cleanup on hardware.
+`phlegm-cli/tests/u7_discovery.py` is a read-only smoke against a real CLI child;
+it requests only discovery/health and rejected requests, never a backend load.
+
+Final local checks passed: core 130 unit tests plus two integration tests; CLI
+five tests; seven prerequisite-dependent tests ignored. The CLI smoke listed
+26 installed models (21 chat, four image, one embedding), all unloaded, and
+passed four rejection routes plus health without invoking a loader. Exact
+commands, results and corrected setup failures:
+[u7-validation.json](u7-validation.json). No new crate or download was needed.
+
+**Untested hardware gate.** After integration into the main checkout, run this
+in one terminal (no such NPU command was run for U7):
+
+```sh
+cd /home/cyrus/code/phlegm
+dibs run build --label 'U7: build integrated server' --eta 10m -- cargo build -p phlegm-cli --offline
+dibs run npu port-8767 --label 'U7: multimodal switch hardware gate' --eta 90m -- target/npu-dev/npu-run.sh target/debug/phlegm serve --models-dir /home/cyrus/models --image-config /home/cyrus/Documents/ChatGPT/current/work/phlegm-image-models/phlegm-flux2-klein-4b-image.json --embed-python /home/cyrus/code/model-experiments/ternary-embedder/.venv/bin/python --keep-alive 5 --queue-timeout 3600 --port 8767
+```
+
+Then, against that freshly started, otherwise idle server, in another terminal
+(the newest process named `phlegm` must be the server just started):
+
+```sh
+cd /home/cyrus/code/phlegm
+python3 -I phlegm-core/tests/check_u7_hardware.py --base-url http://127.0.0.1:8767 --server-pid "$(pgrep -n -x phlegm)" --check-edits
+pgrep -af 'phlegm serve|phlegm-reference-bench|embeddings_worker|flux2_native_generate'
+test ! -e /tmp/phlegm-npu.lock
+```
+
+The script switches KAT Coder -> trit-embed -> Gemma 4 -> FLUX.2 klein, then edits
+its generated image when `--check-edits` is supplied. It checks response shapes,
+reaping of previous workers, observed descendants (PID plus start time to avoid
+PID reuse), idle unload, and the free lock after images/idle. It monitors only
+this server's descendants so unrelated sessions' Python/bridge processes are not
+misidentified or killed. The final `pgrep` is an additional operator inventory;
+the server itself remains running. Lock-free means the lockfile is absent; this
+is not a numerical quality gate. The embedding Python dependencies, all selected
+model/kernel/bridge bundles and the existing image config's output directory
+must be available. Image process-tree behavior on abrupt server termination,
+Windows parent-death behavior, and device failures remain untested.
+
 ## SERVER-EMBEDDINGS: Trit embeddings
 
 `phlegm serve --embed-model DIR` runs the named model as an embedding-only
@@ -138,7 +281,8 @@ default is the source tree used to build Phlegm. The model directory must
 contain the packed model, tokenizer, CPU reference, and compatible NPU bundle.
 The resident Python worker uses the existing `TritNpu` implementation; Rust
 holds the shared NPU lock for the worker's lifetime. The embedding-only mode
-avoids loading two exclusive NPU models at once; U7 covers model switching.
+avoids loading two exclusive NPU models at once; SERVER-MODEL-SWITCHING describes
+the lazy multimodal mode.
 
 `POST /v1/embeddings` requires the served `model` and `input`: a string, an
 array of strings, token IDs, or an array of token-ID arrays. Token IDs must
@@ -439,6 +583,72 @@ Their bridge selection checks `--bridge`, `PHLEGM_REFERENCE_BRIDGE`, an adjacent
 `phlegm-reference-bench` executable, then `bridges/index.json` beside the executable
 using the kernel manifest family, then the build-time developer checkout's bridge tree.
 Explicit paths must exist. `phlegm bench` continues to require `--reference-engine`.
+
+## SERVER-SPECULATIVE: Verified speculative decoding
+
+`phlegm run` and `phlegm serve` accept `--speculative off|auto|lookup|mtp`.
+The per-model `speculative` registry field, settings overlay and
+`PHLEGM_SPECULATIVE` follow SERVER-SETTINGS precedence. The built-in default
+and every shipped registry entry are `off`. No hardware speed or exactness
+claim is established by the Rust fake-bridge checks below; default-on requires
+the model/method's numerical, serving and paired performance gates.
+
+With a protocol-2 bridge advertising `verify_width > 0`, `lookup` uses the
+longest repeated suffix (4 down to 2 tokens), the most recent earlier match
+and its extended continuation (OPEN-SPEC-LOOKUP). `auto` selects an advertised
+MTP drafter, otherwise lookup. `mtp` requires `draft: {"method":"mtp","max":K}`;
+without it the request fails with a stage-4 prerequisite error. Protocol-1
+bridges and bridges without verification always use ordinary decode, for all
+modes. An accepted mode is not evidence of runtime MTP support.
+
+Between cycles Rust holds one emitted token outside the committed context.
+It verifies that token plus at most three drafts, bounded by the advertised
+width, remaining output budget and context capacity. With no lookup match,
+the pass has one row. After a rejection the draft budget halves; a completely
+rejected draft triggers two width-one cycles before another probe. A fully
+accepted cycle grows the budget by one, up to the advertised width.
+
+Protocol 2 retains protocol 1's prefill, reset, rewind and decode commands:
+
+- The process greeting accepts `protocol: 1` or `2`. Protocol 2's `init`
+  adds `verify_width` (0 means unavailable), `verify_ref` (slow reference
+  verifier) and `draft` (null or the MTP capability above).
+- `verify_logits {"accept":m,"tokens":[t0,d1,...],"draft":j}` commits the first
+  m rows of a preceding pass, then runs the supplied inputs without committing
+  them. For j > 0 only t0 is supplied; the bridge appends at most j drafts.
+  The reply declares `rows`, the exact input `tokens`, the committed starting
+  `position`, and `logits_f32_le_bytes = rows * real_vocab * 4`, followed by
+  row-major little-endian f32 logits. Rust validates the row count, input IDs,
+  position, payload size and finite values before walking the rows.
+- `accept {"n":m}` commits only the first m pending rows and discards the rest.
+  This client explicitly accepts after each cycle, so its next verify command
+  carries `accept:0`. Reset, rewind, prefill and decode require no pending pass.
+
+Rust samples only valid rows, once each, in order, using the request's sampler,
+history, penalties, ramps, RNG and structured-output mask. A masked-out draft
+cannot match the sampled token and is rejected. Only sampled, verified tokens
+reach `TokenEvent`, with their raw model logits; drafts never reach callbacks.
+Bit-identical valid verifier rows imply identical greedy and seeded output
+to ordinary decode. Device row identity remains a separate hardware gate.
+
+Stop IDs, output limits and callback `Break` end the walk immediately. Stop
+strings continue to use SERVER-GENERATION's callback. On `Break`, Rust starts
+no new pass and runs no new token, but sends the final `accept` needed to
+discard the pending suffix. The token whose callback broke remains unrun.
+Only acknowledged committed input tokens enter the reusable context; the
+prefill mark is preserved. Failed verification/commit leaves no reusable
+context or mark. Streaming, reasoning splitting and log probabilities use
+the same verified callback path as ordinary decode.
+
+CPU acceptance tests (2026-11-09): `speculative::tests` covers all 13 existing
+lookup fixtures and policy bounds. `bench::reference::speculation::tests`
+checks greedy plus five seeded sampler configurations, adversarial drafts,
+U4 masks, stops, early breaks, capacity/output bounds, committed context and
+marks, follow-up prefix reuse, protocol-1 fallback and malformed replies.
+`server::tests::speculative_bridge_stream_stop_and_reuse_match_plain_http`
+checks SSE/non-stream text, a stop string ending inside a cycle, rollback and
+subsequent HTTP prefix reuse with the protocol-2 fake. These tests load no
+hardware and do not validate C++ verification or MTP implementations.
 
 ## SERVER-SETTINGS: Per-model runtime defaults
 

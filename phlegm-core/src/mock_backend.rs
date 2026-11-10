@@ -127,6 +127,7 @@ mod tests {
     fn echoes_prompt_len_and_respects_max_tokens() {
         let mut backend = MockBackend::new();
         let mut params = GenParams {
+            speculative: Default::default(),
             max_tokens: 5,
             sampler: Sampler::new(0.0, 0, 1.0, 1.0, Some(1)),
             stop_ids: HashSet::new(),
@@ -152,6 +153,7 @@ mod tests {
         // '[' is the first byte of the reply; stopping on it should yield nothing.
         stop_ids.insert(b'[' as u32);
         let mut params = GenParams {
+            speculative: Default::default(),
             max_tokens: 100,
             sampler: Sampler::new(0.0, 0, 1.0, 1.0, Some(1)),
             stop_ids,

@@ -7,6 +7,7 @@ use crate::sampler::Sampler;
 use std::collections::HashSet;
 
 pub struct GenParams {
+    pub speculative: crate::speculative::SpeculativeMode,
     pub max_tokens: usize,
     pub sampler: Sampler,
     pub stop_ids: HashSet<u32>,
@@ -28,7 +29,9 @@ pub trait Backend {
     /// Generate up to `params.max_tokens` tokens from `prompt_ids`, calling
     /// `on_token` for each one (in order) as it's produced. Stops early on a
     /// stop id (not passed to `on_token`) or callback `Break`. On `Break`, do
-    /// not decode that token or issue another bridge command. Kept context must
+    /// not decode that token or start another pass. A speculative backend must
+    /// finish its pending pass with `accept` (only inputs before that token).
+    /// Kept context must
     /// describe only tokens actually run by the bridge (the last output token
     /// need not be in it). Only verified tokens may reach this callback, including
     /// in a future speculative implementation. `Err` is a hard failure the caller

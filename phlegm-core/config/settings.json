@@ -2,6 +2,33 @@
   "version": 1,
   "settings": [
     {
+      "key": "speculative",
+      "cli_flag": "--speculative",
+      "env_var": "PHLEGM_SPECULATIVE",
+      "description": "Speculative decoding; opt-in until model and method gates pass",
+      "type": "enum",
+      "options": [
+        {
+          "value": "off"
+        },
+        {
+          "value": "auto"
+        },
+        {
+          "value": "lookup"
+        },
+        {
+          "value": "mtp"
+        }
+      ],
+      "scope": "per_model",
+      "delivery": "direct",
+      "category": "performance",
+      "reload_required": false,
+      "registry_key": "speculative",
+      "default_value": "off"
+    },
+    {
       "key": "prefill_mode",
       "cli_flag": "--prefill-mode",
       "description": "Memory/speed trade-off for prefill",

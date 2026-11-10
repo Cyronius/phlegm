@@ -12,11 +12,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 mod bench;
+mod multi_model;
 
 const USAGE: &str = "usage: phlegm <command>
 
 commands:
   run --model-dir DIR [--kernels DIR] [--bridge EXE] --prompt TEXT [--max-tokens N (0 or -1: until the context is full)] [--seed N] [--turbo]
+  serve [--models-dir DIR] [--image-config JSON[,JSON...]] [--keep-alive SECONDS] [--queue-timeout SECONDS]
   serve --model-dir DIR [--kernels DIR] [--bridge EXE] [--turbo] [--host 127.0.0.1] [--port 52625]
   serve --embed-model DIR [--embed-python PYTHON] [--embed-source DIR] [--embed-model-name NAME]
   serve --mock [--host H] [--port N]
@@ -32,6 +34,7 @@ commands:
 
 run and serve take the model's settings (phlegm config show --model-dir DIR), each overridable by its flag:
   --max-ctx N  --prefill-route auto|block|sequential  --prefill-mode fast|lean  --think true|false
+  --speculative off|auto|lookup|mtp
   --reasoning-effort default|none|minimal|low|medium|high|xhigh
   --temperature T  --top-k K  --top-p P  --repetition-penalty R  --max-tokens N
   --presence-penalty P  --frequency-penalty F  --repetition-penalty-scope context|response
@@ -154,6 +157,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut backend = NpuBackend::load(npu)?;
     let mut output = Vec::new();
     let mut params = GenParams {
+        speculative: settings.speculative()?,
         max_tokens,
         sampler: Sampler::new(
             settings.f32("temperature"),
@@ -211,7 +215,7 @@ fn serve(args: &[String]) -> Result<(), String> {
         cfg.port = port.parse().map_err(|_| "invalid --port".to_string())?;
     }
     if let Some(dir) = opts.get("--embed-model") {
-        if ["--mock", "--model-dir", "--kernels", "--bridge", "--turbo"].iter().any(|k| opts.contains_key(*k)) {
+        if ["--mock", "--model-dir", "--kernels", "--bridge", "--turbo", "--models-dir", "--image-config", "--keep-alive", "--queue-timeout"].iter().any(|k| opts.contains_key(*k)) {
             return Err("--embed-model serves an embedding model alone; do not combine with chat backend options".into());
         }
         let model_dir = PathBuf::from(dir);
@@ -222,6 +226,18 @@ fn serve(args: &[String]) -> Result<(), String> {
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../open_kernels/designs/trit_embed"));
         let embedder = phlegm_core::embeddings::TritEmbeddingBackend::load(model_id, std::path::Path::new(&python), &source, &model_dir)?;
         return server::serve_embeddings(Box::new(embedder), cfg);
+    }
+    if !opts.contains_key("--mock") && !opts.contains_key("--model-dir")
+        && (cfg.model_dir.is_none() || opts.contains_key("--models-dir") || opts.contains_key("--image-config")) {
+        return multi_model::serve(opts, cfg);
+    }
+    if ["--models-dir", "--image-config", "--keep-alive", "--queue-timeout"].iter().any(|k| opts.contains_key(*k)) {
+        return Err("multi-model options cannot be combined with --model-dir or --mock".into());
+    }
+    // Preserve PHLEGM_MODEL_DIR as the single-model selector too.
+    let mut opts = opts;
+    if let Some(dir) = cfg.model_dir.as_ref().filter(|_| !opts.contains_key("--model-dir")) {
+        opts.insert("--model-dir".into(), dir.to_string_lossy().into_owned());
     }
     let settings = model_settings(&opts)?;
     cfg.default_max_tokens = settings.usize("max_tokens");
@@ -373,15 +389,22 @@ fn image_run(args: &[String]) -> Result<(), String> {
 fn serve_images(args: &[String]) -> Result<(), String> {
     let opts = flags(args)?;
     for key in opts.keys() {
-        if !["--config", "--host", "--port"].contains(&key.as_str()) {
+        if !["--config", "--host", "--port", "--api-key", "--allowed-origins", "--keep-alive", "--queue-timeout"].contains(&key.as_str()) {
             return Err(format!("unknown image server option {key}"));
         }
     }
-    let cfg = ImageConfig::load(&PathBuf::from(required(&opts, "--config")?))?;
-    let host = opts.get("--host").map(String::as_str).unwrap_or("127.0.0.1");
-    let port: u16 = opts.get("--port").map(|v| v.parse()
-        .map_err(|_| "invalid --port".to_string())).unwrap_or(Ok(52626))?;
-    image::serve(cfg, host, port)
+    let path = PathBuf::from(required(&opts, "--config")?);
+    let image = ImageConfig::load(&path)?;
+    let model = server::models::InstalledModel { id: image.model_id().into(), path, kind: server::models::ModelKind::Image };
+    let mut cfg = ServerConfig::from_env();
+    cfg.host = opts.get("--host").cloned().unwrap_or(cfg.host);
+    cfg.port = opts.get("--port").map(|v| v.parse().map_err(|_| "invalid --port".to_string())).unwrap_or(Ok(52626))?;
+    if let Some(key) = opts.get("--api-key") {
+        if key.is_empty() { return Err("--api-key must not be empty".into()); }
+        cfg.api_key = Some(key.clone());
+    }
+    if let Some(origins) = opts.get("--allowed-origins") { cfg.allowed_origins = origins.clone(); }
+    multi_model::start(vec![model], opts, cfg)
 }
 
 fn main() {
