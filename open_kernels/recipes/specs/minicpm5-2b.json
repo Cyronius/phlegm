@@ -49,7 +49,7 @@
   "vocab": 130560,
   "real_vocab": 130560,
   "num_heads": 16,
-  "num_kv_heads": 8,
+  "num_kv_heads": 2,
   "head_dim": 128,
   "rotary_dim": 128,
   "rope_theta": 5000000.0,

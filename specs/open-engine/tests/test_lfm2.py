@@ -193,7 +193,7 @@ def test_no_shipped_models_hash_moved():
         "qwen35-9b.json": "sha256:4105149d2111c0c7e208e1a6c6f8273064394bfb2b5f010fa0fe5c0dfbc6711c",
         "qwen36-35b-a3b.json": "sha256:32e980528551df6ae76741cce159c2e79a7a7daa6b0d01d78f665a1164b9f780",
         "lfm2-1.2b.json": "sha256:fd500fa0be3851a42ecd72a97346ef21f5df2c63866d0f6196a4bf3ed6aeabb8",
-        "minicpm5-2b.json": "sha256:3297b81a61cb0beb690fd0c8c34515be2bc08c089de26441ab463cccae994974",
+        "minicpm5-2b.json": "sha256:cb630a529a482fcdeac49133e5c911110de9c2411c93671155fcbbef06342fd5",
         "bonsai2-27b.json": "sha256:2560477ec77e37594661f099a7b672bf8c3533a348d6630b353ab21893bb7c17",
         "k2-horizon-3.7b.json": "sha256:18952d15a05780550c7d469b728fd6c686b6cb4c23635257e82c842aecd8e50a",
         "k2-horizon-7b.json": "sha256:d6ee7f414ae5095551075722947ce8122f01b2d1e8c5be7c721ea5f0ba1b9778",

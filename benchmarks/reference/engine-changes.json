@@ -7,6 +7,13 @@
       "files": {
         "src/open_qwen36/manifest_test.cpp": "7bae7aea4173c2faa3d2a974801bca195df2fc7d902a95850b8ec7046afe0097"
       }
+    },
+    {
+      "id": "llama-gguf-unpermute-and-q8-head",
+      "origin": "phlegm: pools.cpp ported from target/npu-dev/nanbeige-runtime (OFLM reference-runtime-next lineage): Llama Q/K row un-permute in std_perm_gguf, and the raw-GGUF branch of lmhead_q8 (Q8_0 codes kept, other types requantized to int8 + bf16 scale)",
+      "files": {
+        "src/open_qwen36/pools.cpp": "5a215e1d91aa294af8b756b2ef57d8e5da5224463b51eea7de3c7d8f24239e8f"
+      }
     }
   ]
 }

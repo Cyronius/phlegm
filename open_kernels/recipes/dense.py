@@ -634,10 +634,12 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
     if spec.sandwich_norms != (spec.activation == "gelu_tanh"):
         return None
     L, G, T = layout(spec, max_ctx), geometry(spec), GEMM_T
-    # The attention dispatch (designs/dense/dx_attn.py) has no q/k/v bias stream and acquires
-    # a one-element position record, and refuses at build time otherwise -- so Qwen2 (both)
-    # keeps the sequential route rather than failing its export on dx_attn.
-    if G.QKVB or G.PTAB_ELEMS > 1:
+    # The attention dispatch (designs/dense/dx_attn.py) takes a two-element position record
+    # (NPTAB, as dx.py does) but its q/k/v bias path has not been through the block route, so
+    # Qwen2 keeps the sequential route rather than failing its export on dx_attn.
+    # MiniCPM5-2B (2 kv heads, head dim 128: a 1024-byte record over 512-byte elements)
+    # is the first block route with NPTAB == 2; see .plans/minicpm5-2b.md for its gates.
+    if G.QKVB:
         return None
     hid, ff, qw, kvw = spec.hidden, spec.intermediate, G.QW, G.KVW
     # ---- the NPU block-attention option (Path A, OPEN-PREFILL-ATTN) ----
