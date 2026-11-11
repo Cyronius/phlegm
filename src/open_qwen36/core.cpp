@@ -519,7 +519,10 @@ bool Core::dense_layer_major_ok() const {
     for (int l = 0; l < nl_; ++l) {
         const GemmBlockProgram& gb = types_[l]->gemm_block;
         if (gb.kind != "dense" || gb.t != gemm_block_t_) return false;
-        gated = gated && attn_block_on_ && gb.attn_block.present() && gb.attn_block.prep == "qkvnorm_rope";
+        // qkvnorm_rope: Gemma 4; rope: the dense GGUF view's Llama route (MiniCPM5-2B, 2026-11-11: every prefill logit
+        // byte-identical to the block-major schedule, about 1.4x faster on the bfp16 route)
+        gated = gated && attn_block_on_ && gb.attn_block.present() &&
+                (gb.attn_block.prep == "qkvnorm_rope" || gb.attn_block.prep == "rope");
     }
     return dense_layer_major_ == 1 || gated;
 }

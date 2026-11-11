@@ -358,7 +358,7 @@ from .attnknobs import probe_env as attn_knobs_probe_env
 #                    FF fits whole, so the split can be compared against the whole path
 #                    on a model that is already tested end to end.
 #   DENSE_NORM_SPLIT  "1" -- force the streaming norm helper (the same, for the norm).
-DENSE_PROBE_VARS = ("DENSE_DOWN_SPLIT", "DENSE_NORM_SPLIT", "DENSE_GGUF_GEMM", "DENSE_GGUF_HEAD_Q8", "DENSE_GGUF_COMPACT", "DENSE_GGUF_LAYER", "DENSE_FLASH_PREFILL", "AF_LMAX", "AF_LONG_STREAM")
+DENSE_PROBE_VARS = ("DENSE_DOWN_SPLIT", "DENSE_NORM_SPLIT", "DENSE_GGUF_GEMM", "DENSE_GGUF_HEAD_Q8", "DENSE_GGUF_COMPACT", "DENSE_GGUF_BFP16", "DENSE_AG_SHL", "DENSE_GGUF_LAYER", "DENSE_FLASH_PREFILL", "AF_LMAX", "AF_LONG_STREAM")
 
 
 def probe_env() -> dict[str, str]:
@@ -813,6 +813,18 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
         out["globals"]["ag_a"] = ag_m * ATTN_LMAX * 2
         out["globals"]["ag_b"] = ATTN_LMAX * hd * 2
         out["globals"]["ag_c"] = ag_m * ATTN_LMAX * 4
+        if dense_ag_shl_on():
+            # Q's hi and lo halves stacked as one scores product of 2M rows, on the scores image (cols 8): one
+            # dispatch instead of two per (block, kv head), as Gemma 4's kernels_shl (core.cpp kind 3)
+            attn_block["kernels_shl"] = {str(Lw): f"ag_shl{Lw}" for Lw in ag_tiers}
+            attn_block["qsplit"] = True     # what the rope prep does anyway (core.cpp: split = rope || qsplit)
+            for Lw in ag_tiers:
+                name = f"ag_shl{Lw}"
+                out["kernels"][name] = {"context": "ag_s", "insts": f"{name}/insts.bin", "build": name}
+                out["builds"][name] = {"design": "attn_block/attn_gemm.py",
+                                       "build_dir": f"attn_block/build_shl{Lw}_m{2 * ag_m}_h{hd}{sfx}",
+                                       "env": {"AG_M": str(2 * ag_m), "AG_K": str(hd), "AG_N": str(Lw), "AG_COLS": "8"}}
+            out["globals"]["ag_c"] = 2 * ag_m * ATTN_LMAX * 4
         # D4 (observer brief 2026-10-01): an experimental n=16 / cols=8 family where BOTH
         # products share one xclbin (n=16 with cols=8 tiles N=128 (pv) and every L tier
         # (s)), so the block's chunk loop never switches hardware context between the
@@ -914,11 +926,23 @@ BFP16_FAMILIES = ("granite",)
 BFP16_ROWS = 1024       # gemm_bfp16's n * 8 columns: a weight's rows are padded to a whole number of these
 
 
-def bfp16_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
+def dense_ag_shl_on() -> bool:
+    """DENSE_AG_SHL=1: the dense block attention's stacked-scores products (kernels_shl), an experiment until measured."""
+    return os.environ.get("DENSE_AG_SHL") == "1"
+
+
+def gguf_bfp16_on() -> bool:
+    """DENSE_GGUF_BFP16=1 (with DENSE_GGUF_COMPACT=1): the compact GGUF view's block prefill runs on gemm_bfp16 as
+    `gemm_block`, prefill mode `fast`, and keeps the q4 route as `lean` (`--prefill-mode accurate`), as Gemma 4's
+    view does (OPEN-PREFILL-BFP16). Opt-in until its gates pass on the family's hardware runs."""
+    return os.environ.get("DENSE_GGUF_BFP16") == "1"
+
+
+def bfp16_route(spec: ModelSpec, max_ctx: int = 4096, gguf: bool = False) -> dict | None:
     """`gemm_route`'s five steps on gemm_bfp16, as the `bfp16` variant of the route (the user picks it with
     OFLM_OPEN_PREFILL_MODE=bfp16), plus its contexts / kernels / globals / builds; None when the spec has no q4_1
-    route or its family is not in BFP16_FAMILIES."""
-    if spec.family not in BFP16_FAMILIES:
+    route or its family is not in BFP16_FAMILIES (`gguf`: or the GGUF view's opt-in, gguf_bfp16_on, is set)."""
+    if spec.family not in BFP16_FAMILIES and not (gguf and gguf_bfp16_on() and spec.family in DENSE_FAMILIES):
         return None
     base = gemm_route(spec, max_ctx)
     if not base:
@@ -954,7 +978,8 @@ def bfp16_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
             pad_of[wname] = n_pad
         # OPEN-PREFILL-BFP16-FFN, SwiGLU only: the epilogue computes silu
         ff = gb["ff"]
-        glu = spec.activation == "silu" and ff % 512 == 0
+        # the in-tree engine reads manifest_version <= 4, so the GGUF opt-in keeps gate and up apart (no GLU epilogue)
+        glu = spec.activation == "silu" and ff % 512 == 0 and not (gguf and spec.family not in BFP16_FAMILIES)
         if glu:
             gu = [dict(o, row0=0, n_total=2 * ff, glu=half)
                   for o, half in zip(weights.pop("ggate_w")["pack"] + weights.pop("gup_w")["pack"], ("gate", "up"))]
@@ -1196,6 +1221,21 @@ def finalize_gguf_manifest(spec: ModelSpec, manifest: dict) -> None:
             g["kernels"][kernel] = copy.deepcopy(manifest["kernels"][kernel])
             context = g["kernels"][kernel]["context"]
             g["contexts"][context] = manifest["contexts"][context]
+    if gguf_bfp16_on():
+        bf = bfp16_route(spec, manifest["max_ctx_default"], gguf=True)
+        if not bf:
+            raise OpRangeError("DENSE_GGUF_BFP16: this spec has no bfp16 block prefill route")
+        for k in ("contexts", "kernels", "globals", "builds"):
+            g[k].update(bf[k])
+        for name, layer in g["layer_types"].items():
+            if "gemm_block" not in layer or name not in bf["layer_types"]:
+                raise OpRangeError(f"DENSE_GGUF_BFP16: layer type {name} has no q4 route to keep as lean")
+            # fast (the default) is bfp16; the q4 route stays as `lean` (`--prefill-mode accurate`)
+            layer["gemm_block_variants"] = {"lean": layer["gemm_block"]}
+            layer["gemm_block"] = copy.deepcopy(bf["layer_types"][name])
+        from .manifest import BFP16_MANIFEST_VERSION, GLU_MANIFEST_VERSION, has_glu_step
+        v = GLU_MANIFEST_VERSION if has_glu_step(g["layer_types"]) else BFP16_MANIFEST_VERSION
+        g["manifest_version"] = max(g.get("manifest_version", 1), v)
 
 
 # Only families whose L-row pass (OPEN-DECODE-ROWS) has run on hardware get one.
@@ -1309,7 +1349,7 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
     r = gemm_route(spec)
     if r:
         b.update(r["builds"])
-        bf = bfp16_route(spec)
+        bf = bfp16_route(spec, gguf=gguf_bfp16_on())
         if bf:
             b.update(bf["builds"])
     if os.environ.get("DENSE_GGUF_GEMM") == "1" and f32_twin_fits(spec):

@@ -777,13 +777,26 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
             if (ti.dims.empty() || ti.dims[0] != op.in_dim || src_row0 + rows > nrows)
                 fail("bfp16_gemm " + name + ": rows [" + std::to_string(src_row0) + ", " + std::to_string(src_row0 + rows) +
                      ") of " + std::to_string(op.in_dim) + " columns are not in the GGUF tensor");
+            // A Llama GGUF stores Q / K rows as adjacent rotary pairs; the runtime rotates split halves
+            // (the same un-permute as std_perm_gguf).
+            const bool is_k = name.find("self_attn.k_proj.weight") != std::string::npos;
+            const bool unpermute = g->kv_has("general.architecture") && g->kv_str("general.architecture") == "llama" &&
+                                   (is_k || name.find("self_attn.q_proj.weight") != std::string::npos);
+            const size_t nheads = !unpermute ? 1
+                : g->kv_u64(is_k && g->kv_has("llama.attention.head_count_kv") ? "llama.attention.head_count_kv"
+                                                                              : "llama.attention.head_count");
+            if (unpermute && (!nheads || nrows % nheads || (nrows / nheads) % 2))
+                fail("bfp16_gemm " + name + ": invalid Llama rotary row geometry");
+            const size_t hr = unpermute ? nrows / nheads : 1;
 #pragma omp parallel
             {
                 std::vector<float> w(op.in_dim);
 #pragma omp for
                 for (long long rr = 0; rr < static_cast<long long>(rows); ++rr) {
                     const size_t r = static_cast<size_t>(rr);
-                    g->embed_row(name, src_row0 + r, op.in_dim, w.data());
+                    const size_t lr = src_row0 + r;
+                    const size_t sr = unpermute ? lr / hr * hr + (lr % (hr / 2)) * 2 + (lr % hr) / (hr / 2) : lr;
+                    g->embed_row(name, sr, op.in_dim, w.data());
                     uint8_t* row = out + bfp16_b_offset(op.row0 + r, 0, op.n_total, op.in_dim, t);
                     for (size_t cb = 0; cb < op.in_dim / 8; ++cb)
                         bfp16_encode_block(w.data() + cb * 8, row + bfp16_b_row_block(0, cb, t));

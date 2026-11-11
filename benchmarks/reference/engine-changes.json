@@ -10,9 +10,23 @@
     },
     {
       "id": "llama-gguf-unpermute-and-q8-head",
-      "origin": "phlegm: pools.cpp ported from target/npu-dev/nanbeige-runtime (OFLM reference-runtime-next lineage): Llama Q/K row un-permute in std_perm_gguf, and the raw-GGUF branch of lmhead_q8 (Q8_0 codes kept, other types requantized to int8 + bf16 scale)",
+      "origin": "phlegm: pools.cpp ported from target/npu-dev/nanbeige-runtime (OFLM reference-runtime-next lineage): Llama Q/K row un-permute in std_perm_gguf, and the raw-GGUF branch of lmhead_q8 (Q8_0 codes kept, other types requantized to int8 + bf16 scale); the same un-permute in the bfp16_gemm packer",
       "files": {
-        "src/open_qwen36/pools.cpp": "5a215e1d91aa294af8b756b2ef57d8e5da5224463b51eea7de3c7d8f24239e8f"
+        "src/open_qwen36/pools.cpp": "2e85f084b1cd8f12f8a20ce72bc9871f9d56d09570ed4ddf14ad9075075ff246"
+      }
+    },
+    {
+      "id": "dense-layer-major-rope",
+      "origin": "phlegm: dense_layer_major_ok also accepts the plain `rope` attention prep (MiniCPM5-2B: byte-identical logits, ~1.4x prefill)",
+      "files": {
+        "src/open_qwen36/core.cpp": "1b5f126966d34255b4fc85b6df95f0c893843d75846dc0e6975593432d9215a0"
+      }
+    },
+    {
+      "id": "rope-prep-qsplit",
+      "origin": "phlegm: manifest.cpp treats attn_block prep `rope` as qsplit (core.cpp already splits Q for rope), so a dense kernel set may carry kernels_shl (DENSE_AG_SHL experiment; logits byte-identical on MiniCPM5-2B)",
+      "files": {
+        "src/open_qwen36/manifest.cpp": "51c6d9854c3d6445dabcb2e4a813b1288da18039c377a960b19638b155a1736f"
       }
     }
   ]
