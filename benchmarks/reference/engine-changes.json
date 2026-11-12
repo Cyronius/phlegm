@@ -12,8 +12,29 @@
       "id": "llama-gguf-qk-rows",
       "origin": "phlegm:minicpm5-2b-kv2 (MiniCPM5-2B; undo llama.cpp's paired q/k rows for arch llama)",
       "files": {
-        "src/open_qwen36/pools.cpp": "c5950f3715077fa28f3431361b2fd6d67f5cf3030764d3b387852d531619736c",
+        "src/open_qwen36/pools.cpp": "7175bf76e3573431bdcfcb92c31211e50512b954a4732076f75384a4bdd053d6",
         "src/open_qwen36/gguf_pack_test.cpp": "4fa0fd3c9190f2ef824b1b236cea134da2f0bdf6eb257b4fc44b35d5ed876200"
+      }
+    },
+    {
+      "id": "gguf-lmhead-q8",
+      "origin": "phlegm: the raw-GGUF branch of lmhead_q8, ported from target/npu-dev/nanbeige-runtime (OFLM reference-runtime-next lineage): Q8_0 codes kept, other types requantized to int8 + bf16 scale (MiniCPM5-2B)",
+      "files": {
+        "src/open_qwen36/pools.cpp": "7175bf76e3573431bdcfcb92c31211e50512b954a4732076f75384a4bdd053d6"
+      }
+    },
+    {
+      "id": "dense-layer-major-rope",
+      "origin": "phlegm: dense_layer_major_ok also accepts the plain `rope` attention prep (MiniCPM5-2B: byte-identical logits, ~1.4x prefill)",
+      "files": {
+        "src/open_qwen36/core.cpp": "1b5f126966d34255b4fc85b6df95f0c893843d75846dc0e6975593432d9215a0"
+      }
+    },
+    {
+      "id": "rope-prep-qsplit",
+      "origin": "phlegm: manifest.cpp treats attn_block prep `rope` as qsplit (core.cpp already splits Q for rope), so a dense kernel set may carry kernels_shl (DENSE_AG_SHL experiment; logits byte-identical on MiniCPM5-2B)",
+      "files": {
+        "src/open_qwen36/manifest.cpp": "51c6d9854c3d6445dabcb2e4a813b1288da18039c377a960b19638b155a1736f"
       }
     }
   ]

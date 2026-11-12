@@ -197,6 +197,23 @@
         }
       }
     },
+    "minicpm5": {
+      "2b": {
+        "speculative": "off",
+        "name": "MiniCPM5-2B-NPU2",
+        "default_context_length": 16384,
+        "details": {
+          "family": "llama3",
+          "parameter_size": "2.6B",
+          "quantization_level": "Q4_1",
+          "think": true
+        },
+        "sampling": {
+          "temperature": 1.0,
+          "top_p": 0.95
+        }
+      }
+    },
     "nanbeige4.3": {
       "33b": {
         "speculative": "off",

@@ -331,6 +331,8 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                     a.prep = get<std::string>(aj, "prep", aw);
                     if (a.prep != "qknorm_rope" && a.prep != "rope" && a.prep != "qkvnorm_rope")
                         fail(aw, "prep " + a.prep + " is not one this engine computes (qknorm_rope, rope, qkvnorm_rope)");
+                    // rope always splits Q into hi / lo halves (core.cpp: split = rope || qsplit), so it may stack them
+                    if (a.prep == "rope") a.qsplit = true;
                     if (a.prep == "qkvnorm_rope") {
                         a.scale = aj.value("scale", 0.0);
                         a.window = aj.value("window", uint64_t{0});

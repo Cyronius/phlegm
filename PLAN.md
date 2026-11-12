@@ -324,6 +324,20 @@ fixes subnormal fp16 scales in the Q8_0 head packer. Pack check ALL OK (projecti
 llama.cpp CPU against Vulkan, the control, is 528/545 on a 545-token prompt. Next: a quiet-host
 `timing.sh`, contexts past 4096, and a Q4_0-native pool (about 10% fewer bytes a token). Plan: [.plans/nanbeige.md](.plans/nanbeige.md); spec `OPEN-FAMILY-NANBEIGE`.
 
+## MiniCPM5-2B (dense Llama, 2048 / 42 / 6144, 16 heads over 2 kv)
+
+Runs on the NPU from our own pure Q4_1 GGUF (openbmb's F16 GGUF through `llama quantize --pure`, Q6_K head; the
+published files mix K-quants) through the dense recipe and the in-tree bridge: `bridges/index.json` no longer
+sends llama3 to the nanbeige fork, since `pools.cpp` now un-permutes llama.cpp's Q / K rows and reads a GGUF
+head for `lmhead_q8`. The checked-in spec had 8 kv heads; the model has 2. Block prefill runs on the dense GGUF
+view: `fast` (the default) on bfp16 GEMMs (`DENSE_GGUF_BFP16=1` at export), `accurate` on the q4 route, under
+the layer-major schedule. Against fp32 torch over the same file: median cosine >= 0.99978 and next-token loss
+within 0.1% on the last 256 positions of 1024 / 4352 / 16320-token prompts; fast's NLL within 0.3% of
+accurate's; a 5013-token needle answered. Development timing paired with llama.cpp Vulkan on the same GGUF
+(loaded host): prefill 375-407 against 2204-2393 tok/s, decode ~14 against 65-67 tok/s. Open: NPU flash
+attention at head dim 128 (P2 S6), decode (roadmap O7), a clean benchmark. Plan:
+[.plans/minicpm5-2b.md](.plans/minicpm5-2b.md).
+
 ## Xing4.0-29B-A4B (xing4_0: DeepSeek-V3 MLA + mHC + MoE)
 
 Runs on the NPU (2026-11-08) from our own pure Q4_0 GGUF (the publisher's BF16 through llama.cpp `7d7f0287`'s converter,
