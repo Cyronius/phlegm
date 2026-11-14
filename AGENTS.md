@@ -53,6 +53,42 @@
 - Never commit weights, generated kernels, captures or bulky logs. Link evidence
   by path and hash; check in small summaries or fixtures where appropriate.
 
+## Production bar for OFLM kernel sets
+
+Do not add q4nx support for any model: q4nx is being deprecated. New support
+loads the model from GGUF.
+
+Every OFLM PR that adds or changes support for a model also updates its entry
+in `src/model_list.json`: the entry exists, names the files the engine loads,
+and states the real quant, family and context length. A model with no correct
+registry entry is not supported, whatever the engine can do.
+
+A top-tier supported model ships finished and production-ready. Before you export
+its kernel set as done, or open an OFLM issue or PR that calls it supported,
+show each of these items with measurements:
+
+- Prefill uses the block route (usually). State the reason for any exception.
+- Decode and prefill are near optimal. Profile them and name what is left.
+- No unusual context-length limits. Test up to the model's real context, not
+  only the 4096 default.
+- Everything runs on the NPU (usually). Name each host stage and its cost.
+- Speculative decoding was explored: MTP, DFlash, DFlash2, prompt lookup or
+  another drafter. Ship one, or reject it with the measured reason. We
+  generally want one.
+- `oflm add` and `oflm serve` run the model, not only `open_qwen36_cli`.
+- The model ships quantized, usually q4. Prefer Unsloth's GGUFs when the
+  engine supports their quant types; state the reason for any other source.
+- Benchmarks are recorded: `oflm bench` results (prefill and decode against
+  context length, with the machine and stack named) on the model's page in
+  `docs/docs/benchmarks/`, and a row in the README's "Recommended models"
+  table.
+- Most of the model's own features are exposed: its vision and audio towers,
+  MTP heads (as the drafter), reasoning and tool calling, and for image models
+  every supported resolution and image editing. Name each feature left out
+  and the reason.
+
+If an item is not done, the PR stays a draft and lists the item.
+
 ## Handoffs
 
 Update the active `.plans/` file with the date, completed work, exact commands
