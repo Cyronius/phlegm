@@ -445,6 +445,12 @@ fn handle_request(request: Request, state: &Arc<ServerState>) {
         respond_json(request, 200, &json!({}));
         return;
     }
+    if method == Method::Get && url == "/" {
+        let response = Response::from_string(include_str!("chat.html"))
+            .with_header(Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap());
+        let _ = request.respond(response);
+        return;
+    }
     if let Some(key) = state.cfg.api_key.as_ref().filter(|_| !(method == Method::Get && url == "/health")) {
         let valid = request.headers().iter().any(|h| h.field.equiv("Authorization")
             && h.value.as_str().strip_prefix("Bearer ") == Some(key.as_str()));
@@ -1182,6 +1188,17 @@ mod tests {
             headers,
             String::from_utf8_lossy(&body_out).to_string(),
         )
+    }
+
+    #[test]
+    fn chat_page_is_public_html_with_api_key_configured() {
+        let addr = spawn_test_server(|cfg| cfg.api_key = Some("secret".into()));
+        let (status, headers, body) = http_request(&addr, "GET", "/", None);
+        assert_eq!(status, 200);
+        assert!(headers.iter().any(|h| h.eq_ignore_ascii_case("content-type: text/html; charset=utf-8")));
+        assert!(body.contains("Phlegm chat"));
+        assert!(body.contains("/v1/chat/completions"));
+        assert_eq!(http_request(&addr, "GET", "/v1/models", None).0, 401);
     }
 
     #[test]

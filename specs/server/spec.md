@@ -6,6 +6,13 @@ has no independent spec requirements beyond calling this API.
 
 Requirement prefix: `SERVER`.
 
+## SERVER-CHAT-PAGE: Built-in chat
+
+GET `/` serves a self-contained offline chat page. It lists models, streams chat and
+reasoning, shows tool calls, and keeps conversations in browser localStorage; the API
+key is entered in the page and is not stored. The page is public so it can prompt for
+the key; API endpoints retain their configured authentication.
+
 ## SERVER-HTTP: Browser access, authentication and chat usage
 
 The chat server accepts browser preflight `OPTIONS` requests and sends CORS
@@ -14,7 +21,7 @@ headers with JSON and event-stream responses. `PHLEGM_ALLOWED_ORIGINS` or
 `127.0.0.1`, or `[::1]`, with any port. `*` and a comma-separated list of exact
 origins are opt-in. CORS is not authentication.
 `PHLEGM_API_KEY` or `--api-key` enables `Authorization: Bearer <key>` on all
-non-preflight routes except GET `/health`; it is disabled by default. An invalid or missing key
+non-preflight routes except GET `/health` and GET `/`; it is disabled by default. An invalid or missing key
 returns 401. The command-line value takes precedence over the environment.
 
 Chat requests accept `max_completion_tokens` in preference to `max_tokens`.
