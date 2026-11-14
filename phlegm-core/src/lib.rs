@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod embeddings;
 pub mod bench;
 pub mod gguf;
 pub mod image;

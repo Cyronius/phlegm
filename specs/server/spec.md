@@ -6,6 +6,67 @@ has no independent spec requirements beyond calling this API.
 
 Requirement prefix: `SERVER`.
 
+## SERVER-HTTP: Browser access, authentication and chat usage
+
+The chat server accepts browser preflight `OPTIONS` requests and sends CORS
+headers with JSON and event-stream responses. `PHLEGM_ALLOWED_ORIGINS` or
+`--allowed-origins` defaults to `loopback`: HTTP or HTTPS origins on `localhost`,
+`127.0.0.1`, or `[::1]`, with any port. `*` and a comma-separated list of exact
+origins are opt-in. CORS is not authentication.
+`PHLEGM_API_KEY` or `--api-key` enables `Authorization: Bearer <key>` on all
+non-preflight routes except GET `/health`; it is disabled by default. An invalid or missing key
+returns 401. The command-line value takes precedence over the environment.
+
+Chat requests accept `max_completion_tokens` in preference to `max_tokens`.
+With `stream_options.include_usage: true`, the final event before `[DONE]`
+has an empty `choices` array and the prompt, completion, total and cached
+token counts. These HTTP behaviors are covered by the server's mock tests;
+they do not establish hardware inference correctness.
+
+## SERVER-EMBEDDINGS: Trit embeddings
+
+`phlegm serve --embed-model DIR` runs the named model as an embedding-only
+server and lists it in `/v1/models`. The default model name is the directory
+basename; `--embed-model-name` overrides it. `--embed-python` (or
+`PHLEGM_EMBED_PYTHON`) selects a Python interpreter with the model's PyTorch,
+Transformers, safetensors and NumPy dependencies. `--embed-source` (or
+`PHLEGM_EMBED_SOURCE`) selects the directory containing `trit_npu.py`; the
+default is the source tree used to build Phlegm. The model directory must
+contain the packed model, tokenizer, CPU reference, and compatible NPU bundle.
+The resident Python worker uses the existing `TritNpu` implementation; Rust
+holds the shared NPU lock for the worker's lifetime. The embedding-only mode
+avoids loading two exclusive NPU models at once; U7 covers model switching.
+
+`POST /v1/embeddings` requires the served `model` and `input`: a string, an
+array of strings, token IDs, or an array of token-ID arrays. Token IDs must
+include the model's own special tokens and form nonempty sequences of at most
+128 in-vocabulary IDs; text is tokenized and truncated by `TritNpu` at 128.
+Each request accepts at most 2048 inputs and a 16 MB JSON body.
+`encoding_format` is `float` (default) or `base64` (little-endian float32).
+`dimensions` is unsupported and returns 400. The response contains ordered
+`data[].embedding` values and the actual input-token count in `usage`.
+
+Mock HTTP tests cover request shapes, batching, usage, errors, model listing,
+and base64. An opt-in CPU test compares route vectors from a CPU-reference
+backend with independent CPU-reference calls:
+
+```sh
+dibs run build cpu --label 'U6: CPU reference route test' --eta 10m -- env PHLEGM_TRIT_CPU_PYTHON=/home/cyrus/code/model-experiments/ternary-embedder/.venv/bin/python PHLEGM_TRIT_MODEL=/home/cyrus/models/trit-embed-3l cargo test -p phlegm-core --offline embeddings_route_matches_trit_cpu_reference -- --ignored --nocapture
+```
+
+The device acceptance test remains unrun: after setting a
+Python environment with the dependencies and building the CLI, run, from the
+checkout (replace the Python path as needed):
+
+```sh
+dibs run build --label 'U6: build embedding server' --eta 10m -- cargo build -p phlegm-cli --offline
+dibs run npu port-8767 --label 'U6: trit embeddings hardware acceptance' --eta 15m -- /home/cyrus/code/phlegm/target/npu-dev/npu-run.sh /home/cyrus/code/model-experiments/ternary-embedder/.venv/bin/python -I phlegm-core/tests/trit_embeddings_hardware.py --model-dir /home/cyrus/models/trit-embed-3l --server "$PWD/target/debug/phlegm" --port 8767
+```
+
+It compares the server's text and pretokenized results, binary32 value for
+value, with direct `TritNpu.encode_ids` for the same inputs. This is a pending
+hardware check, not evidence that the route passed on a device.
+
 ## SERVER-VISION: Vision-understanding API
 
 **Applies to:** phlegm-server

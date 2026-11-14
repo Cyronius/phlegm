@@ -32,6 +32,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tiny_http::{Header, Method, Request, Response};
 
+#[path = "server_embeddings.rs"]
+mod embeddings_route;
+
 // --------------------------------------------------------------------------
 // Config
 // --------------------------------------------------------------------------
@@ -56,6 +59,10 @@ pub struct ServerConfig {
     /// Sampling and template defaults for a request that does not set them (the model's
     /// resolved settings, SERVER-SETTINGS).
     pub defaults: GenDefaults,
+    /// Bearer authentication, disabled when absent.
+    pub api_key: Option<String>,
+    /// `loopback`, comma-separated exact origins, or `*`.
+    pub allowed_origins: String,
 }
 
 /// What a request leaves out: the model's resolved `temperature`, `top_k`, `top_p`,
@@ -150,6 +157,8 @@ impl ServerConfig {
             model_dir: std::env::var("PHLEGM_MODEL_DIR").ok().map(PathBuf::from),
             backend_name: env_or("PHLEGM_BACKEND", "mock"),
             defaults: GenDefaults::default(),
+            api_key: std::env::var("PHLEGM_API_KEY").ok().filter(|v| !v.is_empty()),
+            allowed_origins: env_or("PHLEGM_ALLOWED_ORIGINS", "loopback"),
         }
     }
 }
@@ -326,6 +335,9 @@ struct ServerState {
     context_capacity: Option<usize>,
     tokenizer: ServerTokenizer,
     cfg: ServerConfig,
+    embedder: Option<Mutex<Box<dyn crate::embeddings::EmbeddingBackend>>>,
+    embedding_model: Option<String>,
+    embedding_only: bool,
 }
 
 /// Bind the listening socket without starting the accept loop. Split out from
@@ -343,15 +355,29 @@ pub fn run(
     backend: Box<dyn Backend + Send>,
     cfg: ServerConfig,
 ) -> Result<(), String> {
-    let tokenizer = ServerTokenizer::build(&cfg)?;
+    run_inner(server, backend, cfg, None, false)
+}
+
+fn run_inner(
+    server: tiny_http::Server,
+    backend: Box<dyn Backend + Send>,
+    cfg: ServerConfig,
+    embedder: Option<Box<dyn crate::embeddings::EmbeddingBackend>>,
+    embedding_only: bool,
+) -> Result<(), String> {
+    let tokenizer = if embedding_only { ServerTokenizer::Placeholder(PlaceholderTokenizer::new()) } else { ServerTokenizer::build(&cfg)? };
     let backend_name = cfg.backend_name.clone();
-    let model_id = cfg.model_id.clone();
+    let model_id = embedder.as_ref().filter(|_| embedding_only).map(|e| e.model_id().to_owned()).unwrap_or_else(|| cfg.model_id.clone());
     let context_capacity = backend.context_capacity();
+    let embedding_model = embedder.as_ref().map(|e| e.model_id().to_owned());
     let state = Arc::new(ServerState {
         backend: Mutex::new(backend),
         context_capacity,
         tokenizer,
         cfg,
+        embedder: embedder.map(Mutex::new),
+        embedding_model,
+        embedding_only,
     });
 
     println!(
@@ -359,7 +385,11 @@ pub fn run(
         state.cfg.host, state.cfg.port
     );
     println!("  backend: {backend_name}   model: {model_id}");
-    println!("  POST /v1/chat/completions | GET /v1/models | GET /health");
+    if embedding_only {
+        println!("  POST /v1/embeddings | GET /v1/models | GET /health");
+    } else {
+        println!("  POST /v1/chat/completions | GET /v1/models | GET /health");
+    }
 
     loop {
         match server.recv() {
@@ -373,6 +403,14 @@ pub fn run(
     Ok(())
 }
 
+/// Serve one embedding model. The NPU is already held by the embedder; no chat model is loaded.
+pub fn serve_embeddings(embedder: Box<dyn crate::embeddings::EmbeddingBackend>, mut cfg: ServerConfig) -> Result<(), String> {
+    cfg.model_dir = None;
+    let server = bind(&cfg)?;
+    cfg.backend_name = "trit-embed".into();
+    run_inner(server, Box::new(crate::mock_backend::MockBackend::new()), cfg, Some(embedder), true)
+}
+
 /// Bind + run in one call — the entry point `phlegm serve` calls.
 pub fn serve(backend: Box<dyn Backend + Send>, cfg: ServerConfig) -> Result<(), String> {
     let server = bind(&cfg)?;
@@ -383,9 +421,41 @@ pub fn serve(backend: Box<dyn Backend + Send>, cfg: ServerConfig) -> Result<(), 
 // Routing
 // --------------------------------------------------------------------------
 
+fn loopback_origin(origin: &str) -> bool {
+    let Some(authority) = origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://")) else { return false };
+    ["localhost", "127.0.0.1", "[::1]"].iter().any(|host| {
+        authority.strip_prefix(host).is_some_and(|rest| {
+            rest.is_empty() || rest.strip_prefix(':').is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok())
+        })
+    })
+}
+
 fn handle_request(request: Request, state: &Arc<ServerState>) {
+    let origin = request.headers().iter().find(|h| h.field.equiv("Origin"))
+        .map(|h| h.value.as_str());
+    let allowed = if state.cfg.allowed_origins.trim() == "*" {
+        Some("*".to_string())
+    } else if state.cfg.allowed_origins.trim() == "loopback" {
+        origin.filter(|o| loopback_origin(o)).map(str::to_string)
+    } else {
+        origin.filter(|o| state.cfg.allowed_origins.split(',').any(|a| a.trim() == *o))
+            .map(str::to_string)
+    };
+    CORS_ORIGIN.with(|slot| *slot.borrow_mut() = allowed);
     let method = request.method().clone();
     let url = request.url().to_string();
+    if method == Method::Options {
+        respond_json(request, 200, &json!({}));
+        return;
+    }
+    if let Some(key) = state.cfg.api_key.as_ref().filter(|_| !(method == Method::Get && url == "/health")) {
+        let valid = request.headers().iter().any(|h| h.field.equiv("Authorization")
+            && h.value.as_str().strip_prefix("Bearer ") == Some(key.as_str()));
+        if !valid {
+            respond_json(request, 401, &json!({"error": {"message": "Invalid API key", "type": "authentication_error"}}));
+            return;
+        }
+    }
     match (method, url.as_str()) {
         (Method::Get, "/health") => {
             respond_json(
@@ -395,11 +465,12 @@ fn handle_request(request: Request, state: &Arc<ServerState>) {
             );
         }
         (Method::Get, "/v1/models") => {
-            respond_json(request, 200, &models_payload(&state.cfg));
+            respond_json(request, 200, &models_payload(state));
         }
-        (Method::Post, "/v1/chat/completions") => {
+        (Method::Post, "/v1/chat/completions") if !state.embedding_only => {
             handle_chat_completions(request, state);
         }
+        (Method::Post, "/v1/embeddings") => embeddings_route::handle(request, state),
         _ => {
             let msg = format!("unknown path {url}");
             respond_json(
@@ -411,15 +482,18 @@ fn handle_request(request: Request, state: &Arc<ServerState>) {
     }
 }
 
-fn models_payload(cfg: &ServerConfig) -> Value {
+fn models_payload(state: &ServerState) -> Value {
+    let mut ids = Vec::new();
+    if !state.embedding_only { ids.push(state.cfg.model_id.as_str()); }
+    if let Some(id) = state.embedding_model.as_deref() { if !ids.contains(&id) { ids.push(id); } }
     json!({
         "object": "list",
-        "data": [{
-            "id": cfg.model_id,
+        "data": ids.into_iter().map(|id| json!({
+            "id": id,
             "object": "model",
             "created": now_unix(),
             "owned_by": "fastflowlm-open-npu",
-        }],
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -479,7 +553,8 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let requested_max_tokens = req_json
-        .get("max_tokens")
+        .get("max_completion_tokens").filter(|v| !v.is_null())
+        .or_else(|| req_json.get("max_tokens"))
         .and_then(Value::as_u64)
         .map(|v| v as usize);
     let temperature = req_json
@@ -612,7 +687,8 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
     };
 
     if stream {
-        stream_response(request, state, prompt_ids, params, model, reasoning);
+        let include_usage = req_json.get("stream_options").and_then(|v| v.get("include_usage")).and_then(Value::as_bool).unwrap_or(false);
+        stream_response(request, state, prompt_ids, params, model, reasoning, include_usage);
     } else {
         full_response(request, state, prompt_ids, params, model, reasoning);
     }
@@ -705,6 +781,7 @@ fn stream_response(
     mut params: GenParams,
     model: String,
     reasoning: Option<Reasoning>,
+    include_usage: bool,
 ) {
     let max_tokens = params.max_tokens;
     let cid = cmpl_id();
@@ -730,7 +807,7 @@ fn stream_response(
     let mut decode_error = None;
     let mut decoder = state.tokenizer.decode_stream();
     let (mut sent_reasoning, mut sent_answer) = (String::new(), String::new());
-    let gen_result = {
+    let (gen_result, cached_tokens) = {
         let mut backend = state.backend.lock().unwrap();
         let mut on_token = |tid: u32| {
             out_ids.push(tid);
@@ -774,7 +851,8 @@ fn stream_response(
                 );
             }
         };
-        backend.generate(&prompt_ids, &mut params, &mut on_token)
+        let result = backend.generate(&prompt_ids, &mut params, &mut on_token);
+        (result, backend.cached_tokens())
     };
 
     let result = gen_result.and_then(|_| {
@@ -831,6 +909,13 @@ fn stream_response(
         &mut *writer,
         &sse_frame(&sse_chunk(&cid, created, &model, json!({}), Some(finish))),
     );
+    if include_usage {
+        let _ = sse_write(&mut *writer, &sse_frame(&json!({
+            "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+            "choices": [], "usage": {"prompt_tokens": prompt_ids.len(), "completion_tokens": out_ids.len(),
+                "total_tokens": prompt_ids.len() + out_ids.len(), "prompt_tokens_details": {"cached_tokens": cached_tokens}}
+        })));
+    }
     let _ = sse_write(&mut *writer, "data: [DONE]\n\n");
     let _ = sse_end(&mut *writer);
     let _ = writer.flush();
@@ -881,6 +966,12 @@ fn write_sse_headers(writer: &mut dyn Write) -> std::io::Result<()> {
     writer.write_all(b"Cache-Control: no-cache\r\n")?;
     writer.write_all(b"Connection: keep-alive\r\n")?;
     writer.write_all(b"Transfer-Encoding: chunked\r\n")?;
+    CORS_ORIGIN.with(|slot| -> std::io::Result<()> {
+        if let Some(origin) = slot.borrow().as_ref() {
+            write!(writer, "Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n")?;
+        }
+        Ok(())
+    })?;
     writer.write_all(b"\r\n")?;
     writer.flush()
 }
@@ -906,11 +997,23 @@ fn json_content_type() -> Header {
     Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap()
 }
 
+thread_local! { static CORS_ORIGIN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+
 fn respond_json(request: Request, status: u16, value: &Value) {
     let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
-    let response = Response::from_data(body)
+    let mut response = Response::from_data(body)
         .with_status_code(status)
-        .with_header(json_content_type());
+        .with_header(json_content_type())
+        .with_header(Header::from_bytes("Access-Control-Allow-Methods", "GET, POST, OPTIONS").unwrap())
+        .with_header(Header::from_bytes("Access-Control-Allow-Headers", "Authorization, Content-Type").unwrap())
+        .with_header(Header::from_bytes("Vary", "Origin").unwrap());
+    CORS_ORIGIN.with(|slot| {
+        if let Some(origin) = slot.borrow().as_ref() {
+            if let Ok(header) = Header::from_bytes("Access-Control-Allow-Origin", origin.as_bytes()) {
+                response.add_header(header);
+            }
+        }
+    });
     let _ = request.respond(response);
 }
 
@@ -979,6 +1082,8 @@ mod tests {
                 model_dir: None,
                 backend_name: "fixture".into(),
                 defaults: GenDefaults::default(),
+                api_key: None,
+                allowed_origins: "*".into(),
             };
             let server = bind(&cfg).unwrap();
             let addr = server.server_addr().to_ip().unwrap().to_string();
@@ -987,6 +1092,9 @@ mod tests {
                 context_capacity: None,
                 tokenizer: ServerTokenizer::Real(tokenizer),
                 cfg,
+                embedder: None,
+                embedding_model: None,
+                embedding_only: false,
             });
             let thread = std::thread::spawn(move || handle_request(server.recv().unwrap(), &state));
             let (status, _, body) = http_request(
@@ -1036,6 +1144,8 @@ mod tests {
             model_dir: None,
             backend_name: "mock".to_string(),
             defaults: GenDefaults::default(),
+            api_key: None,
+            allowed_origins: "*".into(),
         };
         cfg_mut(&mut cfg);
         let server = bind(&cfg).expect("bind");
@@ -1055,9 +1165,14 @@ mod tests {
         path: &str,
         body: Option<&str>,
     ) -> (u16, Vec<String>, String) {
+        http_request_headers(addr, method, path, body, "")
+    }
+
+    fn http_request_headers(addr: &str, method: &str, path: &str, body: Option<&str>, extra: &str) -> (u16, Vec<String>, String) {
         let mut stream = TcpStream::connect(addr).expect("connect");
         let body_bytes = body.unwrap_or("").as_bytes();
         let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+        req.push_str(extra);
         if body.is_some() {
             req.push_str("Content-Type: application/json\r\n");
             req.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
@@ -1131,6 +1246,179 @@ mod tests {
             headers,
             String::from_utf8_lossy(&body_out).to_string(),
         )
+    }
+
+    #[test]
+    fn cors_and_api_key_apply_to_preflight_json_and_streams() {
+        let addr = spawn_test_server(|cfg| {
+            cfg.api_key = Some("secret".into());
+            cfg.allowed_origins = "https://example.test".into();
+        });
+        let (status, headers, _) = http_request_headers(&addr, "OPTIONS", "/v1/chat/completions", None,
+            "Origin: https://example.test\r\n");
+        assert_eq!(status, 200);
+        assert!(headers.iter().any(|h| h.eq_ignore_ascii_case("access-control-allow-origin: https://example.test")));
+        assert_eq!(http_request(&addr, "GET", "/v1/models", None).0, 401);
+        assert_eq!(http_request(&addr, "GET", "/health", None).0, 200);
+        let (status, headers, _) = http_request_headers(&addr, "POST", "/v1/chat/completions",
+            Some(r#"{"messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":1}"#),
+            "Origin: https://example.test\r\nAuthorization: Bearer secret\r\n");
+        assert_eq!(status, 200);
+        assert!(headers.iter().any(|h| h.eq_ignore_ascii_case("access-control-allow-origin: https://example.test")));
+        let (_, headers, _) = http_request_headers(&addr, "GET", "/v1/models", None,
+            "Origin: https://evil.test\r\nAuthorization: Bearer secret\r\n");
+        assert!(!headers.iter().any(|h| h.to_lowercase().starts_with("access-control-allow-origin:")));
+    }
+
+    #[test]
+    fn cors_default_limits_origins_to_loopback() {
+        let addr = spawn_test_server(|cfg| cfg.allowed_origins = "loopback".into());
+        for origin in ["http://localhost", "https://localhost:3000", "http://127.0.0.1:8080", "https://[::1]:65535"] {
+            let (_, headers, _) = http_request_headers(&addr, "OPTIONS", "/v1/models", None, &format!("Origin: {origin}\r\n"));
+            assert!(headers.iter().any(|h| h.eq_ignore_ascii_case(&format!("access-control-allow-origin: {origin}"))), "{origin}");
+        }
+        for origin in ["https://evil.test", "http://localhost.evil.test", "http://127.0.0.1@evil.test", "http://[::1].evil", "http://localhost:abc", "null", "ftp://localhost"] {
+            let (_, headers, _) = http_request_headers(&addr, "OPTIONS", "/v1/models", None, &format!("Origin: {origin}\r\n"));
+            assert!(!headers.iter().any(|h| h.to_lowercase().starts_with("access-control-allow-origin:")), "{origin}");
+        }
+        let wildcard = spawn_test_server(|cfg| cfg.allowed_origins = "*".into());
+        let (_, headers, _) = http_request_headers(&wildcard, "OPTIONS", "/v1/models", None, "Origin: https://evil.test\r\n");
+        assert!(headers.iter().any(|h| h.eq_ignore_ascii_case("access-control-allow-origin: *")));
+        assert_eq!(ServerConfig::from_env().allowed_origins, std::env::var("PHLEGM_ALLOWED_ORIGINS").unwrap_or_else(|_| "loopback".into()));
+    }
+
+    struct FakeEmbedding;
+    impl crate::embeddings::EmbeddingBackend for FakeEmbedding {
+        fn model_id(&self) -> &str { "fake-embed" }
+        fn embed(&mut self, input: crate::embeddings::EmbeddingInput) -> Result<crate::embeddings::EmbeddingOutput, crate::embeddings::EmbeddingError> {
+            use crate::embeddings::{EmbeddingError, EmbeddingInput, EmbeddingOutput};
+            if matches!(&input, EmbeddingInput::Texts(v) if v.iter().any(|s| s == "backend failure")) {
+                return Err(EmbeddingError::Backend("fake failure".into()));
+            }
+            if matches!(&input, EmbeddingInput::TokenIds(v) if v.iter().flatten().any(|&id| id >= 100)) {
+                return Err(EmbeddingError::Invalid("invalid token id".into()));
+            }
+            let lengths: Vec<usize> = match input {
+                EmbeddingInput::Texts(v) => v.iter().map(|s| s.len()).collect(),
+                EmbeddingInput::TokenIds(v) => v.iter().map(Vec::len).collect(),
+            };
+            Ok(EmbeddingOutput { tokens: lengths.iter().sum(), vectors: lengths.iter().map(|n| vec![*n as f32, -1.0]).collect() })
+        }
+    }
+
+    fn spawn_embedding_server() -> String {
+        let mut cfg = ServerConfig::from_env();
+        cfg.port = 0;
+        cfg.api_key = None;
+        cfg.backend_name = "fake-embed".into();
+        let server = bind(&cfg).unwrap();
+        let addr = server.server_addr().to_ip().unwrap().to_string();
+        std::thread::spawn(move || run_inner(server, Box::new(MockBackend::new()), cfg, Some(Box::new(FakeEmbedding)), true));
+        addr
+    }
+
+    #[test]
+    fn embeddings_shapes_batches_base64_usage_and_errors() {
+        let addr = spawn_embedding_server();
+        let (_, _, body) = http_request(&addr, "GET", "/v1/models", None);
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["data"][0]["id"], "fake-embed");
+        for (input, expected, tokens) in [
+            (json!("cat"), json!([[3.0, -1.0]]), 3),
+            (json!(["a", "dogs"]), json!([[1.0, -1.0], [4.0, -1.0]]), 5),
+            (json!([1, 2, 3]), json!([[3.0, -1.0]]), 3),
+            (json!([[1], [2, 3]]), json!([[1.0, -1.0], [2.0, -1.0]]), 3),
+        ] {
+            let req = json!({"model":"fake-embed", "input":input});
+            let (status, _, body) = http_request(&addr, "POST", "/v1/embeddings", Some(&req.to_string()));
+            assert_eq!(status, 200, "{body}");
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["object"], "list");
+            assert_eq!(v["model"], "fake-embed");
+            assert_eq!(v["usage"]["prompt_tokens"], tokens);
+            assert_eq!(v["usage"]["total_tokens"], tokens);
+            for (i, row) in v["data"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(row["object"], "embedding");
+                assert_eq!(row["index"], i);
+                assert_eq!(row["embedding"], expected[i]);
+            }
+        }
+        let req = json!({"model":"fake-embed", "input":"a", "encoding_format":"base64"});
+        let (_, _, body) = http_request(&addr, "POST", "/v1/embeddings", Some(&req.to_string()));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let bytes = base64::decode(v["data"][0]["embedding"].as_str().unwrap()).unwrap();
+        assert_eq!(bytes, [1f32.to_le_bytes(), (-1f32).to_le_bytes()].concat());
+        for req in [json!({"model":"bad","input":"x"}), json!({"model":"fake-embed","input":[]}),
+            json!({"model":"fake-embed","input":[1,-1]}), json!({"model":"fake-embed","input":[[100]]}), json!({"model":"fake-embed","input":[[]]}),
+            json!({"model":"fake-embed","input":"x","dimensions":2}), json!({"model":"fake-embed","input":"x","encoding_format":"bogus"}), json!({"input":"x"})] {
+            let status = http_request(&addr, "POST", "/v1/embeddings", Some(&req.to_string())).0;
+            assert!(status == 400 || status == 404, "{req}: {status}");
+        }
+        let failure = json!({"model":"fake-embed", "input":"backend failure"});
+        assert_eq!(http_request(&addr, "POST", "/v1/embeddings", Some(&failure.to_string())).0, 500);
+        assert_eq!(http_request(&addr, "POST", "/v1/chat/completions", Some("{}")).0, 404);
+    }
+
+    #[test]
+    #[ignore = "requires PHLEGM_TRIT_CPU_PYTHON and PHLEGM_TRIT_MODEL with the CPU reference dependencies"]
+    fn embeddings_route_matches_trit_cpu_reference() {
+        use crate::embeddings::{EmbeddingBackend, EmbeddingError, EmbeddingInput, EmbeddingOutput};
+        use std::process::{Command, Stdio};
+        fn cpu(texts: &[String]) -> EmbeddingOutput {
+            let code = r#"
+import importlib.util, json, sys, torch
+sys.dont_write_bytecode = True
+torch.set_num_threads(1)
+spec = importlib.util.spec_from_file_location('reference', sys.argv[1] + '/trit_embed.py')
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+model = mod.TritEmbed.from_pretrained(sys.argv[1])
+texts = json.load(sys.stdin)
+ids = model.tokenizer(texts, truncation=True, max_length=128)['input_ids']
+print(json.dumps({'vectors': model.encode(texts).tolist(), 'tokens': sum(map(len, ids))}))
+"#;
+            let mut process = Command::new(std::env::var("PHLEGM_TRIT_CPU_PYTHON").unwrap())
+                .args(["-I", "-c", code, &std::env::var("PHLEGM_TRIT_MODEL").unwrap()])
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            serde_json::to_writer(process.stdin.take().unwrap(), texts).unwrap();
+            let result = process.wait_with_output().unwrap();
+            assert!(result.status.success(), "CPU reference failed");
+            let v: Value = serde_json::from_slice(&result.stdout).unwrap();
+            EmbeddingOutput { vectors: serde_json::from_value(v["vectors"].clone()).unwrap(), tokens: v["tokens"].as_u64().unwrap() as usize }
+        }
+        struct Cpu;
+        impl EmbeddingBackend for Cpu {
+            fn model_id(&self) -> &str { "trit-cpu" }
+            fn embed(&mut self, input: EmbeddingInput) -> Result<EmbeddingOutput, EmbeddingError> {
+                match input { EmbeddingInput::Texts(texts) => Ok(cpu(&texts)), _ => Err(EmbeddingError::Invalid("texts only".into())) }
+            }
+        }
+        let texts = vec!["how do index funds work".to_string(), "A man is playing a guitar on the street.".to_string(), "Rain is expected tomorrow.".to_string()];
+        let expected = cpu(&texts);
+        let mut cfg = ServerConfig::from_env(); cfg.port = 0; cfg.api_key = None;
+        let server = bind(&cfg).unwrap(); let addr = server.server_addr().to_ip().unwrap().to_string();
+        std::thread::spawn(move || run_inner(server, Box::new(MockBackend::new()), cfg, Some(Box::new(Cpu)), true));
+        let req = json!({"model": "trit-cpu", "input": texts});
+        let (status, _, body) = http_request(&addr, "POST", "/v1/embeddings", Some(&req.to_string()));
+        assert_eq!(status, 200, "{body}");
+        let response: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(response["usage"]["total_tokens"], expected.tokens);
+        for (i, expected_vector) in expected.vectors.iter().enumerate() {
+            let got = response["data"][i]["embedding"].as_array().unwrap();
+            assert_eq!(got.len(), expected_vector.len());
+            for (a, b) in got.iter().zip(expected_vector) { assert!((a.as_f64().unwrap() - *b as f64).abs() < 1e-6); }
+        }
+    }
+
+    #[test]
+    fn completion_token_alias_and_stream_usage() {
+        let addr = spawn_test_server(|_| {});
+        let body = r#"{"messages":[{"role":"user","content":"x"}],"max_tokens":1,"max_completion_tokens":3,"stream":true,"stream_options":{"include_usage":true}}"#;
+        let (status, _, response) = http_request(&addr, "POST", "/v1/chat/completions", Some(body));
+        assert_eq!(status, 200);
+        let frames: Vec<Value> = response.split("\n\n").filter_map(|f| f.strip_prefix("data: "))
+            .filter_map(|s| serde_json::from_str(s).ok()).collect();
+        let last = frames.last().unwrap();
+        assert_eq!(last["choices"], json!([]));
+        assert_eq!(last["usage"]["completion_tokens"], 3);
     }
 
     #[test]

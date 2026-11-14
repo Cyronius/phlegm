@@ -230,7 +230,7 @@ fn parse_power_mode(report: &str) -> Result<String, String> {
 /// (PR_SET_PDEATHSIG), so spawn it from a thread that lives as long as the backend (`load` runs
 /// on the caller's thread: main, for `run` and `serve`).
 #[cfg(target_os = "linux")]
-fn die_with_parent(command: &mut Command) {
+pub(crate) fn die_with_parent(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     extern "C" {
         fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
@@ -255,7 +255,7 @@ fn die_with_parent(command: &mut Command) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn die_with_parent(_: &mut Command) {}
+pub(crate) fn die_with_parent(_: &mut Command) {}
 
 struct Process {
     child: Child,

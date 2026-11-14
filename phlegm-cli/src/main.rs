@@ -18,7 +18,9 @@ const USAGE: &str = "usage: phlegm <command>
 commands:
   run --model-dir DIR --kernels DIR --bridge EXE --prompt TEXT [--max-tokens N (0 or -1: until the context is full)] [--seed N] [--turbo]
   serve --model-dir DIR --kernels DIR --bridge EXE [--turbo] [--host 127.0.0.1] [--port 52625]
-  serve --mock [--host H] [--port N]   (--host / --port override PHLEGM_HOST / PHLEGM_PORT)
+  serve --embed-model DIR [--embed-python PYTHON] [--embed-source DIR] [--embed-model-name NAME]
+  serve --mock [--host H] [--port N] [--api-key KEY] [--allowed-origins ORIGINS]
+  (--host / --port override PHLEGM_HOST / PHLEGM_PORT)
   config show [--model-dir DIR | --config-model TAG] [--json]   the settings in effect, and where each comes from
   config set [--model-dir DIR | --config-model TAG] --config-key KEY --config-value VALUE
   config unset [--model-dir DIR | --config-model TAG] --config-key KEY
@@ -191,11 +193,31 @@ fn run(args: &[String]) -> Result<(), String> {
 fn serve(args: &[String]) -> Result<(), String> {
     let opts = flags(args)?;
     let mut cfg = ServerConfig::from_env();
+    if let Some(key) = opts.get("--api-key") {
+        if key.is_empty() { return Err("--api-key must not be empty".into()); }
+        cfg.api_key = Some(key.clone());
+    }
+    if let Some(origins) = opts.get("--allowed-origins") {
+        cfg.allowed_origins = origins.clone();
+    }
     if let Some(host) = opts.get("--host") {
         cfg.host = host.clone();
     }
     if let Some(port) = opts.get("--port") {
         cfg.port = port.parse().map_err(|_| "invalid --port".to_string())?;
+    }
+    if let Some(dir) = opts.get("--embed-model") {
+        if ["--mock", "--model-dir", "--kernels", "--bridge", "--turbo"].iter().any(|k| opts.contains_key(*k)) {
+            return Err("--embed-model serves an embedding model alone; do not combine with chat backend options".into());
+        }
+        let model_dir = PathBuf::from(dir);
+        let model_id = opts.get("--embed-model-name").cloned().or_else(|| model_dir.file_name().and_then(|v| v.to_str()).map(str::to_owned)).ok_or("invalid embedding model name")?;
+        if model_id.is_empty() { return Err("embedding model name must not be empty".into()); }
+        let python = opts.get("--embed-python").cloned().or_else(|| std::env::var("PHLEGM_EMBED_PYTHON").ok()).unwrap_or_else(|| "python3".into());
+        let source = opts.get("--embed-source").map(PathBuf::from).or_else(|| std::env::var_os("PHLEGM_EMBED_SOURCE").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../open_kernels/designs/trit_embed"));
+        let embedder = phlegm_core::embeddings::TritEmbeddingBackend::load(model_id, std::path::Path::new(&python), &source, &model_dir)?;
+        return server::serve_embeddings(Box::new(embedder), cfg);
     }
     let settings = model_settings(&opts)?;
     cfg.default_max_tokens = settings.usize("max_tokens");
@@ -382,6 +404,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedding_mode_rejects_a_second_backend_before_loading() {
+        for extra in [vec!["--mock", "--embed-model", "model"], vec!["--model-dir", "chat", "--embed-model", "model"]] {
+            let args: Vec<String> = extra.into_iter().map(str::to_owned).collect();
+            assert!(serve(&args).unwrap_err().contains("embedding model alone"));
+        }
+    }
 
     #[test]
     fn turbo_is_a_boolean_and_cannot_silently_select_mock() {
