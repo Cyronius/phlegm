@@ -57,6 +57,7 @@ import ln_split as LS  # noqa: E402
 from recipes.load import current_spec  # noqa: E402
 from recipes.families import for_spec  # noqa: E402
 from recipes.attnknobs import TREE8_STACK, kv_cores, kv_slices, kvslice, tree8, tree8_flags  # noqa: E402
+from recipes.dense_precision import q8_projections, ROLES  # noqa: E402
 from recipes.dense import one_context, stream_knobs  # noqa: E402
 from recipes.qwen36moe import BAND_ROWS, ELEM, band_bytes, roundup  # noqa: E402
 from aie.helpers.taplib import TensorAccessPattern  # noqa: E402
@@ -98,7 +99,7 @@ GYSYM = "gemv_q4s32_gy" if F32 else "gemv_q40_gy" if Q40 else "gemv_q4_gy"
 GMSYM = "gemv_q4s32_gms" if F32 else "gemv_q40_gms" if Q40 else "gemv_q4_gms"
 
 
-Q8 = SPEC.q8_roles              # the roles the container stores at q8 (OPEN-QUANT-Q8); usually empty
+Q8 = q8_projections(SPEC) if SPEC.tensor_quant else SPEC.q8_roles
 
 
 def per_band(K):
@@ -112,11 +113,15 @@ def n_groups(K):
 # A q8 projection's band is the same 64 rows and twice the bytes: four 16-row half-tiles
 # per k-tile instead of two chunks (designs/gemv_q4/gemv_q8.h). A q4_1 role gets exactly
 # today's numbers, so a model with no q8 role builds the design it always built.
+def is_q8(role):
+    return (role if SPEC.tensor_quant else ROLES.get(role, role)) in Q8
+
+
 def role_band_bytes(role, K):
     # The q4_1 side is F32-aware: the GGUF-direct f32-scale build (SPEC.quant ==
     # "q4_1_f32") uses 6144-byte chunks rather than q4nx's 5120.
     b = QR.band_bytes(K, SPEC.quant)
-    return 2 * b if role in Q8 else b
+    return 2 * b if is_q8(role) else b
 
 
 def role_per_band(role, K):
@@ -128,10 +133,10 @@ def role_groups(role, K):
 
 
 def role_rs(role):
-    return 4 if role in Q8 else 2
+    return 4 if is_q8(role) else 2
 
 
-NEED_Q4_GY = any(r not in Q8 for r in ("attn", "ffn"))
+NEED_Q4_GY = any(not is_q8(r) for r in ("attn_q", "ffn_down"))
 NEED_Q4_GMS = "ffn" not in Q8
 
 # A container that MIXES formats needs BOTH GEMV bodies on the main core, and 16 KB of
@@ -139,7 +144,7 @@ NEED_Q4_GMS = "ffn" not in Q8
 # On a mixed spec ONLY, the q4_1 pair folds into one `gemv_q4_gyms` with a runtime
 # destination (dst < 0 -> the band's y element, dst >= 0 -> ms + dst) and the GEMV TUs are
 # compiled -Oz. An all-q4_1 or an all-q8 spec keeps today's entries, flags and call order.
-MIXED = bool(Q8) and NEED_Q4_GY and NEED_Q4_GMS
+MIXED = not SPEC.tensor_quant and bool(Q8) and NEED_Q4_GY and NEED_Q4_GMS
 GEMV_OS = ["-Oz"] if MIXED else OS
 
 
@@ -420,7 +425,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
 
     def role_bands(win, yout, tab, K, role, nbands, KK, ms=None):
         """`nbands` bands of a KK-wide projection of `role`, at that role's weight format."""
-        if role in Q8:
+        if is_q8(role):
             gemv_bands(win, yout, tab, K["gy8"], nbands, role_groups(role, KK), role_per_band(role, KK), 4)
         elif MIXED:
             gemv_bands(win, yout, tab, K["gyms"], nbands, n_groups(KK), per_band(KK), 2, ms)
@@ -459,7 +464,11 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
         for i in range(G.XN_ELEMS):
             f_prep(xe[i], tab, HID, i)
         if mode is None:
-            role_bands(win, yout, tab, K, "attn", G.Q_PC + 2 * G.KV_PC, HID, ms)
+            if SPEC.tensor_quant:
+                for projection, count in (("attn_q", G.Q_PC), ("attn_k", G.KV_PC), ("attn_v", G.KV_PC)):
+                    role_bands(win, yout, tab, K, projection, count, HID, ms)
+            else:
+                role_bands(win, yout, tab, K, "attn", G.Q_PC + 2 * G.KV_PC, HID, ms)
         else:
             # read after the x data landed: read at the barrier, it was the previous dispatch's word
             gemv_bands(win, yout, tab, K["gy"], mode[1], n_groups(HID), per_band(HID), 2)
@@ -478,7 +487,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             oe = acq(xin, G.OG_ELEMS)
             for i in range(G.OG_ELEMS):
                 f_prep(oe[i], tab, QW, i)
-            role_bands(win, yout, tab, K, "attn", G.O_PC, QW, ms)
+            role_bands(win, yout, tab, K, "attn_output", G.O_PC, QW, ms)
             xin.release(G.OG_ELEMS)
         else:
             # Gemma 4's global layers: q is 16 x 512 wide, so og is four x elements and the
@@ -490,7 +499,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
                 oe1 = xin.acquire(1)
                 f_prep(oe1, tab, QW, i)
                 xin.release(1)
-            role_bands(win, yout, tab, K, "attn", G.O_PC, QW, ms)
+            role_bands(win, yout, tab, K, "attn_output", G.O_PC, QW, ms)
         if stop == 2:
             return
         # up | gate per band against xm (K = HID), silu -> h band
@@ -523,7 +532,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
                 he = xin.acquire(1)
                 f_prepf(he, tab, k, i)
                 xin.release(1)
-            role_bands(win, yout, tab, K, "ffn", G.DOWN_PC, k, ms)
+            role_bands(win, yout, tab, K, "ffn_down", G.DOWN_PC, k, ms)
 
     def ln_body(ain, aout, f_nr, f_lny, f_lnx, *rest):
         if not ONE_CTX:
@@ -840,8 +849,9 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
         workers.append(Worker(make_attn_body(c), fn_args=[of_ain.cons()] + kwc(c) + bcons() + [of_og[c].prod()] + abufs(c) + afns(c),
                               tile=att_tile(c), stack_size=ASTACK))
 
-    BB_H, BB_Q, BB_F = (role_band_bytes("attn", HID), role_band_bytes("attn", QW),
-                        role_band_bytes("ffn", FF))
+    BB_H, BB_Q, BB_F = (role_band_bytes("attn_q", HID), role_band_bytes("attn_output", QW),
+                        role_band_bytes("ffn_down", FF))
+    BB_V = role_band_bytes("attn_v", HID)
     BB_UG = role_band_bytes("ffn", HID)          # the FFN's up | gate bands (K = HID)
     YB = BAND_ROWS * 4
 
@@ -889,7 +899,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
         for c in range(N_CORES):
             pw.fill(w_prods[c], a_pool, bt(L.POOL_BYTES, L.POOL_Q + c * G.Q_PC * BB_H, G.Q_PC * BB_H))
             pw.fill(w_prods[c], a_pool, bt(L.POOL_BYTES, L.POOL_K + c * G.KV_PC * BB_H, G.KV_PC * BB_H))
-            pw.fill(w_prods[c], a_pool, bt(L.POOL_BYTES, L.POOL_V + c * G.KV_PC * BB_H, G.KV_PC * BB_H))
+            pw.fill(w_prods[c], a_pool, bt(L.POOL_BYTES, L.POOL_V + c * G.KV_PC * BB_V, G.KV_PC * BB_V))
             py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_Q + c * G.Q_PC * YB, G.Q_PC * YB))
             py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_KVN + c * G.KV_PC * YB, G.KV_PC * YB))
             py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_KVN + KVW * 4 + c * G.KV_PC * YB, G.KV_PC * YB))
@@ -1054,8 +1064,8 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
                 for c in range(N_CORES):
                     pw.fill(w_prods[c], a_pool,
                             piece_tap(L.POOL_BYTES,
-                                      L.POOL_DOWN + c * G.DOWN_PC * BB_F + role_band_bytes("ffn", k0),
-                                      BB_F, role_band_bytes("ffn", k), G.DOWN_PC, CH))
+                                      L.POOL_DOWN + c * G.DOWN_PC * BB_F + role_band_bytes("ffn_down", k0),
+                                      BB_F, role_band_bytes("ffn_down", k), G.DOWN_PC, CH))
                     py.drain(y_conss[c], a_act, bt(L.AD_BYTES, dst + c * G.DOWN_PC * YB, G.DOWN_PC * YB))
                 k0 += k
         else:

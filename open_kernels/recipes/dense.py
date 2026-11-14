@@ -48,6 +48,7 @@ from .qwen36moe import (BAND_ROWS, CHUNK, ELEM, GEMM_T, MB, _op_index, band_byte
                         down_split, gguf_direct, norm_split, q4_bytes, proj_op, q4_chunks, mixed_check, NORM_L1,
                         quant_check, require_gemv, role_bytes, roundup, tab_bytes)
 from .spec import DENSE, DENSE_LOCAL, ModelSpec
+from .dense_precision import projection_spec, q8_projections
 
 
 @dataclass(frozen=True)
@@ -231,6 +232,16 @@ def _check(spec: ModelSpec) -> None:
     else:
         quant_check(spec, "dense")
     mixed_check(spec, "dense", ("attn", "ffn"))
+    if spec.tensor_quant:
+        if one_context(spec):
+            raise OpRangeError("dense tensor selector: compile-only probe requires DX_ONECTX=0")
+        # Only the V0/V1 probe is accepted until the q8 up/gate fold is gated.
+        if q8_projections(spec) - {"attn_v", "ffn_down"}:
+            raise OpRangeError("dense tensor selector: fit probe supports q8 attn_v / ffn_down only")
+        for projection, k, rows in (("attn_v", spec.hidden, spec.attn_kv_width // n),
+                                    ("ffn_down", spec.intermediate, spec.hidden // n)):
+            require_gemv(projection_spec(spec, projection),
+                         "attn" if projection == "attn_v" else "ffn", k, rows, per_call(spec))
     if spec.quant_of("experts") == "q8" or spec.quant_of("shared") == "q8" or spec.quant_of("linear") == "q8":
         raise OpRangeError("dense: this family has only the 'attn' and 'ffn' roles")
     if not spec.has_dense or spec.has_linear or spec.has_full or spec.intermediate == 0:
@@ -347,7 +358,7 @@ from .attnknobs import probe_env as attn_knobs_probe_env
 #                    FF fits whole, so the split can be compared against the whole path
 #                    on a model that is already tested end to end.
 #   DENSE_NORM_SPLIT  "1" -- force the streaming norm helper (the same, for the norm).
-DENSE_PROBE_VARS = ("DENSE_DOWN_SPLIT", "DENSE_NORM_SPLIT", "DENSE_GGUF_GEMM", "DENSE_GGUF_HEAD_Q8", "DENSE_GGUF_COMPACT", "DENSE_FLASH_PREFILL", "AF_LMAX", "AF_LONG_STREAM")
+DENSE_PROBE_VARS = ("DENSE_DOWN_SPLIT", "DENSE_NORM_SPLIT", "DENSE_GGUF_GEMM", "DENSE_GGUF_HEAD_Q8", "DENSE_GGUF_COMPACT", "DENSE_GGUF_LAYER", "DENSE_FLASH_PREFILL", "AF_LMAX", "AF_LONG_STREAM")
 
 
 def probe_env() -> dict[str, str]:
@@ -518,7 +529,8 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> DenseLayout:
                                    ("up", "ffn", ff, hid), ("gate", "ffn", ff, hid),
                                    ("down", "ffn", hid, ff)):
         p[name] = off
-        off += role_bytes(spec, role, rows, cols)
+        projection = {"o": "attn_output"}.get(name, ("attn_" if role == "attn" else "ffn_") + name)
+        off += role_bytes(projection_spec(spec, projection), role, rows, cols)
     pool_bytes = roundup(off, MB)
     kv_row = 2 * e_a
     ptab_row = _ptab_row(spec)
@@ -544,6 +556,8 @@ def recipe(spec: ModelSpec, max_ctx: int = 4096) -> DenseRecipe:
 
 
 def pack_plan(spec: ModelSpec) -> dict:
+    if spec.tensor_quant:
+        raise OpRangeError("tensor_quant is compile-only: GGUF packing and variant dispatch await S1/S2")
     L, G = layout(spec), geometry(spec)
     hid, ff = spec.hidden, spec.intermediate
     pre = "model.layers.{l}."
@@ -605,7 +619,7 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
     f32_gemm = spec.quant == "q4_1_f32" and os.environ.get("DENSE_GGUF_GEMM") == "1"
     # A projection streamed at q8 has no route: the GEMM dequantises the q4_1 band law only
     # (OPEN-PREFILL-BATCH), so such a spec keeps exactly the sequential manifest it had.
-    if any(spec.quant_of(r) == "q8" for r in Q8_ROLES):
+    if spec.tensor_quant or any(spec.quant_of(r) == "q8" for r in Q8_ROLES):
         return None
     # This route only knows the dense layer shape (`dense`, and Gemma 3's sliding-window
     # `dense_local`) -- a hybrid family's short_conv / full_attention / linear_attention layer

@@ -57,6 +57,52 @@ pub enum Metadata {
     Float(f64),
     Bool(bool),
     String(String),
+    Array(Vec<Metadata>),
+}
+
+/// Read metadata without inspecting or mapping tensor payloads. This also accepts
+/// a range-fetched header, so tokenizer acceptance never needs the model weights.
+pub fn read_metadata_file(path: &Path) -> Result<HashMap<String, Metadata>, String> {
+    let mut reader = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // Tokenizer headers fit comfortably below this cap. A corrupt file must
+    // not turn the size of its weight payload into an allocation budget.
+    let len = reader.metadata().map_err(|e| e.to_string())?.len().min(128 * 1024 * 1024);
+    let mut magic = [0; 4];
+    read_exact(&mut reader, &mut magic)?;
+    if &magic != b"GGUF" { return Err("not a GGUF file".into()); }
+    let version = read_u32(&mut reader)?;
+    if !(2..=3).contains(&version) { return Err(format!("GGUF version {version} is unsupported")); }
+    let _tensors = read_u64(&mut reader)?;
+    let count = read_u64(&mut reader)?;
+    if count > len / 13 { return Err("GGUF metadata count exceeds file size".into()); }
+    let mut values = HashMap::new();
+    for _ in 0..count {
+        let key = read_string(&mut reader, len)?;
+        let ty = read_u32(&mut reader)?;
+        let value = read_metadata(&mut reader, len, ty, 0, key.starts_with("tokenizer."))?;
+        if let Some(value) = value {
+            if values.insert(key.clone(), value).is_some() {
+                return Err(format!("duplicate GGUF metadata key {key}"));
+            }
+        }
+    }
+    Ok(values)
+}
+
+/// A bare model directory must select exactly one GGUF, independently of its
+/// publisher's filename. Ambiguous directories fail instead of picking a file.
+pub fn model_file(dir: &Path) -> Result<std::path::PathBuf, String> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.is_file() && path.extension().is_some_and(|s| s.eq_ignore_ascii_case("gguf")) {
+            files.push(path);
+        }
+    }
+    match files.len() {
+        1 => Ok(files.remove(0)),
+        n => Err(format!("{} needs exactly one GGUF when tokenizer.json is absent (found {n})", dir.display())),
+    }
 }
 
 pub struct Gguf<R: Read + Seek> {
@@ -136,7 +182,7 @@ impl<R: Read + Seek> Gguf<R> {
         for _ in 0..metadata_count {
             let key = read_string(&mut reader, file_len)?;
             let ty = read_u32(&mut reader)?;
-            let value = read_metadata(&mut reader, file_len, ty, 0)?;
+            let value = read_metadata(&mut reader, file_len, ty, 0, false)?;
             if let Some(value) = value {
                 if metadata.insert(key.clone(), value).is_some() {
                     return Err(format!("duplicate GGUF metadata key {key}"));
@@ -537,8 +583,9 @@ fn skip_bytes<R: Seek>(r: &mut R, len: u64, n: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn read_metadata<R: Read + Seek>(r: &mut R, len: u64, ty: u32, depth: u8) -> Result<Option<Metadata>, String> {
+fn read_metadata<R: Read + Seek>(r: &mut R, len: u64, ty: u32, depth: u8, retain_arrays: bool) -> Result<Option<Metadata>, String> {
     if depth > 4 { return Err("GGUF metadata array nesting is too deep".into()); }
+    if r.stream_position().map_err(|e| e.to_string())? >= len { return Err("GGUF metadata runs past EOF or header limit".into()); }
     let value = match ty {
         0 => Some(Metadata::Unsigned(read_u8(r)? as u64)),
         1 => Some(Metadata::Signed(read_u8(r)? as i8 as i64)),
@@ -552,12 +599,23 @@ fn read_metadata<R: Read + Seek>(r: &mut R, len: u64, ty: u32, depth: u8) -> Res
         9 => {
             let elem_type = read_u32(r)?;
             let count = read_u64(r)?;
+            if count > 2_000_000 || count > len.saturating_sub(r.stream_position().map_err(|e| e.to_string())?) {
+                return Err("GGUF metadata array count exceeds limit or file size".into());
+            }
+            if retain_arrays {
+                if elem_type == 9 { return Err("nested tokenizer metadata arrays are unsupported".into()); }
+                let mut values = Vec::new();
+                for _ in 0..count {
+                    values.push(read_metadata(r, len, elem_type, depth + 1, true)?.ok_or("missing array value")?);
+                }
+                return Ok(Some(Metadata::Array(values)));
+            }
             if let Some(size) = match elem_type { 0 | 1 | 7 => Some(1), 2 | 3 => Some(2),
                 4 | 5 | 6 => Some(4), 10 | 11 | 12 => Some(8), _ => None } {
                 skip_bytes(r, len, count.checked_mul(size).ok_or("GGUF array size overflow")?)?;
             } else {
                 if count > len / 8 { return Err("GGUF metadata array count exceeds file size".into()); }
-                for _ in 0..count { read_metadata(r, len, elem_type, depth + 1)?; }
+                for _ in 0..count { read_metadata(r, len, elem_type, depth + 1, false)?; }
             }
             None
         }

@@ -1,0 +1,36 @@
+name: Release Linux binary
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build CLI
+        run: cargo build --release -p phlegm-cli --locked
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          cp target/release/phlegm release-assets/phlegm-linux-x86_64
+          cd release-assets
+          sha256sum phlegm-linux-x86_64 > SHA256SUMS
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" release-assets/* --verify-tag --title "$TAG" --generate-notes
+          fi

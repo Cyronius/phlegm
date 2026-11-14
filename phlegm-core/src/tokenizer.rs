@@ -3,10 +3,13 @@
 //! templates may be an external Jinja file or embedded in tokenizer_config.json.
 
 use crate::reasoning_effort::TemplateVars;
-use minijinja::{context, Environment};
+use minijinja::Environment;
 use serde_json::{Map, Value};
 use std::path::Path;
 use tokenizers::Tokenizer as HfTokenizer;
+
+#[path = "gguf_tokenizer.rs"]
+mod gguf_tokenizer;
 
 /// Padded logit width emitted by the lm_head (tokenizer.json vocab is 248070).
 pub const MODEL_VOCAB_SIZE: usize = 248320;
@@ -207,9 +210,12 @@ impl Reasoning {
     }
 }
 
+#[derive(Default, serde::Serialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[cfg(test)]
@@ -289,6 +295,7 @@ pub(crate) mod tests {
                         &[ChatMessage {
                             role: "user".into(),
                             content: "A".into(),
+                            ..Default::default()
                         }],
                         true,
                         true,
@@ -319,8 +326,15 @@ pub(crate) mod tests {
         )
         .unwrap();
         let tokenizer = Tokenizer::load(&dir).unwrap();
-        let msg = [ChatMessage { role: "user".into(), content: "A".into() }];
-        assert_eq!(tokenizer.render_chat(&msg, true, &Map::new()).unwrap(), "A|TrueTrueFalse");
+        let msg = [ChatMessage {
+            role: "user".into(),
+            content: "A".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            tokenizer.render_chat(&msg, true, &Map::new()).unwrap(),
+            "A|TrueTrueFalse"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -343,7 +357,11 @@ pub(crate) mod tests {
             {"details": {"reasoning_efforts": {"none": "no_think", "low": "low", "high": "high"}}}
         )))
         .unwrap();
-        let msg = [ChatMessage { role: "user".into(), content: "A".into() }];
+        let msg = [ChatMessage {
+            role: "user".into(),
+            content: "A".into(),
+            ..Default::default()
+        }];
         let render = |t: Thinking| {
             let kwargs = template_kwargs(&t, tokenizer.template_vars(), levels.as_ref());
             tokenizer.render_chat(&msg, true, &kwargs).unwrap()
@@ -474,11 +492,15 @@ pub(crate) mod tests {
 }
 
 pub struct Tokenizer {
+    constrained_vocab:
+        std::sync::OnceLock<Result<std::sync::Arc<crate::structured_output::Vocabulary>, String>>,
+    tool_format: Option<crate::tool_calls::Format>,
     reasoning: Option<ReasoningFormat>,
     template_vars: TemplateVars,
     tk: HfTokenizer,
     env: Environment<'static>,
     add_bos_token: bool,
+    gguf_add_eos: Option<u32>,
     bos_token: Option<String>,
     eos_ids: std::collections::HashSet<u32>,
 }
@@ -486,6 +508,10 @@ pub struct Tokenizer {
 impl Tokenizer {
     /// Load tokenizer files and the model chat template from a model directory.
     pub fn load(model_dir: &Path) -> Result<Tokenizer, String> {
+        if !model_dir.join("tokenizer.json").try_exists().map_err(|e| e.to_string())? {
+            let (tk, config) = gguf_tokenizer::load(model_dir)?;
+            return Self::from_parts(model_dir, tk, config, Value::Null);
+        }
         let tk = HfTokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| format!("loading tokenizer.json: {e}"))?;
 
@@ -499,6 +525,10 @@ impl Tokenizer {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
             Err(e) => return Err(format!("reading special_tokens_map.json: {e}")),
         };
+        Self::from_parts(model_dir, tk, config, special_map)
+    }
+
+    fn from_parts(model_dir: &Path, tk: HfTokenizer, config: Value, special_map: Value) -> Result<Tokenizer, String> {
         let special_token = |name: &str| {
             [
                 config.get(name),
@@ -520,6 +550,10 @@ impl Tokenizer {
             .get("add_bos_token")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let gguf_add_eos = if config.get("_gguf").and_then(Value::as_bool) == Some(true)
+            && config.get("add_eos_token").and_then(Value::as_bool) == Some(true) {
+            eos_token.as_deref().and_then(|t| tk.token_to_id(t))
+        } else { None };
 
         let template_src = match std::fs::read_to_string(model_dir.join("chat_template.jinja")) {
             Ok(text) => text,
@@ -539,6 +573,17 @@ impl Tokenizer {
         // Mirror transformers' jinja2 Environment(trim_blocks=True, lstrip_blocks=True). Most
         // templates use `{%- -%}` everywhere and render the same either way; HY V3's opens with
         // a plain `{# ... #}` comment and `{% if %}` blocks, whose newlines transformers drops.
+        // Publisher templates use Python json.dumps' ensure_ascii keyword. The native filter
+        // already writes Unicode; consume the explicit false before delegating its other options.
+        env.add_filter(
+            "tojson",
+            |v: minijinja::Value,
+             indent: Option<minijinja::Value>,
+             args: minijinja::value::Kwargs| {
+                let _: Option<bool> = args.get("ensure_ascii")?;
+                minijinja::filters::tojson(&v, indent, args)
+            },
+        );
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
         // jinja2's `iterable` is `iter(value)` succeeding, so `none is iterable` is false there;
@@ -584,6 +629,7 @@ impl Tokenizer {
         } else {
             None
         };
+        let tool_format = crate::tool_calls::Format::of(&template_src);
         let template_vars = TemplateVars::of(&template_src);
         env.add_template_owned("chat", template_src)
             .map_err(|e| format!("compiling chat_template.jinja: {e}"))?;
@@ -641,9 +687,12 @@ impl Tokenizer {
         Ok(Tokenizer {
             tk,
             env,
+            tool_format,
+            constrained_vocab: std::sync::OnceLock::new(),
             reasoning,
             template_vars,
             add_bos_token,
+            gguf_add_eos,
             bos_token,
             eos_ids,
         })
@@ -657,7 +706,11 @@ impl Tokenizer {
             .bos_token
             .as_ref()
             .is_some_and(|bos| text.starts_with(bos));
-        self.encode_with(text, self.add_bos_token && !has_bos)
+        let mut ids = self.encode_with(text, (self.add_bos_token || self.gguf_add_eos.is_some()) && !has_bos)?;
+        if has_bos {
+            if let Some(eos) = self.gguf_add_eos { ids.push(eos); }
+        }
+        Ok(ids)
     }
 
     /// `add_special_tokens` controls only the model's automatic BOS/EOS
@@ -706,8 +759,23 @@ impl Tokenizer {
         }
     }
 
-    /// The chat template speaks OpenAI's harmony format (GPT-OSS): replies arrive as an analysis
-    /// channel then a final one, which the CLI and server separate (`harmony_split`).
+    /// Lazily build and share exact token bytes for requests with a JSON constraint.
+    pub fn structured_vocabulary(
+        &self,
+    ) -> Result<std::sync::Arc<crate::structured_output::Vocabulary>, String> {
+        self.constrained_vocab
+            .get_or_init(|| {
+                crate::structured_output::Vocabulary::from_tokenizer(&self.tk, self.stop_ids())
+                    .map(std::sync::Arc::new)
+            })
+            .clone()
+    }
+
+    pub fn tool_format(&self) -> Option<crate::tool_calls::Format> {
+        self.tool_format
+    }
+
+    /// Whether the chat template uses OpenAI harmony channels (GPT-OSS).
     pub fn is_harmony(&self) -> bool {
         self.reasoning == Some(ReasoningFormat::Harmony)
     }
@@ -738,7 +806,8 @@ impl Tokenizer {
 
     /// Render messages through the model's chat template with extra template variables, the way
     /// transformers and vLLM pass `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`,
-    /// `preserve_thinking`, ...). They cannot replace `messages`, `add_generation_prompt` or `tools`.
+    /// `preserve_thinking`, ...). `messages` and `add_generation_prompt` remain reserved;
+    /// the server supplies `tools` through these variables after processing request options.
     pub fn render_chat(
         &self,
         messages: &[ChatMessage],
@@ -746,17 +815,45 @@ impl Tokenizer {
         kwargs: &Map<String, Value>,
     ) -> Result<String, String> {
         let tmpl = self.env.get_template("chat").map_err(|e| e.to_string())?;
-        let msgs: Vec<_> = messages
-            .iter()
-            .map(|m| context! { role => m.role.clone(), content => m.content.clone() })
-            .collect();
+        let mut msgs = Vec::new();
+        for m in messages {
+            let mut msg = serde_json::to_value(m).map_err(|e| e.to_string())?;
+            if msg
+                .get("tool_calls")
+                .is_some_and(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty))
+            {
+                msg.as_object_mut().unwrap().remove("tool_calls");
+            }
+            if msg.get("tool_calls").is_some_and(|v| !v.is_array()) {
+                return Err("tool_calls must be an array".into());
+            }
+            if let Some(calls) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for call in calls {
+                    if let Some(args) = call.pointer_mut("/function/arguments") {
+                        if let Some(text) = args.as_str() {
+                            *args = serde_json::from_str(text)
+                                .map_err(|e| format!("tool_calls arguments must be JSON: {e}"))?;
+                        }
+                        if !args.is_object() {
+                            return Err("tool_calls arguments must be a JSON object".into());
+                        }
+                    }
+                }
+            }
+            // GPT-OSS names its reasoning field `thinking`.
+            if let Some(r) = msg.get("reasoning_content").cloned() {
+                msg["thinking"] = r;
+            }
+            msgs.push(msg);
+        }
         let mut ctx: std::collections::BTreeMap<String, minijinja::Value> = kwargs
             .iter()
             .map(|(k, v)| (k.clone(), minijinja::Value::from_serialize(v)))
             .collect();
-        ctx.insert("messages".into(), minijinja::Value::from(msgs));
+        ctx.insert("messages".into(), minijinja::Value::from_serialize(msgs));
         ctx.insert("add_generation_prompt".into(), add_generation_prompt.into());
-        ctx.insert("tools".into(), minijinja::Value::from(()));
+        ctx.entry("tools".into())
+            .or_insert_with(|| minijinja::Value::from(()));
         tmpl.render(ctx)
             .map_err(|e| format!("rendering chat template: {e:#}"))
     }

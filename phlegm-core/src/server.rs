@@ -5,6 +5,7 @@
 //!   GET  /health                 -> {"status":"ok","backend":...}
 //!   GET  /v1/models              -> OpenAI model list
 //!   POST /v1/chat/completions    -> chat completion; stream=true gives SSE deltas
+//!   POST /v1/completions         -> raw prompt completion (no chat template)
 //!
 //! Backend-agnostic: `serve()` takes any `Box<dyn Backend + Send>` (a
 //! `NpuBackend` for normal serving, `MockBackend` for explicit tests).
@@ -32,6 +33,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tiny_http::{Header, Method, Request, Response};
 
+#[path = "server_embeddings.rs"]
+mod embeddings_route;
+#[path = "server_generation.rs"]
+mod generation;
+
 // --------------------------------------------------------------------------
 // Config
 // --------------------------------------------------------------------------
@@ -56,6 +62,10 @@ pub struct ServerConfig {
     /// Sampling and template defaults for a request that does not set them (the model's
     /// resolved settings, SERVER-SETTINGS).
     pub defaults: GenDefaults,
+    /// Bearer authentication, disabled when absent.
+    pub api_key: Option<String>,
+    /// `loopback`, comma-separated exact origins, or `*`.
+    pub allowed_origins: String,
 }
 
 /// What a request leaves out: the model's resolved `temperature`, `top_k`, `top_p`,
@@ -150,6 +160,8 @@ impl ServerConfig {
             model_dir: std::env::var("PHLEGM_MODEL_DIR").ok().map(PathBuf::from),
             backend_name: env_or("PHLEGM_BACKEND", "mock"),
             defaults: GenDefaults::default(),
+            api_key: std::env::var("PHLEGM_API_KEY").ok().filter(|v| !v.is_empty()),
+            allowed_origins: env_or("PHLEGM_ALLOWED_ORIGINS", "loopback"),
         }
     }
 }
@@ -167,18 +179,16 @@ impl ServerTokenizer {
     fn decode_stream(&self) -> Box<dyn FnMut(u32) -> Result<Option<String>, String> + '_> {
         match self {
             Self::Real(t) => Box::new(t.decode_stream()),
-            Self::Placeholder(t) => {
-                let mut ids = Vec::new();
-                let mut emitted = String::new();
+            Self::Placeholder(_) => {
+                let mut pending = Vec::new();
                 Box::new(move |id| {
-                    ids.push(id);
-                    let full = t.decode(&ids);
-                    let piece = full
-                        .strip_prefix(&emitted)
-                        .ok_or("nonmonotonic placeholder decode")?
-                        .to_owned();
-                    emitted = full;
-                    Ok(Some(piece))
+                    let byte = u8::try_from(id).map_err(|_| "non-byte mock output token")?;
+                    pending.push(byte);
+                    match std::str::from_utf8(&pending) {
+                        Ok(text) => { let text = text.to_owned(); pending.clear(); Ok(Some(text)) }
+                        Err(e) if e.error_len().is_none() => Ok(None),
+                        Err(_) => Err("invalid UTF-8 mock output".into()),
+                    }
                 })
             }
         }
@@ -217,16 +227,6 @@ impl ServerTokenizer {
         }
     }
 
-    fn decode(&self, ids: &[u32]) -> String {
-        match self {
-            ServerTokenizer::Real(t) => t.decode(ids).unwrap_or_else(|e| {
-                eprintln!("server: tokenizer decode error: {e}");
-                String::new()
-            }),
-            ServerTokenizer::Placeholder(t) => t.decode(ids),
-        }
-    }
-
     /// add_generation_prompt=true (a completion always follows), with the template variables.
     fn apply_chat_template(
         &self,
@@ -235,7 +235,13 @@ impl ServerTokenizer {
     ) -> Result<String, String> {
         match self {
             ServerTokenizer::Real(t) => t.render_chat(messages, true, kwargs),
-            ServerTokenizer::Placeholder(t) => Ok(t.apply_chat_template(messages)),
+            ServerTokenizer::Placeholder(t) => {
+                let mut prompt = t.apply_chat_template(messages);
+                if let Some(tools) = kwargs.get("tools").filter(|v| v.is_array()) {
+                    prompt.push_str(&format!("\n__phlegm_mock_tools__{tools}"));
+                }
+                Ok(prompt)
+            },
         }
     }
 
@@ -326,6 +332,9 @@ struct ServerState {
     context_capacity: Option<usize>,
     tokenizer: ServerTokenizer,
     cfg: ServerConfig,
+    embedder: Option<Mutex<Box<dyn crate::embeddings::EmbeddingBackend>>>,
+    embedding_model: Option<String>,
+    embedding_only: bool,
 }
 
 /// Bind the listening socket without starting the accept loop. Split out from
@@ -343,15 +352,29 @@ pub fn run(
     backend: Box<dyn Backend + Send>,
     cfg: ServerConfig,
 ) -> Result<(), String> {
-    let tokenizer = ServerTokenizer::build(&cfg)?;
+    run_inner(server, backend, cfg, None, false)
+}
+
+fn run_inner(
+    server: tiny_http::Server,
+    backend: Box<dyn Backend + Send>,
+    cfg: ServerConfig,
+    embedder: Option<Box<dyn crate::embeddings::EmbeddingBackend>>,
+    embedding_only: bool,
+) -> Result<(), String> {
+    let tokenizer = if embedding_only { ServerTokenizer::Placeholder(PlaceholderTokenizer::new()) } else { ServerTokenizer::build(&cfg)? };
     let backend_name = cfg.backend_name.clone();
-    let model_id = cfg.model_id.clone();
+    let model_id = embedder.as_ref().filter(|_| embedding_only).map(|e| e.model_id().to_owned()).unwrap_or_else(|| cfg.model_id.clone());
     let context_capacity = backend.context_capacity();
+    let embedding_model = embedder.as_ref().map(|e| e.model_id().to_owned());
     let state = Arc::new(ServerState {
         backend: Mutex::new(backend),
         context_capacity,
         tokenizer,
         cfg,
+        embedder: embedder.map(Mutex::new),
+        embedding_model,
+        embedding_only,
     });
 
     println!(
@@ -359,7 +382,11 @@ pub fn run(
         state.cfg.host, state.cfg.port
     );
     println!("  backend: {backend_name}   model: {model_id}");
-    println!("  POST /v1/chat/completions | GET /v1/models | GET /health");
+    if embedding_only {
+        println!("  POST /v1/embeddings | GET /v1/models | GET /health");
+    } else {
+        println!("  POST /v1/chat/completions | POST /v1/completions | GET /v1/models | GET /health");
+    }
 
     loop {
         match server.recv() {
@@ -373,6 +400,14 @@ pub fn run(
     Ok(())
 }
 
+/// Serve one embedding model. The NPU is already held by the embedder; no chat model is loaded.
+pub fn serve_embeddings(embedder: Box<dyn crate::embeddings::EmbeddingBackend>, mut cfg: ServerConfig) -> Result<(), String> {
+    cfg.model_dir = None;
+    let server = bind(&cfg)?;
+    cfg.backend_name = "trit-embed".into();
+    run_inner(server, Box::new(crate::mock_backend::MockBackend::new()), cfg, Some(embedder), true)
+}
+
 /// Bind + run in one call — the entry point `phlegm serve` calls.
 pub fn serve(backend: Box<dyn Backend + Send>, cfg: ServerConfig) -> Result<(), String> {
     let server = bind(&cfg)?;
@@ -383,9 +418,41 @@ pub fn serve(backend: Box<dyn Backend + Send>, cfg: ServerConfig) -> Result<(), 
 // Routing
 // --------------------------------------------------------------------------
 
+fn loopback_origin(origin: &str) -> bool {
+    let Some(authority) = origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://")) else { return false };
+    ["localhost", "127.0.0.1", "[::1]"].iter().any(|host| {
+        authority.strip_prefix(host).is_some_and(|rest| {
+            rest.is_empty() || rest.strip_prefix(':').is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok())
+        })
+    })
+}
+
 fn handle_request(request: Request, state: &Arc<ServerState>) {
+    let origin = request.headers().iter().find(|h| h.field.equiv("Origin"))
+        .map(|h| h.value.as_str());
+    let allowed = if state.cfg.allowed_origins.trim() == "*" {
+        Some("*".to_string())
+    } else if state.cfg.allowed_origins.trim() == "loopback" {
+        origin.filter(|o| loopback_origin(o)).map(str::to_string)
+    } else {
+        origin.filter(|o| state.cfg.allowed_origins.split(',').any(|a| a.trim() == *o))
+            .map(str::to_string)
+    };
+    CORS_ORIGIN.with(|slot| *slot.borrow_mut() = allowed);
     let method = request.method().clone();
     let url = request.url().to_string();
+    if method == Method::Options {
+        respond_json(request, 200, &json!({}));
+        return;
+    }
+    if let Some(key) = state.cfg.api_key.as_ref().filter(|_| !(method == Method::Get && url == "/health")) {
+        let valid = request.headers().iter().any(|h| h.field.equiv("Authorization")
+            && h.value.as_str().strip_prefix("Bearer ") == Some(key.as_str()));
+        if !valid {
+            respond_json(request, 401, &json!({"error": {"message": "Invalid API key", "type": "authentication_error"}}));
+            return;
+        }
+    }
     match (method, url.as_str()) {
         (Method::Get, "/health") => {
             respond_json(
@@ -395,11 +462,15 @@ fn handle_request(request: Request, state: &Arc<ServerState>) {
             );
         }
         (Method::Get, "/v1/models") => {
-            respond_json(request, 200, &models_payload(&state.cfg));
+            respond_json(request, 200, &models_payload(state));
         }
-        (Method::Post, "/v1/chat/completions") => {
-            handle_chat_completions(request, state);
+        (Method::Post, "/v1/chat/completions") if !state.embedding_only => {
+            handle_chat_completions(request, state, false);
         }
+        (Method::Post, "/v1/completions") if !state.embedding_only => {
+            handle_chat_completions(request, state, true);
+        }
+        (Method::Post, "/v1/embeddings") => embeddings_route::handle(request, state),
         _ => {
             let msg = format!("unknown path {url}");
             respond_json(
@@ -411,15 +482,18 @@ fn handle_request(request: Request, state: &Arc<ServerState>) {
     }
 }
 
-fn models_payload(cfg: &ServerConfig) -> Value {
+fn models_payload(state: &ServerState) -> Value {
+    let mut ids = Vec::new();
+    if !state.embedding_only { ids.push(state.cfg.model_id.as_str()); }
+    if let Some(id) = state.embedding_model.as_deref() { if !ids.contains(&id) { ids.push(id); } }
     json!({
         "object": "list",
-        "data": [{
-            "id": cfg.model_id,
+        "data": ids.into_iter().map(|id| json!({
+            "id": id,
             "object": "model",
             "created": now_unix(),
             "owned_by": "fastflowlm-open-npu",
-        }],
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -427,7 +501,7 @@ fn models_payload(cfg: &ServerConfig) -> Value {
 // /v1/chat/completions
 // --------------------------------------------------------------------------
 
-fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
+fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>, legacy: bool) {
     let mut body = Vec::new();
     if let Err(e) = request.as_reader().read_to_end(&mut body) {
         let msg = format!("invalid JSON body: {e}");
@@ -455,31 +529,24 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
         }
     };
 
-    let messages_val = req_json.get("messages").and_then(Value::as_array);
-    let messages_val = match messages_val {
-        Some(arr) if !arr.is_empty() => arr,
-        _ => {
-            respond_json(
-                request,
-                400,
-                &json!({"error": {"message": "'messages' must be a non-empty array", "type": "invalid_request_error"}}),
-            );
-            return;
+    let options = match generation::Options::parse(&req_json, legacy) {
+        Ok(v) => v,
+        Err(e) => { respond_json(request, 400, &json!({"error":{"message":e,"type":"invalid_request_error"}})); return; }
+    };
+    let messages: Vec<ChatMessage> = if legacy { vec![] } else {
+        match req_json.get("messages").and_then(Value::as_array) {
+            Some(arr) if !arr.is_empty() => arr.iter().map(parse_message).collect(),
+            _ => { respond_json(request, 400, &json!({"error":{"message":"'messages' must be a non-empty array","type":"invalid_request_error"}})); return; }
         }
     };
-    let messages: Vec<ChatMessage> = messages_val.iter().map(parse_message).collect();
-
     let model = req_json
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or(&state.cfg.model_id)
         .to_string();
-    let stream = req_json
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let requested_max_tokens = req_json
-        .get("max_tokens")
+        .get("max_completion_tokens").filter(|v| !v.is_null())
+        .or_else(|| req_json.get("max_tokens"))
         .and_then(Value::as_u64)
         .map(|v| v as usize);
     let temperature = req_json
@@ -557,7 +624,95 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
     if let Some(Value::Object(extra)) = kwargs_field {
         kwargs.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
-    let prompt = match state.tokenizer.apply_chat_template(&messages, &kwargs) {
+    let tools = match crate::tool_calls::Tools::from_request(if legacy { &Value::Null } else { &req_json }) {
+        Ok(tools) => tools,
+        Err(e) => {
+            respond_json(
+                request,
+                400,
+                &json!({"error":{"message":e,"type":"invalid_request_error"}}),
+            );
+            return;
+        }
+    };
+    kwargs.insert("tools".into(), tools.tools.clone());
+    kwargs.insert("tool_choice".into(), tools.choice.clone());
+    let mut messages = messages;
+    if tools.choice == "required" || tools.named.is_some() {
+        let instruction = tools.named.as_ref().map_or_else(
+            || "You must call at least one of the available tools.".to_owned(),
+            |name| format!("You must call the function {name}."),
+        );
+        // Most publisher templates do not inspect tool_choice; express the choice in their system turn.
+        if messages[0].role == "system" {
+            messages[0].content.push_str(&format!("\n{instruction}"));
+        } else {
+            messages.insert(
+                0,
+                ChatMessage {
+                    role: "system".into(),
+                    content: instruction,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    let tool_format = match &state.tokenizer {
+        ServerTokenizer::Real(t) => t.tool_format(),
+        _ => Some(crate::tool_calls::Format::Function),
+    }
+    .filter(|_| tools.enabled);
+    if tools.enabled && tool_format.is_none() {
+        respond_json(
+            request,
+            400,
+            &json!({"error":{"message":"model template has no supported tool-call format","type":"invalid_request_error"}}),
+        );
+        return;
+    }
+    let format = req_json
+        .get("response_format")
+        .filter(|v| !legacy && !v.is_null() && v.get("type") != Some(&json!("text")));
+    if format.is_some() && (tools.choice == "required" || tools.named.is_some()) {
+        respond_json(
+            request,
+            400,
+            &json!({"error":{"message":"response_format cannot be combined with required or named tool_choice; use auto or none","type":"invalid_request_error"}}),
+        );
+        return;
+    }
+    let constraint = match format
+        .map(|f| {
+            let vocab = match &state.tokenizer {
+                ServerTokenizer::Real(t) => t.structured_vocabulary()?,
+                ServerTokenizer::Placeholder(_) => {
+                    Arc::new(crate::structured_output::Vocabulary::new(
+                        (0u16..256)
+                            .map(|b| Some(vec![b as u8]))
+                            .chain([None])
+                            .collect(),
+                        [256].into_iter().collect(),
+                    ))
+                }
+            };
+            crate::structured_output::Constraint::from_response_format(f, vocab)
+        })
+        .transpose()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            respond_json(
+                request,
+                400,
+                &json!({"error":{"message":e,"type":"invalid_request_error"}}),
+            );
+            return;
+        }
+    };
+    if constraint.is_some() {
+        kwargs.insert("enable_thinking".into(), json!(false));
+    }
+    let prompt = match if legacy { Ok(String::new()) } else { state.tokenizer.apply_chat_template(&messages, &kwargs) } {
         Ok(p) => p,
         Err(e) => {
             respond_json(
@@ -568,7 +723,12 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
             return;
         }
     };
-    let prompt_ids = state.tokenizer.encode(&prompt);
+    let prompt_ids = if legacy {
+        match generation::prompt_ids(&req_json, &state.tokenizer) {
+            Ok(ids) => ids,
+            Err(e) => { respond_json(request, 400, &json!({"error":{"message":e,"type":"invalid_request_error"}})); return; }
+        }
+    } else { state.tokenizer.encode(&prompt) };
     let max_tokens = match output_budget(
         requested_max_tokens,
         &state.cfg,
@@ -585,8 +745,15 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
             return;
         }
     };
-    let stop_ids = state.tokenizer.stop_ids();
-    let reasoning = state.tokenizer.reasoning_for(&prompt);
+    let mut stop_ids = state.tokenizer.stop_ids();
+    if constraint.is_some() && matches!(state.tokenizer, ServerTokenizer::Placeholder(_)) {
+        stop_ids.insert(256);
+    }
+    let reasoning = if legacy || constraint.is_some() {
+        None
+    } else {
+        state.tokenizer.reasoning_for(&prompt)
+    };
 
     let sampler = Sampler::new(
         temperature.unwrap_or(d.temperature),
@@ -604,18 +771,20 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
         &stop_ids,
         state.tokenizer.think_end_id(),
     ));
+    let sampler = if let Some(c) = constraint {
+        sampler.with_constraint(c)
+    } else {
+        sampler
+    };
     let params = GenParams {
         max_tokens,
         sampler,
         stop_ids,
-        reuse_mark: state.tokenizer.conversation_end(&messages, &kwargs, &prompt_ids),
+        reuse_mark: if legacy { None } else { state.tokenizer.conversation_end(&messages, &kwargs, &prompt_ids) },
     };
 
-    if stream {
-        stream_response(request, state, prompt_ids, params, model, reasoning);
-    } else {
-        full_response(request, state, prompt_ids, params, model, reasoning);
-    }
+    generation::respond(request, state, prompt_ids, params, model, reasoning,
+        tool_format.map(|f| (f, tools)), options);
 }
 
 fn parse_message(m: &Value) -> ChatMessage {
@@ -633,207 +802,66 @@ fn parse_message(m: &Value) -> ChatMessage {
             .join(""),
         _ => String::new(),
     };
-    ChatMessage { role, content }
+    let extra = m
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .filter(|(k, _)| !matches!(k.as_str(), "role" | "content"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    ChatMessage {
+        role,
+        content,
+        extra,
+    }
 }
 
-fn full_response(
-    request: Request,
-    state: &Arc<ServerState>,
-    prompt_ids: Vec<u32>,
-    mut params: GenParams,
-    model: String,
-    reasoning: Option<Reasoning>,
-) {
-    let max_tokens = params.max_tokens;
-    let mut out_ids: Vec<u32> = Vec::new();
-    let (gen_result, cached_tokens) = {
-        let mut backend = state.backend.lock().unwrap();
-        let mut on_token = |tid: u32| out_ids.push(tid);
-        let result = backend.generate(&prompt_ids, &mut params, &mut on_token);
-        (result, backend.cached_tokens())
-    };
-    if let Err(e) = gen_result {
-        let msg = format!("generation error: {e}");
-        respond_json(
-            request,
-            500,
-            &json!({"error": {"message": msg, "type": "internal_error"}}),
-        );
-        return;
-    }
-
-    let text = state.tokenizer.decode(&out_ids);
-    let finish = if out_ids.len() >= max_tokens {
-        "length"
-    } else {
-        "stop"
-    };
-    // A reasoning model's thinking (harmony analysis, Gemma 4's thought channel, Qwen's <think>)
-    // goes beside the answer as reasoning_content (the field llama.cpp's and vLLM's OpenAI
-    // servers use).
-    let message = match &reasoning {
-        Some(r) => {
-            let (reasoning, answer) = r.split(&text);
-            json!({"role": "assistant", "content": answer, "reasoning_content": reasoning})
-        }
-        None => json!({"role": "assistant", "content": text}),
-    };
-    let resp = json!({
-        "id": cmpl_id(),
-        "object": "chat.completion",
-        "created": now_unix(),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish,
-        }],
-        "usage": {
-            "prompt_tokens": prompt_ids.len(),
-            "completion_tokens": out_ids.len(),
-            "total_tokens": prompt_ids.len() + out_ids.len(),
-            "prompt_tokens_details": {"cached_tokens": cached_tokens},
-        },
-    });
-    respond_json(request, 200, &resp);
-}
-
-fn stream_response(
-    request: Request,
-    state: &Arc<ServerState>,
-    prompt_ids: Vec<u32>,
-    mut params: GenParams,
-    model: String,
-    reasoning: Option<Reasoning>,
-) {
-    let max_tokens = params.max_tokens;
-    let cid = cmpl_id();
-    let created = now_unix();
-
-    let mut writer = request.into_writer();
-    if write_sse_headers(&mut *writer).is_err() {
-        return;
-    }
-    let _ = sse_write(
-        &mut *writer,
-        &sse_frame(&sse_chunk(
-            &cid,
-            created,
-            &model,
-            json!({"role": "assistant"}),
-            None,
-        )),
-    );
-
-    let mut out_ids: Vec<u32> = Vec::new();
-    let mut emitted = String::new();
-    let mut decode_error = None;
-    let mut decoder = state.tokenizer.decode_stream();
-    let (mut sent_reasoning, mut sent_answer) = (String::new(), String::new());
-    let gen_result = {
-        let mut backend = state.backend.lock().unwrap();
-        let mut on_token = |tid: u32| {
-            out_ids.push(tid);
-            if decode_error.is_some() {
-                return;
+/// Parse calls before splitting reasoning: harmony's recipient lives in the header, not its final channel.
+fn assistant_message(
+    text: &str,
+    reasoning: Option<&Reasoning>,
+    tools: Option<&(crate::tool_calls::Format, crate::tool_calls::Tools)>,
+) -> (Value, bool) {
+    let parsed = tools.map(|(format, cfg)| {
+        let mut parsed = format.parse(text);
+        cfg.restore_argument_types(&mut parsed.calls);
+        if cfg.accepts(&parsed.calls) {
+            parsed
+        } else {
+            crate::tool_calls::Parsed {
+                content: text.into(),
+                calls: vec![],
             }
-            let piece = match decoder(tid) {
-                Ok(Some(piece)) => piece,
-                Ok(None) => return,
-                Err(e) => {
-                    decode_error = Some(e);
-                    return;
-                }
+        }
+    });
+    let raw = parsed.as_ref().map_or(text, |p| p.content.as_str());
+    let mut message = if let Some(r) = reasoning {
+        let (thought, answer) =
+            if tools.is_some_and(|(format, _)| *format == crate::tool_calls::Format::Harmony) {
+                crate::tool_calls::harmony_parts(raw)
+            } else {
+                r.split(raw)
             };
-            emitted.push_str(&piece);
-            if let Some(r) = &reasoning {
-                // each side's new suffix, re-derived from everything decoded so far
-                let (reasoning, answer) = r.progress(&emitted);
-                for (field, now, sent) in [("reasoning_content", reasoning, &mut sent_reasoning),
-                                           ("content", answer, &mut sent_answer)] {
-                    if let Some(delta) = now.strip_prefix(sent.as_str()).filter(|d| !d.is_empty()) {
-                        let _ = sse_write(
-                            &mut *writer,
-                            &sse_frame(&sse_chunk(&cid, created, &model, json!({ field: delta }), None)),
-                        );
-                        *sent = now.clone();
-                    }
-                }
-                return;
-            }
-            if !piece.is_empty() {
-                let _ = sse_write(
-                    &mut *writer,
-                    &sse_frame(&sse_chunk(
-                        &cid,
-                        created,
-                        &model,
-                        json!({"content": piece}),
-                        None,
-                    )),
-                );
-            }
-        };
-        backend.generate(&prompt_ids, &mut params, &mut on_token)
-    };
-
-    let result = gen_result.and_then(|_| {
-        if let Some(error) = decode_error {
-            return Err(error);
-        }
-        let full = state.tokenizer.final_decode(&out_ids)?;
-        let tail = final_stream_tail(&full, &emitted)?;
-        if let Some(r) = &reasoning {
-            // whatever the last token completed, through the same derivation
-            let (reasoning, answer) = r.progress_done(&full);
-            for (field, now, sent) in [("reasoning_content", reasoning, &sent_reasoning),
-                                       ("content", answer, &sent_answer)] {
-                let delta = now.strip_prefix(sent.as_str()).ok_or("reasoning stream rewrote emitted text")?;
-                if !delta.is_empty() {
-                    sse_write(&mut *writer, &sse_frame(&sse_chunk(&cid, created, &model, json!({ field: delta }), None)))
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-            return Ok(());
-        }
-        if !tail.is_empty() {
-            sse_write(
-                &mut *writer,
-                &sse_frame(&sse_chunk(
-                    &cid,
-                    created,
-                    &model,
-                    json!({"content": tail}),
-                    None,
-                )),
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        Ok(())
-    });
-    if let Err(e) = result {
-        let _ = sse_write(
-            &mut *writer,
-            &sse_frame(&json!({"error": {"message": e, "type": "internal_error"}})),
-        );
-        let _ = sse_write(&mut *writer, "data: [DONE]\n\n");
-        let _ = sse_end(&mut *writer);
-        let _ = writer.flush();
-        return;
-    }
-
-    let finish = if out_ids.len() >= max_tokens {
-        "length"
+        json!({"role":"assistant","content":answer,"reasoning_content":thought})
     } else {
-        "stop"
+        json!({"role":"assistant","content":raw})
     };
-    let _ = sse_write(
-        &mut *writer,
-        &sse_frame(&sse_chunk(&cid, created, &model, json!({}), Some(finish))),
-    );
-    let _ = sse_write(&mut *writer, "data: [DONE]\n\n");
-    let _ = sse_end(&mut *writer);
-    let _ = writer.flush();
+    let has_calls = parsed.as_ref().is_some_and(|p| !p.calls.is_empty());
+    if let Some(mut p) = parsed.filter(|p| !p.calls.is_empty()) {
+        for c in &mut p.calls {
+            c["id"] = json!(format!(
+                "call_{}",
+                cmpl_id().trim_start_matches("chatcmpl-")
+            ));
+        }
+        message["tool_calls"] = json!(p.calls);
+        if message["content"] == "" {
+            message["content"] = Value::Null;
+        }
+    }
+    (message, has_calls)
 }
 
 fn final_stream_tail<'a>(full: &'a str, emitted: &str) -> Result<&'a str, String> {
@@ -844,16 +872,6 @@ fn final_stream_tail<'a>(full: &'a str, emitted: &str) -> Result<&'a str, String
         return Err("stream ended with unresolved UTF-8/replacement text".into());
     }
     Ok(tail)
-}
-
-fn sse_chunk(cid: &str, created: u64, model: &str, delta: Value, finish: Option<&str>) -> Value {
-    json!({
-        "id": cid,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-    })
 }
 
 fn sse_frame(payload: &Value) -> String {
@@ -881,6 +899,12 @@ fn write_sse_headers(writer: &mut dyn Write) -> std::io::Result<()> {
     writer.write_all(b"Cache-Control: no-cache\r\n")?;
     writer.write_all(b"Connection: keep-alive\r\n")?;
     writer.write_all(b"Transfer-Encoding: chunked\r\n")?;
+    CORS_ORIGIN.with(|slot| -> std::io::Result<()> {
+        if let Some(origin) = slot.borrow().as_ref() {
+            write!(writer, "Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n")?;
+        }
+        Ok(())
+    })?;
     writer.write_all(b"\r\n")?;
     writer.flush()
 }
@@ -906,11 +930,23 @@ fn json_content_type() -> Header {
     Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap()
 }
 
+thread_local! { static CORS_ORIGIN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+
 fn respond_json(request: Request, status: u16, value: &Value) {
     let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
-    let response = Response::from_data(body)
+    let mut response = Response::from_data(body)
         .with_status_code(status)
-        .with_header(json_content_type());
+        .with_header(json_content_type())
+        .with_header(Header::from_bytes("Access-Control-Allow-Methods", "GET, POST, OPTIONS").unwrap())
+        .with_header(Header::from_bytes("Access-Control-Allow-Headers", "Authorization, Content-Type").unwrap())
+        .with_header(Header::from_bytes("Vary", "Origin").unwrap());
+    CORS_ORIGIN.with(|slot| {
+        if let Some(origin) = slot.borrow().as_ref() {
+            if let Ok(header) = Header::from_bytes("Access-Control-Allow-Origin", origin.as_bytes()) {
+                response.add_header(header);
+            }
+        }
+    });
     let _ = request.respond(response);
 }
 
@@ -943,6 +979,9 @@ fn cmpl_id() -> String {
 mod tests {
     use super::*;
 
+    include!("server_tools_tests.rs");
+    include!("server_generation_tests.rs");
+
     #[test]
     fn stream_finalization_flushes_only_unemitted_text_and_rejects_rewrites() {
         assert_eq!(final_stream_tail("hello!", "hello").unwrap(), "!");
@@ -959,10 +998,10 @@ mod tests {
                 &mut self,
                 _: &[u32],
                 _: &mut GenParams,
-                emit: &mut dyn FnMut(u32),
+                emit: &mut dyn FnMut(crate::backend::TokenEvent<'_>) -> std::ops::ControlFlow<()>,
             ) -> Result<(), String> {
                 for &id in &self.0 {
-                    emit(id);
+                    if emit(crate::backend::TokenEvent { id, logits: None }).is_break() { break; }
                 }
                 Ok(())
             }
@@ -979,6 +1018,8 @@ mod tests {
                 model_dir: None,
                 backend_name: "fixture".into(),
                 defaults: GenDefaults::default(),
+                api_key: None,
+                allowed_origins: "*".into(),
             };
             let server = bind(&cfg).unwrap();
             let addr = server.server_addr().to_ip().unwrap().to_string();
@@ -987,6 +1028,9 @@ mod tests {
                 context_capacity: None,
                 tokenizer: ServerTokenizer::Real(tokenizer),
                 cfg,
+                embedder: None,
+                embedding_model: None,
+                embedding_only: false,
             });
             let thread = std::thread::spawn(move || handle_request(server.recv().unwrap(), &state));
             let (status, _, body) = http_request(
@@ -1036,6 +1080,8 @@ mod tests {
             model_dir: None,
             backend_name: "mock".to_string(),
             defaults: GenDefaults::default(),
+            api_key: None,
+            allowed_origins: "*".into(),
         };
         cfg_mut(&mut cfg);
         let server = bind(&cfg).expect("bind");
@@ -1055,9 +1101,14 @@ mod tests {
         path: &str,
         body: Option<&str>,
     ) -> (u16, Vec<String>, String) {
+        http_request_headers(addr, method, path, body, "")
+    }
+
+    fn http_request_headers(addr: &str, method: &str, path: &str, body: Option<&str>, extra: &str) -> (u16, Vec<String>, String) {
         let mut stream = TcpStream::connect(addr).expect("connect");
         let body_bytes = body.unwrap_or("").as_bytes();
         let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+        req.push_str(extra);
         if body.is_some() {
             req.push_str("Content-Type: application/json\r\n");
             req.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
@@ -1134,6 +1185,179 @@ mod tests {
     }
 
     #[test]
+    fn cors_and_api_key_apply_to_preflight_json_and_streams() {
+        let addr = spawn_test_server(|cfg| {
+            cfg.api_key = Some("secret".into());
+            cfg.allowed_origins = "https://example.test".into();
+        });
+        let (status, headers, _) = http_request_headers(&addr, "OPTIONS", "/v1/chat/completions", None,
+            "Origin: https://example.test\r\n");
+        assert_eq!(status, 200);
+        assert!(headers.iter().any(|h| h.eq_ignore_ascii_case("access-control-allow-origin: https://example.test")));
+        assert_eq!(http_request(&addr, "GET", "/v1/models", None).0, 401);
+        assert_eq!(http_request(&addr, "GET", "/health", None).0, 200);
+        let (status, headers, _) = http_request_headers(&addr, "POST", "/v1/chat/completions",
+            Some(r#"{"messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":1}"#),
+            "Origin: https://example.test\r\nAuthorization: Bearer secret\r\n");
+        assert_eq!(status, 200);
+        assert!(headers.iter().any(|h| h.eq_ignore_ascii_case("access-control-allow-origin: https://example.test")));
+        let (_, headers, _) = http_request_headers(&addr, "GET", "/v1/models", None,
+            "Origin: https://evil.test\r\nAuthorization: Bearer secret\r\n");
+        assert!(!headers.iter().any(|h| h.to_lowercase().starts_with("access-control-allow-origin:")));
+    }
+
+    #[test]
+    fn cors_default_limits_origins_to_loopback() {
+        let addr = spawn_test_server(|cfg| cfg.allowed_origins = "loopback".into());
+        for origin in ["http://localhost", "https://localhost:3000", "http://127.0.0.1:8080", "https://[::1]:65535"] {
+            let (_, headers, _) = http_request_headers(&addr, "OPTIONS", "/v1/models", None, &format!("Origin: {origin}\r\n"));
+            assert!(headers.iter().any(|h| h.eq_ignore_ascii_case(&format!("access-control-allow-origin: {origin}"))), "{origin}");
+        }
+        for origin in ["https://evil.test", "http://localhost.evil.test", "http://127.0.0.1@evil.test", "http://[::1].evil", "http://localhost:abc", "null", "ftp://localhost"] {
+            let (_, headers, _) = http_request_headers(&addr, "OPTIONS", "/v1/models", None, &format!("Origin: {origin}\r\n"));
+            assert!(!headers.iter().any(|h| h.to_lowercase().starts_with("access-control-allow-origin:")), "{origin}");
+        }
+        let wildcard = spawn_test_server(|cfg| cfg.allowed_origins = "*".into());
+        let (_, headers, _) = http_request_headers(&wildcard, "OPTIONS", "/v1/models", None, "Origin: https://evil.test\r\n");
+        assert!(headers.iter().any(|h| h.eq_ignore_ascii_case("access-control-allow-origin: *")));
+        assert_eq!(ServerConfig::from_env().allowed_origins, std::env::var("PHLEGM_ALLOWED_ORIGINS").unwrap_or_else(|_| "loopback".into()));
+    }
+
+    struct FakeEmbedding;
+    impl crate::embeddings::EmbeddingBackend for FakeEmbedding {
+        fn model_id(&self) -> &str { "fake-embed" }
+        fn embed(&mut self, input: crate::embeddings::EmbeddingInput) -> Result<crate::embeddings::EmbeddingOutput, crate::embeddings::EmbeddingError> {
+            use crate::embeddings::{EmbeddingError, EmbeddingInput, EmbeddingOutput};
+            if matches!(&input, EmbeddingInput::Texts(v) if v.iter().any(|s| s == "backend failure")) {
+                return Err(EmbeddingError::Backend("fake failure".into()));
+            }
+            if matches!(&input, EmbeddingInput::TokenIds(v) if v.iter().flatten().any(|&id| id >= 100)) {
+                return Err(EmbeddingError::Invalid("invalid token id".into()));
+            }
+            let lengths: Vec<usize> = match input {
+                EmbeddingInput::Texts(v) => v.iter().map(|s| s.len()).collect(),
+                EmbeddingInput::TokenIds(v) => v.iter().map(Vec::len).collect(),
+            };
+            Ok(EmbeddingOutput { tokens: lengths.iter().sum(), vectors: lengths.iter().map(|n| vec![*n as f32, -1.0]).collect() })
+        }
+    }
+
+    fn spawn_embedding_server() -> String {
+        let mut cfg = ServerConfig::from_env();
+        cfg.port = 0;
+        cfg.api_key = None;
+        cfg.backend_name = "fake-embed".into();
+        let server = bind(&cfg).unwrap();
+        let addr = server.server_addr().to_ip().unwrap().to_string();
+        std::thread::spawn(move || run_inner(server, Box::new(MockBackend::new()), cfg, Some(Box::new(FakeEmbedding)), true));
+        addr
+    }
+
+    #[test]
+    fn embeddings_shapes_batches_base64_usage_and_errors() {
+        let addr = spawn_embedding_server();
+        let (_, _, body) = http_request(&addr, "GET", "/v1/models", None);
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["data"][0]["id"], "fake-embed");
+        for (input, expected, tokens) in [
+            (json!("cat"), json!([[3.0, -1.0]]), 3),
+            (json!(["a", "dogs"]), json!([[1.0, -1.0], [4.0, -1.0]]), 5),
+            (json!([1, 2, 3]), json!([[3.0, -1.0]]), 3),
+            (json!([[1], [2, 3]]), json!([[1.0, -1.0], [2.0, -1.0]]), 3),
+        ] {
+            let req = json!({"model":"fake-embed", "input":input});
+            let (status, _, body) = http_request(&addr, "POST", "/v1/embeddings", Some(&req.to_string()));
+            assert_eq!(status, 200, "{body}");
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["object"], "list");
+            assert_eq!(v["model"], "fake-embed");
+            assert_eq!(v["usage"]["prompt_tokens"], tokens);
+            assert_eq!(v["usage"]["total_tokens"], tokens);
+            for (i, row) in v["data"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(row["object"], "embedding");
+                assert_eq!(row["index"], i);
+                assert_eq!(row["embedding"], expected[i]);
+            }
+        }
+        let req = json!({"model":"fake-embed", "input":"a", "encoding_format":"base64"});
+        let (_, _, body) = http_request(&addr, "POST", "/v1/embeddings", Some(&req.to_string()));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let bytes = base64::decode(v["data"][0]["embedding"].as_str().unwrap()).unwrap();
+        assert_eq!(bytes, [1f32.to_le_bytes(), (-1f32).to_le_bytes()].concat());
+        for req in [json!({"model":"bad","input":"x"}), json!({"model":"fake-embed","input":[]}),
+            json!({"model":"fake-embed","input":[1,-1]}), json!({"model":"fake-embed","input":[[100]]}), json!({"model":"fake-embed","input":[[]]}),
+            json!({"model":"fake-embed","input":"x","dimensions":2}), json!({"model":"fake-embed","input":"x","encoding_format":"bogus"}), json!({"input":"x"})] {
+            let status = http_request(&addr, "POST", "/v1/embeddings", Some(&req.to_string())).0;
+            assert!(status == 400 || status == 404, "{req}: {status}");
+        }
+        let failure = json!({"model":"fake-embed", "input":"backend failure"});
+        assert_eq!(http_request(&addr, "POST", "/v1/embeddings", Some(&failure.to_string())).0, 500);
+        assert_eq!(http_request(&addr, "POST", "/v1/chat/completions", Some("{}")).0, 404);
+    }
+
+    #[test]
+    #[ignore = "requires PHLEGM_TRIT_CPU_PYTHON and PHLEGM_TRIT_MODEL with the CPU reference dependencies"]
+    fn embeddings_route_matches_trit_cpu_reference() {
+        use crate::embeddings::{EmbeddingBackend, EmbeddingError, EmbeddingInput, EmbeddingOutput};
+        use std::process::{Command, Stdio};
+        fn cpu(texts: &[String]) -> EmbeddingOutput {
+            let code = r#"
+import importlib.util, json, sys, torch
+sys.dont_write_bytecode = True
+torch.set_num_threads(1)
+spec = importlib.util.spec_from_file_location('reference', sys.argv[1] + '/trit_embed.py')
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+model = mod.TritEmbed.from_pretrained(sys.argv[1])
+texts = json.load(sys.stdin)
+ids = model.tokenizer(texts, truncation=True, max_length=128)['input_ids']
+print(json.dumps({'vectors': model.encode(texts).tolist(), 'tokens': sum(map(len, ids))}))
+"#;
+            let mut process = Command::new(std::env::var("PHLEGM_TRIT_CPU_PYTHON").unwrap())
+                .args(["-I", "-c", code, &std::env::var("PHLEGM_TRIT_MODEL").unwrap()])
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            serde_json::to_writer(process.stdin.take().unwrap(), texts).unwrap();
+            let result = process.wait_with_output().unwrap();
+            assert!(result.status.success(), "CPU reference failed");
+            let v: Value = serde_json::from_slice(&result.stdout).unwrap();
+            EmbeddingOutput { vectors: serde_json::from_value(v["vectors"].clone()).unwrap(), tokens: v["tokens"].as_u64().unwrap() as usize }
+        }
+        struct Cpu;
+        impl EmbeddingBackend for Cpu {
+            fn model_id(&self) -> &str { "trit-cpu" }
+            fn embed(&mut self, input: EmbeddingInput) -> Result<EmbeddingOutput, EmbeddingError> {
+                match input { EmbeddingInput::Texts(texts) => Ok(cpu(&texts)), _ => Err(EmbeddingError::Invalid("texts only".into())) }
+            }
+        }
+        let texts = vec!["how do index funds work".to_string(), "A man is playing a guitar on the street.".to_string(), "Rain is expected tomorrow.".to_string()];
+        let expected = cpu(&texts);
+        let mut cfg = ServerConfig::from_env(); cfg.port = 0; cfg.api_key = None;
+        let server = bind(&cfg).unwrap(); let addr = server.server_addr().to_ip().unwrap().to_string();
+        std::thread::spawn(move || run_inner(server, Box::new(MockBackend::new()), cfg, Some(Box::new(Cpu)), true));
+        let req = json!({"model": "trit-cpu", "input": texts});
+        let (status, _, body) = http_request(&addr, "POST", "/v1/embeddings", Some(&req.to_string()));
+        assert_eq!(status, 200, "{body}");
+        let response: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(response["usage"]["total_tokens"], expected.tokens);
+        for (i, expected_vector) in expected.vectors.iter().enumerate() {
+            let got = response["data"][i]["embedding"].as_array().unwrap();
+            assert_eq!(got.len(), expected_vector.len());
+            for (a, b) in got.iter().zip(expected_vector) { assert!((a.as_f64().unwrap() - *b as f64).abs() < 1e-6); }
+        }
+    }
+
+    #[test]
+    fn completion_token_alias_and_stream_usage() {
+        let addr = spawn_test_server(|_| {});
+        let body = r#"{"messages":[{"role":"user","content":"x"}],"max_tokens":1,"max_completion_tokens":3,"stream":true,"stream_options":{"include_usage":true}}"#;
+        let (status, _, response) = http_request(&addr, "POST", "/v1/chat/completions", Some(body));
+        assert_eq!(status, 200);
+        let frames: Vec<Value> = response.split("\n\n").filter_map(|f| f.strip_prefix("data: "))
+            .filter_map(|s| serde_json::from_str(s).ok()).collect();
+        let last = frames.last().unwrap();
+        assert_eq!(last["choices"], json!([]));
+        assert_eq!(last["usage"]["completion_tokens"], 3);
+    }
+
+    #[test]
     fn health_reports_backend_name() {
         let addr = spawn_test_server(|_| {});
         let (status, _headers, body) = http_request(&addr, "GET", "/health", None);
@@ -1182,11 +1406,11 @@ mod tests {
     fn requests_take_the_model_defaults_and_override_them() {
         struct Record(Arc<Mutex<Vec<(f32, usize, f32, f32)>>>);
         impl Backend for Record {
-            fn generate(&mut self, _: &[u32], p: &mut GenParams, emit: &mut dyn FnMut(u32))
+            fn generate(&mut self, _: &[u32], p: &mut GenParams, emit: &mut dyn FnMut(crate::backend::TokenEvent<'_>) -> std::ops::ControlFlow<()>)
                 -> Result<(), String> {
                 let s = &p.sampler;
                 self.0.lock().unwrap().push((s.temperature, s.top_k, s.top_p, s.repetition_penalty));
-                emit(1);
+                let _ = emit(crate::backend::TokenEvent { id: 1, logits: None });
                 Ok(())
             }
         }

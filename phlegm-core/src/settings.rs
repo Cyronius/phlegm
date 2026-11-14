@@ -30,6 +30,34 @@ use std::path::{Path, PathBuf};
 const SCHEMA: &str = include_str!("../config/settings.json");
 const SHIPPED: &str = include_str!("../config/model_list.json");
 
+/// An immutable publisher artifact for future `pull` and kernel onboarding.
+/// A source declaration is not evidence that kernels or hardware gates exist.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedGguf {
+    pub repo: String,
+    pub file: String,
+    pub revision: String,
+}
+
+impl PublishedGguf {
+    pub fn validate(&self) -> Result<(), String> {
+        let component = |s: &str| !s.is_empty() && s != "." && s != ".."
+            && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+        let parts: Vec<_> = self.repo.split('/').collect();
+        if parts.len() != 2 || !parts.iter().all(|s| component(s)) {
+            return Err("published GGUF repo must be owner/repository".into());
+        }
+        if !self.file.split('/').all(component) || !self.file.ends_with(".gguf") {
+            return Err("published GGUF file must be a relative .gguf repository path".into());
+        }
+        if self.revision.len() != 40 || !self.revision.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("published GGUF revision must be a pinned 40-digit commit".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -453,6 +481,15 @@ impl Config {
         self.models().get(family)?.get(size).cloned()
     }
 
+    pub fn published_gguf(&self, tag: &str) -> Result<Option<PublishedGguf>, String> {
+        let Some(source) = self.entry(tag).and_then(|e| e.get("published_gguf").cloned()) else {
+            return Ok(None);
+        };
+        let source: PublishedGguf = serde_json::from_value(source).map_err(|e| format!("{tag}: {e}"))?;
+        source.validate().map_err(|e| format!("{tag}: {e}"))?;
+        Ok(Some(source))
+    }
+
     /// Every (tag, entry), sorted by tag.
     pub fn tags(&self) -> Vec<(String, Value)> {
         let mut out = Vec::new();
@@ -655,6 +692,19 @@ fn obj<'a>(m: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<String, Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_gguf_is_pinned_and_does_not_claim_npu_readiness() {
+        let cfg = Config::with_user(json!({}), PathBuf::from("/nonexistent/settings.json"));
+        let source = cfg.published_gguf("qwen3:0.6b-q4km").unwrap().unwrap();
+        assert_eq!(source.repo, "unsloth/Qwen3-0.6B-GGUF");
+        assert_eq!(cfg.entry("qwen3:0.6b-q4km").unwrap()["details"]["npu_ready"], false);
+        assert!(cfg.published_gguf("lfm3:1.7b").unwrap().is_none());
+        for file in ["../model.gguf", "/model.gguf", "a\\model.gguf", "model.bin"] {
+            assert!(PublishedGguf { file: file.into(), ..source.clone() }.validate().is_err());
+        }
+        assert!(PublishedGguf { revision: "main".into(), ..source }.validate().is_err());
+    }
 
     fn no_env(_: &str) -> Option<String> {
         None
