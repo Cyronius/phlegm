@@ -47,9 +47,6 @@ fn parse_input(value: Option<&Value>) -> Result<EmbeddingInput, &'static str> {
 }
 
 pub(super) fn handle(mut request: Request, state: &ServerState) {
-    let Some(embedder) = &state.embedder else {
-        return invalid(request, 404, "no embedding model is loaded");
-    };
     let mut body = Vec::new();
     if request
         .as_reader()
@@ -60,7 +57,14 @@ pub(super) fn handle(mut request: Request, state: &ServerState) {
     {
         return invalid(request, 400, "invalid or oversized request body");
     }
-    let req: Value = match serde_json::from_slice(&body) {
+    handle_body(request, state, &body);
+}
+
+pub(super) fn handle_body(request: Request, state: &ServerState, body: &[u8]) {
+    let Some(embedder) = &state.embedder else {
+        return invalid(request, 404, "no embedding model is loaded");
+    };
+    let req: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return invalid(request, 400, "invalid JSON body"),
     };
