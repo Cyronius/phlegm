@@ -60,6 +60,11 @@ enter the API key there if one is configured.
 sidecar must be built from this phlegm revision and a compatible OpenFlowLM
 checkout. The CLI validates the sidecar before using the NPU.
 
+To run Phlegm inside Lemonade Server, apply the
+[Lemonade main integration](integrations/lemonade/README.md). It registers a
+local Phlegm model directory as a Lemonade `phlegm` recipe and lets Lemonade
+start and stop the NPU server.
+
 The [Phlegm Bench protocol](specs/bench/spec.md) measures prefill and decode at
 512, 1024, 2048, and 4096 input tokens, with JSON reports restricted to clean,
 optimized builds from matching release tags. Machine metadata collection and

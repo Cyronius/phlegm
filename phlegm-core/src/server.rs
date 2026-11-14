@@ -544,6 +544,10 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>, legac
     handle_chat_body(request, state, legacy, &body);
 }
 
+fn model_matches(configured: &str, requested: &str) -> bool {
+    configured == requested || configured.strip_prefix("user.") == Some(requested)
+}
+
 fn handle_chat_body(request: Request, state: &Arc<ServerState>, legacy: bool, body: &[u8]) {
     let req_json: Value = if body.is_empty() {
         json!({})
@@ -577,7 +581,9 @@ fn handle_chat_body(request: Request, state: &Arc<ServerState>, legacy: bool, bo
         .and_then(Value::as_str)
         .unwrap_or(&state.cfg.model_id)
         .to_string();
-    if model != state.cfg.model_id {
+    // Lemonade exposes user models both with and without its `user.` namespace.
+    // The launched Phlegm process is bound to one registered model only.
+    if !model_matches(&state.cfg.model_id, &model) {
         respond_json(request, 404, &json!({"error":{"message":"model not found","type":"not_found"}}));
         return;
     }
@@ -1427,6 +1433,14 @@ print(json.dumps({'vectors': model.encode(texts).tolist(), 'tokens': sum(map(len
         assert_eq!(v["data"][0]["id"], "my-model");
         assert_eq!(v["data"][0]["object"], "model");
         assert!(v["data"][0]["created"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn lemonade_user_model_accepts_its_bare_alias() {
+        assert!(model_matches("user.test-model", "user.test-model"));
+        assert!(model_matches("user.test-model", "test-model"));
+        assert!(!model_matches("user.test-model", "other"));
+        assert!(!model_matches("test-model", "user.test-model"));
     }
 
     #[test]

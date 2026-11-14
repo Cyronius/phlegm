@@ -1,6 +1,6 @@
 # Phlegm integration and kernel work plan
 
-Updated: 2026-10-26. Status: Linux NPU development in progress; current evidence and remaining gates live in `.plans/`.
+Updated: 2026-11-11. Status: Linux NPU development in progress; current evidence and remaining gates live in `.plans/`.
 
 This is the project handoff plan for continuing on another machine. Paths are
 relative to the repository root. Check the current checkout and later result
@@ -56,6 +56,11 @@ that they all block CLI/server integration.
 - [x] Sample in Rust, load external/inline model chat templates, and derive EOS IDs.
 - [x] Stream server output, reset for each request, and bound generation by context capacity.
 - [x] Surface load/worker errors without silently using a placeholder tokenizer.
+- [x] Add a source patch for a Lemonade main `phlegm` backend. A local Llama 3.2 1B
+  model registered, loaded, answered chat and legacy completion requests, streamed
+  through its bare alias, and unloaded on Linux XDNA2 (2026-11-11; details in
+  [the Lemonade handoff](.plans/lemonade-backend.md) and
+  [integration instructions](integrations/lemonade/README.md)).
 - [ ] Verify actual OpenAI responses, finish reasons, streaming, and NPU
   hold/release on a device with matching model and kernels.
 

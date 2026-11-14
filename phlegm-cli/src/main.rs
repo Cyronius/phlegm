@@ -19,7 +19,7 @@ const USAGE: &str = "usage: phlegm <command>
 commands:
   run --model-dir DIR [--kernels DIR] [--bridge EXE] --prompt TEXT [--max-tokens N (0 or -1: until the context is full)] [--seed N] [--turbo]
   serve [--models-dir DIR] [--image-config JSON[,JSON...]] [--keep-alive SECONDS] [--queue-timeout SECONDS]
-  serve --model-dir DIR [--kernels DIR] [--bridge EXE] [--turbo] [--host 127.0.0.1] [--port 52625]
+  serve --model-dir DIR [--model-id ID] [--kernels DIR] [--bridge EXE] [--turbo] [--host 127.0.0.1] [--port 52625]
   serve --embed-model DIR [--embed-python PYTHON] [--embed-source DIR] [--embed-model-name NAME]
   serve --mock [--host H] [--port N]
   every serve: [--api-key KEY] [--allowed-origins ORIGINS]   (--host / --port override PHLEGM_HOST / PHLEGM_PORT)
@@ -215,7 +215,7 @@ fn serve(args: &[String]) -> Result<(), String> {
         cfg.port = port.parse().map_err(|_| "invalid --port".to_string())?;
     }
     if let Some(dir) = opts.get("--embed-model") {
-        if ["--mock", "--model-dir", "--kernels", "--bridge", "--turbo", "--models-dir", "--image-config", "--keep-alive", "--queue-timeout"].iter().any(|k| opts.contains_key(*k)) {
+        if ["--mock", "--model-dir", "--model-id", "--kernels", "--bridge", "--turbo", "--models-dir", "--image-config", "--keep-alive", "--queue-timeout"].iter().any(|k| opts.contains_key(*k)) {
             return Err("--embed-model serves an embedding model alone; do not combine with chat backend options".into());
         }
         let model_dir = PathBuf::from(dir);
@@ -229,6 +229,7 @@ fn serve(args: &[String]) -> Result<(), String> {
     }
     if !opts.contains_key("--mock") && !opts.contains_key("--model-dir")
         && (cfg.model_dir.is_none() || opts.contains_key("--models-dir") || opts.contains_key("--image-config")) {
+        if opts.contains_key("--model-id") { return Err("--model-id requires --model-dir".into()); }
         return multi_model::serve(opts, cfg);
     }
     if ["--models-dir", "--image-config", "--keep-alive", "--queue-timeout"].iter().any(|k| opts.contains_key(*k)) {
@@ -236,6 +237,10 @@ fn serve(args: &[String]) -> Result<(), String> {
     }
     // Preserve PHLEGM_MODEL_DIR as the single-model selector too.
     let mut opts = opts;
+    if let Some(id) = opts.get("--model-id") {
+        if id.is_empty() { return Err("--model-id must not be empty".into()); }
+        cfg.model_id = id.clone();
+    }
     if let Some(dir) = cfg.model_dir.as_ref().filter(|_| !opts.contains_key("--model-dir")) {
         opts.insert("--model-dir".into(), dir.to_string_lossy().into_owned());
     }
@@ -253,12 +258,10 @@ fn serve(args: &[String]) -> Result<(), String> {
     // Load before binding the port. A missing template must fail startup rather
     // than silently sending placeholder IDs to a real model.
     Tokenizer::load(&npu.model_dir)?;
-    cfg.model_id = npu
-        .model_dir
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("local-model")
-        .into();
+    if !opts.contains_key("--model-id") {
+        cfg.model_id = npu.model_dir.file_name().and_then(|v| v.to_str())
+            .unwrap_or("local-model").into();
+    }
     cfg.model_dir = Some(npu.model_dir.clone());
     cfg.backend_name = "npu".into();
     let backend = NpuBackend::load(npu)?;
@@ -438,6 +441,14 @@ mod tests {
             let args: Vec<String> = extra.into_iter().map(str::to_owned).collect();
             assert!(serve(&args).unwrap_err().contains("embedding model alone"));
         }
+    }
+
+    #[test]
+    fn model_id_is_scoped_to_a_single_served_model() {
+        assert!(serve(&["--model-id".into(), "user.example".into()])
+            .unwrap_err().contains("requires --model-dir"));
+        assert!(serve(&["--model-dir".into(), "model".into(), "--model-id".into(), "".into()])
+            .unwrap_err().contains("must not be empty"));
     }
 
     #[test]

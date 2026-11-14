@@ -1,0 +1,317 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9521f25..7a5a265 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -229,6 +229,7 @@ set(LEMON_BACKENDS
+     "kokoro|kokoro"
+     "sd-cpp|sdcpp"
+     "flm|fastflowlm"
++    "phlegm|phlegm"
+     "ryzenai-llm|ryzenai"
+     "vllm|vllm"
+     "thenoise|thenoise"
+diff --git a/README.md b/README.md
+index 25f8751..96aaede 100644
+--- a/README.md
++++ b/README.md
+@@ -147,7 +147,7 @@ Lemonade supports multiple inference engines for LLM, speech, TTS, and image gen
+   </thead>
+   <tbody>
+     <tr>
+-      <td rowspan="16"><strong>Text generation</strong></td>
++      <td rowspan="17"><strong>Text generation</strong></td>
+       <td rowspan="8"><code>llamacpp</code></td>
+       <td><code>system</code></td>
+       <td><code>x86_64</code>/ARM64 CPU, GPU</td>
+@@ -200,6 +200,12 @@ Lemonade supports multiple inference engines for LLM, speech, TTS, and image gen
+       <td>XDNA2 NPU</td>
+       <td>Windows, Linux</td>
+     </tr>
++    <tr>
++      <td rowspan="1"><code>phlegm</code></td>
++      <td><code>npu</code>‡</td>
++      <td>AMD XDNA2 NPU</td>
++      <td>Linux</td>
++    </tr>
+     <tr>
+       <td rowspan="1"><code>ryzenai-llm</code></td>
+       <td><code>npu</code></td>
+diff --git a/docs/assets/models.js b/docs/assets/models.js
+index 286e7a2..53b29ae 100644
+--- a/docs/assets/models.js
++++ b/docs/assets/models.js
+@@ -15,6 +15,7 @@ const RECIPE_PRIORITY = [
+   'moonshine',
+   'onnxruntime',
+   'openmoss',
++  'phlegm',
+   'rocmfpx',
+   'ryzenai-llm',
+   'sd-cpp',
+@@ -31,6 +32,7 @@ const RECIPE_DISPLAY_NAMES = {
+   whispercpp: 'whisper.cpp',
+   'sd-cpp': 'stable-diffusion.cpp',
+   flm: 'FastFlowLM NPU',
++  phlegm: 'Phlegm NPU',
+   'ryzenai-llm': 'Ryzen AI SW NPU',
+   vllm: 'vLLM ROCm',
+   thenoise: 'thenoise',
+diff --git a/docs/dev/backends-reference.md b/docs/dev/backends-reference.md
+index 6e8d5f6..3eb9920 100644
+--- a/docs/dev/backends-reference.md
++++ b/docs/dev/backends-reference.md
+@@ -20,6 +20,7 @@ the generator instead. Prose outside the markers is preserved. -->
+ | `moonshine` | Moonshine | no | no | cpu |
+ | `onnxruntime` | ONNX Runtime | no | no | cpu |
+ | `openmoss` | OpenMOSS TTS | yes | no | cuda, vulkan |
++| `phlegm` | Phlegm NPU | no | yes | npu |
+ | `rocmfpx` | ROCm FPX | no | yes | rocm |
+ | `ryzenai-llm` | Ryzen AI LLM | no | yes | npu |
+ | `sd-cpp` | StableDiffusion.cpp | yes | no | cpu, cuda, metal, rocm, vulkan |
+@@ -63,6 +64,7 @@ Each backend has a tier and a format; see [Backend Tiers and Formats](../api/lem
+ | `onnxruntime` | cpu | experimental | native | macos | cpu (arm64) |
+ | `openmoss` | cuda | experimental | native | linux, windows | nvidia_gpu |
+ | `openmoss` | vulkan | experimental | native | linux, windows | amd_gpu; cpu (x86_64); nvidia_gpu |
++| `phlegm` | npu | guest | native | linux | amd_npu (XDNA2) |
+ | `rocmfpx` | rocm | guest | container | linux | amd_gpu (gfx1151) |
+ | `ryzenai-llm` | npu | core | native | windows | amd_npu (XDNA2) |
+ | `sd-cpp` | metal | core | native | macos | metal |
+@@ -160,6 +162,14 @@ Each backend has a tier and a format; see [Backend Tiers and Formats](../api/lem
+ | `pcm_sample_rate` | — | SIZE | 0 | Sample rate of the PCM this model emits, reported as X-MOSS-Sample-Rate (0 omits the header) |
+ | `pcm_channels` | — | SIZE | 0 | Channel count of the PCM this model emits, reported as X-MOSS-Channels (0 omits the header) |
+ 
++#### `phlegm` — Phlegm NPU
++
++| Option | CLI flag | Type | Default | Description |
++|--------|----------|------|---------|-------------|
++| `ctx_size` | `--ctx-size` | SIZE | -1 | Context size for the model |
++| `phlegm_kernels` | `--phlegm-kernels` | PATH | "" | Kernel directory (default: MODEL_DIR/open_kernels) |
++| `phlegm_bridge` | `--phlegm-bridge` | PATH | "" | C++ bridge executable (default: resolve from kernels) |
++
+ #### `rocmfpx` — ROCm FPX
+ 
+ | Option | CLI flag | Type | Default | Description |
+diff --git a/docs/guide/cli.md b/docs/guide/cli.md
+index 6b4ed46..7180eba 100644
+--- a/docs/guide/cli.md
++++ b/docs/guide/cli.md
+@@ -415,6 +415,14 @@ The following options are available depending on the recipe being used:
+ | `--ctx-size SIZE` | Context size for the model | auto |
+ | `--flm-args ARGS` | Safe flm serve tuning args: --pmode, --prefill-chunk-len, --img-pre-resize, --socket, --q-len, --preemption | `""` |
+ 
++#### Phlegm NPU (`phlegm` recipe)
++
++| Option | Description | Default |
++|--------|-------------|---------|
++| `--ctx-size SIZE` | Context size for the model | auto |
++| `--phlegm-kernels PATH` | Kernel directory (default: MODEL_DIR/open_kernels) | `""` |
++| `--phlegm-bridge PATH` | C++ bridge executable (default: resolve from kernels) | `""` |
++
+ #### Ryzen AI LLM (`ryzenai-llm` recipe)
+ 
+ | Option | Description | Default |
+diff --git a/docs/guide/configuration/custom-models.md b/docs/guide/configuration/custom-models.md
+index 104f0b5..425483e 100644
+--- a/docs/guide/configuration/custom-models.md
++++ b/docs/guide/configuration/custom-models.md
+@@ -99,7 +99,7 @@ Supported registration flags:
+ |------|-------------|
+ | `--source SOURCE` | Remote registry for every checkpoint in this model: <!-- BEGIN GENERATED: remote-registry-tokens -->`huggingface` or `modelscope`<!-- END GENERATED: remote-registry-tokens -->. When omitted, the server's configured `default_model_source` applies. |
+ | `--checkpoint TYPE CHECKPOINT` | Add a checkpoint entry. Repeat for multi-file models such as `main` + `mmproj` or `main` + `vae`. |
+-| `--recipe RECIPE` | Recipe to associate with the new `user.*` model. Common values: <!-- BEGIN GENERATED: recipe-values -->`llamacpp`, `llamacpp-hrx`, `whispercpp`, `moonshine`, `kokoro`, `sd-cpp`, `flm`, `ryzenai-llm`, `vllm`, `thenoise`, `ds4`, `rocmfpx`, `halogen`, `gufo`, `thinksound`, `acestep`, `onnxruntime`, `trellis`, `openmoss`, `collection.omni`<!-- END GENERATED: recipe-values -->. |
++| `--recipe RECIPE` | Recipe to associate with the new `user.*` model. Common values: <!-- BEGIN GENERATED: recipe-values -->`llamacpp`, `llamacpp-hrx`, `whispercpp`, `moonshine`, `kokoro`, `sd-cpp`, `flm`, `phlegm`, `ryzenai-llm`, `vllm`, `thenoise`, `ds4`, `rocmfpx`, `halogen`, `gufo`, `thinksound`, `acestep`, `onnxruntime`, `trellis`, `openmoss`, `collection.omni`<!-- END GENERATED: recipe-values -->. |
+ | `--label LABEL` | Add a label to the new model. Repeatable. Valid labels include `chat`, `coding`, `dflash`, `embeddings`, `hot`, `mtp`, `reasoning`, `reranking`, `tool-calling`, `vision`. When no [deployment label](../../api/openai.md#model-labels) is given, the recipe's default is added — `chat` for `llamacpp`, `flm`, `ryzenai-llm` and `vllm`; `transcription` for `whispercpp`; `image` for `sd-cpp`; and so on. |
+ | `--components MODEL [MODEL ...]` | Components for an omni collection (see below). Use with `--recipe collection.omni`. |
+ 
+diff --git a/docs/guide/configuration/multi-model.md b/docs/guide/configuration/multi-model.md
+index ec00acb..f08a211 100644
+--- a/docs/guide/configuration/multi-model.md
++++ b/docs/guide/configuration/multi-model.md
+@@ -63,7 +63,7 @@ backend's hardware slot policy:
+ ## Device Constraints
+ 
+ <!-- BEGIN GENERATED: npu-exclusivity -->
+-- **NPU Exclusivity:** `whispercpp`, `flm`, and `ryzenai-llm` are mutually exclusive on the NPU.
++- **NPU Exclusivity:** `whispercpp`, `flm`, `phlegm`, and `ryzenai-llm` are mutually exclusive on the NPU.
+ <!-- END GENERATED: npu-exclusivity -->
+     - Loading a model from one of these backends will automatically evict all NPU models from the other backends.
+     - `flm` supports loading 1 ASR model, 1 LLM, and 1 embedding model on the NPU at the same time.
+diff --git a/src/cpp/include/lemon/backends/phlegm/phlegm.h b/src/cpp/include/lemon/backends/phlegm/phlegm.h
+new file mode 100644
+index 0000000..0ecdb81
+--- /dev/null
++++ b/src/cpp/include/lemon/backends/phlegm/phlegm.h
+@@ -0,0 +1,35 @@
++#pragma once
++
++#include "lemon/backends/backend_descriptor.h"
++
++namespace lemon { namespace backends { namespace phlegm {
++
++inline const BackendDescriptor descriptor = {
++    /*recipe*/          "phlegm",
++    /*display_name*/    "Phlegm NPU",
++    /*binary*/          "phlegm",
++    /*config_section*/  "",
++    /*default_device*/  DEVICE_NPU,
++    /*slot_policy*/     SlotPolicy::ExclusiveNpu,
++    /*selectable_backend*/ false,
++    /*uses_ctx_size*/   true,
++    /*dynamic_models*/  false,
++    /*options*/ {
++        {"phlegm_kernels", "--phlegm-kernels", "", "PATH",
++         "Kernel directory (default: MODEL_DIR/open_kernels)", "Phlegm Options"},
++        {"phlegm_bridge", "--phlegm-bridge", "", "PATH",
++         "C++ bridge executable (default: resolve from kernels)", "Phlegm Options"},
++    },
++    /*support*/ {
++        {"npu", BackendTier::Guest, BackendFormat::Native, {"linux"},
++         {{"amd_npu", {"XDNA2"}}}, "AMD XDNA2 NPU"},
++    },
++    /*about*/ {
++        {"npu", {"Locally installed C++ NPU inference engine with a Rust OpenAI-compatible server.",
++                 "Phlegm contributors", "Your system", "MIT", "https://github.com/cyronius/phlegm"}},
++    },
++    /*supported_modes*/ {"chat"},
++    /*required_checkpoints*/ {"main"},
++};
++
++}}}  // namespace lemon::backends::phlegm
+diff --git a/src/cpp/include/lemon/backends/phlegm/phlegm_server.h b/src/cpp/include/lemon/backends/phlegm/phlegm_server.h
+new file mode 100644
+index 0000000..5260cf8
+--- /dev/null
++++ b/src/cpp/include/lemon/backends/phlegm/phlegm_server.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include "lemon/backends/backend_registry.h"
++#include "lemon/wrapped_server.h"
++
++namespace lemon { namespace backends {
++
++class PhlegmServer : public WrappedServer {
++public:
++    PhlegmServer(const std::string& log_level, ModelManager* model_manager,
++                 BackendManager* backend_manager);
++
++    void load(const std::string& model_name, const ModelInfo& model_info,
++              const RecipeOptions& options, bool do_not_upgrade = false) override;
++    json chat_completion(const json& request) override;
++    json completion(const json& request) override;
++};
++
++namespace phlegm {
++std::unique_ptr<WrappedServer> create(const BackendContext& ctx);
++const BackendSpec* spec();
++const BackendOps* ops();
++constexpr uint32_t capabilities() { return capability_mask_of<PhlegmServer>(); }
++}
++
++}}  // namespace lemon::backends
+diff --git a/src/cpp/server/backends/phlegm/phlegm_server.cpp b/src/cpp/server/backends/phlegm/phlegm_server.cpp
+new file mode 100644
+index 0000000..4e94fdb
+--- /dev/null
++++ b/src/cpp/server/backends/phlegm/phlegm_server.cpp
+@@ -0,0 +1,100 @@
++#include "lemon/backends/phlegm/phlegm_server.h"
++
++#include "lemon/backends/backend_ops.h"
++#include "lemon/backends/backend_utils.h"
++#include "lemon/backends/phlegm/phlegm.h"
++#include "lemon/utils/path_utils.h"
++
++#include <filesystem>
++#include <stdexcept>
++
++namespace lemon { namespace backends {
++
++namespace {
++
++class PhlegmOps : public BackendOps {
++public:
++    std::string validate_registration_checkpoint(const std::string& checkpoint) const override {
++        const std::filesystem::path path = utils::path_from_utf8(checkpoint);
++        if (!path.is_absolute()) return "Phlegm's main checkpoint must be an absolute model directory";
++        std::error_code ec;
++        if (!std::filesystem::is_directory(path, ec)) return "Phlegm model directory does not exist: " + checkpoint;
++        return "";
++    }
++
++    std::string validate_checkpoint_file(const std::string& path) const override {
++        std::error_code ec;
++        return std::filesystem::is_directory(utils::path_from_utf8(path), ec)
++            ? "" : "Phlegm checkpoint must be a model directory";
++    }
++
++    InstallCheck check_install(const std::string&, bool) const override {
++        const bool found = !utils::find_executable_in_path(phlegm::descriptor.binary).empty();
++        return {found, found ? "" : "Install phlegm and put its executable on PATH"};
++    }
++
++    DownloadPolicy plan_download(const ModelInfo&, const BackendOpsContext&) const override {
++        return DownloadPolicy::None;
++    }
++};
++
++}  // namespace
++
++PhlegmServer::PhlegmServer(const std::string& log_level, ModelManager* model_manager,
++                           BackendManager* backend_manager)
++    : WrappedServer("Phlegm", log_level, model_manager, backend_manager) {}
++
++void PhlegmServer::load(const std::string& model_name, const ModelInfo& model_info,
++                        const RecipeOptions& options, bool do_not_upgrade) {
++    (void)do_not_upgrade;
++    const std::string binary = utils::find_executable_in_path(phlegm::descriptor.binary);
++    if (binary.empty()) throw std::runtime_error("phlegm executable not found on PATH");
++
++    const std::string model_dir = model_info.resolved_path();
++    if (auto error = phlegm::ops()->validate_checkpoint_file(model_dir); !error.empty()) {
++        throw std::runtime_error(error + ": " + model_dir);
++    }
++
++    device_type_ = DEVICE_NPU;
++    port_ = choose_port();
++    ServerCommand command;
++    command.program = binary;
++    command.args = {"serve", "--model-dir", model_dir,
++                    "--model-id", model_name,
++                    "--host", "127.0.0.1", "--port", std::to_string(port_)};
++    const int ctx_size = options.get_option("ctx_size");
++    if (ctx_size > 0) {
++        command.args.insert(command.args.end(), {"--max-ctx", std::to_string(ctx_size)});
++    }
++    for (const auto& [option, flag] : {
++             std::pair<const char*, const char*>{"phlegm_kernels", "--kernels"},
++             {"phlegm_bridge", "--bridge"}}) {
++        const std::string value = options.get_option(option);
++        if (!value.empty()) command.args.insert(command.args.end(), {flag, value});
++    }
++    command.port = port_;
++    command.ready_endpoint = "/health";
++    const bool inherit_output = (log_level_ == "info") || is_debug();
++    start_server(std::make_unique<NativeProcess>(ProcessOutput{inherit_output, true}), command, 900);
++}
++
++json PhlegmServer::chat_completion(const json& request) {
++    return forward_request("/v1/chat/completions", request);
++}
++
++json PhlegmServer::completion(const json& request) {
++    return forward_request("/v1/completions", request);
++}
++
++namespace phlegm {
++std::unique_ptr<WrappedServer> create(const BackendContext& ctx) {
++    return make_server<PhlegmServer>(ctx);
++}
++const BackendSpec* spec() {
++    static const BackendSpec kSpec(descriptor.recipe, descriptor.binary);
++    return &kSpec;
++}
++const BackendOps* ops() { return single_ops<PhlegmOps>(); }
++}
++
++}}  // namespace lemon::backends
