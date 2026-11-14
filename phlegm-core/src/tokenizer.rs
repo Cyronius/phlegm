@@ -8,6 +8,9 @@ use serde_json::{Map, Value};
 use std::path::Path;
 use tokenizers::Tokenizer as HfTokenizer;
 
+#[path = "gguf_tokenizer.rs"]
+mod gguf_tokenizer;
+
 /// Padded logit width emitted by the lm_head (tokenizer.json vocab is 248070).
 pub const MODEL_VOCAB_SIZE: usize = 248320;
 
@@ -479,6 +482,7 @@ pub struct Tokenizer {
     tk: HfTokenizer,
     env: Environment<'static>,
     add_bos_token: bool,
+    gguf_add_eos: Option<u32>,
     bos_token: Option<String>,
     eos_ids: std::collections::HashSet<u32>,
 }
@@ -486,6 +490,10 @@ pub struct Tokenizer {
 impl Tokenizer {
     /// Load tokenizer files and the model chat template from a model directory.
     pub fn load(model_dir: &Path) -> Result<Tokenizer, String> {
+        if !model_dir.join("tokenizer.json").try_exists().map_err(|e| e.to_string())? {
+            let (tk, config) = gguf_tokenizer::load(model_dir)?;
+            return Self::from_parts(model_dir, tk, config, Value::Null);
+        }
         let tk = HfTokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| format!("loading tokenizer.json: {e}"))?;
 
@@ -499,6 +507,10 @@ impl Tokenizer {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
             Err(e) => return Err(format!("reading special_tokens_map.json: {e}")),
         };
+        Self::from_parts(model_dir, tk, config, special_map)
+    }
+
+    fn from_parts(model_dir: &Path, tk: HfTokenizer, config: Value, special_map: Value) -> Result<Tokenizer, String> {
         let special_token = |name: &str| {
             [
                 config.get(name),
@@ -520,6 +532,10 @@ impl Tokenizer {
             .get("add_bos_token")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let gguf_add_eos = if config.get("_gguf").and_then(Value::as_bool) == Some(true)
+            && config.get("add_eos_token").and_then(Value::as_bool) == Some(true) {
+            eos_token.as_deref().and_then(|t| tk.token_to_id(t))
+        } else { None };
 
         let template_src = match std::fs::read_to_string(model_dir.join("chat_template.jinja")) {
             Ok(text) => text,
@@ -644,6 +660,7 @@ impl Tokenizer {
             reasoning,
             template_vars,
             add_bos_token,
+            gguf_add_eos,
             bos_token,
             eos_ids,
         })
@@ -657,7 +674,11 @@ impl Tokenizer {
             .bos_token
             .as_ref()
             .is_some_and(|bos| text.starts_with(bos));
-        self.encode_with(text, self.add_bos_token && !has_bos)
+        let mut ids = self.encode_with(text, (self.add_bos_token || self.gguf_add_eos.is_some()) && !has_bos)?;
+        if has_bos {
+            if let Some(eos) = self.gguf_add_eos { ids.push(eos); }
+        }
+        Ok(ids)
     }
 
     /// `add_special_tokens` controls only the model's automatic BOS/EOS

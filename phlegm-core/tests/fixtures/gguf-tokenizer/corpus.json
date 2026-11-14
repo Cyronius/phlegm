@@ -1,0 +1,18 @@
+{
+  "template_kwargs": {"enable_thinking": false, "date_string": "09 Nov 2026"},
+  "texts": [
+    {"name": "empty", "text": ""},
+    {"name": "plain", "text": "Hello, world! It's 2026. Don't stop; I'M here."},
+    {"name": "unicode", "text": "café café Ελληνικά 中文 日本語 한국어 العربية हिन्दी 🙂👨‍👩‍👧‍👦 🦙\u0000�"},
+    {"name": "whitespace", "text": " leading   spaces\t\tand\r\nnewlines\n\n\n  trailing   "},
+    {"name": "code", "text": "def fib(n: int):\n    return n if n < 2 else fib(n-1) + fib(n-2)\n```rust\nlet x = 1234567890; // 🦀\n```\n"},
+    {"name": "specials", "text": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|><|end_of_text|><|im_start|>user\nHi<|im_end|><|endoftext|><bos><eos><|turn>user\nHi<turn|><|channel>thought\nhello<channel|>"},
+    {"name": "combining", "text": "á̀ a̐éö̲\nनमस्तेक्षि\r\n１２３ ١٢٣ A\u00a0B\u2003C\u2028D\u200bE"},
+    {"name": "eog-markers", "text": "</s> <|fim_pad|> <|repo_name|> <|file_sep|> <|eom_id|> <|tool_response> <turn|> <|im_end|> <|endoftext|> <|eot_id|> <|end_of_text|>"}
+  ],
+  "conversations": [
+    {"name": "chat-single", "messages": [{"role": "user", "content": "Say hello in French."}]},
+    {"name": "chat-system", "messages": [{"role": "system", "content": "Be concise."}, {"role": "user", "content": "What is 2 + 2?"}]},
+    {"name": "chat-multi", "messages": [{"role": "user", "content": "Write λ in Python."}, {"role": "assistant", "content": "print('λ')"}, {"role": "user", "content": "Now add a newline.\n  Keep indentation."}]}
+  ]
+}
