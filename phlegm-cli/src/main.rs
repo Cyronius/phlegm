@@ -16,8 +16,8 @@ mod bench;
 const USAGE: &str = "usage: phlegm <command>
 
 commands:
-  run --model-dir DIR --kernels DIR --bridge EXE --prompt TEXT [--max-tokens N (0 or -1: until the context is full)] [--seed N] [--turbo]
-  serve --model-dir DIR --kernels DIR --bridge EXE [--turbo] [--host 127.0.0.1] [--port 52625]
+  run --model-dir DIR [--kernels DIR] [--bridge EXE] --prompt TEXT [--max-tokens N (0 or -1: until the context is full)] [--seed N] [--turbo]
+  serve --model-dir DIR [--kernels DIR] [--bridge EXE] [--turbo] [--host 127.0.0.1] [--port 52625]
   serve --mock [--host H] [--port N]   (--host / --port override PHLEGM_HOST / PHLEGM_PORT)
   config show [--model-dir DIR | --config-model TAG] [--json]   the settings in effect, and where each comes from
   config set [--model-dir DIR | --config-model TAG] --config-key KEY --config-value VALUE
@@ -35,7 +35,7 @@ run and serve take the model's settings (phlegm config show --model-dir DIR), ea
   --presence-penalty P  --frequency-penalty F  --repetition-penalty-scope context|response
   --length-bias B --length-bias-start N --length-bias-window N  --think-end-bias B --think-end-start N --think-end-window N
 --turbo selects experimental lower-precision kernels from DIR/turbo; requires a matching bundle.
-Build the resident NPU bridge with benchmarks/reference/build.ps1 first.";
+--kernels defaults to DIR/open_kernels; --bridge selects a reference bridge explicitly.";
 
 fn flags(args: &[String]) -> Result<HashMap<String, String>, String> {
     let mut out = HashMap::new();
@@ -92,11 +92,14 @@ fn npu_options(map: &HashMap<String, String>, settings: &Resolved) -> Result<Npu
             .map(|v| v.parse().map_err(|_| format!("invalid {key}")))
             .unwrap_or(Ok(default))
     };
+    let model_dir = PathBuf::from(required(map, "--model-dir")?);
+    let kernel_dir = map.get("--kernels").map(PathBuf::from).unwrap_or_else(|| model_dir.join("open_kernels"));
+    let bridge = phlegm_core::bridge_resolver::resolve_bridge(map.get("--bridge").map(std::path::Path::new), &kernel_dir)?;
     Ok(NpuOptions {
-        model_dir: PathBuf::from(required(map, "--model-dir")?),
-        kernel_dir: PathBuf::from(required(map, "--kernels")?),
+        model_dir,
+        kernel_dir,
         turbo: map.contains_key("--turbo"),
-        bridge: PathBuf::from(required(map, "--bridge")?),
+        bridge,
         context_capacity: settings.usize("ctx_len"),
         threads: number("--threads", default_threads())?,
         prefill_route: settings.str("prefill_route"),
@@ -391,7 +394,7 @@ mod tests {
         let mut map = HashMap::from([
             ("--model-dir".into(), "model".into()),
             ("--kernels".into(), "kernels".into()),
-            ("--bridge".into(), "bridge".into()),
+            ("--bridge".into(), std::env::current_exe().unwrap().to_string_lossy().into_owned()),
             ("--turbo".into(), "true".into()),
         ]);
         let resolve = |map: &HashMap<String, String>| {

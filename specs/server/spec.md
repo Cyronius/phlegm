@@ -270,6 +270,12 @@ follow-ups, greedy, 400 reply tokens): turns 2 and 3 reuse 2816 tokens and take 
 1117 / 1103 / 1188 characters, the text itself was not recorded). KAT Coder: 3328 and 3584 of
 3600 / 3624 tokens reused (its no-reuse round was cut short to free the machine).
 
+`phlegm run` and `phlegm serve` default `--kernels` to `<model-dir>/open_kernels`.
+Their bridge selection checks `--bridge`, `PHLEGM_REFERENCE_BRIDGE`, an adjacent
+`phlegm-reference-bench` executable, then `bridges/index.json` beside the executable
+using the kernel manifest family, then the build-time developer checkout's bridge tree.
+Explicit paths must exist. `phlegm bench` continues to require `--reference-engine`.
+
 ## SERVER-SETTINGS: Per-model runtime defaults
 
 `phlegm run` and `phlegm serve` take their sampling, template, context and prefill defaults from

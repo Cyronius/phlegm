@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod bench;
+pub mod bridge_resolver;
 pub mod gguf;
 pub mod image;
 pub mod mock_backend;
