@@ -1,0 +1,64 @@
+{
+  "model": "Hy-Memory-30B-A3B-NPU2",
+  "command": [
+    "/home/cyrus/.local/bin/llama",
+    "serve",
+    "-m",
+    "/home/cyrus/models/Hy-Memory-30B-A3B-NPU2/model.gguf",
+    "--device",
+    "none",
+    "-ngl",
+    "0",
+    "-t",
+    "8",
+    "-c",
+    "2048",
+    "-np",
+    "1",
+    "--port",
+    "8415",
+    "--host",
+    "127.0.0.1",
+    "--jinja",
+    "--chat-template-file",
+    "/home/cyrus/models/Hy-Memory-30B-A3B-NPU2/chat_template.jinja"
+  ],
+  "build": "0.8.0-dev build 12015 commit a34de8618 Clang 22.1.8 Linux x86_64",
+  "request": {
+    "model": "Hy-Memory-30B-A3B-NPU2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Call get_weather for Paris now. Do not answer from memory. Do not explain."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "chat_template_kwargs": {
+      "enable_thinking": false,
+      "reasoning_effort": "no_think"
+    }
+  },
+  "prompt": "<｜hy_begin▁of▁sentence｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls>\nFor each function call, you should return object like:\n<tool_call>{function-name}<tool_sep>\n<arg_key>{arg-key-1}</arg_key>\n<arg_value>{arg-value-1}</arg_value>\n<arg_key>{arg-key-2}</arg_key>\n<arg_value>{arg-value-2}</arg_value>\n...\n</tool_call>\nAt the end of function call returns, you should print </tool_calls><｜reasoning_mode｜>reasoning_effort:no_think<｜hy_User｜>Call get_weather for Paris now. Do not answer from memory. Do not explain.<｜hy_Assistant｜><think></think>",
+  "output": "<tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>\n</tool_calls>",
+  "tokens_predicted": 20,
+  "source": "CPU model output"
+}

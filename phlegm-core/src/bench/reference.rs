@@ -905,7 +905,7 @@ impl Backend for NpuBackend {
         }
         let mut history: Vec<i64> = prompt_ids.iter().map(|&id| i64::from(id)).collect();
         for index in 0..params.max_tokens {
-            let next = params.sampler.sample(&logits, &history) as u32;
+            let next = params.sampler.try_sample(&logits, &history)? as u32;
             if params.stop_ids.contains(&next) {
                 break;
             }

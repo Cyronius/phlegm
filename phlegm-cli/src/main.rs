@@ -130,6 +130,7 @@ fn run(args: &[String]) -> Result<(), String> {
         &[ChatMessage {
             role: "user".into(),
             content: prompt,
+            ..Default::default()
         }],
         true,
         &kwargs,

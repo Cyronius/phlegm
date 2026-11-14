@@ -32,6 +32,21 @@ impl Backend for MockBackend {
         params: &mut GenParams,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<(), String> {
+        if params.sampler.is_constrained() {
+            // Hardware-free serving still exercises the actual sampler mask. Prefer closing a
+            // value and EOS over extending it, so arbitrary supported schemas finish promptly.
+            let mut logits = vec![0.0; 257];
+            for b in [b' ', b'\n', b'\r', b'\t'] { logits[b as usize] = -100.0; }
+            for b in [b'}', b']', b'"'] { logits[b as usize] = 10.0; }
+            logits[256] = 20.0;
+            let mut history = Vec::new();
+            for _ in 0..params.max_tokens {
+                let id = params.sampler.try_sample(&logits, &history)? as u32;
+                if params.stop_ids.contains(&id) { break; }
+                history.push(i64::from(id)); on_token(id);
+            }
+            return Ok(());
+        }
         let reply = format!(
             "[mock npu] received {} prompt tokens. interval-3 is finite here.",
             prompt_ids.len()

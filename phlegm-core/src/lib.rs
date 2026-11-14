@@ -12,3 +12,6 @@ pub mod tokenizer;
 pub mod npu_lock;
 #[cfg(feature = "npu")]
 pub mod xrt;
+
+pub mod tool_calls;
+pub mod structured_output;

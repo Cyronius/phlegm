@@ -557,6 +557,94 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
     if let Some(Value::Object(extra)) = kwargs_field {
         kwargs.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
+    let tools = match crate::tool_calls::Tools::from_request(&req_json) {
+        Ok(tools) => tools,
+        Err(e) => {
+            respond_json(
+                request,
+                400,
+                &json!({"error":{"message":e,"type":"invalid_request_error"}}),
+            );
+            return;
+        }
+    };
+    kwargs.insert("tools".into(), tools.tools.clone());
+    kwargs.insert("tool_choice".into(), tools.choice.clone());
+    let mut messages = messages;
+    if tools.choice == "required" || tools.named.is_some() {
+        let instruction = tools.named.as_ref().map_or_else(
+            || "You must call at least one of the available tools.".to_owned(),
+            |name| format!("You must call the function {name}."),
+        );
+        // Most publisher templates do not inspect tool_choice; express the choice in their system turn.
+        if messages[0].role == "system" {
+            messages[0].content.push_str(&format!("\n{instruction}"));
+        } else {
+            messages.insert(
+                0,
+                ChatMessage {
+                    role: "system".into(),
+                    content: instruction,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    let tool_format = match &state.tokenizer {
+        ServerTokenizer::Real(t) => t.tool_format(),
+        _ => Some(crate::tool_calls::Format::Function),
+    }
+    .filter(|_| tools.enabled);
+    if tools.enabled && tool_format.is_none() {
+        respond_json(
+            request,
+            400,
+            &json!({"error":{"message":"model template has no supported tool-call format","type":"invalid_request_error"}}),
+        );
+        return;
+    }
+    let format = req_json
+        .get("response_format")
+        .filter(|v| !v.is_null() && v.get("type") != Some(&json!("text")));
+    if format.is_some() && (tools.choice == "required" || tools.named.is_some()) {
+        respond_json(
+            request,
+            400,
+            &json!({"error":{"message":"response_format cannot be combined with required or named tool_choice; use auto or none","type":"invalid_request_error"}}),
+        );
+        return;
+    }
+    let constraint = match format
+        .map(|f| {
+            let vocab = match &state.tokenizer {
+                ServerTokenizer::Real(t) => t.structured_vocabulary()?,
+                ServerTokenizer::Placeholder(_) => {
+                    Arc::new(crate::structured_output::Vocabulary::new(
+                        (0u16..256)
+                            .map(|b| Some(vec![b as u8]))
+                            .chain([None])
+                            .collect(),
+                        [256].into_iter().collect(),
+                    ))
+                }
+            };
+            crate::structured_output::Constraint::from_response_format(f, vocab)
+        })
+        .transpose()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            respond_json(
+                request,
+                400,
+                &json!({"error":{"message":e,"type":"invalid_request_error"}}),
+            );
+            return;
+        }
+    };
+    if constraint.is_some() {
+        kwargs.insert("enable_thinking".into(), json!(false));
+    }
     let prompt = match state.tokenizer.apply_chat_template(&messages, &kwargs) {
         Ok(p) => p,
         Err(e) => {
@@ -585,8 +673,15 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
             return;
         }
     };
-    let stop_ids = state.tokenizer.stop_ids();
-    let reasoning = state.tokenizer.reasoning_for(&prompt);
+    let mut stop_ids = state.tokenizer.stop_ids();
+    if constraint.is_some() && matches!(state.tokenizer, ServerTokenizer::Placeholder(_)) {
+        stop_ids.insert(256);
+    }
+    let reasoning = if constraint.is_some() {
+        None
+    } else {
+        state.tokenizer.reasoning_for(&prompt)
+    };
 
     let sampler = Sampler::new(
         temperature.unwrap_or(d.temperature),
@@ -604,6 +699,11 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
         &stop_ids,
         state.tokenizer.think_end_id(),
     ));
+    let sampler = if let Some(c) = constraint {
+        sampler.with_constraint(c)
+    } else {
+        sampler
+    };
     let params = GenParams {
         max_tokens,
         sampler,
@@ -612,9 +712,25 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>) {
     };
 
     if stream {
-        stream_response(request, state, prompt_ids, params, model, reasoning);
+        stream_response(
+            request,
+            state,
+            prompt_ids,
+            params,
+            model,
+            reasoning,
+            tool_format.map(|f| (f, tools)),
+        );
     } else {
-        full_response(request, state, prompt_ids, params, model, reasoning);
+        full_response(
+            request,
+            state,
+            prompt_ids,
+            params,
+            model,
+            reasoning,
+            tool_format.map(|f| (f, tools)),
+        );
     }
 }
 
@@ -633,7 +749,20 @@ fn parse_message(m: &Value) -> ChatMessage {
             .join(""),
         _ => String::new(),
     };
-    ChatMessage { role, content }
+    let extra = m
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .filter(|(k, _)| !matches!(k.as_str(), "role" | "content"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    ChatMessage {
+        role,
+        content,
+        extra,
+    }
 }
 
 fn full_response(
@@ -643,6 +772,7 @@ fn full_response(
     mut params: GenParams,
     model: String,
     reasoning: Option<Reasoning>,
+    tools: Option<(crate::tool_calls::Format, crate::tool_calls::Tools)>,
 ) {
     let max_tokens = params.max_tokens;
     let mut out_ids: Vec<u32> = Vec::new();
@@ -663,20 +793,13 @@ fn full_response(
     }
 
     let text = state.tokenizer.decode(&out_ids);
-    let finish = if out_ids.len() >= max_tokens {
+    let (message, has_calls) = assistant_message(&text, reasoning.as_ref(), tools.as_ref());
+    let finish = if has_calls {
+        "tool_calls"
+    } else if out_ids.len() >= max_tokens {
         "length"
     } else {
         "stop"
-    };
-    // A reasoning model's thinking (harmony analysis, Gemma 4's thought channel, Qwen's <think>)
-    // goes beside the answer as reasoning_content (the field llama.cpp's and vLLM's OpenAI
-    // servers use).
-    let message = match &reasoning {
-        Some(r) => {
-            let (reasoning, answer) = r.split(&text);
-            json!({"role": "assistant", "content": answer, "reasoning_content": reasoning})
-        }
-        None => json!({"role": "assistant", "content": text}),
     };
     let resp = json!({
         "id": cmpl_id(),
@@ -705,6 +828,7 @@ fn stream_response(
     mut params: GenParams,
     model: String,
     reasoning: Option<Reasoning>,
+    tools: Option<(crate::tool_calls::Format, crate::tool_calls::Tools)>,
 ) {
     let max_tokens = params.max_tokens;
     let cid = cmpl_id();
@@ -746,6 +870,9 @@ fn stream_response(
                 }
             };
             emitted.push_str(&piece);
+            if tools.is_some() {
+                return;
+            }
             if let Some(r) = &reasoning {
                 // each side's new suffix, re-derived from everything decoded so far
                 let (reasoning, answer) = r.progress(&emitted);
@@ -777,12 +904,44 @@ fn stream_response(
         backend.generate(&prompt_ids, &mut params, &mut on_token)
     };
 
+    let mut has_calls = false;
     let result = gen_result.and_then(|_| {
         if let Some(error) = decode_error {
             return Err(error);
         }
         let full = state.tokenizer.final_decode(&out_ids)?;
         let tail = final_stream_tail(&full, &emitted)?;
+        if tools.is_some() {
+            let (message, called) = assistant_message(&full, reasoning.as_ref(), tools.as_ref());
+            has_calls = called;
+            for field in ["reasoning_content", "content"] {
+                if let Some(text) = message[field].as_str().filter(|t| !t.is_empty()) {
+                    sse_write(
+                        &mut *writer,
+                        &sse_frame(&sse_chunk(&cid, created, &model, json!({field:text}), None)),
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            if let Some(calls) = message["tool_calls"].as_array() {
+                for (index, call) in calls.iter().enumerate() {
+                    let mut delta = call.clone();
+                    delta["index"] = json!(index);
+                    sse_write(
+                        &mut *writer,
+                        &sse_frame(&sse_chunk(
+                            &cid,
+                            created,
+                            &model,
+                            json!({"tool_calls":[delta]}),
+                            None,
+                        )),
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            return Ok(());
+        }
         if let Some(r) = &reasoning {
             // whatever the last token completed, through the same derivation
             let (reasoning, answer) = r.progress_done(&full);
@@ -822,7 +981,9 @@ fn stream_response(
         return;
     }
 
-    let finish = if out_ids.len() >= max_tokens {
+    let finish = if has_calls {
+        "tool_calls"
+    } else if out_ids.len() >= max_tokens {
         "length"
     } else {
         "stop"
@@ -834,6 +995,52 @@ fn stream_response(
     let _ = sse_write(&mut *writer, "data: [DONE]\n\n");
     let _ = sse_end(&mut *writer);
     let _ = writer.flush();
+}
+
+/// Parse calls before splitting reasoning: harmony's recipient lives in the header, not its final channel.
+fn assistant_message(
+    text: &str,
+    reasoning: Option<&Reasoning>,
+    tools: Option<&(crate::tool_calls::Format, crate::tool_calls::Tools)>,
+) -> (Value, bool) {
+    let parsed = tools.map(|(format, cfg)| {
+        let mut parsed = format.parse(text);
+        cfg.restore_argument_types(&mut parsed.calls);
+        if cfg.accepts(&parsed.calls) {
+            parsed
+        } else {
+            crate::tool_calls::Parsed {
+                content: text.into(),
+                calls: vec![],
+            }
+        }
+    });
+    let raw = parsed.as_ref().map_or(text, |p| p.content.as_str());
+    let mut message = if let Some(r) = reasoning {
+        let (thought, answer) =
+            if tools.is_some_and(|(format, _)| *format == crate::tool_calls::Format::Harmony) {
+                crate::tool_calls::harmony_parts(raw)
+            } else {
+                r.split(raw)
+            };
+        json!({"role":"assistant","content":answer,"reasoning_content":thought})
+    } else {
+        json!({"role":"assistant","content":raw})
+    };
+    let has_calls = parsed.as_ref().is_some_and(|p| !p.calls.is_empty());
+    if let Some(mut p) = parsed.filter(|p| !p.calls.is_empty()) {
+        for c in &mut p.calls {
+            c["id"] = json!(format!(
+                "call_{}",
+                cmpl_id().trim_start_matches("chatcmpl-")
+            ));
+        }
+        message["tool_calls"] = json!(p.calls);
+        if message["content"] == "" {
+            message["content"] = Value::Null;
+        }
+    }
+    (message, has_calls)
 }
 
 fn final_stream_tail<'a>(full: &'a str, emitted: &str) -> Result<&'a str, String> {
@@ -942,6 +1149,8 @@ fn cmpl_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("server_tools_tests.rs");
 
     #[test]
     fn stream_finalization_flushes_only_unemitted_text_and_rejects_rewrites() {

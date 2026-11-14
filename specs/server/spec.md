@@ -405,3 +405,145 @@ no shipped model uses it.
   268 / 210 / 199 tokens (seeds 1-3) at the model's settings against 1254 greedy without the
   penalty (that request's override reproduces the earlier greedy run token count exactly);
   `enable_thinking: false` answered in 5 tokens.
+
+## SERVER-TOOLS: Chat Completions tool calling (U3)
+
+`/v1/chat/completions` accepts OpenAI function `tools` and `tool_choice` (`auto`,
+`none`, `required`, or `{"type":"function","function":{"name":"..."}}`). Bad choices,
+unknown named functions, duplicate names and malformed tool lists are HTTP 400.
+`none` hides the definitions and disables output parsing. A named choice exposes
+only that function. Required/named choices also add a system instruction because
+publisher templates generally do not inspect `tool_choice`; this is prompting,
+not a guarantee that the model will obey. Invalid model output remains plain text.
+
+Tool definitions and the choice reach the Jinja context. Assistant `tool_calls`,
+call IDs, tool messages' `tool_call_id`/`name`, and `reasoning_content` survive the
+request. JSON-string arguments are deserialized into objects before rendering;
+invalid argument JSON is HTTP 400. GPT-OSS additionally receives `thinking` as
+its template's alias for `reasoning_content`.
+
+The model's template selects one of six parsers (`tool_calls.rs`): function XML;
+JSON/key-value tool tags; Gemma's `call:name{...}`; Hy-Memory's tool list (including
+DeepSeek tokens); LFM2.5's function list; or harmony recipient headers. Installed
+Flint and Xing templates actually use `arg_key` and `param_key` tags respectively,
+although the November roadmap described this group as JSON. Both are supported.
+LFM2.5 also emits a bare function list in the recorded CPU fixture.
+
+Successful calls receive opaque `call_...` IDs, a function name and JSON-string
+arguments, and finish with `tool_calls`. Text preceding a call stays in `content`;
+reasoning remains in `reasoning_content`. An empty content beside calls is null.
+SSE emits indexed `delta.tool_calls` entries and the same finish reason. Tool-enabled
+requests currently buffer the generated response before emitting validated calls
+(one delta per complete call), preserving plain-content fallback for malformed or
+truncated calls. Ordinary text-only streaming retains its existing latency.
+Unknown function names also fall back to content. No model output is evaluated.
+
+Verification (2026-11-09): six small CPU-generated fixtures, with exact prompts,
+llama.cpp identity and command, live in `phlegm-core/tests/fixtures/tool_calls/`.
+They cover KAT Coder, Gemma 4 26B-A4B, GPT-OSS 20B, Flint, Hy-Memory and LFM2.5.
+The parser suite additionally exercises documented JSON and DeepSeek variants.
+`server::tests::tool_loop_streaming_and_full_and_malformed` covers two-step HTTP
+loops, `none` and malformed output in both modes. The ignored local-files test
+`installed_templates_round_trip_tools` exercises the installed templates; the
+six protocol groups exclude K2's separate, unsupported protocol. Hardware SDK
+loops remain untested; offline tests do not establish hardware acceptance.
+
+## SERVER-STRUCTURED-OUTPUT: JSON and schema token constraints (U4)
+
+`response_format` accepts `{"type":"json_object"}` and the OpenAI
+`{"type":"json_schema","json_schema":{"name":"...","strict":true,"schema":{...}}}`
+shape. `strict` must be boolean when supplied. Both strict and non-strict schema
+requests enforce the supported schema constraints; strict never silently relaxes
+one. Omitted/null `response_format` and `{"type":"text"}` follow the ordinary
+sampler path without constructing a vocabulary, grammar, or mask.
+
+`structured_output.rs` compiles a byte grammar into incremental parser stacks.
+A cached vocabulary trie uses the tokenizer's inverse ByteLevel mapping or
+SentencePiece replacement/byte-fallback mapping; it preserves partial UTF-8 bytes,
+rather than decoding individual tokens with replacement characters. Traversing
+that trie against the current parser stacks computes which complete tokens keep
+a valid prefix. The sampler masks other logits after penalties and before greedy
+selection or temperature/top-k/top-p. EOS is allowed only when a complete value
+has been accepted. Invalid UTF-8, unpaired escaped surrogates, special control
+tokens and IDs outside the tokenizer vocabulary are excluded. An empty candidate
+set is a generation error, never an unconstrained fallback.
+
+Supported schema keywords: `type` (also type arrays), `properties`, `required`,
+`enum`, `const`, `items`, `anyOf`, and boolean/schema `additionalProperties`.
+Types: object, array, string, number, integer, boolean and null. Nested boolean
+schemas are supported. Annotations `title`, `description`, `default`, `examples`,
+`$schema`, `$id` are accepted without changing validation. Other features,
+including `$ref`, `oneOf`, `allOf`, numeric bounds and string patterns, are HTTP 400
+with the offending feature's schema path. Invalid/unsatisfiable schemas are also
+HTTP 400. Current construction limits: depth 48, 256 properties per object,
+64 alternatives per `anyOf`.
+
+Generation uses a valid subset of the schema language: declared object keys are
+emitted in sorted order, optional properties may be omitted, and permitted extra
+properties need not be emitted when declared properties exist. Generic objects
+have arbitrary keys. Unconstrained numeric productions use finite decimal values
+(up to 15 integral and 9 fractional digits); enum/const use their exact JSON
+literals. This avoids numeric overflow in consumers. These choices restrict
+representation without allowing values outside the requested schema.
+
+Structured responses constrain the entire generated reply and disable reasoning
+splitting (and request `enable_thinking: false` from templates). They can coexist
+with `tools` in auto/none mode: plain JSON remains content. Argument-only tool
+constraints and mixing mandatory tool calls with whole-reply JSON constraints
+are not implemented. As for any finite output budget, `finish_reason: length`
+can leave an incomplete prefix; clients must not treat a truncated reply as a
+complete JSON value.
+
+Verification: grammar tests cover nested objects/arrays, unions, enums/constants,
+UTF-8 and escapes, spanning tokens, EOS, invalid schemas and unsupported features;
+`constraints_win_over_logits_penalties_and_sampled_candidate_lists` covers greedy
+and stochastic sampling. The fake-logits HTTP test exercises both response modes
+and tools in auto mode. The ignored `every_registry_tokenizer_random_walks` test
+uses all 18 registry entries' actual tokenizer files, samples random valid prefixes,
+completes them, parses the result with serde_json, and independently validates it
+against the schema; it also checks the actual IDs' decoded output. Run it offline
+with the local models installed. Hardware validation remains separate.
+
+### U3/U4 offline evidence, 2026-11-09
+
+Core checks: 96 unit tests passed, four prerequisite tests ignored; the release-report
+and CPU tool-fixture integration tests passed. CLI: three tests passed. Explicit
+local-files checks passed for all 18 tool-capable installed templates and all 18
+registry tokenizers (five schemas, two random walks each, with grammar completion).
+Two hardware/native bridge checks remain ignored. The SDK client is
+`phlegm-core/tests/check_tools_sdk.py`; its Python syntax was checked, its hardware
+loop was not run. No NPU execution or new dependency crate was used.
+
+Dibs-isolated CPU development microbenchmark, CLEAN before and after, Gemma's
+262,144-token vocabulary, required `city` string property, parser positioned just
+inside the string: the first mask at that state took 87.65–101.12 ms (three samples,
+median 95.95 ms); cached repeated-state masks took 0.1223–0.1449 ms (nine samples,
+median 0.1278 ms). These timings include applying the mask to a full logit vector,
+exclude tokenizer/vocabulary loading, and are not end-to-end HTTP or NPU timings.
+New parser states pay a cache miss; this is not a universal per-token latency.
+The vocabulary is shared per tokenizer, transitions are memoized per request,
+and up to 32 completed masks are cached per request.
+
+Retained negative experiment: the first, uncached implementation spent
+2194.38–2287.69 ms constructing the string-state mask (nine samples, median
+2231.03 ms, without the subsequent logits mask). It was replaced after measurement.
+An initial timing attempt never reached CLEAN because host CPU stayed at 76–91%;
+it was canceled and its reservation released. All completed measurement series
+reported CLEAN before and after. Host: Strix Halo Ryzen AI MAX+ 395, Linux
+7.2.13-200.fc44.x86_64, `powersave` CPU governor, rustc 1.99.1, optimized Rust build;
+base revision `7742985b53e464a1a8171321fe4e33281905ec8a` with these uncommitted changes.
+The pre-fast-path sampler comparison exposed a greedy regression, retained as a
+failed development experiment; the final unconstrained path is separately compiled
+and stores the inactive constraint behind an optional pointer.
+
+The final paired sampler comparison also reported CLEAN before and after. Both
+samplers were called through identical out-of-line wrappers, with black-boxed
+state and logits, one warmup pair discarded, and 14 retained alternating pairs
+of 100 tokens each. On the same 262,144 logits, unconstrained greedy took a median
+0.132 ms/token versus the pre-change sampler's 0.170; temperature 1 / top-k 64 /
+top-p 0.95 took 0.407 versus 0.443 ms/token. Every retained final pair favored the
+new sampler. No slowdown was observed in these two sampler cases. The bare greedy
+path avoids copying logits when penalties are inactive; non-greedy and penalized
+paths retain their transformations. These are CPU component measurements, not an
+end-to-end HTTP performance or hardware acceptance claim. Raw samples, provenance,
+commands and retained failures: [u3-u4-validation.json](u3-u4-validation.json).
