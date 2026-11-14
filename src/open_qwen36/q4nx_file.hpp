@@ -1,0 +1,103 @@
+/// \file q4nx_file.hpp
+/// \brief Open reader for OFLM's `.q4nx` weight container (format 1.0.2, q4_1).
+/// \note Replaces the closed q4_npu_eXpress reader on the open Qwen3.6 path.
+///
+/// The container is a safetensors file: an 8-byte header length, a JSON header
+/// of tensor name -> {dtype, shape, data_offsets}, then the data. BF16 / F32
+/// tensors are plain row-major. Quantized tensors are packed 8192-value chunks
+/// (5120 B q4_1 with bf16 scale + min per 32-block; 8704 B q8), stored in the
+/// file's raster order — the NPU pools reorder them (pools.hpp).
+///
+/// The chunk format is PER TENSOR, not per file: the stock Qwen3.6-35B keeps
+/// only its lm_head at q8, while its fine-tunes (Darwin, Grug, BigBang,
+/// Aquila-mini, Ornith 1.5, and Atomic-Germ's own NPU2 mirror) pack attention,
+/// linear-attention and shared-expert projections at q8 and only the routed
+/// experts at q4_1. So this reader classifies each tensor from its own shape
+/// and refuses nothing at open; the packer re-quantizes a q8 source to q4_1 on
+/// the way into the pool and names the tensor if its chunks are neither
+/// (OPEN-PACK-PLAN).
+///
+/// The file is memory-mapped and read on demand: the whole 22 GB is never
+/// resident on the host, only what the packers touch while filling device
+/// buffers, plus the embedding rows read per token.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "open_qwen36/weight_file.hpp"
+
+namespace open_qwen36 {
+
+class Q4nxFile final : public WeightFile {
+public:
+    explicit Q4nxFile(const std::string& path);
+    ~Q4nxFile();
+    Q4nxFile(const Q4nxFile&) = delete;
+    Q4nxFile& operator=(const Q4nxFile&) = delete;
+
+    bool has(const std::string& name) const override { return tensors_.count(name) != 0; }
+    const TensorMeta& meta(const std::string& name) const override;
+    /// Raw bytes of a tensor (a view into the mapping).
+    const uint8_t* raw(const std::string& name, size_t* nbytes = nullptr) const override;
+    /// A BF16 tensor decoded to f32.
+    std::vector<float> bf16(const std::string& name) const override;
+    std::vector<float> f32(const std::string& name) const override;
+    /// One row of a BF16 [rows, dim] tensor as f32 (the embedding lookup).
+    void bf16_row(const std::string& name, size_t row, size_t dim, float* out) const override;
+    void embed_row(const std::string& name, size_t row, size_t dim, float* out) const override {
+        bf16_row(name, row, dim, out);
+    }
+
+    /// Release the mapping's resident pages (unmap + map again). After the
+    /// pools are packed, ~22 GB of file pages sit in the working set with no
+    /// further use beyond the embedding rows; on a box holding 21 GB of NPU
+    /// buffers that is the difference between fitting and paging.
+    void drop_pages() override;
+
+    /// The POOL's q4_1 chunk (5120 B) — what the packing plan's offsets are in.
+    size_t chunk_bytes() const { return chunk_bytes_; }
+    /// The quantized chunk size `name` is stored in: its last shape dimension for an
+    /// I8 tensor (5120 = q4_1, 8704 = q8), 0 when the tensor is not quantized.
+    size_t chunk_bytes(const std::string& name) const;
+    const std::string& path() const { return path_; }
+    /// How many tensors the header lists, so a loader can say when a container holds more
+    /// than it read rather than silently ignoring the rest.
+    size_t tensor_count() const { return tensors_.size(); }
+    /// A string from the header's `__metadata__`, "" when absent (uno.q4nx records its adapter's there).
+    std::string metadata(const std::string& key) const;
+
+private:
+    std::string path_;
+    const uint8_t* map_ = nullptr;
+    size_t map_size_ = 0;
+    size_t data_base_ = 0;
+    static constexpr size_t chunk_bytes_ = 5120;   ///< the pool's q4_1 chunk (a constant, not a guess)
+    std::unordered_map<std::string, TensorMeta> tensors_;
+    std::unordered_map<std::string, std::string> metadata_;
+#ifdef _WIN32
+    void* file_ = nullptr;
+    void* mapping_ = nullptr;
+#else
+    int fd_ = -1;
+#endif
+};
+
+inline float bf16_to_f32(uint16_t u) {
+    uint32_t w = static_cast<uint32_t>(u) << 16;
+    float f;
+    std::memcpy(&f, &w, 4);
+    return f;
+}
+
+inline uint16_t f32_to_bf16(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return static_cast<uint16_t>((u + 0x7FFF + ((u >> 16) & 1)) >> 16);  // round to nearest even
+}
+
+}  // namespace open_qwen36

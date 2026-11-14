@@ -1,19 +1,21 @@
-// Build the XRT C++ shim only under the `npu` feature. Windows uses MSVC;
-// Linux uses a local XRT install and the configured C++ toolchain.
+// Build the XRT C++ shim only under `npu`, plus the in-tree bridge on Linux.
+// Windows bridge integration is tracked separately (P1 S10).
 
 use std::path::PathBuf;
 use std::process::Command;
 
 mod build_release;
+mod build_bridge;
 
 fn main() {
     build_release::emit();
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    build_bridge::emit(manifest.parent().unwrap());
     // Only build the shim when the npu feature is enabled.
     if std::env::var("CARGO_FEATURE_NPU").is_err() {
         return;
     }
 
-    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
     let shim_src = manifest.join("xrt-shim").join("xrt_shim.cpp");
@@ -22,22 +24,28 @@ fn main() {
     println!("cargo:rerun-if-changed={}", shim_hdr.display());
     match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
         Ok("windows") => build_windows(&manifest, &out_dir, &shim_src),
-        Ok("linux") => build_linux(&out_dir, &shim_src),
+        Ok("linux") => build_linux(&manifest, &out_dir, &shim_src),
         _ => panic!("the npu feature supports Windows and Linux only"),
     }
 }
 
-fn build_linux(out_dir: &std::path::Path, shim_src: &std::path::Path) {
+fn build_linux(manifest: &std::path::Path, out_dir: &std::path::Path, shim_src: &std::path::Path) {
     for name in ["CXX", "AR", "XILINX_XRT", "XRT_INCLUDE_DIR", "XRT_LIB_DIR"] {
         println!("cargo:rerun-if-env-changed={name}");
     }
-    let xrt_root = PathBuf::from(std::env::var("XILINX_XRT").unwrap_or_else(|_| "/opt/xilinx/xrt".into()));
+    let xrt_root = PathBuf::from(std::env::var("XILINX_XRT").unwrap_or_else(|_| {
+        if std::path::Path::new("/usr/include/xrt/xrt_device.h").is_file() { "/usr".into() }
+        else { "/opt/xilinx/xrt".into() }
+    }));
     let include = std::env::var_os("XRT_INCLUDE_DIR").map(PathBuf::from)
         .unwrap_or_else(|| xrt_root.join("include"));
     let lib_dir = std::env::var_os("XRT_LIB_DIR").map(PathBuf::from)
-        .unwrap_or_else(|| xrt_root.join("lib"));
-    if !include.join("xrt/xrt_device.h").is_file() || !lib_dir.join("libxrt_coreutil.so").is_file() {
-        panic!("Linux XRT headers or libxrt_coreutil.so are missing under {} and {}",
+        .unwrap_or_else(|| {
+            let lib64 = xrt_root.join("lib64");
+            if lib64.join("libxrt_coreutil.so.2").is_file() { lib64 } else { xrt_root.join("lib") }
+        });
+    if !include.join("xrt/xrt_device.h").is_file() || !lib_dir.join("libxrt_coreutil.so.2").is_file() {
+        panic!("npu feature requires Linux XRT headers and libxrt_coreutil.so.2 under {} and {}; install XRT development files or set XRT_INCLUDE_DIR and XRT_LIB_DIR",
                include.display(), lib_dir.display());
     }
     let cxx = std::env::var("CXX").unwrap_or_else(|_| "g++".into());
@@ -55,8 +63,9 @@ fn build_linux(out_dir: &std::path::Path, shim_src: &std::path::Path) {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=static=xrt_shim");
-    println!("cargo:rustc-link-lib=dylib=xrt_coreutil");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    println!("cargo:rustc-link-lib=dylib:+verbatim=libxrt_coreutil.so.2");
+    println!("cargo:rustc-link-lib=dylib:+verbatim=libstdc++.so.6");
+    build_bridge::build(manifest.parent().unwrap(), out_dir, &include, &lib_dir);
 }
 
 fn build_windows(manifest: &std::path::Path, out_dir: &std::path::Path, shim_src: &std::path::Path) {

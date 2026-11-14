@@ -4,16 +4,16 @@
 
 phlegm started as a fix for FastFlowLM, which silently skips the full-attention block of a pruned Qwen3.6 model and
 outputs garbage. It went on to replace FastFlowLM's closed NPU kernels with open ones, written with the IRON /
-mlir-aie toolchain. Those kernels now run whole models on the NPU, through the openflowlm-next engine.
+mlir-aie toolchain. Those kernels now run whole models on the NPU, through Phlegm's C++ engine, derived from openflowlm-next.
 
-> **Status (2026-10-26):** C++ remains the inference engine; the native Rust engine port comes last.
+> **Status (2026-11-10):** The in-tree engine stays C++; Rust owns the CLI, server, tokenizer, sampling and tray.
 > CLI/server generation is connected to the resident C++ bridge. Local Llama 3.2 1B NPU generation and experimental kernels have hardware evidence; other models and HTTP performance still need acceptance. Tray model flows remain pending.
 
 ## Layout
 
 | dir | what | state |
 |---|---|---|
-| [`phlegm-core/`](phlegm-core/) | Rust runtime support: tokenizer, sampler, OpenAI server, XRT bindings and resident C++ engine adapter | C++ bridge connected to CLI and server; native Rust engine port deferred |
+| [`phlegm-core/`](phlegm-core/) | Rust runtime support: tokenizer, sampler, OpenAI server, XRT bindings and resident C++ engine adapter | C++ bridge connected to CLI and server |
 | [`phlegm-cli/`](phlegm-cli/) | The `phlegm` command: `run`, `serve`, `bench` | real C++ inference path for run/serve/bench; model onboarding pending |
 | [`phlegm-tray/`](phlegm-tray/) | Windows tray app (Tauri v2): model library, downloads, chat, a local OpenAI endpoint | tray icon and window only |
 | [`open_kernels/`](open_kernels/) | The open AIE kernels, their recipes per model family, the build harness and the fp64 replicas | working; see its README |
@@ -117,7 +117,7 @@ without the `npu` feature, and run `pytest.ini`'s offline suite with Python 3.12
 NumPy, ml-dtypes, SciPy and pytest. Optional upstream runtime, model, PyTorch and
 AIE checks may skip; the test output lists their reasons. The tray is excluded:
 its Tauri build needs a built frontend and Linux GTK/WebKit development packages. Pushed `v*`
-tags build the Linux x86_64 CLI and publish it with SHA256SUMS; the external C++
+tags build the Linux x86_64 CLI and publish it with SHA256SUMS; the C++
 bridge and NPU hardware are not covered. Benchmark publication additionally
 requires the clean, exact version tag described in [the benchmark spec](specs/bench/spec.md).
 

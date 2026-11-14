@@ -18,8 +18,8 @@ System power mode remains **default**. Attempting `performance` through XRT
 failed with `DRM_IOCTL_AMDXDNA_SET_STATE`, `EACCES`; no mode change occurred.
 
 Linux toolchain/source identities remain those in
-[baseline readiness](artlite-baseline-readiness.md). The external runtime
-development reconciliation is now retained as
+[baseline readiness](artlite-baseline-readiness.md). The PR 209 lineage's runtime
+development reconciliation is retained as
 [`linux-baseline-runtime.patch`](../../open_kernels/upstream-patches/linux-baseline-runtime.patch),
 against OFLM `478dbea3f00f868ac58205803cc537b402c6cad5`. Its manifest support
 is limited to versions 1–3 and local DIT 7; it rejects 4/5/6 and does not claim
@@ -627,7 +627,7 @@ Actual integration overhead and model quality must still be measured.
 Focused regression command `python -m pytest -q specs/open-engine/tests/test_gguf_quality_gate.py specs/open-engine/tests/test_gguf_compact.py`:4 passed.
 Python tools compile; git diff --check passes. User's existing work preserved.
 Next: finish isolated profiling, integrate explicitly tagged experimental packed
-input format with checked buffer sizing in external C++ runtime, build all
+input format with checked buffer sizing in the PR 209 C++ lineage, build all
 projection streams in a complete image, rerun300 and long-context/model/bridge
 gates, then paired engine timing. Preserve probability hi/lo and the known
 artificial zero-history failure. No defaults/parity promotion; no paid resources.

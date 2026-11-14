@@ -13,11 +13,11 @@
 
 - Reach or exceed ArtLite performance while preserving model correctness. Treat
   parity as a measurement goal, never as an inference from offline tests.
-- Keep C++ as the reference inference engine for CLI/server, onboarding and tray
-  work. Port inference to Rust last, as described in `PLAN.md`.
+- Keep the inference engine in C++ permanently. Rust owns the CLI, server,
+  tokenizer, sampling and tray, as described in `PLAN.md`.
 - This repository is the canonical home of `open_kernels/` and
   `specs/open-engine/`. Consult `open_kernels/UPSTREAM.md` before kernel work.
-- The OFLM C++ runtime is external. Companion patches in
+- The C++ engine lives in `src/open_qwen36/`, derived from OFLM. Companion patches in
   `open_kernels/upstream-patches/` have separate source bases; they are not a
   ready-to-apply series. Preserve the manifest/runtime ABI, local version-7 DIT
   mapping, and the Llama high/low probability contract.

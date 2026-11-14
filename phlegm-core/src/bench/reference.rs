@@ -1,5 +1,5 @@
-//! Temporary, resident C++ reference-engine adapter. Timings originate in the
-//! child process, not in its JSON transport. The source checkout is never copied.
+//! Resident adapter for Phlegm's in-tree C++ engine. Timings originate in the
+//! child process, not in its JSON transport.
 mod turbo;
 pub(crate) mod speculation;
 
@@ -21,6 +21,7 @@ use std::{
 
 pub const BACKEND_NAME: &str = "openflowlm-cpp-reference";
 const BRIDGE_SOURCE: &[u8] = include_bytes!("../../../benchmarks/reference/bridge.cpp");
+pub const ENGINE_TREE_SHA256: &str = env!("PHLEGM_ENGINE_TREE_SHA256");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +30,12 @@ pub struct ReferenceInfo {
     pub source_commit: String,
     pub source_dirty: bool,
     pub source_tree_sha256: String,
+    /// Absent for legacy per-family bridges built outside this repository (P1 stopgap).
+    pub engine_tree_sha256: Option<String>,
+    pub release_tag: Option<String>,
+    pub xrt_rpath: Option<String>,
+    #[serde(default)]
+    pub compiler_version: String,
     pub binary_sha256: String,
     pub compiler_flags: String,
     pub prefill_route: String,
@@ -54,6 +61,7 @@ impl ReferenceInfo {
         if self.engine != BACKEND_NAME
             || !is_hex(&self.source_commit, 40)
             || !is_hex(&self.source_tree_sha256, 64)
+            || self.engine_tree_sha256.as_deref().is_some_and(|h| h != ENGINE_TREE_SHA256)
             || !is_hex(&self.binary_sha256, 64)
             || self.compiler_flags.trim().is_empty()
             || !["sequential", "gemm-block", "layer-major"].contains(&self.prefill_route.as_str())
@@ -81,6 +89,14 @@ struct BuildInfo {
     source_commit: String,
     source_dirty: bool,
     source_tree_sha256: String,
+    #[serde(default)]
+    engine_tree_sha256: Option<String>,
+    #[serde(default)]
+    release_tag: Option<String>,
+    #[serde(default)]
+    xrt_rpath: Option<String>,
+    #[serde(default)]
+    compiler_version: String,
     adapter_sha256: String,
     binary_sha256: String,
     compiler_flags: String,
@@ -138,6 +154,11 @@ fn build_info(bridge: &Path) -> Result<BuildInfo, String> {
     }
     let build: BuildInfo =
         serde_json::from_slice(&data).map_err(|e| format!("reference build metadata: {e}"))?;
+    // A bridge built from this repository must match its engine tree. Legacy per-family bridges
+    // (no engine_tree_sha256) stay accepted until P1 S4-S7 fold their families in.
+    if build.engine_tree_sha256.as_deref().is_some_and(|h| h != ENGINE_TREE_SHA256) {
+        return Err("reference bridge engine_tree_sha256 differs from this Phlegm build; rebuild the bridge".into());
+    }
     if !matches!(build.protocol, 1 | 2)
         || build.engine != BACKEND_NAME
         || !is_hex(&build.source_commit, 40)
@@ -442,6 +463,10 @@ impl ReferenceBackend {
             source_commit: build.source_commit,
             source_dirty: build.source_dirty,
             source_tree_sha256: build.source_tree_sha256,
+            engine_tree_sha256: build.engine_tree_sha256,
+            release_tag: build.release_tag,
+            xrt_rpath: build.xrt_rpath,
+            compiler_version: build.compiler_version,
             binary_sha256: build.binary_sha256,
             compiler_flags: build.compiler_flags,
             prefill_route: hello
@@ -698,6 +723,30 @@ mod tests {
             manifest_hash(&a),
             format!("{:x}", Sha256::digest(b"a\x001\nb\x002\n"))
         );
+    }
+
+    #[test]
+    fn bridge_from_a_different_engine_tree_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("phlegm-engine-hash-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bridge = dir.join("bridge");
+        fs::write(&bridge, b"test binary").unwrap();
+        let adapter = format!("{:x}", Sha256::digest(BRIDGE_SOURCE));
+        let files = BTreeMap::from([("bridge/bridge.cpp".into(), adapter.clone())]);
+        let mut sidecar = json!({"protocol":1, "engine":BACKEND_NAME,
+            "source_commit":"0".repeat(40), "source_dirty":false,
+            "source_tree_sha256":manifest_hash(&files), "engine_tree_sha256":ENGINE_TREE_SHA256,
+            "adapter_sha256":adapter, "binary_sha256":hash_file(&bridge).unwrap(),
+            "compiler_flags":"test", "source_files":files});
+        fs::write(bridge.with_extension("build.json"), sidecar.to_string()).unwrap();
+        assert!(build_info(&bridge).is_ok());
+        sidecar["engine_tree_sha256"] = json!("0".repeat(64));
+        fs::write(bridge.with_extension("build.json"), sidecar.to_string()).unwrap();
+        assert!(build_info(&bridge).err().unwrap().contains("engine_tree_sha256 differs"));
+        sidecar.as_object_mut().unwrap().remove("engine_tree_sha256");
+        fs::write(bridge.with_extension("build.json"), sidecar.to_string()).unwrap();
+        assert!(build_info(&bridge).unwrap().engine_tree_sha256.is_none(), "legacy bridge accepted");
+        fs::remove_dir_all(dir).unwrap();
     }
 }
 
@@ -1015,7 +1064,7 @@ for line in sys.stdin:
         let adapter_sha = format!("{:x}", Sha256::digest(BRIDGE_SOURCE));
         let files = BTreeMap::from([("bridge/bridge.cpp".into(), adapter_sha.clone())]);
         let sidecar = json!({"protocol":1, "engine":BACKEND_NAME, "source_commit":"0".repeat(40),
-            "source_dirty":false, "source_tree_sha256":manifest_hash(&files),
+            "source_dirty":false, "source_tree_sha256":manifest_hash(&files), "engine_tree_sha256":ENGINE_TREE_SHA256,
             "adapter_sha256":adapter_sha, "binary_sha256":hash_file(&bridge).unwrap(),
             "compiler_flags":"fake test bridge", "source_files":files});
         fs::write(bridge.with_extension("build.json"), sidecar.to_string()).unwrap();
@@ -1105,7 +1154,7 @@ for line in sys.stdin:
         let adapter_sha = format!("{:x}", Sha256::digest(BRIDGE_SOURCE));
         let files = BTreeMap::from([("bridge/bridge.cpp".into(), adapter_sha.clone())]);
         let sidecar = json!({"protocol":1, "engine":BACKEND_NAME, "source_commit":"0".repeat(40),
-            "source_dirty":false, "source_tree_sha256":manifest_hash(&files),
+            "source_dirty":false, "source_tree_sha256":manifest_hash(&files), "engine_tree_sha256":ENGINE_TREE_SHA256,
             "adapter_sha256":adapter_sha, "binary_sha256":hash_file(&bridge).unwrap(),
             "compiler_flags":"fake test bridge", "source_files":files});
         fs::write(bridge.with_extension("build.json"), sidecar.to_string()).unwrap();

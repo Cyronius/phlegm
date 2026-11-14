@@ -16,4 +16,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.9"
 tiny_http = "0.12.0"
-tokenizers = "0.23.1"
+# esaxx_fast is a training-only C++ accelerator; inference uses the Rust path.
+# Keep the default build free of a C++ compiler requirement.
+tokenizers = { version = "0.23.1", default-features = false, features = ["progressbar", "onig"] }
+
+[build-dependencies]
+sha2 = "0.10.9"
