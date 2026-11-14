@@ -9309,6 +9309,15 @@ See [the source audit](artlite-prefill-code-audit.md) and
 [owning experimental report](gguf-prefill-linux.md) for numerical/model gates,
 failed variants and timing limitations. No default or parity promotion.
 
+### OPEN-GGUF-DENSE
+
+P5 S6 loads tokenizer and chat-template metadata from a directory containing
+one published GGUF when `tokenizer.json` is absent. Existing tokenizer-file
+directories retain their path. See [the tokenizer contract and offline gates](gguf-tokenizer.md)
+for supported metadata, pinned sources, independent reference limitations and
+publisher disagreements. This tokenizer stage does not establish NPU model
+support; faithful dense carriage and hardware gates remain separate work.
+
 ### OPEN-TURBO-PREFILL
 
 `run` and `serve` accept an explicit boolean `--turbo`. This opts into a

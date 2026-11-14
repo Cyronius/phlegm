@@ -1,0 +1,639 @@
+{
+  "date": "2026-11-09",
+  "kind": "offline development evidence, not a published engine benchmark",
+  "base_revision": "7742985b53e464a1a8171321fe4e33281905ec8a",
+  "host": {
+    "cpu": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+    "os": "Linux 7.2.13-200.fc44.x86_64",
+    "cpu_governor": "powersave",
+    "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+    "llama": "0.8.0-dev build 12015 a34de8618; Clang 22.1.8 Linux x86_64"
+  },
+  "resource_policy": "All cargo builds/tests under dibs run build; CPU captures/walks under dibs run cpu; timings under dibs run --measure. No NPU execution. No registry dependency added.",
+  "checks": [
+    [
+      "dibs run cpu port-8415 --label \"U3: fixture capture\" --eta 20m -- python -I /tmp/u3_capture.py /tmp/u3-captures",
+      "Six CPU model outputs captured successfully. Build 12015/a34de8618; each fixture records full prompt/command."
+    ],
+    [
+      "cargo test -p phlegm-core --offline tool_calls -- --nocapture",
+      "Initial compile smoke: 0 tests matched. Superseded by parser tests and integration fixtures."
+    ],
+    [
+      "cargo test -p phlegm-core --offline --lib",
+      "Initial: 86 passed, 1 failed, 2 ignored (SSE test assertion). Later full core checks pass."
+    ],
+    [
+      "cargo test -p phlegm-core --offline",
+      "Final: 96 unit passed, 4 ignored; release-provenance integration 1 passed; CPU fixture integration 1 passed/1 ignored; doc tests 0."
+    ],
+    [
+      "cargo test -p phlegm-cli --offline",
+      "Final: 3 passed."
+    ],
+    [
+      "cargo test -p phlegm-core --offline --test tool_calls installed_templates_round_trip_tools -- --ignored --nocapture",
+      "Initially failed ensure_ascii keyword, then K2 generation tag; compatibility fixed, unsupported K2 excluded from six-format test."
+    ],
+    [
+      "cargo test -p phlegm-core --offline --test tool_calls -- --include-ignored --nocapture",
+      "2 passed; 18 installed supported templates round-tripped, plus six CPU fixtures."
+    ],
+    [
+      "cargo test -p phlegm-core --offline structured_output",
+      "Initial compile smoke: 0 matching tests before test definitions were added."
+    ],
+    [
+      "cargo test -p phlegm-core --offline structured_output::tests -- --nocapture",
+      "Focused grammar: 3 passed, 2 local/performance prerequisites ignored; cache equivalence later included in full suite."
+    ],
+    [
+      "cargo test -p phlegm-core --offline --release --no-run",
+      "Optimized validation/measurement executables built successfully (repeated after changes)."
+    ],
+    [
+      "dibs run cpu --label \"U4: every registry tokenizer random walks\" --eta 10m -- target/release/deps/phlegm_core-d43e132571ccf07c structured_output::tests::every_registry_tokenizer_random_walks --ignored --nocapture",
+      "1 passed: all 18 registry tokenizers, 180 completed walks, actual sampled-ID decoding validated."
+    ],
+    [
+      "dibs run cpu --label \"U4: cached mask equivalence and all registry tokenizers\" --eta 10m -- sh -c 'target/release/deps/phlegm_core-d43e132571ccf07c structured_output::tests::cached_masks_equal_independent_token_walks --nocapture && target/release/deps/phlegm_core-d43e132571ccf07c structured_output::tests::every_registry_tokenizer_random_walks --ignored --nocapture'",
+      "Release cache-test filter initially matched 0 because that binary predated the new test; the full debug suite subsequently ran and passed it. All 18 registry tokenizers passed again with caches enabled."
+    ],
+    [
+      "dibs run build --label \"U3 U4: final handoff regression checks\" --eta 5m -- sh -c 'cargo test -p phlegm-core --offline && cargo test -p phlegm-cli --offline'",
+      "Final full checks passed; /tmp/u3-u4-handoff-tests.log."
+    ],
+    [
+      "dibs run build --label \"U4: symmetric baseline timing harness build\" --eta 5m -- env CARGO_TARGET_DIR=/home/cyrus/code/phlegm-wt/u3-u4-tools-schema/target cargo build --release --offline --manifest-path /tmp/u4-sampler-bench/Cargo.toml",
+      "Passed; local benchmark harness uses only the existing phlegm-core dependency and pre-change MIT sampler source."
+    ],
+    [
+      "dibs run --measure --label \"U4: final greedy allocation fix comparison\" --eta 10m -- target/release/u4-sampler-bench 2>&1 | tee /tmp/u4-greedy-measure.log",
+      "CLEAN before/after; both measured unconstrained cases faster than baseline in every retained pair."
+    ],
+    [
+      "python -I -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in (\"phlegm-core/tests/check_tools_sdk.py\",\"phlegm-core/tests/fixtures/tool_calls/capture.py\")]; print(\"2 Python syntax checks passed\")'",
+      "2 passed; SDK/hardware execution remains untested."
+    ],
+    [
+      "git diff --check",
+      "Passed repeatedly, including final handoff."
+    ]
+  ],
+  "retained_failures": [
+    {
+      "check": "U3 HTTP test",
+      "verbatim": "assertion failed: body.contains(if malformed { \"broken\" } else { \"sunny\" })",
+      "resolution": "Test now reconstructs SSE content before asserting."
+    },
+    {
+      "check": "installed templates",
+      "verbatim": "rendering chat template: too many arguments: unknown keyword argument 'ensure_ascii' (in chat:8)",
+      "resolution": "Tokenizer filter consumes Python ensure_ascii keyword."
+    },
+    {
+      "check": "K2 (outside requested six groups and registry)",
+      "verbatim": "compiling chat_template.jinja: syntax error: unknown statement generation (in chat:984)",
+      "resolution": "Pre-existing unsupported template extension; census test skips its separate unsupported protocol."
+    },
+    {
+      "check": "mock JSON",
+      "verbatim": "Error(\"EOF while parsing a value\", line: 1, column: 64)",
+      "resolution": "Mock logits now prefer completion over whitespace."
+    },
+    {
+      "check": "initial measurement",
+      "verbatim": "dibs: waiting for other work to finish: total CPU 91% (quiet means under 25%)",
+      "resolution": "Canceled before CLEAN, exit 130, released reservation; later completed clean series retained."
+    },
+    {
+      "check": "formatter availability",
+      "verbatim": "error: 'rustfmt' is not installed for the toolchain 'stable-x86_64-unknown-linux-gnu'.",
+      "resolution": "Used installed 1.99.1 toolchain rustfmt; no download."
+    }
+  ],
+  "uncached_mask_prototype": {
+    "samples_ms": [
+      2212.764547,
+      2231.034093,
+      2213.830409,
+      2242.45875,
+      2287.694614,
+      2206.058116,
+      2255.170053,
+      2256.443926,
+      2194.381767
+    ],
+    "clean_before": true,
+    "clean_after": true,
+    "note": "Construction only, before logits application. Replaced after measurement."
+  },
+  "timing_series": [
+    {
+      "log": "/tmp/u4-measure-final.log",
+      "clean_before": true,
+      "clean_after": true,
+      "comparisons": [
+        {
+          "temperature": 0.0,
+          "top_k": 0,
+          "top_p": 1.0,
+          "baseline_ms": [
+            0.17795165000000002,
+            0.17696711,
+            0.26016985,
+            0.26032142,
+            0.17859296,
+            0.19728006999999997,
+            0.19949303000000002,
+            0.16776432000000002,
+            0.22061191000000002,
+            0.23538557000000002,
+            0.1777616,
+            0.17969283,
+            0.27223381,
+            0.24404083
+          ],
+          "current_ms": [
+            0.19605908,
+            0.21290252999999998,
+            0.26627521,
+            0.20103884,
+            0.20697709000000003,
+            0.27729642,
+            0.32857036,
+            0.20663475,
+            0.22292165,
+            0.31020495,
+            0.20897254,
+            0.22208507,
+            0.27365487,
+            0.19849767000000001
+          ],
+          "baseline_median_ms": 0.19838655,
+          "current_median_ms": 0.2174938,
+          "paired_current_over_baseline_median": 1.1672547398366522,
+          "all_pairs_no_slower": false
+        },
+        {
+          "temperature": 1.0,
+          "top_k": 64,
+          "top_p": 0.95,
+          "baseline_ms": [
+            0.63382731,
+            0.88891991,
+            0.82295867,
+            0.7639723399999999,
+            0.61783547,
+            0.58604534,
+            0.57434685,
+            0.56779294,
+            0.55962458,
+            0.56301676,
+            0.57412072,
+            0.56561444,
+            0.52835865,
+            0.6052699500000001
+          ],
+          "current_ms": [
+            0.49970921,
+            0.87260175,
+            0.82144624,
+            0.66302608,
+            0.62225167,
+            0.54216227,
+            0.53836334,
+            0.5253473799999999,
+            0.52507297,
+            0.52132733,
+            0.5268965999999999,
+            0.45695649,
+            0.45962459,
+            0.50367236
+          ],
+          "baseline_median_ms": 0.580196095,
+          "current_median_ms": 0.5261219899999999,
+          "paired_current_over_baseline_median": 0.9251823292787251,
+          "all_pairs_no_slower": false
+        }
+      ],
+      "cold_mask_ms": {
+        "samples": [
+          85.463949,
+          84.583917,
+          82.81947100000001
+        ],
+        "median": 84.583917
+      },
+      "cached_mask_ms": {
+        "samples": [
+          0.07553199999999999,
+          0.087445,
+          0.080461,
+          0.077125,
+          0.076524,
+          0.07632299999999999,
+          0.076254,
+          0.07770600000000001,
+          0.081282
+        ],
+        "median": 0.077125
+      },
+      "command": "dibs run --measure --label \"U4: cached mask and baseline sampler timing\" --eta 10m -- sh -c 'target/release/deps/phlegm_core-d43e132571ccf07c structured_output::tests::largest_vocabulary_mask_cost --ignored --nocapture && target/release/u4-sampler-bench' 2>&1 | tee /tmp/u4-measure-final.log"
+    },
+    {
+      "log": "/tmp/u4-fast-path-measure.log",
+      "clean_before": true,
+      "clean_after": true,
+      "comparisons": [
+        {
+          "temperature": 0.0,
+          "top_k": 0,
+          "top_p": 1.0,
+          "baseline_ms": [
+            0.17668748,
+            0.18005711000000002,
+            0.25738059,
+            0.27814289999999997,
+            0.25869907000000003,
+            0.27325372000000003,
+            0.27216536999999996,
+            0.26927174000000004,
+            0.24960188,
+            0.25032253,
+            0.22644076,
+            0.22235227999999999,
+            0.20234047000000002,
+            0.19853533
+          ],
+          "current_ms": [
+            0.20059029,
+            0.25016253,
+            0.27249279000000004,
+            0.32562331,
+            0.30676908999999997,
+            0.31687938,
+            0.31819275,
+            0.30441686,
+            0.29528131,
+            0.28685748,
+            0.2727699,
+            0.24959446,
+            0.24219516,
+            0.2311428
+          ],
+          "baseline_median_ms": 0.249962205,
+          "current_median_ms": 0.27981369,
+          "paired_current_over_baseline_median": 1.1666778141753122,
+          "all_pairs_no_slower": false
+        },
+        {
+          "temperature": 1.0,
+          "top_k": 64,
+          "top_p": 0.95,
+          "baseline_ms": [
+            0.6031020699999999,
+            0.60654393,
+            0.60136901,
+            0.58748703,
+            0.57508522,
+            0.52424691,
+            0.61815134,
+            0.52891317,
+            0.54065684,
+            0.63066034,
+            0.61798392,
+            0.53500221,
+            0.55989709,
+            0.61527263
+          ],
+          "current_ms": [
+            0.5407339800000001,
+            0.54502484,
+            0.54435799,
+            0.51992729,
+            0.51900716,
+            0.44732598,
+            0.61231608,
+            0.53575843,
+            0.56556363,
+            0.49514883000000004,
+            0.5272777,
+            0.60101835,
+            0.50693929,
+            0.57702417
+          ],
+          "baseline_median_ms": 0.5944280200000001,
+          "current_median_ms": 0.5382462050000001,
+          "paired_current_over_baseline_median": 0.9038426664784502,
+          "all_pairs_no_slower": false
+        }
+      ],
+      "cold_mask_ms": {
+        "samples": [
+          101.124943,
+          87.65167799999999,
+          95.94905800000001
+        ],
+        "median": 95.94905800000001
+      },
+      "cached_mask_ms": {
+        "samples": [
+          0.144852,
+          0.136015,
+          0.128902,
+          0.12776,
+          0.1275,
+          0.12249,
+          0.128051,
+          0.12264,
+          0.122299
+        ],
+        "median": 0.12776
+      },
+      "command": "dibs run --measure --label \"U4: final unconstrained fast path comparison\" --eta 10m -- sh -c 'target/release/deps/phlegm_core-d43e132571ccf07c structured_output::tests::largest_vocabulary_mask_cost --ignored --nocapture && target/release/u4-sampler-bench' 2>&1 | tee /tmp/u4-fast-path-measure.log"
+    },
+    {
+      "log": "/tmp/u4-symmetric-measure.log",
+      "clean_before": true,
+      "clean_after": true,
+      "comparisons": [
+        {
+          "temperature": 0.0,
+          "top_k": 0,
+          "top_p": 1.0,
+          "baseline_ms": [
+            0.17535858000000001,
+            0.1759009,
+            0.17569121,
+            0.17612361999999998,
+            0.15204888,
+            0.15153262,
+            0.15160576,
+            0.15113266,
+            0.1524836,
+            0.15415454,
+            0.16065445,
+            0.15185272,
+            0.15200840999999998,
+            0.17044525000000002
+          ],
+          "current_ms": [
+            0.1757409,
+            0.17652307,
+            0.1757938,
+            0.17642298,
+            0.17608324000000003,
+            0.17670902,
+            0.17708983,
+            0.17681321,
+            0.17586714,
+            0.17714984,
+            0.18233178,
+            0.1786701,
+            0.17856339999999998,
+            0.18201408
+          ],
+          "baseline_median_ms": 0.15331907,
+          "current_median_ms": 0.176761115,
+          "paired_current_over_baseline_median": 1.1512608082149631,
+          "all_pairs_no_slower": false
+        },
+        {
+          "temperature": 1.0,
+          "top_k": 64,
+          "top_p": 0.95,
+          "baseline_ms": [
+            0.42279789,
+            0.42593728999999997,
+            0.41770252,
+            0.41926656,
+            0.42051099000000003,
+            0.41931405,
+            0.42439439,
+            0.44186311,
+            0.42811278,
+            0.44833687999999994,
+            0.45785486,
+            0.45819529999999997,
+            0.46199344000000003,
+            0.45969340999999997
+          ],
+          "current_ms": [
+            0.42417307000000004,
+            0.42132202,
+            0.41964537,
+            0.41852467,
+            0.41756785999999996,
+            0.41723955,
+            0.42199328,
+            0.4208287,
+            0.43210348000000004,
+            0.4192374,
+            0.42281032,
+            0.42093098,
+            0.42494403000000003,
+            0.42095593
+          ],
+          "baseline_median_ms": 0.427025035,
+          "current_median_ms": 0.42094345499999997,
+          "paired_current_over_baseline_median": 0.991082750311921,
+          "all_pairs_no_slower": false
+        }
+      ],
+      "command": "dibs run --measure --label \"U4: symmetric out-of-line sampler comparison\" --eta 10m -- target/release/u4-sampler-bench 2>&1 | tee /tmp/u4-symmetric-measure.log"
+    },
+    {
+      "log": "/tmp/u4-greedy-measure.log",
+      "clean_before": true,
+      "clean_after": true,
+      "comparisons": [
+        {
+          "temperature": 0.0,
+          "top_k": 0,
+          "top_p": 1.0,
+          "baseline_ms": [
+            0.24365911,
+            0.24346363999999998,
+            0.24363737,
+            0.22749223999999998,
+            0.16970826,
+            0.16929258,
+            0.16996174,
+            0.16935169,
+            0.16983188999999999,
+            0.16966999,
+            0.17001234,
+            0.17003358,
+            0.17051257,
+            0.17030047999999998
+          ],
+          "current_ms": [
+            0.21192288,
+            0.18568569000000001,
+            0.18541517000000002,
+            0.14257548,
+            0.12862868,
+            0.13054668,
+            0.1325207,
+            0.15323271,
+            0.13798276,
+            0.12950683,
+            0.12960511,
+            0.12952396,
+            0.12967615,
+            0.12955913
+          ],
+          "baseline_median_ms": 0.17002296,
+          "current_median_ms": 0.13153368999999998,
+          "paired_current_over_baseline_median": 0.7625055592393707,
+          "all_pairs_no_slower": true
+        },
+        {
+          "temperature": 1.0,
+          "top_k": 64,
+          "top_p": 0.95,
+          "baseline_ms": [
+            0.44284015000000004,
+            0.44225285000000003,
+            0.44317317,
+            0.44256944,
+            0.44261413,
+            0.44250893,
+            0.44272923999999997,
+            0.44313871,
+            0.44249629999999995,
+            0.44236064999999997,
+            0.44318439,
+            0.44263245,
+            0.44210888,
+            0.44209795
+          ],
+          "current_ms": [
+            0.40648414,
+            0.40647071,
+            0.40692337,
+            0.40783508,
+            0.40672640000000004,
+            0.40677898999999995,
+            0.40677409,
+            0.40689922,
+            0.40721852000000003,
+            0.4066253,
+            0.4063004,
+            0.40604913,
+            0.40702455,
+            0.40562252
+          ],
+          "baseline_median_ms": 0.44259178499999996,
+          "current_median_ms": 0.406750245,
+          "paired_current_over_baseline_median": 0.9188530971337157,
+          "all_pairs_no_slower": true
+        }
+      ],
+      "command": "dibs run --measure --label \"U4: final greedy allocation fix comparison\" --eta 10m -- target/release/u4-sampler-bench 2>&1 | tee /tmp/u4-greedy-measure.log"
+    }
+  ],
+  "sampler_comparator": {
+    "baseline_command": "git show HEAD:phlegm-core/src/sampler.rs > /tmp/u4-sampler-bench/src/baseline.rs",
+    "baseline_sha256": "009e93b227541dfd4a057e93a0bccdedfdb0f6548e7c91fbacd52501074683b0",
+    "baseline_license": "MIT (repository source)",
+    "harness_sha256": "0e59f852c4ec926346a82ab0c816f261224959d9b95df722f723d43d4b5b0f7b",
+    "harness_source": "#[allow(dead_code)]mod baseline;\nuse std::{hint::black_box as bb,time::Instant};\n#[inline(never)]\nfn old_sample(s:&mut baseline::Sampler,l:&[f32])->usize {s.sample(l,&[])}\n#[inline(never)]\nfn new_sample(s:&mut phlegm_core::sampler::Sampler,l:&[f32])->usize {s.try_sample(l,&[]).unwrap()}\nfn main(){\n let mut logits=vec![0f32;262144];for(i,v)in logits.iter_mut().enumerate(){*v=((i*7331)%100000)as f32/10000.0;}\n for(t,k,p)in [(0.,0,1.),(1.,64,0.95)]{\n  let mut old=baseline::Sampler::new(t,k,p,1.,Some(1));let mut new=phlegm_core::sampler::Sampler::new(t,k,p,1.,Some(1));let mut a=vec![];let mut b=vec![];\n  for round in 0..15 {for mode in if round%2==0{[false,true]}else{[true,false]}{let start=Instant::now();for _ in 0..100{if mode{bb(new_sample(bb(&mut new),bb(&logits)));}else{bb(old_sample(bb(&mut old),bb(&logits)));}}let ms=start.elapsed().as_secs_f64()*10.0;if round>0{if mode{b.push(ms)}else{a.push(ms)}}}}\n  println!(\"t={t} k={k} p={p} baseline_ms={a:?} current_ms={b:?}\");\n }\n}\n",
+    "note": "15 alternating batches, 100 tokens each; first pair discarded. Last two series use symmetric out-of-line wrappers and black-boxed sampler state. Final series removes unnecessary bare-greedy logit allocation."
+  },
+  "source_sha256": {
+    "phlegm-cli/src/main.rs": "b87f8d560d0a3abee7651e2b4b6565e9508c5959e092149025f93360ba940194",
+    "phlegm-core/src/bench/reference.rs": "78a59b858eabb94169dbe6adacef05dcc09619becf6efcf81b4cdced1e3de62d",
+    "phlegm-core/src/lib.rs": "45fed74a4e5ab5b25f0f4956c59bb6f788cb3ed363ea141e0f2fae8129b0d016",
+    "phlegm-core/src/mock_backend.rs": "c2dab6bb89452cb146bb34c136dab8a6d794f4624b15c12580fd5367c17f4e87",
+    "phlegm-core/src/placeholder_tokenizer.rs": "b99b1ffeba5a29ca1b74eda402d451b17dd65da21ea0c206f3d9ade93011a15c",
+    "phlegm-core/src/sampler.rs": "7faeab9d5bd9c8c3673136043c8a873079bdf10f3fd8b4495163b3792122551d",
+    "phlegm-core/src/server.rs": "3e8cf95a3d09fd713f8d1a9ea94687aa8bd681e9a613834e2143319ab9692421",
+    "phlegm-core/src/tokenizer.rs": "f2f3af5fe981e71f7f027e0ec0bbff15d0b281782f5a7226f52e2a08c52667e6",
+    "specs/server/spec.md": "ac2dbcbbec9f8895d58315d6eaa69f48c01f0412b0a65a140b9dec6cc7aa099a",
+    "phlegm-core/src/server_tools_tests.rs": "66e1f1908fe1eab4245b6d370b6dc51ce194a417ba1f1a004be3a751d587ea5d",
+    "phlegm-core/src/structured_output.rs": "0ccbaa9f76b7570f7d97ba7e4047a617c742c965f7f6f2057dfcb0c457da2a61",
+    "phlegm-core/src/tool_calls.rs": "9621141985e0ace37ef4700b43879fe7d15099331bfd68c8df6131ac07ee3804",
+    "phlegm-core/tests/check_tools_sdk.py": "204c7234416b1dc2a99e2ff202f30bb9a1ecd006cd2646413fd57cb76ee2f9a5",
+    "phlegm-core/tests/fixtures/tool_calls/Hy-Memory-30B-A3B-NPU2.json": "78933a6fac1831976ba3b615de9d8860568a6e4be394aa64246c1946bdb05378",
+    "phlegm-core/tests/fixtures/tool_calls/KAT-Coder-V2.5-Dev-Q4pure-NPU2.json": "80bbff98bb89ddafd5506935bca1d18744463cd489c7ceda91ad9f92d75c6806",
+    "phlegm-core/tests/fixtures/tool_calls/LFM2.5-24B-A2B-NPU2.json": "d7de0d2a49b6d6083ee0e1e4d7d546f67f6c8472b7a1d4ed761369a1e6245a49",
+    "phlegm-core/tests/fixtures/tool_calls/capture.py": "ed725e8da3a8a3c265678aa1aa2fad1cea56275f74c99145f9c26a4c15cff810",
+    "phlegm-core/tests/fixtures/tool_calls/flint-NPU2.json": "e871e7210607672e92e6313bfd237825f1b5f454fb4bfe364ff016933a99e5dc",
+    "phlegm-core/tests/fixtures/tool_calls/gemma-4-26B-A4B-it-NPU2.json": "68717fc1cb1719fbc2401313ba0d80da2ba40b27b022d53d648f1f814fd0a2ab",
+    "phlegm-core/tests/fixtures/tool_calls/gpt-oss-20b-NPU2.json": "a1b4353ca860f718cf616420e821eb2df67a833b0cb2420faa2d7b897145c808",
+    "phlegm-core/tests/tool_calls.rs": "ab1cddd38c151807c4f6f20a23d47e1f7d6900965068b0422d222f14b85d9ac9"
+  },
+  "scratch_artifacts": [
+    "/tmp/u3-captures",
+    "/tmp/u3-core.log",
+    "/tmp/u3-templates.log",
+    "/tmp/u3-templates2.log",
+    "/tmp/u3-test.log",
+    "/tmp/u3-u4-cached-final.log",
+    "/tmp/u3-u4-final-tests.log",
+    "/tmp/u3-u4-final.log",
+    "/tmp/u3-u4-handoff-tests.log",
+    "/tmp/u3-u4-regressions.log",
+    "/tmp/u3-u4-regressions2.log",
+    "/tmp/u3-validation.log",
+    "/tmp/u3_capture.py",
+    "/tmp/u3_format_regions.py",
+    "/tmp/u3_u4_record.py",
+    "/tmp/u4-baseline-build.log",
+    "/tmp/u4-cache-validation.log",
+    "/tmp/u4-cached-tokenizers.log",
+    "/tmp/u4-compile.log",
+    "/tmp/u4-core.log",
+    "/tmp/u4-fast-path-measure.log",
+    "/tmp/u4-fast-path-validation.log",
+    "/tmp/u4-final-measure-build.log",
+    "/tmp/u4-focused.log",
+    "/tmp/u4-greedy-measure.log",
+    "/tmp/u4-greedy-validation.log",
+    "/tmp/u4-measure-final.log",
+    "/tmp/u4-measure.log",
+    "/tmp/u4-release-build.log",
+    "/tmp/u4-release-build2.log",
+    "/tmp/u4-sampler-bench",
+    "/tmp/u4-symmetric-build.log",
+    "/tmp/u4-symmetric-measure.log",
+    "/tmp/u4-tokenizers.log"
+  ],
+  "untested": [
+    "NPU OpenAI SDK loops for KAT Coder, Gemma 4 26B-A4B and GPT-OSS 20B.",
+    "Real NPU structured generation and end-to-end HTTP performance.",
+    "Compiled bridge native/hardware tests remain ignored."
+  ],
+  "limitations": [
+    "Tool-enabled SSE buffers output before emitting one delta per validated call.",
+    "Required/named tool_choice is prompted; malformed model output still falls back to content.",
+    "Whole-reply response_format with required/named tool_choice returns HTTP 400; argument-only masks are future work.",
+    "Generation uses canonical property order and a finite decimal sublanguage; see SERVER-STRUCTURED-OUTPUT."
+  ],
+  "hardware_build_command": "dibs run build --label \"U3: hardware client prerequisites\" --eta 5m -- cargo build -p phlegm-cli --release --offline",
+  "hardware_checks": [
+    {
+      "model": "KAT-Coder-V2.5-Dev-Q4pure-NPU2",
+      "status": "untested on hardware, forbidden by task",
+      "serve_command": "dibs run npu port-8415 --label \"U3: SDK KAT-Coder-V2.5-Dev-Q4pure-NPU2\" --eta 10m -- /home/cyrus/code/phlegm/target/npu-dev/npu-run.sh /home/cyrus/code/phlegm-wt/u3-u4-tools-schema/target/release/phlegm serve --model-dir /home/cyrus/models/KAT-Coder-V2.5-Dev-Q4pure-NPU2 --kernels /home/cyrus/models/KAT-Coder-V2.5-Dev-Q4pure-NPU2/open_kernels --bridge /home/cyrus/code/phlegm/target/npu-dev/bridges/qwen35moe --port 8415 --max-ctx 4096",
+      "client_command": "python -I phlegm-core/tests/check_tools_sdk.py --base-url http://127.0.0.1:8415/v1 --model KAT-Coder-V2.5-Dev-Q4pure-NPU2",
+      "instructions": "Start this server under its lease, run the client in another terminal, then stop the server before changing models. Requires OpenAI Python SDK and matching installed native artifacts."
+    },
+    {
+      "model": "gemma-4-26B-A4B-it-NPU2",
+      "status": "untested on hardware, forbidden by task",
+      "serve_command": "dibs run npu port-8415 --label \"U3: SDK gemma-4-26B-A4B-it-NPU2\" --eta 10m -- /home/cyrus/code/phlegm/target/npu-dev/npu-run.sh /home/cyrus/code/phlegm-wt/u3-u4-tools-schema/target/release/phlegm serve --model-dir /home/cyrus/models/gemma-4-26B-A4B-it-NPU2 --kernels /home/cyrus/models/gemma-4-26B-A4B-it-NPU2/open_kernels --bridge /home/cyrus/code/phlegm/target/npu-dev/bridges/gemma4moe-blk --port 8415 --max-ctx 4096",
+      "client_command": "python -I phlegm-core/tests/check_tools_sdk.py --base-url http://127.0.0.1:8415/v1 --model gemma-4-26B-A4B-it-NPU2",
+      "instructions": "Start this server under its lease, run the client in another terminal, then stop the server before changing models. Requires OpenAI Python SDK and matching installed native artifacts."
+    },
+    {
+      "model": "gpt-oss-20b-NPU2",
+      "status": "untested on hardware, forbidden by task",
+      "serve_command": "dibs run npu port-8415 --label \"U3: SDK gpt-oss-20b-NPU2\" --eta 10m -- /home/cyrus/code/phlegm/target/npu-dev/npu-run.sh /home/cyrus/code/phlegm-wt/u3-u4-tools-schema/target/release/phlegm serve --model-dir /home/cyrus/models/gpt-oss-20b-NPU2 --kernels /home/cyrus/models/gpt-oss-20b-NPU2/open_kernels --bridge /home/cyrus/code/phlegm/target/npu-dev/bridges/gptoss --port 8415 --max-ctx 4096",
+      "client_command": "python -I phlegm-core/tests/check_tools_sdk.py --base-url http://127.0.0.1:8415/v1 --model gpt-oss-20b-NPU2",
+      "instructions": "Start this server under its lease, run the client in another terminal, then stop the server before changing models. Requires OpenAI Python SDK and matching installed native artifacts."
+    }
+  ]
+}
