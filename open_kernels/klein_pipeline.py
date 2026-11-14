@@ -333,8 +333,8 @@ def param_table() -> tuple[dict[str, tuple[int, int]], int]:
     return table, off
 
 
-def fill_params(get_dit, get_te) -> np.ndarray:
-    """PARAMS contents (bf16): qk norm weights + RoPE tables, RMSNorm weights."""
+def fill_params(get_dit, get_te=None) -> np.ndarray:
+    """PARAMS contents; get_te=None leaves unused text-encoder slots zero."""
     ewp = _ew_params()
     table, total = param_table()
     out = np.zeros(total // 2, bfloat16)
@@ -359,13 +359,14 @@ def fill_params(get_dit, get_te) -> np.ndarray:
     for j in range(N_SGL):
         p = f"single_transformer_blocks.{j}.attn."
         put(f"qk_sgl{j}", ewp.qk_params(get_dit(p + "norm_q.weight"), get_dit(p + "norm_k.weight")))
-    for l in range(TE_LAYERS):
-        p = f"model.layers.{l}."
-        put(f"te{l}_qk", ewp.qwen_qk_params(get_te(p + "self_attn.q_norm.weight"),
-                                            get_te(p + "self_attn.k_norm.weight")))
-        put(f"te{l}_post", norm_vec(get_te(p + "post_attention_layernorm.weight")))
-    for l in range(TE_LAYERS + 1):
-        put(f"te{l}_in", norm_vec(get_te(f"model.layers.{l}.input_layernorm.weight")))
+    if get_te is not None:
+        for l in range(TE_LAYERS):
+            p = f"model.layers.{l}."
+            put(f"te{l}_qk", ewp.qwen_qk_params(get_te(p + "self_attn.q_norm.weight"),
+                                                get_te(p + "self_attn.k_norm.weight")))
+            put(f"te{l}_post", norm_vec(get_te(p + "post_attention_layernorm.weight")))
+        for l in range(TE_LAYERS + 1):
+            put(f"te{l}_in", norm_vec(get_te(f"model.layers.{l}.input_layernorm.weight")))
     return out
 
 

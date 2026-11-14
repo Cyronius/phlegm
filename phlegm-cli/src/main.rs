@@ -28,6 +28,7 @@ commands:
   config unset [--model-dir DIR | --config-model TAG] --config-key KEY
   config list                                                   the registry's models
   image --config JSON --prompt TEXT --out DIR [--image REF] [--size 512x512] [--steps N] [--guidance N]
+        [--projected-conditioning FILE]   experimental FLUX.2 klein conditioning input
   serve-images --config JSON [--host 127.0.0.1] [--port 52626]
   bench     benchmark protocol, machine metadata, and result validation
   version   print the version
@@ -353,7 +354,8 @@ fn config(args: &[String]) -> Result<(), String> {
 fn image_run(args: &[String]) -> Result<(), String> {
     let opts = flags(args)?;
     const ALLOWED: &[&str] = &["--config", "--prompt", "--out", "--model",
-        "--negative-prompt", "--size", "--steps", "--guidance", "--seed", "--image"];
+        "--negative-prompt", "--size", "--steps", "--guidance", "--seed", "--image",
+        "--projected-conditioning"];
     for key in opts.keys() {
         if !ALLOWED.contains(&key.as_str()) {
             return Err(format!("unknown image option {key}"));
@@ -364,8 +366,15 @@ fn image_run(args: &[String]) -> Result<(), String> {
     let out = if out.is_absolute() { out } else {
         std::env::current_dir().map_err(|e| e.to_string())?.join(out)
     };
-    let request = ImageRequest {
-        prompt: required(&opts, "--prompt")?,
+    let request = image_request(&opts)?;
+    let path = image::generate(&cfg, &request, &out)?;
+    println!("{}", path.display());
+    Ok(())
+}
+
+fn image_request(opts: &HashMap<String, String>) -> Result<ImageRequest, String> {
+    Ok(ImageRequest {
+        prompt: required(opts, "--prompt")?,
         model: opts.get("--model").cloned(),
         negative_prompt: opts.get("--negative-prompt").cloned().unwrap_or_default(),
         size: opts.get("--size").cloned().unwrap_or_else(|| "512x512".into()),
@@ -380,10 +389,9 @@ fn image_run(args: &[String]) -> Result<(), String> {
         // --image REF edits REF instead of generating from text alone.
         image: opts.get("--image").map(|p| std::fs::canonicalize(p)
             .map_err(|e| format!("reading --image {p}: {e}"))).transpose()?,
-    };
-    let path = image::generate(&cfg, &request, &out)?;
-    println!("{}", path.display());
-    Ok(())
+        projected_conditioning: opts.get("--projected-conditioning").map(|p| std::fs::canonicalize(p)
+            .map_err(|e| format!("reading --projected-conditioning {p}: {e}"))).transpose()?,
+    })
 }
 
 fn serve_images(args: &[String]) -> Result<(), String> {
@@ -438,6 +446,21 @@ mod tests {
             let args: Vec<String> = extra.into_iter().map(str::to_owned).collect();
             assert!(serve(&args).unwrap_err().contains("embedding model alone"));
         }
+    }
+
+    #[test]
+    fn image_conditioning_path_is_resolved_before_dispatch() {
+        let path = std::env::current_exe().unwrap();
+        let opts = flags(&["--prompt".into(), "fox".into(), "--projected-conditioning".into(),
+                           path.to_string_lossy().into_owned()]).unwrap();
+        let request = image_request(&opts).unwrap();
+        assert_eq!(request.projected_conditioning, Some(std::fs::canonicalize(path).unwrap()));
+        assert!(request.image.is_none());
+        let mut missing = opts;
+        missing.insert("--projected-conditioning".into(),
+                       std::env::temp_dir().join(format!("missing-conditioning-{}", std::process::id()))
+                           .to_string_lossy().into_owned());
+        assert!(image_request(&missing).err().unwrap().contains("reading --projected-conditioning"));
     }
 
     #[test]

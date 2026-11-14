@@ -12,6 +12,7 @@ q4nx bundle. The reference is ``flux2_klein_reference.py`` (the unchanged diffus
     python -m open_kernels.flux2_native_generate --model <checkpoint> --kernels <set dir> \
         --prompt "a red fox in fresh snow" --size 512 --seed 1 --out <dir> \
         [--image ref.png] [--noise noise.npy] [--steps 4]
+        [--projected-conditioning target.safetensors]  # experimental, skips text encoding
 
 Kernel directory: ``export_dit_kernels.py --resolutions ... [--edits ...] --out <dir>``.
 Packed weights are cached in ``<kernels>/packed/`` (dit_gemm's bfp16 layout, ~8 GB for
@@ -113,17 +114,20 @@ def _pack_one(sub: str, name: str, cache: str, model: str) -> tuple[str, float]:
     return name, time.time() - t0
 
 
-def ensure_packed(cache: Path, model: Path, jobs: int) -> dict[str, tuple[Path, int]]:
+def ensure_packed(cache: Path, model: Path, jobs: int, *, text_encoder: bool = True) -> dict[str, tuple[Path, int]]:
     cache.mkdir(parents=True, exist_ok=True)
     stamp = cache / "provenance.txt"
-    fp = fingerprint(model, ("transformer", "text_encoder"), inspect.getsource(kp.pack_b_cols))
+    subs = ("transformer", "text_encoder") if text_encoder else ("transformer",)
+    fp = fingerprint(model, subs, inspect.getsource(kp.pack_b_cols))
     if stamp.exists() and stamp.read_text().strip() != fp:
         print(f"{cache}: packed from another checkpoint or packer; repacking", flush=True)
         for p in cache.glob("*.bin"):
             p.unlink()
     stamp.write_text(fp + "\n")
-    want = {n: ("transformer", K * N * 9 // 8) for n, (K, N, _) in kp.dit_weight_specs().items()}
-    want |= {n: ("text_encoder", K * N * 9 // 8) for n, (K, N, _) in kp.te_weight_specs().items()}
+    want = {n: ("transformer", K * N * 9 // 8) for n, (K, N, _) in kp.dit_weight_specs().items()
+            if text_encoder or n != "ctx_emb"}
+    if text_encoder:
+        want |= {n: ("text_encoder", K * N * 9 // 8) for n, (K, N, _) in kp.te_weight_specs().items()}
     todo = [n for n, (_, nb) in want.items()
             if not (cache / f"{n}.bin").exists() or (cache / f"{n}.bin").stat().st_size != nb]
     if todo:
@@ -170,17 +174,18 @@ def embed_rows(st: SafeTensors, ids: np.ndarray) -> np.ndarray:
     return x
 
 
-def check_checkpoint(model: Path) -> dict:
+def check_checkpoint(model: Path, *, projected: bool = False) -> dict:
     """The schedule's constants against the checkpoint's configs: refuse a different
     geometry (another klein size) instead of running it with the wrong layout."""
     tc = json.loads((model / "transformer" / "config.json").read_text())
-    te = json.loads((model / "text_encoder" / "config.json").read_text())
     want_t = {"num_layers": kp.N_DBL, "num_single_layers": kp.N_SGL,
               "num_attention_heads": kp.HEADS, "attention_head_dim": kp.HD,
               "joint_attention_dim": 3 * kp.TE_HID, "in_channels": kp.LAT_CH}
     want_e = {"hidden_size": kp.TE_HID, "intermediate_size": kp.TE_MLP}
     bad = [f"transformer.{k}={tc.get(k)} (schedule {v})" for k, v in want_t.items() if tc.get(k) != v]
-    bad += [f"text_encoder.{k}={te.get(k)} (schedule {v})" for k, v in want_e.items() if te.get(k) != v]
+    if not projected:
+        te = json.loads((model / "text_encoder" / "config.json").read_text())
+        bad += [f"text_encoder.{k}={te.get(k)} (schedule {v})" for k, v in want_e.items() if te.get(k) != v]
     if bad:
         raise SystemExit("checkpoint geometry differs from klein_pipeline's: " + "; ".join(bad))
     mi = json.loads((model / "model_index.json").read_text())
@@ -190,28 +195,32 @@ def check_checkpoint(model: Path) -> dict:
 
 
 class Runner:
-    def __init__(self, model: Path, kdir: Path, R: int, steps: int, edit: bool, pack_jobs: int):
+    def __init__(self, model: Path, kdir: Path, R: int, steps: int, edit: bool, pack_jobs: int,
+                 *, projected: bool = False):
         from npu_host import Npu
         import vae_decoder as vd
 
         t0 = time.time()
         self.R, self.steps = R, steps
+        self.projected, self._conditioning_bits = projected, None
         self.pl = kp.plan(R, steps=steps, edit=edit)
         self.dit = SafeTensors(model / "transformer")
-        self.te = SafeTensors(model / "text_encoder")
+        self.te = None if projected else SafeTensors(model / "text_encoder")
         from tokenizers import Tokenizer
         self.tok = Tokenizer.from_file(str(model / "tokenizer" / "tokenizer.json"))
-        packed = ensure_packed(kdir / "packed", model, pack_jobs)
+        packed = ensure_packed(kdir / ("packed_projected" if projected else "packed"),
+                               model, pack_jobs, text_encoder=not projected)
 
         self.npu = npu = Npu()
         self.sets = {n: npu.kernel_set(n, kdir / d) for n, d in SETS.items()}
-        fa_meta = json.loads((kdir / "fa" / "dit_fa.json").read_text())
-        self.vl_words = fa_meta["patch"]["te_attn"]["valid_len"]
+        if not projected:
+            fa_meta = json.loads((kdir / "fa" / "dit_fa.json").read_text())
+            self.vl_words = fa_meta["patch"]["te_attn"]["valid_len"]
 
         self.bufs = {n: npu.buf(n, nb) for n, nb in self.pl.buffers.items()}
         for b in self.bufs.values():
             b.zero()
-        self.bufs["PARAMS"].write(kp.fill_params(self.dit.get, self.te.get))
+        self.bufs["PARAMS"].write(kp.fill_params(self.dit.get, self.te.get if self.te else None))
         qin = self.pl.vae.buffers["QIN"]
         q = np.zeros((qin.H * qin.W, qin.C), bfloat16)
         q[:, 512] = 1                                  # the VAE attention GEMM's bias row
@@ -242,12 +251,23 @@ class Runner:
         self.bufs["DT"].write(kp.dt_params(self.sig, steps))
         self.ops = []
         for o in self.pl.ops:
+            if projected and o["phase"] == "text":
+                continue
+            if projected and o["what"] == "ctx_emb":
+                # Host input boundary at every step; X's text rows were mutated by the last step.
+                self.ops.append((o["set"], None, [], o["phase"], o))
+                continue
             st = self.sets[o["set"]].stream(o["stream"])
             self.ops.append((o["set"], st, [self._arg(a) for a in o["args"]], o["phase"], o))
-        self.vl_stream = self.sets["fa"].stream("te_attn")
+        if not projected:
+            self.vl_stream = self.sets["fa"].stream("te_attn")
         self.load_s = time.time() - t0
         print(f"loaded {R}x{R} ({'edit' if edit else 't2i'}, {steps} steps): "
-              f"{len(self.ops)} dispatches in {self.load_s:.1f} s", flush=True)
+              f"{self.dispatch_count} dispatches in {self.load_s:.1f} s", flush=True)
+
+    @property
+    def dispatch_count(self) -> int:
+        return sum(st is not None for _, st, _, _, _ in self.ops)
 
     def _arg(self, ref):
         kind = ref[0]
@@ -269,9 +289,21 @@ class Runner:
         raise ValueError(ref)
 
     def set_prompt(self, prompt: str) -> tuple[np.ndarray, int]:
+        if self.projected:
+            raise ValueError("use set_projected_conditioning in projected-input mode")
         ids, n_real = kp.token_ids(self.tok, prompt)
         self.bufs["XT"].write(embed_rows(self.te, ids))
         self.vl_stream.patch(self.vl_words, n_real)
+        return ids, n_real
+
+    def set_projected_conditioning(self, conditioning, prompt: str) -> tuple[np.ndarray, int]:
+        if not self.projected:
+            raise ValueError("runner was not created for projected conditioning")
+        # Invalidate the old input even if the new prompt check fails.
+        self._conditioning_bits = None
+        ids, n_real = kp.token_ids(self.tok, prompt)
+        conditioning.require_prompt(ids, n_real)
+        self._conditioning_bits = conditioning.bits.copy()
         return ids, n_real
 
     def set_noise(self, lat_bits: np.ndarray) -> None:
@@ -287,6 +319,8 @@ class Runner:
         self.bufs[self.pl.enc_buffers["IN"]].write(x)
 
     def run(self) -> dict[str, float]:
+        if self.projected and self._conditioning_bits is None:
+            raise ValueError("projected conditioning has not been set")
         from npu_host import COMPLETED
 
         def wait(h, what):
@@ -316,6 +350,10 @@ class Runner:
                         phases[cur_phase] = now - t_phase
                     t_phase, cur_phase = now, phase
                 cur_set = kset
+            if st is None:
+                drain("before projected conditioning upload")
+                self.bufs["X"].write(self._conditioning_bits)
+                continue
             if len(inflight) >= 64:                    # same context: in order, so the
                 wait(inflight.pop(0), f"{kset}/{st.name}")   # oldest finishes first
             inflight.append(st.start(*bos))
@@ -358,6 +396,8 @@ def main() -> int:
     ap.add_argument("--model", type=Path, required=True, help="diffusers checkpoint directory")
     ap.add_argument("--kernels", type=Path, required=True)
     ap.add_argument("--prompt", required=True)
+    ap.add_argument("--projected-conditioning", type=Path,
+                    help="experimental 512x3072 artifact; bypass native text encoding/projection")
     ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--steps", type=int, default=kp.STEPS)
     ap.add_argument("--seed", type=int, default=0)
@@ -372,7 +412,14 @@ def main() -> int:
         raise SystemExit(f"unsupported size: {why}")
     if not 1 <= a.steps <= 50:
         raise SystemExit("steps must be between 1 and 50")
-    geometry = check_checkpoint(a.model)
+    geometry = check_checkpoint(a.model, projected=a.projected_conditioning is not None)
+    conditioning = None
+    if a.projected_conditioning:
+        from klein_conditioning import load_projected_conditioning
+        from tokenizers import Tokenizer
+        conditioning = load_projected_conditioning(a.projected_conditioning)
+        tokenizer = Tokenizer.from_file(str(a.model / "tokenizer" / "tokenizer.json"))
+        conditioning.require_prompt(*kp.token_ids(tokenizer, a.prompt))
     a.out.mkdir(parents=True, exist_ok=True)
     T = kp.image_tokens(a.size)
     if a.noise:
@@ -387,8 +434,10 @@ def main() -> int:
         rng = np.random.default_rng([a.seed, 1] if a.image else a.seed)
         lat = rng.standard_normal((T, kp.LAT_CH), np.float32).astype(bfloat16).view(np.uint16)
 
-    r = Runner(a.model, a.kernels, a.size, a.steps, a.image is not None, a.pack_jobs)
-    ids, n_real = r.set_prompt(a.prompt)
+    r = Runner(a.model, a.kernels, a.size, a.steps, a.image is not None, a.pack_jobs,
+               projected=conditioning is not None)
+    ids, n_real = (r.set_projected_conditioning(conditioning, a.prompt) if conditioning is not None
+                   else r.set_prompt(a.prompt))
     r.set_noise(lat)
     if a.image:
         r.set_reference(load_reference(a.image, a.size))
@@ -401,7 +450,9 @@ def main() -> int:
                "steps": a.steps, "seed": a.seed, "noise": str(a.noise) if a.noise else None,
                "edit": a.image is not None, "reference": str(a.image) if a.image else None,
                "tokens": n_real, "model": str(a.model), "kernels": str(a.kernels),
-               "checkpoint": geometry, "dispatches": len(r.ops),
+               "checkpoint": geometry, "dispatches": r.dispatch_count,
+               "projected_conditioning": ({"path": str(a.projected_conditioning),
+                                            **conditioning.provenance()} if conditioning else None),
                "load_s": round(r.load_s, 2),
                "npu_phases_s": {k: round(v, 4) for k, v in phases.items()}}
     (a.out / "summary.json").write_text(json.dumps(summary, indent=1))
