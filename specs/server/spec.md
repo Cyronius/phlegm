@@ -440,6 +440,72 @@ Their bridge selection checks `--bridge`, `PHLEGM_REFERENCE_BRIDGE`, an adjacent
 using the kernel manifest family, then the build-time developer checkout's bridge tree.
 Explicit paths must exist. `phlegm bench` continues to require `--reference-engine`.
 
+## SERVER-SPECULATIVE: Verified speculative decoding
+
+`phlegm run` and `phlegm serve` accept `--speculative off|auto|lookup|mtp`.
+The per-model `speculative` registry field, settings overlay and
+`PHLEGM_SPECULATIVE` follow SERVER-SETTINGS precedence. The built-in default
+and every shipped registry entry are `off`. No hardware speed or exactness
+claim is established by the Rust fake-bridge checks below; default-on requires
+the model/method's numerical, serving and paired performance gates.
+
+With a protocol-2 bridge advertising `verify_width > 0`, `lookup` uses the
+longest repeated suffix (4 down to 2 tokens), the most recent earlier match
+and its extended continuation (OPEN-SPEC-LOOKUP). `auto` selects an advertised
+MTP drafter, otherwise lookup. `mtp` requires `draft: {"method":"mtp","max":K}`;
+without it the request fails with a stage-4 prerequisite error. Protocol-1
+bridges and bridges without verification always use ordinary decode, for all
+modes. An accepted mode is not evidence of runtime MTP support.
+
+Between cycles Rust holds one emitted token outside the committed context.
+It verifies that token plus at most three drafts, bounded by the advertised
+width, remaining output budget and context capacity. With no lookup match,
+the pass has one row. After a rejection the draft budget halves; a completely
+rejected draft triggers two width-one cycles before another probe. A fully
+accepted cycle grows the budget by one, up to the advertised width.
+
+Protocol 2 retains protocol 1's prefill, reset, rewind and decode commands:
+
+- The process greeting accepts `protocol: 1` or `2`. Protocol 2's `init`
+  adds `verify_width` (0 means unavailable), `verify_ref` (slow reference
+  verifier) and `draft` (null or the MTP capability above).
+- `verify_logits {"accept":m,"tokens":[t0,d1,...],"draft":j}` commits the first
+  m rows of a preceding pass, then runs the supplied inputs without committing
+  them. For j > 0 only t0 is supplied; the bridge appends at most j drafts.
+  The reply declares `rows`, the exact input `tokens`, the committed starting
+  `position`, and `logits_f32_le_bytes = rows * real_vocab * 4`, followed by
+  row-major little-endian f32 logits. Rust validates the row count, input IDs,
+  position, payload size and finite values before walking the rows.
+- `accept {"n":m}` commits only the first m pending rows and discards the rest.
+  This client explicitly accepts after each cycle, so its next verify command
+  carries `accept:0`. Reset, rewind, prefill and decode require no pending pass.
+
+Rust samples only valid rows, once each, in order, using the request's sampler,
+history, penalties, ramps, RNG and structured-output mask. A masked-out draft
+cannot match the sampled token and is rejected. Only sampled, verified tokens
+reach `TokenEvent`, with their raw model logits; drafts never reach callbacks.
+Bit-identical valid verifier rows imply identical greedy and seeded output
+to ordinary decode. Device row identity remains a separate hardware gate.
+
+Stop IDs, output limits and callback `Break` end the walk immediately. Stop
+strings continue to use SERVER-GENERATION's callback. On `Break`, Rust starts
+no new pass and runs no new token, but sends the final `accept` needed to
+discard the pending suffix. The token whose callback broke remains unrun.
+Only acknowledged committed input tokens enter the reusable context; the
+prefill mark is preserved. Failed verification/commit leaves no reusable
+context or mark. Streaming, reasoning splitting and log probabilities use
+the same verified callback path as ordinary decode.
+
+CPU acceptance tests (2026-11-09): `speculative::tests` covers all 13 existing
+lookup fixtures and policy bounds. `bench::reference::speculation::tests`
+checks greedy plus five seeded sampler configurations, adversarial drafts,
+U4 masks, stops, early breaks, capacity/output bounds, committed context and
+marks, follow-up prefix reuse, protocol-1 fallback and malformed replies.
+`server::tests::speculative_bridge_stream_stop_and_reuse_match_plain_http`
+checks SSE/non-stream text, a stop string ending inside a cycle, rollback and
+subsequent HTTP prefix reuse with the protocol-2 fake. These tests load no
+hardware and do not validate C++ verification or MTP implementations.
+
 ## SERVER-SETTINGS: Per-model runtime defaults
 
 `phlegm run` and `phlegm serve` take their sampling, template, context and prefill defaults from

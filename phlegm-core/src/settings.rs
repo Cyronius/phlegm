@@ -228,6 +228,9 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    pub fn speculative(&self) -> Result<crate::speculative::SpeculativeMode, String> {
+        self.str("speculative").parse()
+    }
     fn value(&self, key: &str) -> &Value {
         &self
             .values
@@ -757,6 +760,26 @@ mod tests {
         //   sort_keys=True, separators=(",",":")).encode()).hexdigest()[:16])'
         assert_eq!(canonical(&json!({"b": 1, "a": "x"})), r#"{"a":"x","b":1}"#);
         assert_eq!(defaults_version(&json!({"b": 1, "a": "x"})), "cdab067e9f3beb32");
+    }
+
+    #[test]
+    fn speculation_is_off_everywhere_until_explicitly_selected() {
+        use crate::speculative::SpeculativeMode;
+        let cfg = Config::with_user(json!({}), PathBuf::new());
+        assert_eq!(cfg.resolve_with(None, None, &HashMap::new(), &no_env).unwrap().speculative().unwrap(), SpeculativeMode::Off);
+        for (tag, entry) in cfg.tags() {
+            assert_eq!(entry["speculative"], "off", "{tag}");
+            assert_eq!(cfg.resolve_with(Some(&tag), None, &HashMap::new(), &no_env).unwrap().speculative().unwrap(), SpeculativeMode::Off);
+        }
+        let user = Config::with_user(json!({"defaults":{"speculative":"lookup"}}), PathBuf::new());
+        assert_eq!(user.resolve_with(None, None, &HashMap::new(), &no_env).unwrap().speculative().unwrap(), SpeculativeMode::Lookup);
+        let env = |key: &str| (key == "PHLEGM_SPECULATIVE").then(|| "auto".into());
+        assert_eq!(user.resolve_with(None, None, &HashMap::new(), &env).unwrap().speculative().unwrap(), SpeculativeMode::Auto);
+        for mode in ["off", "auto", "lookup", "mtp"] {
+            let cli = HashMap::from([("--speculative".into(), mode.into())]);
+            assert_eq!(user.resolve_with(None, None, &cli, &env).unwrap().speculative().unwrap(), mode.parse().unwrap());
+        }
+        assert!(cfg.def("speculative").unwrap().parse("on").is_err());
     }
 
     #[test]

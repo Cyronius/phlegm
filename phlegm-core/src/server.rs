@@ -73,6 +73,7 @@ pub struct ServerConfig {
 /// table of the template's effort values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenDefaults {
+    pub speculative: crate::speculative::SpeculativeMode,
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
@@ -88,6 +89,7 @@ impl Default for GenDefaults {
     /// The settings' built-in defaults: greedy, the template's thinking on.
     fn default() -> Self {
         GenDefaults {
+            speculative: Default::default(),
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
@@ -102,6 +104,7 @@ impl Default for GenDefaults {
 impl GenDefaults {
     pub fn from_settings(r: &crate::settings::Resolved) -> Result<GenDefaults, String> {
         Ok(GenDefaults {
+            speculative: r.speculative()?,
             temperature: r.f32("temperature"),
             top_k: r.usize("top_k"),
             top_p: r.f32("top_p"),
@@ -777,6 +780,7 @@ fn handle_chat_completions(mut request: Request, state: &Arc<ServerState>, legac
         sampler
     };
     let params = GenParams {
+        speculative: state.cfg.defaults.speculative,
         max_tokens,
         sampler,
         stop_ids,
@@ -981,6 +985,7 @@ mod tests {
 
     include!("server_tools_tests.rs");
     include!("server_generation_tests.rs");
+    include!("server_speculative_tests.rs");
 
     #[test]
     fn stream_finalization_flushes_only_unemitted_text_and_rejects_rewrites() {

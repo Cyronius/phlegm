@@ -8,6 +8,7 @@
   "models": {
     "qwen3": {
       "0.6b-q4km": {
+        "speculative": "off",
         "name": "Qwen3-0.6B-Q4_K_M",
         "published_gguf": {
           "repo": "unsloth/Qwen3-0.6B-GGUF",
@@ -25,6 +26,7 @@
     },
     "clover": {
       "35b-a3b-q4pure": {
+        "speculative": "off",
         "name": "Clover-35B-A3B-Preview-Q4pure-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -50,6 +52,7 @@
     },
     "flint": {
       "40b-a2.5b": {
+        "speculative": "off",
         "name": "flint-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -65,6 +68,7 @@
     },
     "gemma4-it": {
       "26b-a4b": {
+        "speculative": "off",
         "name": "gemma-4-26B-A4B-it-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -82,6 +86,7 @@
     },
     "gpt-oss": {
       "20b": {
+        "speculative": "off",
         "name": "gpt-oss-20b-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -98,6 +103,7 @@
     },
     "hy-memory": {
       "30b-a3b": {
+        "speculative": "off",
         "name": "Hy-Memory-30B-A3B-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -113,6 +119,7 @@
     },
     "kat-coder-v2.5": {
       "dev": {
+        "speculative": "off",
         "name": "KAT-Coder-V2.5-Dev-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -127,6 +134,7 @@
         }
       },
       "dev-q4k": {
+        "speculative": "off",
         "name": "KAT-Coder-V2.5-Dev-Q4K-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -141,6 +149,7 @@
         }
       },
       "dev-q4pure": {
+        "speculative": "off",
         "name": "KAT-Coder-V2.5-Dev-Q4pure-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -157,6 +166,7 @@
     },
     "lfm2.5-moe": {
       "24b-a2b": {
+        "speculative": "off",
         "name": "LFM2.5-24B-A2B-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -172,6 +182,7 @@
     },
     "lfm3": {
       "1.7b": {
+        "speculative": "off",
         "name": "LFM3-1.7B-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -188,6 +199,7 @@
     },
     "nanbeige4.3": {
       "33b": {
+        "speculative": "off",
         "name": "Nanbeige4.3-33B-Q4pure-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -204,6 +216,7 @@
     },
     "nemotron-3.5-lightning": {
       "30b-a3b": {
+        "speculative": "off",
         "name": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -220,6 +233,7 @@
     },
     "nex-n2.5": {
       "mini-q4k": {
+        "speculative": "off",
         "name": "Nex-N2.5-mini-Q4K-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -234,6 +248,7 @@
         }
       },
       "mini-q4pure": {
+        "speculative": "off",
         "name": "Nex-N2.5-mini-Q4pure-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -250,6 +265,7 @@
     },
     "ornith1.5": {
       "35b-a3b-q4k": {
+        "speculative": "off",
         "name": "Ornith-1.5-35B-A3B-Q4K-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -265,6 +281,7 @@
         }
       },
       "35b-a3b-q4pure": {
+        "speculative": "off",
         "name": "Ornith-1.5-35B-A3B-Q4pure-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -282,6 +299,7 @@
     },
     "underdog-saluki": {
       "27b": {
+        "speculative": "off",
         "name": "Underdog-Saluki-27B-1.0-NPU2",
         "default_context_length": 32768,
         "details": {
@@ -299,6 +317,7 @@
     },
     "xing4.0": {
       "29b-a4b": {
+        "speculative": "off",
         "name": "Xing4.0-29B-A4B-Q4pure-NPU2",
         "default_context_length": 4096,
         "details": {

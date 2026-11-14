@@ -10,6 +10,7 @@ pub mod reasoning_effort;
 pub mod sampler;
 pub mod server;
 pub mod settings;
+pub mod speculative;
 pub mod tokenizer;
 pub mod npu_lock;
 #[cfg(feature = "npu")]

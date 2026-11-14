@@ -32,6 +32,7 @@ commands:
 
 run and serve take the model's settings (phlegm config show --model-dir DIR), each overridable by its flag:
   --max-ctx N  --prefill-route auto|block|sequential  --prefill-mode fast|lean  --think true|false
+  --speculative off|auto|lookup|mtp
   --reasoning-effort default|none|minimal|low|medium|high|xhigh
   --temperature T  --top-k K  --top-p P  --repetition-penalty R  --max-tokens N
   --presence-penalty P  --frequency-penalty F  --repetition-penalty-scope context|response
@@ -154,6 +155,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut backend = NpuBackend::load(npu)?;
     let mut output = Vec::new();
     let mut params = GenParams {
+        speculative: settings.speculative()?,
         max_tokens,
         sampler: Sampler::new(
             settings.f32("temperature"),

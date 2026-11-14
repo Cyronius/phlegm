@@ -1,6 +1,7 @@
 //! Temporary, resident C++ reference-engine adapter. Timings originate in the
 //! child process, not in its JSON transport. The source checkout is never copied.
 mod turbo;
+pub(crate) mod speculation;
 
 use super::{is_hex, BenchBackend, ModelInfo, RuntimeInfo, Sample};
 use crate::backend::{Backend, GenParams};
@@ -137,7 +138,7 @@ fn build_info(bridge: &Path) -> Result<BuildInfo, String> {
     }
     let build: BuildInfo =
         serde_json::from_slice(&data).map_err(|e| format!("reference build metadata: {e}"))?;
-    if build.protocol != 1
+    if !matches!(build.protocol, 1 | 2)
         || build.engine != BACKEND_NAME
         || !is_hex(&build.source_commit, 40)
         || build.compiler_flags.trim().is_empty()
@@ -258,6 +259,7 @@ pub(crate) fn die_with_parent(command: &mut Command) {
 pub(crate) fn die_with_parent(_: &mut Command) {}
 
 struct Process {
+    protocol: u64,
     child: Child,
     input: ChildStdin,
     /// Each reply line, with the raw bytes that follow it when it announces
@@ -320,13 +322,15 @@ impl Process {
             }
         });
         let mut process = Self {
+            protocol: 0,
             child,
             input,
             replies,
             timeout,
         };
         let hello = process.receive()?;
-        if hello.get("protocol").and_then(Value::as_u64) != Some(1)
+        process.protocol = hello.get("protocol").and_then(Value::as_u64).unwrap_or(0);
+        if !matches!(process.protocol, 1 | 2)
             || hello.get("engine").and_then(Value::as_str) != Some(BACKEND_NAME)
         {
             return Err("unsupported reference bridge protocol".into());
@@ -700,6 +704,8 @@ mod tests {
 /// Resident generation backend using the same verified C++ bridge as Phlegm Bench.
 /// Rust owns sampling and the device lock; the C++ child owns XRT resources.
 pub struct NpuBackend {
+    verify_width: usize,
+    draft_max: usize,
     process: Process,
     context_capacity: usize,
     real_vocab: usize,
@@ -756,7 +762,11 @@ pub struct NpuOptions {
 }
 
 impl NpuBackend {
-    pub fn load(mut options: NpuOptions) -> Result<Self, String> {
+    pub fn load(options: NpuOptions) -> Result<Self, String> {
+        Self::load_with_lock(options, || NpuLock::acquire("phlegm NPU"))
+    }
+
+    fn load_with_lock(mut options: NpuOptions, acquire_lock: impl FnOnce() -> Result<NpuLock, String>) -> Result<Self, String> {
         options.prefill_mode = canonical_prefill_mode(&options.prefill_mode);
         if options.threads == 0
             || options.request_timeout.is_zero()
@@ -774,7 +784,7 @@ impl NpuBackend {
         }
         crate::gguf::preflight_direct_route(&options.model_dir, &options.kernel_dir)?;
         build_info(&options.bridge)?;
-        let lock = NpuLock::acquire("phlegm NPU")?;
+        let lock = acquire_lock()?;
         let mut process =
             Process::spawn(&options.bridge, options.threads, options.request_timeout)?;
         let hello = process.request(json!({"command":"init", "model_dir":options.model_dir,
@@ -804,6 +814,12 @@ impl NpuBackend {
             .filter(|_| reuse)
             .map(|n| n > 0);
         Ok(Self {
+            verify_width: if process.protocol == 2 {
+                hello.get("verify_width").and_then(Value::as_u64).unwrap_or(0).min(4) as usize
+            } else { 0 },
+            draft_max: if hello["draft"]["method"] == "mtp" {
+                hello["draft"]["max"].as_u64().unwrap_or(0).min(3) as usize
+            } else { 0 },
             process,
             context_capacity,
             real_vocab,
@@ -841,12 +857,13 @@ impl NpuBackend {
     }
 }
 
-impl Backend for NpuBackend {
-    fn generate(
+impl NpuBackend {
+    fn generate_with_drafter(
         &mut self,
         prompt_ids: &[u32],
         params: &mut GenParams,
         on_token: &mut dyn FnMut(crate::backend::TokenEvent<'_>) -> std::ops::ControlFlow<()>,
+        drafter: Option<Box<dyn crate::speculative::Drafter>>,
     ) -> Result<(), String> {
         self._lock.ensure_held()?;
         if prompt_ids.is_empty()
@@ -903,6 +920,9 @@ impl Backend for NpuBackend {
         if self.recurrent.is_some() {
             eprintln!("phlegm: prompt {} tokens, {} reused", prompt_ids.len(), start);
         }
+        if let Some(mut drafter) = drafter {
+            return self.generate_speculative(prompt_ids, params, on_token, logits, drafter.as_mut());
+        }
         let mut history: Vec<i64> = prompt_ids.iter().map(|&id| i64::from(id)).collect();
         for index in 0..params.max_tokens {
             let next = params.sampler.try_sample(&logits, &history)? as u32;
@@ -919,6 +939,18 @@ impl Backend for NpuBackend {
             }
         }
         Ok(())
+    }
+}
+
+impl Backend for NpuBackend {
+    fn generate(
+        &mut self,
+        prompt_ids: &[u32],
+        params: &mut GenParams,
+        on_token: &mut dyn FnMut(crate::backend::TokenEvent<'_>) -> std::ops::ControlFlow<()>,
+    ) -> Result<(), String> {
+        let drafter = self.drafter(params.speculative)?;
+        self.generate_with_drafter(prompt_ids, params, on_token, drafter)
     }
 
     fn context_capacity(&self) -> Option<usize> {
@@ -1002,6 +1034,7 @@ for line in sys.stdin:
         let mut backend = NpuBackend::load(opts).unwrap();
         for _ in 0..2 {
             let mut params = GenParams {
+                speculative: Default::default(),
                 max_tokens: 4,
                 sampler: crate::sampler::Sampler::new(0.0, 0, 1.0, 1.0, None),
                 stop_ids: [4u32].into_iter().collect(),
@@ -1091,6 +1124,7 @@ for line in sys.stdin:
         let mut backend = NpuBackend::load(opts).unwrap();
         let mut turn = |prompt: &[u32], mark: usize| {
             let mut params = GenParams {
+                speculative: Default::default(),
                 max_tokens: 3,
                 sampler: crate::sampler::Sampler::new(0.0, 0, 1.0, 1.0, None),
                 stop_ids: std::collections::HashSet::new(),
@@ -1141,6 +1175,7 @@ for line in sys.stdin:
         let before = fs::read_to_string(&log).unwrap().lines().count();
         let early = vec![3, 3, 3, 5, 5, 1, 2];
         let mut params = GenParams {
+            speculative: Default::default(),
             max_tokens: 8,
             sampler: crate::sampler::Sampler::new(0.0, 0, 1.0, 1.0, None),
             stop_ids: Default::default(), reuse_mark: Some(6),

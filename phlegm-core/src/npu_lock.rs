@@ -18,6 +18,14 @@ pub struct NpuLock {
 }
 
 impl NpuLock {
+    /// Fake backends must not contend with hardware sessions or mutate the
+    /// process-wide PHLEGM_NPU_LOCK environment variable while tests run.
+    #[cfg(test)]
+    pub(crate) fn for_test(path: PathBuf) -> Self {
+        std::fs::write(&path, std::process::id().to_string()).unwrap();
+        Self::start(path, Duration::from_secs(60))
+    }
+
     // One lockfile per machine: every process that drives the NPU must agree on it.
     fn path() -> std::path::PathBuf {
         std::env::var_os("PHLEGM_NPU_LOCK")
