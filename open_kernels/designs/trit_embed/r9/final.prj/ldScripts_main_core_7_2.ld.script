@@ -1,0 +1,171 @@
+
+MEMORY
+{
+   program (RX) : ORIGIN = 0, LENGTH = 0x0020000
+   data (!RX) : ORIGIN = 0x7DCC0, LENGTH = 0x2340
+}
+ENTRY(__start)
+SECTIONS
+{
+  . = 0x0;
+  .text : {
+     /* the __start symbol has to come at address zero. */
+     *crt0.o(.text*)
+     _ctors_start = .;
+     _init_array_start = .;
+     KEEP(SORT(*.init_array))
+     _ctors_end = .;
+     _init_array_end = .;
+     _dtors_start = .;
+     _dtors_end = .;
+     *(.text*)
+  } > program
+  .data : {
+     *(.data*)
+     *(.rodata*)
+  } > data
+  .comment : {
+     *(.comment*)
+  }
+  .symtab : {
+     *(.symtab)
+  }
+  .shstrtab : {
+     *(.shstrtab)
+  }
+  .strtab : {
+     *(.strtab)
+  }
+  .stack_sizes : {
+     *(.stack_sizes)
+  }
+
+. = 0x70000;
+_sp_start_value_DM_stack = .;
+. += 0x900; /* stack */
+/* No tile with memory exists to the south. */
+. = 0x40000;
+. += 0x10000;
+. = 0x53900;
+y6_0_buff_0 = .;
+. += 0x1B00;
+. = 0x56C00;
+stream_b1_8_cons_buff_0 = .;
+. += 0x1000;
+. = 0x57C00;
+stream_b1_8_cons_buff_1 = .;
+. += 0x1000;
+. = 0x58C00;
+stream_a1_8_cons_buff_0 = .;
+. += 0x1000;
+. = 0x59C00;
+stream_a1_8_cons_buff_1 = .;
+. += 0x1000;
+. = 0x50900;
+buf_192 = .;
+. += 0x3000;
+. = 0x55400;
+buf_193 = .;
+. += 0x1800;
+. = 0x5BC00;
+buf_194 = .;
+. += 0xC00;
+. = 0x5AC00;
+buf_195 = .;
+. += 0x1000;
+. = 0x5C800;
+buf_196 = .;
+. += 0xC00;
+. = 0x5DC00;
+buf_197 = .;
+. += 0x80;
+. = 0x5D400;
+buf_198 = .;
+. += 0x800;
+. = 0x5DC80;
+buf_199 = .;
+. += 0x40;
+. = 0x63900;
+y7_1_buff_0 = .;
+. += 0x1B00;
+. = 0x66C00;
+stream_b1_13_cons_buff_0 = .;
+. += 0x1000;
+. = 0x67C00;
+stream_b1_13_cons_buff_1 = .;
+. += 0x1000;
+. = 0x68C00;
+stream_a1_13_cons_buff_0 = .;
+. += 0x1000;
+. = 0x69C00;
+stream_a1_13_cons_buff_1 = .;
+. += 0x1000;
+. = 0x60900;
+buf_232 = .;
+. += 0x3000;
+. = 0x65400;
+buf_233 = .;
+. += 0x1800;
+. = 0x6BC00;
+buf_234 = .;
+. += 0xC00;
+. = 0x6AC00;
+buf_235 = .;
+. += 0x1000;
+. = 0x6C800;
+buf_236 = .;
+. += 0xC00;
+. = 0x6DC00;
+buf_237 = .;
+. += 0x80;
+. = 0x6D400;
+buf_238 = .;
+. += 0x800;
+. = 0x6DC80;
+buf_239 = .;
+. += 0x40;
+. = 0x73900;
+y7_0_buff_0 = .;
+. += 0x1B00;
+. = 0x76C00;
+stream_b1_12_cons_buff_0 = .;
+. += 0x1000;
+. = 0x77C00;
+stream_b1_12_cons_buff_1 = .;
+. += 0x1000;
+. = 0x78C00;
+stream_a1_12_cons_buff_0 = .;
+. += 0x1000;
+. = 0x79C00;
+stream_a1_12_cons_buff_1 = .;
+. += 0x1000;
+. = 0x70900;
+buf_224 = .;
+. += 0x3000;
+. = 0x75400;
+buf_225 = .;
+. += 0x1800;
+. = 0x7BC00;
+buf_226 = .;
+. += 0xC00;
+. = 0x7AC00;
+buf_227 = .;
+. += 0x1000;
+. = 0x7C800;
+buf_228 = .;
+. += 0xC00;
+. = 0x7DC00;
+buf_229 = .;
+. += 0x80;
+. = 0x7D400;
+buf_230 = .;
+. += 0x800;
+. = 0x7DC80;
+buf_231 = .;
+. += 0x40;
+  .bss : { *(.bss*) } > data
+}
+INPUT(/home/cyrus/code/phlegm-trit-embed/open_kernels/designs/trit_embed/build/final.prj/f2_pre.o)
+INPUT(/home/cyrus/code/phlegm-trit-embed/open_kernels/designs/trit_embed/build/final.prj/f2_step.o)
+INPUT(/home/cyrus/code/phlegm-trit-embed/open_kernels/designs/trit_embed/build/final.prj/f2_out.o)
+PROVIDE(main = core_7_2);

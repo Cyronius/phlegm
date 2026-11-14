@@ -1,0 +1,37 @@
+{
+  "tag": "L3_cap128_d2_cycles96",
+  "stub": "",
+  "broadcast_depth": 2,
+  "defs": [
+    "F2_PROF_CYCLES=96"
+  ],
+  "packets": 170,
+  "element_bytes": 8192,
+  "streams": 2,
+  "slots": 2,
+  "packet_format": 3,
+  "aiecc_opt": "",
+  "cap": 128,
+  "texts_per_dispatch": 1,
+  "cores": 32,
+  "layers": 3,
+  "scope": "One dispatch, 3 full encoder layers; host embedding lookup/input norm/output projection/pooling",
+  "program_text_bytes": 16208,
+  "stack_bytes_per_core": 5120,
+  "mlir_aie": "1.4.2",
+  "llvm_aie": "21.0.0.2026080301+c9c5ecb7",
+  "source_sha256": {
+    "fused2.h": "524e2a057291c868d3102e4cd0155e3d4bc2c4c897da44aa2a1e98ecf6f56f06",
+    "gelu_lut.h": "2d4bb893c6576f6d1b17f56f3ed6d43da8e5bc378c6e94bf5e543561f23fc5df",
+    "trit_design.py": "ed2b45667579071a84aac30a7ad858033a4a8b68070e157012a9d4668706652c",
+    "../../include/vecmath.h": "ab8e6c6f74b83739918dcc015da0f6729548a9e8b7765dd6b8e221f0156dd1cf",
+    "f2_out.cc": "bf1c3a937f18cc2412b17054786b912397cf3172841ab8ab8da08c83d7c5fb4a",
+    "f2_pre.cc": "05831015c513b76151f218ad1c7a8d8cc92ed97c136f027d46cce367b25fde50",
+    "f2_step.cc": "63fed1281b7fb2a6cbe6d9a109fab4c43c5932615f69344691406af040601700"
+  },
+  "artifact_sha256": {
+    "final.xclbin": "3c29c76c32a2c33c10795b1f9b78a4b87a8473bc6cdf3ab5a6bc8c7b759ea8f8",
+    "insts.bin": "9af3ceb2384e4d1f5ca98e358c9993eda08e41503f892b23d7b196b9eab3121e"
+  },
+  "build_seconds": 24.442609507008456
+}

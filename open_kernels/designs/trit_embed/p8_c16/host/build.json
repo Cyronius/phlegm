@@ -1,0 +1,18 @@
+{
+  "command": [
+    "/home/cyrus/code/phlegm/target/npu-dev/env/bin/x86_64-conda-linux-gnu-c++",
+    "-std=c++17",
+    "-shared",
+    "-fPIC",
+    "-O2",
+    "/home/cyrus/code/phlegm-trit-embed/open_kernels/designs/trit_embed/host/td_npu2.cpp",
+    "-I/home/cyrus/code/phlegm/target/npu-dev/xrt/include",
+    "-L/home/cyrus/code/phlegm/target/npu-dev/xrt/lib",
+    "-Wl,-rpath,/home/cyrus/code/phlegm/target/npu-dev/xrt/lib",
+    "-lxrt_coreutil",
+    "-o",
+    "/home/cyrus/code/phlegm-trit-embed/open_kernels/designs/trit_embed/build/host/libtd_npu2.so"
+  ],
+  "source_sha256": "26558a84fe18ca66226d056356cb5da511c988021bee40c3363928fbb7a6dc09",
+  "library_sha256": "2796a81fb2a889b7ce84a099827770a60d9de2c3b7ec07005133d6ba5218a0f7"
+}
