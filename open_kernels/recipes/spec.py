@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from typing import Any, Mapping
 
 LINEAR, FULL, DENSE, DENSE_LOCAL = "linear_attention", "full_attention", "dense", "dense_local"
@@ -380,19 +380,34 @@ class ModelSpec:
         return HF_FAMILIES[mt](cfg, real_vocab)
 
     @classmethod
-    def from_gguf_metadata(cls, md: Mapping[str, Any], tensors=None) -> "ModelSpec":
+    def from_gguf_metadata(cls, md: Mapping[str, Any], tensors=None, *, tensor_types=None) -> "ModelSpec":
         """From a GGUF's key/value metadata (llama.cpp's key names).
 
         `tensors` is the file's tensor names, when the caller has them: the
         depth and the layer types are read off the weights, because a fine-tune
         can differ from the pattern the header's interval describes (the
         Qwen3.8-9B distill has two full attention layers at the end where the
-        interval says one).
+        interval says one). `tensor_types`, when supplied, is the complete dense
+        tensor-name -> GGML type-name map. It derives explicit per-tensor carriage
+        without collapsing a mixed Q4_K_M file to one format per role. Runtime
+        export of that selector remains gated on per-layer variant dispatch.
         """
         arch = md.get("general.architecture")
         if arch not in GGUF_FAMILIES:
             raise SpecError(f"general.architecture {arch!r} has no recipe (known: {sorted(GGUF_FAMILIES)})")
-        return GGUF_FAMILIES[arch](md, tensors)
+        spec = GGUF_FAMILIES[arch](md, tensors)
+        if tensor_types is not None:
+            from .dense_precision import from_gguf_types, layer_formats
+            from .dense import DENSE_FAMILIES
+            if spec.family not in DENSE_FAMILIES:
+                raise SpecError("tensor_types carriage currently requires a dense family")
+            selector = from_gguf_types(tensor_types, spec.num_layers)
+            if not selector:
+                raise SpecError("tensor_types contains no dense projections")
+            spec = replace(spec, tensor_quant=selector)
+            for layer in range(spec.num_layers):
+                layer_formats(spec, layer)  # a full model derivation must cover every layer
+        return spec
 
 
 GEMMA4_FIELDS = ("global_head_dim", "global_kv_heads", "global_rotary_dim", "attn_k_eq_v", "v_norm",
@@ -2373,7 +2388,9 @@ _GGUF_ROLE = {"attn_q.weight": "attn", "attn_k.weight": "attn", "attn_v.weight":
               "ffn_up_shexp.weight": "shared", "ffn_gate_shexp.weight": "shared",
               "ffn_down_shexp.weight": "shared",
               "ssm_in.weight": "linear", "attn_gate.weight": "linear", "ssm_out.weight": "linear_out"}
-GGUF_TYPE_FORMAT = {"Q8_0": "q8", "Q4_1": "q4_1", "Q4_0": "q4_1"}
+GGUF_TYPE_FORMAT = {"Q8_0": "q8", "Q4_1": "q4_1", "Q4_0": "q4_1", "Q4_K": "q4_1",
+                    "Q6_K": "q8", "Q5_K": "q8", "Q5_0": "q8", "Q5_1": "q8",
+                    "F16": "q8", "BF16": "q8"}
 
 
 def _collapse(found: dict[str, tuple[str, str]]) -> dict[str, str]:
@@ -2439,8 +2456,10 @@ def quant_map_from_gguf_types(family: str, tensor_types: Mapping[str, str]) -> d
     for name, ty in tensor_types.items():
         role = _GGUF_ROLE.get(_GGUF_BLOCK.sub("", name))
         fmt = GGUF_TYPE_FORMAT.get(str(ty).upper())
-        if role is None or role not in roles or fmt is None:
+        if role is None or role not in roles:
             continue
+        if fmt is None:
+            raise SpecError(f"{name}: unsupported GGUF projection type {ty!r}")
         prev = found.get(role)
         if prev is None:
             found[role] = (fmt, name)
