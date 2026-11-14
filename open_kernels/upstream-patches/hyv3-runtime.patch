@@ -93,7 +93,7 @@
      xrt::bo& act = act_[layer];
      const size_t off = act_off + w_->rout_idx_off;
      if (route_log_on_) {
-@@ -1921,9 +1923,95 @@
+@@ -1921,9 +1923,96 @@
  void Core::host_step(const Step& s, int layer) {
      if (s.op == "gptoss_route") gptoss_route(s, layer);
      else if (s.op == "flint_route") flint_route(s, layer);
@@ -148,6 +148,7 @@
 +        std::vector<double> x(hr);
 +        for (size_t i = 0; i < hr; ++i) x[i] = bf16_to_f32(xb[i]);
 +        std::vector<double> score(E), choice(E);
++        #pragma omp parallel for schedule(static)
 +        for (size_t e = 0; e < E; ++e) {
 +            const float* wr = W.data() + e * hr;
 +            double acc = 0.0;

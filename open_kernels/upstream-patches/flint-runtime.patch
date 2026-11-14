@@ -166,7 +166,7 @@
      // ---- the block route's helpers (core.cpp)
 --- a/src/open_qwen36/core.cpp
 +++ b/src/open_qwen36/core.cpp
-@@ -1920,9 +1920,77 @@
+@@ -1920,9 +1920,78 @@
  
  void Core::host_step(const Step& s, int layer) {
      if (s.op == "gptoss_route") gptoss_route(s, layer);
@@ -204,6 +204,7 @@
 +    std::vector<double> x(hr);
 +    for (size_t i = 0; i < hr; ++i) x[i] = bf16_to_f32(xb[i]);
 +    std::vector<double> score(E);
++    #pragma omp parallel for schedule(static)
 +    for (size_t e = 0; e < E; ++e) {
 +        const float* wr = W.data() + e * hr;
 +        double acc = 0.0;
