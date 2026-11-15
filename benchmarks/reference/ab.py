@@ -151,7 +151,7 @@ def generate(args):
                     source /= 'q4pure'
             files = sorted(source.glob('*.ids'))
             if family == 'llama3':
-                files.append(ROOT / 'specs/open-engine/tests/fixtures/issue212/llama-context-8192.ids')
+                files.append(ROOT / 'open-kernels/specs/open-engine/tests/fixtures/issue212/llama-context-8192.ids')
             profile = {'hyv3': 'hy', 'lfm2moe': 'lfm25'}.get(family, family)
             files += sorted((args.dev / 'prefill-prof').glob(profile + '-*.ids'))
             files = [p for p in files if p.is_file()]

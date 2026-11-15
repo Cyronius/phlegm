@@ -1,0 +1,3 @@
+[submodule "open-kernels"]
+	path = open-kernels
+	url = https://github.com/Cyronius/open-kernels.git

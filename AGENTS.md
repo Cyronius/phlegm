@@ -15,12 +15,23 @@
   parity as a measurement goal, never as an inference from offline tests.
 - Keep the inference engine in C++ permanently. Rust owns the CLI, server,
   tokenizer, sampling and tray, as described in `PLAN.md`.
-- This repository is the canonical home of `open_kernels/` and
-  `specs/open-engine/`. Consult `open_kernels/UPSTREAM.md` before kernel work.
-- The C++ engine lives in `src/open_qwen36/`, derived from OFLM. Companion patches in
-  `open_kernels/upstream-patches/` have separate source bases; they are not a
-  ready-to-apply series. Preserve the manifest/runtime ABI, local version-7 DIT
-  mapping, and the Llama high/low probability contract.
+- The kernels, the C++ engine (`src/open_qwen36/`), `npu_offload/`, the viz and
+  `specs/open-engine/` live in the `open-kernels/` submodule, the canonical home
+  (https://github.com/Cyronius/open-kernels). Read `open-kernels/AGENTS.md` and
+  `open-kernels/open_kernels/UPSTREAM.md` before kernel or engine work.
+
+## Submodule workflow
+
+- Run `git config submodule.recurse true` once per clone, so `checkout`, `pull`
+  and `switch` also update `open-kernels/`.
+- A new clone or worktree needs `git submodule update --init`.
+- `open-kernels/` is a detached HEAD after an update. Make a branch in it before
+  you commit.
+- A kernel change is a commit in `open-kernels/`, then a phlegm commit that moves
+  the `open-kernels` pointer. Push the open-kernels commit first, or the phlegm
+  pointer names a commit nobody can fetch.
+- Kernel tests run inside `open-kernels/` (`python -m pytest`); phlegm's
+  `pytest.ini` covers only phlegm's own tests.
 
 ## Research and optimization
 

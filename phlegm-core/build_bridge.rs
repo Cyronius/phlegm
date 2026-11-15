@@ -16,11 +16,11 @@ fn collect(base: &Path, prefix: &str, files: &mut BTreeMap<String, String>) {
 
 pub fn engine_hash(root: &Path) -> String {
     let mut files = BTreeMap::new();
-    collect(&root.join("src/open_qwen36"), "engine", &mut files);
-    collect(&root.join("src/include/nlohmann"), "json", &mut files);
+    collect(&root.join("open-kernels/src/open_qwen36"), "engine", &mut files);
+    collect(&root.join("open-kernels/src/include/nlohmann"), "json", &mut files);
     for (name, path) in [
         ("bridge/bridge.cpp", "benchmarks/reference/bridge.cpp"),
-        ("harness/stream_patch.hpp", "open_kernels/harness/stream_patch.hpp"),
+        ("harness/stream_patch.hpp", "open-kernels/open_kernels/harness/stream_patch.hpp"),
     ] {
         files.insert(name.into(), format!("{:x}", Sha256::digest(fs::read(root.join(path)).unwrap())));
     }
@@ -32,7 +32,7 @@ pub fn engine_hash(root: &Path) -> String {
 }
 
 pub fn emit(root: &Path) {
-    for path in ["src/open_qwen36", "src/include/nlohmann", "open_kernels/harness/stream_patch.hpp"] {
+    for path in ["open-kernels/src/open_qwen36", "open-kernels/src/include/nlohmann", "open-kernels/open_kernels/harness/stream_patch.hpp"] {
         println!("cargo:rerun-if-changed={}", root.join(path).display());
     }
     println!("cargo:rustc-env=PHLEGM_ENGINE_TREE_SHA256={}", engine_hash(root));

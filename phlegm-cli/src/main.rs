@@ -223,7 +223,7 @@ fn serve(args: &[String]) -> Result<(), String> {
         if model_id.is_empty() { return Err("embedding model name must not be empty".into()); }
         let python = opts.get("--embed-python").cloned().or_else(|| std::env::var("PHLEGM_EMBED_PYTHON").ok()).unwrap_or_else(|| "python3".into());
         let source = opts.get("--embed-source").map(PathBuf::from).or_else(|| std::env::var_os("PHLEGM_EMBED_SOURCE").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../open_kernels/designs/trit_embed"));
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../open-kernels/open_kernels/designs/trit_embed"));
         let embedder = phlegm_core::embeddings::TritEmbeddingBackend::load(model_id, std::path::Path::new(&python), &source, &model_dir)?;
         return server::serve_embeddings(Box::new(embedder), cfg);
     }

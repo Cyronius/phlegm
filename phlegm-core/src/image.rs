@@ -80,7 +80,7 @@ impl MossImageConfig {
                 return Err(format!("missing image asset: {}", file.display()));
             }
         }
-        if !cfg.repo_root.join("open_kernels/moss_native_sample.py").is_file() {
+        if !cfg.repo_root.join("open-kernels/open_kernels/moss_native_sample.py").is_file() {
             return Err("image repo_root has no native MOSS sampler".into());
         }
         if !cfg.refine_kernels.contains("{length}")
@@ -230,7 +230,7 @@ impl Flux3ImageConfig {
             self.text_model.join("model.q4nx"), self.text_kernels.join("manifest.json"),
             self.condition_kernels.join("manifest.json"),
             self.image_block_kernels.join("manifest.json"), self.vae_kernels.join("manifest.json"),
-            self.repo_root.join("open_kernels/flux3_native_generate.py")];
+            self.repo_root.join("open-kernels/open_kernels/flux3_native_generate.py")];
         if self.edge_kernels.is_empty() || self.edge_kernels.keys().collect::<Vec<_>>()
             != self.text_block_kernels.keys().collect::<Vec<_>>()
             || self.edge_kernels.keys().collect::<Vec<_>>()
@@ -372,7 +372,7 @@ impl Qwen21ImageConfig {
                      &self.vae_ew_kernels.join("manifest.json"),
                      &self.vae_attention_kernel.join("final.xclbin"),
                      &self.vae_attention_kernel.join("insts.bin"),
-                     &self.repo_root.join("open_kernels/qwen21_native_generate.py")] {
+                     &self.repo_root.join("open-kernels/open_kernels/qwen21_native_generate.py")] {
             if !file.is_file() {
                 return Err(format!("missing Qwen image asset: {}", file.display()));
             }
@@ -383,7 +383,7 @@ impl Qwen21ImageConfig {
     }
 }
 
-/// FLUX.2 [klein] (distilled) through `open_kernels/flux2_native_generate.py`: the klein
+/// FLUX.2 [klein] (distilled) through `open-kernels/open_kernels/flux2_native_generate.py`: the klein
 /// schedule on the pyxrt host, weights read from the published diffusers checkpoint.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -431,7 +431,7 @@ impl Flux2ImageConfig {
                      Some(&self.kernels.join("final.xclbin")),
                      Some(&self.kernels.join("fa/dit_fa.json")),
                      Some(&self.kernels.join("ew/dit_ew.json")),
-                     Some(&self.repo_root.join("open_kernels/flux2_native_generate.py"))]
+                     Some(&self.repo_root.join("open-kernels/open_kernels/flux2_native_generate.py"))]
             .into_iter().flatten() {
             if !file.is_file() {
                 return Err(format!("missing FLUX.2 image asset: {}", file.display()));
@@ -702,7 +702,7 @@ fn generate_moss(cfg: &MossImageConfig, request: &ImageRequest,
         .arg("--steps").arg(steps.to_string())
         .arg("--guidance").arg(guidance.to_string())
         .arg("--seed").arg(request.seed.to_string())
-        .current_dir(&cfg.repo_root);
+        .current_dir(cfg.repo_root.join("open-kernels"));
     crate::bench::reference::die_with_parent(&mut process);
     let status = process.status().map_err(|e| format!("starting native image sampler: {e}"))?;
     if !status.success() {
@@ -760,7 +760,7 @@ fn generate_flux3(cfg: &Flux3ImageConfig, request: &ImageRequest,
         .arg("--alpha").arg(cfg.alpha.to_string())
         .arg("--seed").arg(request.seed.to_string())
         .arg("--pup-max-tokens").arg(cfg.pup_max_tokens.to_string())
-        .current_dir(&cfg.repo_root);
+        .current_dir(cfg.repo_root.join("open-kernels"));
     if let Some(image) = &request.image {
         process.arg("--image").arg(image)
             .arg("--vae-encoder-kernels").arg(cfg.vae_encoder_kernels.as_ref().unwrap())
@@ -814,7 +814,7 @@ fn generate_qwen21(cfg: &Qwen21ImageConfig, request: &ImageRequest,
         .arg("--out").arg(out)
         .arg("--steps").arg(steps.to_string())
         .arg("--seed").arg(request.seed.to_string())
-        .current_dir(&cfg.repo_root);
+        .current_dir(cfg.repo_root.join("open-kernels"));
     crate::bench::reference::die_with_parent(&mut process);
     let status = process.status().map_err(|e| format!("starting native Qwen sampler: {e}"))?;
     if !status.success() { return Err(format!("native Qwen sampler exited with {status}")); }
@@ -848,7 +848,7 @@ fn generate_flux2(cfg: &Flux2ImageConfig, request: &ImageRequest,
         .arg("--steps").arg(steps.to_string())
         .arg("--seed").arg(request.seed.to_string())
         .arg("--out").arg(out)
-        .current_dir(&cfg.repo_root);
+        .current_dir(cfg.repo_root.join("open-kernels"));
     if let Some(image) = &request.image {
         process.arg("--image").arg(image);
     }

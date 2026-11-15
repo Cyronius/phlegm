@@ -22,29 +22,44 @@ def manifest_hash(files):
     return hashlib.sha256(content.encode()).hexdigest()
 
 
-INPUT_PATHS = ["open_kernels/harness/stream_patch.hpp", "benchmarks/reference/bridge.cpp",
+INPUT_PATHS = ["benchmarks/reference/bridge.cpp",
                "benchmarks/reference/build.py", "phlegm-core/build.rs",
                "phlegm-core/build_bridge.rs", "phlegm-core/Cargo.toml"]
 
 
+def kernel_root(root):
+    # Phlegm keeps the engine in its open-kernels submodule; an OFLM-layout tree keeps it at the top.
+    sub = root / "open-kernels"
+    return sub if (sub / "src/open_qwen36").is_dir() else root
+
+
 def git_state(root):
-    def git(*args):
+    def git(repo, *args):
         return subprocess.check_output(
-            ["git", "-C", str(root), *args], text=True
+            ["git", "-C", str(repo), *args], text=True
         ).strip()
-    commit = git("rev-parse", "HEAD")
+    commit = git(root, "rev-parse", "HEAD")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise RuntimeError("Cannot identify reference engine commit")
-    paths = list(INPUT_PATHS)
-    paths.extend(path for path in git("ls-files", "--", "src/open_qwen36", "src/include/nlohmann").splitlines()
+    kernels = kernel_root(root)
+    paths = ["open_kernels/harness/stream_patch.hpp"]
+    paths.extend(path for path in git(kernels, "ls-files", "--", "src/open_qwen36", "src/include/nlohmann").splitlines()
                  if Path(path).suffix in {".cpp", ".hpp", ".h"})
-    for base in (root / "src/open_qwen36", root / "src/include/nlohmann"):
-        paths.extend(path.relative_to(root).as_posix() for path in base.rglob("*")
+    for base in (kernels / "src/open_qwen36", kernels / "src/include/nlohmann"):
+        paths.extend(path.relative_to(kernels).as_posix() for path in base.rglob("*")
                      if path.is_file() and path.suffix in {".cpp", ".hpp", ".h"})
-    return commit, bool(git("status", "--porcelain", "--untracked-files=all", "--", *sorted(set(paths))))
+    status = ["status", "--porcelain", "--untracked-files=all", "--"]
+    dirty = bool(git(kernels, *status, *sorted(set(paths))))
+    if kernels != root:
+        dirty |= bool(git(root, *status, *INPUT_PATHS))
+        # The phlegm commit names the engine only while the submodule sits at the pinned commit.
+        pinned = git(root, "ls-tree", "HEAD", "open-kernels").split()
+        dirty |= len(pinned) < 3 or pinned[2] != git(kernels, "rev-parse", "HEAD")
+    return commit, dirty
 
 
 def engine_inputs(root, adapter):
+    root = kernel_root(root)
     files = {"bridge/bridge.cpp": digest(adapter),
              "harness/stream_patch.hpp": digest(root / "open_kernels/harness/stream_patch.hpp")}
     for base, prefix in ((root / "src/open_qwen36", "engine"),
@@ -94,7 +109,8 @@ def main():
     args = parser.parse_args()
     adapter = Path(__file__).resolve().with_name("bridge.cpp")
     root = args.reference_root.resolve()
-    engine = root / "src/open_qwen36"
+    kernels = kernel_root(root)
+    engine = kernels / "src/open_qwen36"
     out = (args.out_dir or adapter.parents[2] / "target/reference-bench").resolve()
     xrt_include = (args.xrt_include or Path(os.environ.get(
         "XILINX_XRT", "/opt/xilinx/xrt")) / "include").resolve()
@@ -114,10 +130,10 @@ def main():
     sources = [engine / name for name in (
         "core.cpp", "block_host.cpp", "pools.cpp", "manifest.cpp",
         "q4nx_file.cpp", "gguf_file.cpp")]
-    helper = root / "open_kernels/harness/stream_patch.hpp"
+    helper = kernels / "open_kernels/harness/stream_patch.hpp"
     for path in [adapter, *sources, helper, xrt_lib,
                  xrt_include / "xrt/xrt_device.h",
-                 root / "src/include/nlohmann/json.hpp"]:
+                 kernels / "src/include/nlohmann/json.hpp"]:
         if not path.is_file():
             raise RuntimeError(f"Missing build input: {path}")
 
@@ -150,7 +166,7 @@ def main():
     # implicit FMA; changing core.cpp's contraction policy changes its logits.
     flags = ["-O3", "-DNDEBUG", "-std=c++17", "-fopenmp", "-mavx2", "-mfma"]
     common = [str(compiler), *flags]
-    for include in (xrt_include, root / "src", root / "src/include", helper.parent):
+    for include in (xrt_include, kernels / "src", kernels / "src/include", helper.parent):
         common += ["-I", str(include)]
     out.mkdir(parents=True, exist_ok=True)
     specs_path = out / "link-no-rpath.specs"

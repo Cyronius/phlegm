@@ -20,7 +20,7 @@ parser.add_argument("--port", type=int, default=8767)
 parser.add_argument("--direct", action="store_true")
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[2]
-source = root / "open_kernels/designs/trit_embed"
+source = root / "open-kernels/open_kernels/designs/trit_embed"
 texts = ["how do index funds work", "A man is playing a guitar on the street.", "Rain is expected tomorrow."]
 if args.direct:
     sys.path.insert(0, str(source))
