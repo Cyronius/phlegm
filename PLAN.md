@@ -8,7 +8,7 @@ entries before resuming: several older plan headers predate completed work.
 
 ## Direction and priority
 
-Keep the inference engine in C++ permanently, in `src/open_qwen36/`. Rust owns
+Keep the inference engine in C++ permanently, in `open-kernels/src/open_qwen36/` (the open-kernels submodule). Rust owns
 the CLI, server, tokenizer, sampling and tray.
 The CLI/server now use the resident C++ process adapter for NPU inference.
 The next milestone is a real hardware run with a compatible combined kernel set,
@@ -28,13 +28,13 @@ that they all block CLI/server integration.
   The tray currently provides its shell. Device inference with this Phlegm
   revision has not yet been verified.
 - The 2026-10-23 kernel sync and worktree recovery are recorded in
-  [UPSTREAM.md](open_kernels/UPSTREAM.md). The audited kernel imports are present.
+  [UPSTREAM.md](open-kernels/open_kernels/UPSTREAM.md). The audited kernel imports are present.
 - That ledger records an offline suite result of 1793 passed, 58 skipped and
   8 deselected. This is historical evidence, not a check performed by this plan.
 - No fresh NPU build or hardware acceptance has been established for the combined
   tree. Earlier measurements remain tied to their original revisions/artifacts.
 - C++ runtime companion patches are retained in
-  [open_kernels/upstream-patches](open_kernels/upstream-patches/). They are separate
+  [open_kernels/upstream-patches](open-kernels/open_kernels/upstream-patches/). They are separate
   diffs against recorded source heads, not a combined runtime or a patch series.
 
 ## 1. Connect CLI and server generation to C++
@@ -69,7 +69,7 @@ Sources: [current direction](.claude/plans/phlegm-monorepo.md),
 
 ## 2. Validate the combined kernels and runtime
 
-2026-10-24 host inventory: see [baseline readiness](specs/open-engine/artlite-baseline-readiness.md).
+2026-10-24 host inventory: see [baseline readiness](open-kernels/specs/open-engine/artlite-baseline-readiness.md).
 The current boot initializes the Strix Halo driver with IOMMU. Local Linux
 tools, XRT/plugin, the C++ bridge, an isolated ArtLite comparator and fresh Llama
 1B kernels are built, and Q4_1 weights are available. An ArtLite arithmetic NPU
@@ -77,7 +77,7 @@ smoke passes. The authenticated memlock adjustment now permits Phlegm XRT
 enumeration, resident model inference and reset. Experimental GGUF block
 prefill and an explicit Q8 head pass a 300-token quality gate; the artificial
 4096-window gate still fails. See
-[Linux GGUF prefill](specs/open-engine/gguf-prefill-linux.md) for fixes and
+[Linux GGUF prefill](open-kernels/specs/open-engine/gguf-prefill-linux.md) for fixes and
 diagnostic survey progress. These routes remain opt-in.
 The measured development baseline supports versions 1–3 and local DIT7;
 a separate PR209 runtime candidate supports1–7 while preserving DIT7 and
@@ -91,7 +91,7 @@ open; these development measurements are not clean-release benchmark results.
 
 - [x] Import the pristine C++ trunk at `38ae3d2` into `src/open_qwen36/`.
 - [ ] Reconcile the required companion changes against that checkout. Use
-  [sources.json](open_kernels/upstream-patches/sources.json) for patch bases.
+  [sources.json](open-kernels/open_kernels/upstream-patches/sources.json) for patch bases.
 - [ ] Ensure the runtime implements every selected manifest feature, including
   the local version-7 `bfp16_dit` mapping.
 - [ ] Preserve the paired precision/state/KV contracts and Bonsai/Hadamard ABI
@@ -105,7 +105,7 @@ open; these development measurements are not clean-release benchmark results.
 Completion: the selected combined kernel/runtime routes pass their documented
 acceptance checks on hardware. Offline success alone does not close this task.
 
-Source: [sync ledger and recovery notes](open_kernels/UPSTREAM.md).
+Source: [sync ledger and recovery notes](open-kernels/open_kernels/UPSTREAM.md).
 
 ## 3. Finish model and kernel onboarding
 
@@ -139,7 +139,7 @@ the CLI can open a model's decode visualization. Track prefill and measured
 timing as separate follow-ups.
 
 Sources: [monorepo plan, P5](.claude/plans/phlegm-monorepo.md),
-[visualization plan](specs/viz/plans/flow-viz.md).
+[visualization plan](open-kernels/specs/viz/plans/flow-viz.md).
 
 ## GPT-OSS 20B
 
@@ -409,7 +409,7 @@ non-commercial licence. Plan: [FLUX.2 klein and image follow-ups](.plans/flux2-k
 2026-11-08 result: FLUX.2 [klein] 4B runs natively through `phlegm image` and
 `serve-images` (`backend=flux2`): text-to-image and one-reference edits at 512 and
 1024 on hardware, edits at 39 dB PSNR against the published pipeline; FLUX 3's
-1024 API request also passed. Details: [the klein spec](specs/open-engine/flux2-klein-native.md).
+1024 API request also passed. Details: [the klein spec](open-kernels/specs/open-engine/flux2-klein-native.md).
 
 MOSS's pinned checkpoint, DiT weight packer, SiTU and q/k RoPE kernel
 checks are recorded in [the MOSS plan](.plans/moss-image-native.md). Its
@@ -531,7 +531,7 @@ passed on hardware; longer buckets wait on text-encoder pad masking across
 prefill blocks. Qwen Image 2.1 editing needs a native Qwen3-VL vision tower,
 LM image-embedding input and the Qwen VAE encoder; the server rejects it.
 Neither model is registered as supported. Details:
-[`specs/open-engine/flux3-image-native.md`](specs/open-engine/flux3-image-native.md).
+[`specs/open-engine/flux3-image-native.md`](open-kernels/specs/open-engine/flux3-image-native.md).
 Reference-image editing still needs the upsampler's vision tower and native
 conditioning path; 1024-pixel kernels and validation remain open.
 
@@ -561,7 +561,7 @@ red cube on a light table. A 21-token prompt passed the CLI end to end, and a
 separate 16-token API request returned HTTP 200 with a valid PNG. One-step
 requests are rejected because the published terminal stretch yields NaN there.
 Native editing, 1024-pixel output, and longer prompts remain open.
-See [the Qwen Image 2.1 native spec](specs/open-engine/qwen-image21-native.md)
+See [the Qwen Image 2.1 native spec](open-kernels/specs/open-engine/qwen-image21-native.md)
 for the checkpoint contract, validation artifacts and remaining gates; the
 working implementation log is `.plans/native-image-models.md`.
 
@@ -578,7 +578,7 @@ Latest recorded checkpoint: isolated projection improvements pass, but L53/P17
 still exceeds the 0.005 residual bound and retained full residual acceptance is
 3974/4032, FAIL. The 2026-10-23 host/build merge checks do not resolve that failure.
 
-Source: [Qwen3.8 validation report](specs/open-engine/plans/qwen38-main-rebaseline.md).
+Source: [Qwen3.8 validation report](open-kernels/specs/open-engine/plans/qwen38-main-rebaseline.md).
 
 ### Prefill pipeline stages 2-4
 
@@ -593,7 +593,7 @@ Stage 1 is done. Preserve byte-identical logits when arithmetic order is
 unchanged; use the route's documented numerical gate when arithmetic changes.
 Measure prefill before and after under comparable conditions.
 
-Source: [prefill pipeline plan](specs/open-engine/plans/prefill-pipeline.md).
+Source: [prefill pipeline plan](open-kernels/specs/open-engine/plans/prefill-pipeline.md).
 
 ### K2 Uno speed
 
@@ -606,7 +606,7 @@ Source: [prefill pipeline plan](specs/open-engine/plans/prefill-pipeline.md).
 Base K2/Uno and row-parallel attention are already implemented. The remaining
 speed plan covers phases 3-7; projected gains are not measured results.
 
-Source: [K2 Uno speed plan](specs/open-engine/plans/k2-uno-speed.md).
+Source: [K2 Uno speed plan](open-kernels/specs/open-engine/plans/k2-uno-speed.md).
 
 ### MoE speculative decoding and expert quantization
 
@@ -622,9 +622,9 @@ Source: [K2 Uno speed plan](specs/open-engine/plans/k2-uno-speed.md).
 These are distinct from the imported dense Bonsai ternary/DFlash work. Recheck
 current implementation and upstream status before following old PR milestones.
 
-Sources: [speculative decoding](specs/open-engine/plans/spec-decode.md),
-[expert quantization](specs/open-engine/plans/expert-quant-2bit.md),
-[drafter/model work](specs/open-engine/plans/dflash-drafters.md).
+Sources: [speculative decoding](open-kernels/specs/open-engine/plans/spec-decode.md),
+[expert quantization](open-kernels/specs/open-engine/plans/expert-quant-2bit.md),
+[drafter/model work](open-kernels/specs/open-engine/plans/dflash-drafters.md).
 
 ### trit-embed-3l sentence embedder
 
@@ -640,7 +640,7 @@ activations) in one dispatch per 128-token slot. On a quiet machine (2026-11-01)
 SciFact abstracts/s and 14,926 packed STSB sentences/s, 1.6x the 2026-10-31 build; its vectors
 score with the CPU reference (four-task nDCG@10 33.81 against 33.85).
 
-Source: [design README](open_kernels/designs/trit_embed/README.md).
+Source: [design README](open-kernels/open_kernels/designs/trit_embed/README.md).
 
 ## 6. Keep the C++ engine and Rust application
 

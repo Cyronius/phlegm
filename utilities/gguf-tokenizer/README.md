@@ -53,7 +53,7 @@ run without external data.
 The Python gate deliberately exits **1** if any publisher mismatch remains.
 Raw inputs, rendered conversations, actual/expected IDs, publisher provenance,
 and NFC controls are retained; a llama.cpp-only pass cannot hide this failure.
-See [the owning evidence report](../../specs/open-engine/gguf-tokenizer.md).
+See [the owning evidence report](../../open-kernels/specs/open-engine/gguf-tokenizer.md).
 
 Earlier attempts are retained in `s6-check-v1` through `s6-check-v4` beside the
 final evidence, rather than overwritten:

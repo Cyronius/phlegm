@@ -13,7 +13,7 @@ fn embedding_options(opts: &HashMap<String, String>) -> (PathBuf, PathBuf) {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("PHLEGM_EMBED_SOURCE").map(PathBuf::from))
         .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../open_kernels/designs/trit_embed")
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../open-kernels/open_kernels/designs/trit_embed")
         });
     (python, source)
 }

@@ -15,6 +15,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - name: Build CLI
         run: cargo build --release -p phlegm-cli --locked

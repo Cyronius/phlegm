@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn lookup_matches_all_replay_fixtures() {
         let cases: serde_json::Value = serde_json::from_str(include_str!(
-            "../../specs/open-engine/tests/fixtures/spec_lookup_cases.json"
+            "../../open-kernels/specs/open-engine/tests/fixtures/spec_lookup_cases.json"
         ))
         .unwrap();
         assert_eq!(cases["cases"].as_array().unwrap().len(), 13);

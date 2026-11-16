@@ -6,7 +6,7 @@ description: Build and validate the experimental compensated-BFP Llama1B GGUF pr
 Use the canonical Phlegm checkout for kernels and experiment utilities; the OFLM
 runtime reconciliation is a separate source base, not a patch series. Read
 `utilities/gguf-prefill/README.md` and the latest continuation in
-`specs/open-engine/gguf-prefill-linux.md` there before rebuilding.
+`open-kernels/specs/open-engine/gguf-prefill-linux.md` there before rebuilding.
 
 The experimental `bfp16_hilo` step tag describes activation packing, not a
 weight requantization or the older `bfp16` c-tiled-output route. It requires

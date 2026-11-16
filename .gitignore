@@ -34,30 +34,9 @@ xdna-dump/tools/kernel-interp/hf_ref/
 xdna-dump/tools/q4nx/reference/
 
 # Small golden fixtures that ARE committed
-!specs/viz/tests/fixtures/mlir/lx0/insts.bin
 !xdna-dump/tools/kernel-interp/rust_ref/
 !xdna-dump/tools/kernel-interp/rust_ref/*.f32
 !xdna-dump/tools/kernel-interp/rust_ref/*.i64
-
-# open_kernels build output, run configs and logs
-/open_kernels/.staging*/
-/open_kernels/designs/.locks/
-open_kernels/designs/*/build*/
-open_kernels/designs/*/out*.bin
-open_kernels/designs/*/in.bin
-open_kernels/designs/*/run*.cfg
-open_kernels/designs/*/big.bin
-open_kernels/designs/*/*.log
-# Generated kernel TUs: written per spec by the exports, never source
-# (specs/open-engine/tests/test_generated_tus_untracked.py)
-open_kernels/designs/dense/*.cc
-open_kernels/designs/layer_x/*.cc
-open_kernels/designs/layer_x/xh_signs.h
-open_kernels/designs/lm_head_q4/*.cc
-open_kernels/designs/gemv_q4/gemv_q4_prep_k*.cc
-open_kernels/designs/gemv_t2/*.cc
-open_kernels/model/out*/
-open_kernels/harness/out/
 
 # Editor / tooling / index artifacts
 .kernel-import/

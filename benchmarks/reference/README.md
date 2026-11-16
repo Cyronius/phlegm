@@ -1,6 +1,6 @@
 # C++ reference benchmarks
 
-This adapter runs Phlegm's in-tree `open_qwen36::Core`, derived from OpenFlowLM.
+This adapter runs `open_qwen36::Core` from the `open-kernels/` submodule, derived from OpenFlowLM.
 The engine stays C++; Rust owns the CLI, server, tokenizer, sampling and tray.
 Results retain the label `openflowlm-cpp-reference`.
 
@@ -56,12 +56,12 @@ python3 benchmarks/reference/build.py \
 different engine hashes can be used directly by `ab.py`, but the Rust verifier
 accepts only its compiled-in engine tree.
 
-Every engine file must match OFLM trunk `38ae3d2` unless
-`engine-changes.json` records the change (its origin and the file's new
-sha256). Add an entry there with each engine change; check with:
+The engine's import check against OFLM trunk (`check_import.py` and
+`engine-changes.json`) moved with the engine to `open-kernels/benchmarks/reference/`.
+Add an entry there with each engine change; check with:
 
 ```bash
-python3 benchmarks/reference/check_import.py --upstream /path/to/trunk-checkout
+python3 open-kernels/benchmarks/reference/check_import.py --upstream /path/to/trunk-checkout
 ```
 
 ## Windows migration
@@ -76,11 +76,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File benchmarks/reference/build.p
   -ReferenceRoot C:/code/OpenFlowLM-Next2
 ```
 
+`open-kernels/` has the same layout, so `-ReferenceRoot open-kernels` builds the pinned engine.
+
 For Linux hardware runs, check `/dev/accel/accel0` access and both soft and hard
 memlock limits. The current local XRT stack needs a 64 MiB locked heap at device
 open; an 8 MiB limit prevents even enumeration. Local setup and remaining
 coverage are recorded in
-[baseline readiness](../../specs/open-engine/artlite-baseline-readiness.md).
+[baseline readiness](../../open-kernels/specs/open-engine/artlite-baseline-readiness.md).
 
 ## Run and serve through the NPU bridge
 

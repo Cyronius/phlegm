@@ -722,7 +722,7 @@ was a fixed constant, so identical requests returned identical replies.
 
 **Context:** `ctx_len` defaults to 32768 (OpenFlowLM's usual `default_context_length`), and every
 registry entry states it; it was 4096, the kernel manifests' `max_ctx_default`. Capacity is a
-runtime allocation (no descriptor compiles it in: `specs/open-engine/spec.md`, `kvslice`): at most
+runtime allocation (no descriptor compiles it in: `open-kernels/specs/open-engine/spec.md`, `kvslice`): at most
 `kv_row` x attention layers a token from the manifests, 20-225 KB (at 32768: 0.6-0.7 GiB for the
 Qwen3.5 MoE and LFM models, 1.5 GiB gpt-oss, 3 GiB Flint and Hy-Memory, 6.9 GiB Gemma 4; an upper
 bound, counting sliding-window layers as full). Measured 2026-11-04 (`target/npu-dev/fastdefault/ctxcost.py`,
@@ -746,7 +746,7 @@ prefill, at either capacity: Flint and Hy-Memory prefill at ~4.5 tokens/s, and L
 11.7k tokens ran past the server's 600 s request timeout (HTTP 500) on LFM2.5 and Flint.
 
 Later the same day the LFM routes' host attention became a vectorised, tiled version of the same
-arithmetic (bit-identical logits; `open_kernels/upstream-patches/block-host-attention-runtime.patch`,
+arithmetic (bit-identical logits; `open-kernels/open_kernels/upstream-patches/block-host-attention-runtime.patch`,
 `.plans/long-prefill.md`) and phlegm's bridge got 16 host threads instead of 4 (`--threads`
 defaults to half the logical CPUs, 4 to 16). The same probes through `phlegm serve` at 32768
 (`ctxcost-fa.json`, `ctx32k-fa.json`; host shared with two other sessions' builds and NPU jobs):

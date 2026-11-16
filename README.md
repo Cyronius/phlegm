@@ -16,15 +16,14 @@ mlir-aie toolchain. Those kernels now run whole models on the NPU, through Phleg
 | [`phlegm-core/`](phlegm-core/) | Rust runtime support: tokenizer, sampler, OpenAI server, XRT bindings and resident C++ engine adapter | C++ bridge connected to CLI and server |
 | [`phlegm-cli/`](phlegm-cli/) | The `phlegm` command: `run`, `serve`, `bench` | real C++ inference path for run/serve/bench; model onboarding pending |
 | [`phlegm-tray/`](phlegm-tray/) | Windows tray app (Tauri v2): model library, downloads, chat, a local OpenAI endpoint | tray icon and window only |
-| [`open_kernels/`](open_kernels/) | The open AIE kernels, their recipes per model family, the build harness and the fp64 replicas | working; see its README |
-| [`viz/`](viz/) | Animated NPU decode flow, with topology and timing explanations | Python exporter and HTML viewer; CLI integration pending |
-| [`npu_offload/`](npu_offload/) | Embedding GEMM sources and block-attention build dependencies | source imported; embedding runtime port pending |
-| [`specs/open-engine/`](specs/open-engine/) | Requirements and tests for the kernels and recipes (`OPEN-*`) | imported with the kernels |
+| [`open-kernels/`](https://github.com/Cyronius/open-kernels) | Git submodule: the open AIE kernels and recipes, the C++ engine (`src/open_qwen36/`), `npu_offload/`, the decode-flow viz, and their specs (`OPEN-*`, `VIZ-*`) | working; see its README |
 | [`website/`](website/) | The project site (Astro + Starlight), for GitHub Pages | skeleton |
 | [`xdna-dump/`](xdna-dump/) | What we know about the XDNA2 NPU, its toolchain and FastFlowLM, plus the tools that found it | raw sources; synthesis pending |
 
-`open_kernels/` and `specs/open-engine/` are also in openflowlm-next (https://github.com/Atomic-Germ/openflowlm-next),
-at the same paths. phlegm is their canonical home; `open_kernels/UPSTREAM.md` records what moves between the two.
+The kernels and the C++ engine live in their own repository, [open-kernels](https://github.com/Cyronius/open-kernels),
+mounted here as a submodule. Clone with `git clone --recurse-submodules`, or run `git submodule update --init` after
+a plain clone. openflowlm-next (https://github.com/Atomic-Germ/openflowlm-next) has the same paths;
+`open-kernels/open_kernels/UPSTREAM.md` records what moves between the two.
 
 ## Building
 
@@ -96,11 +95,11 @@ pnpm site      # website on http://localhost:4321/phlegm
 ```
 
 Kernels build with mlir-aie 1.4.2 + Peano, natively on Windows or in WSL: see
-[`open_kernels/README.md`](open_kernels/README.md).
+[`open-kernels/open_kernels/README.md`](https://github.com/Cyronius/open-kernels/blob/main/open_kernels/README.md).
 
-The [flow visualization](specs/viz/spec.md) models one decode step from an exported
-kernel set. The kernel exporter writes `viz.json` automatically when the build
-metadata is available. From the repository root, generate or render it with:
+The [flow visualization](https://github.com/Cyronius/open-kernels/blob/main/specs/viz/spec.md) models one decode
+step from an exported kernel set. The kernel exporter writes `viz.json` automatically when the build
+metadata is available. From `open-kernels/`, generate or render it with:
 
 ```sh
 python -m open_kernels.viz <kernel-set-dir>
@@ -114,8 +113,8 @@ Open `decode.html` in a browser to play the step and inspect its tiles and strea
 
 Pushes and pull requests check changed whitespace, test the Rust core and CLI
 without the `npu` feature, and run `pytest.ini`'s offline suite with Python 3.12,
-NumPy, ml-dtypes, SciPy and pytest. Optional upstream runtime, model, PyTorch and
-AIE checks may skip; the test output lists their reasons. The tray is excluded:
+NumPy, ml-dtypes, SciPy and pytest. The checkout includes the `open-kernels`
+submodule; its own CI runs the kernel, engine and viz suite. The tray is excluded:
 its Tauri build needs a built frontend and Linux GTK/WebKit development packages. Pushed `v*`
 tags build the Linux x86_64 CLI and publish it with SHA256SUMS; the C++
 bridge and NPU hardware are not covered. Benchmark publication additionally

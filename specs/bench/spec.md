@@ -143,7 +143,7 @@ cleared; OpenMP passive waiting and the requested thread count are explicit.
 
 The adapter supports the in-tree C++ engine's `model.gguf` and `model.q4nx`
 directories, recording which artifact was loaded (q4nx wins if both exist).
-The engine derives from OpenFlowLM; its MIT notice ships in `LICENSE_OPEN_RUNTIME.md`.
+The engine derives from OpenFlowLM; its MIT notice ships in `open-kernels/LICENSE_OPEN_RUNTIME.md`.
 
 The bridge sidecar records `source_commit` as Phlegm HEAD and `source_dirty`
 over engine/build inputs only. `engine_tree_sha256` hashes sorted relative
