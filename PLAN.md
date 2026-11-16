@@ -391,6 +391,54 @@ switching is in [.plans/clover.md](.plans/clover.md).
 
 ## Native image model support
 
+2026-11-09 research decision: keep compact text conditioning and VAE decoder
+distillation independent. Train encoding first, then bolt on separate enrichment
+layers. A compact shared representation feeds a replaceable output head targeting
+Klein 4B's projected conditioning; later smaller denoisers get their own heads.
+Tokenizer research is deferred. Architecture, ternary quality and performance are
+unvalidated. Scope and next action: [distillation design](open-kernels/specs/open-engine/flux-conditioning-distillation.md);
+local handoff: `.plans/flux-conditioning-distillation.md`.
+
+2026-11-09 encoding harness: companion `model-experiments/flux-conditioning/`
+now exports projected teacher targets and compares student artifacts, retaining
+512 positions, padding semantics and file provenance. Fifteen harness checks pass,
+including a tiny Qwen3 checkpoint export. The expanded suite has 17 checks.
+Original teacher components were downloaded and verified at the pinned revision;
+all 12 BF16 exports agree exactly with pinned upstream text methods and projection,
+including 511/512/513-token boundaries. Training and image-quality gates remain
+open. Phlegm is the intended inference
+engine for the eventual student. Evidence hashes are in the distillation spec.
+An isolated Trashcan worker passes the 17 harness checks and completed the
+two-prompt FP32 export/reference control successfully (confirmed 2026-11-10): both
+cases match exactly, including the truncation boundary. It used 12 CPU threads;
+the export stage took 132 s including loading/provenance checks. Production corpus,
+training and live Phlegm validation remain open. Evidence is in the distillation spec.
+
+2026-11-10 conditioning continuation: Trashcan completed the remaining ten FP32
+controls, giving 12/12 exact matches in total, in parallel with the local runtime
+work. Phlegm now has an experimental local CLI `--projected-conditioning FILE`
+that validates projected artifacts and bypasses native text encoding/projection,
+restoring the conditioning at each denoising step. Twenty-three focused Python
+checks pass on Windows and Linux; all twelve artifacts on each host ingest
+correctly, plus six core image and four CLI tests pass. Native capture/replay is
+prepared but unrun: a compatible NPU host with pyxrt, full model/VAE and compiled
+kernels is required. No trained student, image-quality acceptance or speed claim.
+
+2026-11-11 Windows XRT environment recovered. The existing IRON activation
+`. C:\dev\mlir-aie\iron_env.ps1` selects Python 3.13 and the installed pyxrt SDK.
+Device0 opens as NPU Strix and the official SAXPY NPU execution check passes.
+All23 conditioning checks pass there after adding safetensors and pytest.
+Earlier missing-installation evidence was a sandbox access error. The next
+capture/replay gate can run locally once complete image assets are located.
+
+2026-11-11 companion reconciliation: Claude has trained a vector-diffusion
+enricher prototype and is curating/exporting a larger append-form corpus in the
+same model-experiments/flux-conditioning directory. Trashcan's new curation and
+paired-export jobs are active. The companion now supplies VAE/pipeline components.
+Phlegm's remaining work is native replay and an adapter assembling appended rows
+into the validated512-position runtime artifact. Current evidence and prototype
+limits are recorded in the distillation spec and companion ENRICHER_SMOKE.md.
+
 Qwen Image 2.1 and FLUX 3 Image Klein are requested for text-to-image and
 editing through the CLI and image API, with native NPU inference. MOSS Image
 SFT is also requested for its published text-to-image path. They are

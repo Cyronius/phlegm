@@ -399,6 +399,12 @@ pub struct Flux2ImageConfig {
     #[serde(default)]
     pub env_script: Option<PathBuf>,
     pub model: PathBuf,
+    /// The DiT from this GGUF; `model` still supplies the text encoder, VAE and tokenizer.
+    #[serde(default)]
+    pub transformer_gguf: Option<PathBuf>,
+    /// The GGUF's final adaLN half order: "auto" (default), "bfl" or "diffusers".
+    #[serde(default)]
+    pub gguf_modulation: Option<String>,
     pub kernels: PathBuf,
     pub output_root: PathBuf,
 }
@@ -418,15 +424,25 @@ impl Flux2ImageConfig {
             }
         }
         for path in [Some(&self.python), Some(&self.repo_root), self.env_script.as_ref(),
-                     Some(&self.model), Some(&self.kernels), Some(&self.output_root)]
+                     Some(&self.model), self.transformer_gguf.as_ref(), Some(&self.kernels),
+                     Some(&self.output_root)]
             .into_iter().flatten() {
             if !path.is_absolute() {
                 return Err(format!("FLUX.2 image config path must be absolute: {}", path.display()));
             }
         }
+        if let Some(m) = &self.gguf_modulation {
+            if self.transformer_gguf.is_none() || !["auto", "bfl", "diffusers"].contains(&m.as_str()) {
+                return Err(format!("gguf_modulation {m:?} needs transformer_gguf and one of auto, bfl, diffusers"));
+            }
+        }
+        let transformer = match &self.transformer_gguf {
+            Some(gguf) => gguf.clone(),
+            None => self.model.join("transformer/config.json"),
+        };
         for file in [Some(&self.python), self.env_script.as_ref(),
                      Some(&self.model.join("model_index.json")),
-                     Some(&self.model.join("transformer/config.json")),
+                     Some(&transformer),
                      Some(&self.model.join("tokenizer/tokenizer.json")),
                      Some(&self.kernels.join("final.xclbin")),
                      Some(&self.kernels.join("fa/dit_fa.json")),
@@ -540,6 +556,14 @@ impl ImageConfig {
         if request.model.as_deref().is_some_and(|id| id != self.model_id()) {
             return Err(format!("unsupported image model; expected {}", self.model_id()));
         }
+        if let Some(path) = &request.projected_conditioning {
+            if !matches!(self, Self::Flux2(_)) {
+                return Err("projected conditioning is experimental and requires the FLUX.2 klein backend".into());
+            }
+            if !path.is_absolute() || !path.is_file() {
+                return Err("projected conditioning must be an existing absolute file path".into());
+            }
+        }
         self.supports_resolution(resolution)?;
         if let Some(image) = &request.image {
             match self {
@@ -617,6 +641,9 @@ pub struct ImageRequest {
     /// Reference image for an edit; set by the CLI or the edits endpoint.
     #[serde(skip)]
     pub image: Option<PathBuf>,
+    /// Experimental local CLI input. HTTP clients cannot select a host file.
+    #[serde(skip)]
+    pub projected_conditioning: Option<PathBuf>,
 }
 
 fn default_size() -> String { "512x512".into() }
@@ -825,22 +852,62 @@ fn generate_qwen21(cfg: &Qwen21ImageConfig, request: &ImageRequest,
 
 fn generate_flux2(cfg: &Flux2ImageConfig, request: &ImageRequest,
                   out: &Path, resolution: u32) -> Result<PathBuf, String> {
+    let mut process = flux2_command(cfg, request, out, resolution)?;
+    crate::bench::reference::die_with_parent(&mut process);
+    let status = process.status().map_err(|e| format!("starting native FLUX.2 sampler: {e}"))?;
+    if !status.success() { return Err(format!("native FLUX.2 sampler exited with {status}")); }
+    let summary = read_manifest(&out.join("summary.json"))?;
+    let image = summary["image"].as_str().map(PathBuf::from)
+        .unwrap_or_else(|| out.join("image.png"));
+    if !image.is_file() { return Err("native FLUX.2 sampler did not produce a PNG".into()); }
+    Ok(image)
+}
+
+/// The environment a PowerShell env script leaves behind (Windows has no `bash -c "source"`).
+fn powershell_env(script: &Path) -> Result<Vec<(String, String)>, String> {
+    let quoted = script.to_string_lossy().replace('\'', "''");
+    let dump = format!(". '{quoted}' *> $null; Get-ChildItem env: | ForEach-Object {{ \"$($_.Name)=$($_.Value)\" }}");
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &dump])
+        .output().map_err(|e| format!("running env script {}: {e}", script.display()))?;
+    if !output.status.success() {
+        return Err(format!("env script {} failed: {}", script.display(),
+                           String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines()
+        .filter_map(|l| l.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+        .collect())
+}
+
+fn flux2_command(cfg: &Flux2ImageConfig, request: &ImageRequest,
+                 out: &Path, resolution: u32) -> Result<Command, String> {
     let steps = request.steps.unwrap_or(4);
+    let windows = cfg!(windows);
     let mut process = if let Some(dibs) = &cfg.dibs {
         let mut wrapped = Command::new(dibs);
         wrapped.args(["run", "npu", "cpu", "--label", "Phlegm native FLUX.2 klein generation",
                       "--eta"])
             .arg(format!("{}m", (steps * if resolution > 512 { 2 } else { 1 } + 15).min(120)))
-            .arg("--").arg("bash");
+            .arg("--");
+        if windows { wrapped.arg(&cfg.python); } else { wrapped.arg("bash"); }
         wrapped
+    } else if windows {
+        Command::new(&cfg.python)
     } else {
         Command::new("bash")
     };
-    let script = if cfg.env_script.is_some() { "source \"$1\" && shift && exec \"$@\"" }
-                 else { "shift && exec \"$@\"" };
-    process.arg("-c").arg(script).arg("phlegm-flux2-image")
-        .arg(cfg.env_script.clone().unwrap_or_default())
-        .arg(&cfg.python).arg("-m").arg("open_kernels.flux2_native_generate")
+    if windows {
+        if let Some(script) = &cfg.env_script {
+            process.env_clear().envs(powershell_env(script)?);
+        }
+    } else {
+        let script = if cfg.env_script.is_some() { "source \"$1\" && shift && exec \"$@\"" }
+                     else { "shift && exec \"$@\"" };
+        process.arg("-c").arg(script).arg("phlegm-flux2-image")
+            .arg(cfg.env_script.clone().unwrap_or_default())
+            .arg(&cfg.python);
+    }
+    process.arg("-m").arg("open_kernels.flux2_native_generate")
         .arg("--prompt").arg(&request.prompt)
         .arg("--model").arg(&cfg.model)
         .arg("--kernels").arg(&cfg.kernels)
@@ -852,14 +919,14 @@ fn generate_flux2(cfg: &Flux2ImageConfig, request: &ImageRequest,
     if let Some(image) = &request.image {
         process.arg("--image").arg(image);
     }
-    crate::bench::reference::die_with_parent(&mut process);
-    let status = process.status().map_err(|e| format!("starting native FLUX.2 sampler: {e}"))?;
-    if !status.success() { return Err(format!("native FLUX.2 sampler exited with {status}")); }
-    let summary = read_manifest(&out.join("summary.json"))?;
-    let image = summary["image"].as_str().map(PathBuf::from)
-        .unwrap_or_else(|| out.join("image.png"));
-    if !image.is_file() { return Err("native FLUX.2 sampler did not produce a PNG".into()); }
-    Ok(image)
+    if let Some(path) = &request.projected_conditioning {
+        process.arg("--projected-conditioning").arg(path);
+    }
+    if let Some(gguf) = &cfg.transformer_gguf {
+        process.arg("--transformer-gguf").arg(gguf)
+            .arg("--gguf-modulation").arg(cfg.gguf_modulation.as_deref().unwrap_or("auto"));
+    }
+    Ok(process)
 }
 
 fn respond(request: Request, status: u16, value: Value) {
@@ -1067,7 +1134,7 @@ mod tests {
         let base = ImageRequest { prompt: "cube".into(), model: Some(MOSS_ID.into()),
             negative_prompt: String::new(), size: default_size(), steps: Some(50),
             guidance_scale: Some(3.0), seed: 41, n: 1, response_format: default_response_format(),
-            image: None };
+            image: None, projected_conditioning: None };
         assert_eq!(base.validate().unwrap(), 512);
         let mut wrong = base.clone();
         wrong.size = "768x512".into();
@@ -1096,8 +1163,11 @@ mod tests {
         let mut request = ImageRequest { prompt: "red cube".into(), model: Some(QWEN21_ID.into()),
             negative_prompt: String::new(), size: default_size(), steps: Some(40),
             guidance_scale: None, seed: 41, n: 1, response_format: default_response_format(),
-            image: None };
+            image: None, projected_conditioning: None };
         assert_eq!(cfg.validate_request(&request).unwrap(), 512);
+        request.projected_conditioning = Some(PathBuf::from("unused.safetensors"));
+        assert!(cfg.validate_request(&request).unwrap_err().contains("requires the FLUX.2"));
+        request.projected_conditioning = None;
         request.steps = Some(1);
         assert!(cfg.validate_request(&request).is_err());
         request.steps = Some(51);
@@ -1128,7 +1198,7 @@ mod tests {
         let mut request = ImageRequest { prompt: "red cube".into(), model: Some(FLUX3_ID.into()),
             negative_prompt: String::new(), size: "1024x1024".into(), steps: Some(16),
             guidance_scale: None, seed: 7, n: 1, response_format: default_response_format(),
-            image: None };
+            image: None, projected_conditioning: None };
         assert!(ImageConfig::Flux3(flux.clone()).validate_request(&request).is_err());
         flux.resolutions.insert("1024".into(), Flux3ResolutionKernels {
             edge_kernels: BTreeMap::new(), image_block_kernels: path.clone(),
@@ -1218,7 +1288,8 @@ mod tests {
         let flux = Flux2ImageConfig {
             backend: "flux2".into(), model_id: FLUX2_KLEIN_IDS[0].into(), dibs: None,
             python: path.clone(), repo_root: path.clone(), env_script: None,
-            model: path.clone(), kernels, output_root: root.clone(),
+            model: path.clone(), transformer_gguf: None, gguf_modulation: None,
+            kernels, output_root: root.clone(),
         };
         let cfg = ImageConfig::Flux2(flux);
         assert_eq!(cfg.model_id(), "black-forest-labs/FLUX.2-klein-4B");
@@ -1227,8 +1298,28 @@ mod tests {
         let mut request = ImageRequest { prompt: "fox".into(), model: None,
             negative_prompt: String::new(), size: "1024x1024".into(), steps: None,
             guidance_scale: None, seed: 1, n: 1, response_format: default_response_format(),
-            image: None };
+            image: None, projected_conditioning: None };
         assert_eq!(cfg.validate_request(&request).unwrap(), 1024);
+        let ImageConfig::Flux2(flux) = &cfg else { unreachable!() };
+        let original = flux2_command(flux, &request, &root.join("out"), 1024).unwrap();
+        assert!(!original.get_args().any(|a| a == "--transformer-gguf"));
+        assert!(!original.get_args().any(|a| a == "--projected-conditioning"));
+        let projected = root.join("projected input;literal.safetensors");
+        fs::write(&projected, b"fixture").unwrap();
+        request.projected_conditioning = Some(projected.clone());
+        assert_eq!(cfg.validate_request(&request).unwrap(), 1024);
+        let command = flux2_command(flux, &request, &root.join("out"), 1024).unwrap();
+        let arguments: Vec<_> = command.get_args().collect();
+        let flag = arguments.iter().position(|a| *a == "--projected-conditioning").unwrap();
+        assert_eq!(arguments[flag + 1], projected.as_os_str());
+        let gguf = Flux2ImageConfig { transformer_gguf: Some(root.join("dit.gguf")),
+                                      gguf_modulation: Some("bfl".into()), ..flux.clone() };
+        let command = flux2_command(&gguf, &request, &root.join("out"), 1024).unwrap();
+        let arguments: Vec<_> = command.get_args().collect();
+        let flag = arguments.iter().position(|a| *a == "--transformer-gguf").unwrap();
+        assert_eq!(arguments[flag + 1], root.join("dit.gguf").as_os_str());
+        assert_eq!(arguments[flag + 3], "bfl");
+        request.projected_conditioning = None;
         request.image = Some(reference.clone());
         assert!(cfg.validate_request(&request).unwrap_err().contains("1024-pixel editing"));
         request.size = default_size();
@@ -1242,5 +1333,14 @@ mod tests {
         request.model = Some(FLUX2_KLEIN_IDS[1].into());
         assert!(cfg.validate_request(&request).unwrap_err().contains("unsupported image model"));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn projected_conditioning_is_not_an_http_file_selector() {
+        let ordinary: ImageRequest = serde_json::from_value(serde_json::json!({"prompt":"fox"})).unwrap();
+        assert!(ordinary.projected_conditioning.is_none());
+        assert!(serde_json::from_value::<ImageRequest>(serde_json::json!({
+            "prompt":"fox", "projected_conditioning":"/host/private.safetensors"
+        })).is_err());
     }
 }
