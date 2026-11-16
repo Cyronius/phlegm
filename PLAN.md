@@ -334,8 +334,11 @@ view: `fast` (the default) on bfp16 GEMMs (`DENSE_GGUF_BFP16=1` at export), `acc
 the layer-major schedule. Against fp32 torch over the same file: median cosine >= 0.99978 and next-token loss
 within 0.1% on the last 256 positions of 1024 / 4352 / 16320-token prompts; fast's NLL within 0.3% of
 accurate's; a 5013-token needle answered. Development timing paired with llama.cpp Vulkan on the same GGUF
-(loaded host): prefill 375-407 against 2204-2393 tok/s, decode ~14 against 65-67 tok/s. Open: NPU flash
-attention at head dim 128 (P2 S6), decode (roadmap O7), a clean benchmark. Plan:
+(loaded host): prefill 375-407 against 2204-2393 tok/s, decode ~14 against 65-67 tok/s. O7 step 1 (2026-11-15,
+open-kernels caf97c9): decode attention on 8 cores, 4 a kv head with per-core windows (OPEN-ATTN-KVSLICE
+`KVCORES` 4), byte-identical logits; paired decode 65-70 -> 45-48 ms a token at 1k and 278-288 -> 146-157 ms at
+16k (development, loaded host). Open: NPU flash attention at head dim 128 (P2 S6), the rest of decode (O7: 4-core
+layer cap, the head), a clean benchmark against llama.cpp. Plan:
 [.plans/minicpm5-2b.md](.plans/minicpm5-2b.md).
 
 ## Xing4.0-29B-A4B (xing4_0: DeepSeek-V3 MLA + mHC + MoE)
