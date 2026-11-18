@@ -472,6 +472,8 @@ fn image_routes_reuse_native_validation_and_support_multipart_model_selection() 
                     env_script: None,
                     model: "/missing".into(),
                     kernels: "/missing".into(),
+                    transformer_gguf: None,
+                    gguf_modulation: None,
                     output_root: "/missing".into(),
                 },
             )))
