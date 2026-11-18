@@ -4,6 +4,7 @@ pub mod bench;
 pub mod bridge_resolver;
 pub mod gguf;
 pub mod image;
+pub mod image_worker;
 pub mod mock_backend;
 pub mod placeholder_tokenizer;
 pub mod reasoning_effort;

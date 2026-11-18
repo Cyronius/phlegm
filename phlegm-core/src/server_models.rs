@@ -188,7 +188,7 @@ pub fn discover(
 pub struct LoadedModel(Loaded);
 enum Loaded {
     Inference(Arc<ServerState>),
-    Image(ImageConfig),
+    Image(crate::image_worker::ImageModel),
 }
 impl LoadedModel {
     pub fn chat(backend: Box<dyn Backend + Send>, cfg: ServerConfig) -> Result<Self, String> {
@@ -219,8 +219,12 @@ impl LoadedModel {
             embedding_only: true,
         })))
     }
+    /// One sampler process per request (no resident worker).
     pub fn image(cfg: ImageConfig) -> Self {
-        Self(Loaded::Image(cfg))
+        Self(Loaded::Image(crate::image_worker::ImageModel::per_request(cfg)))
+    }
+    pub fn image_model(model: crate::image_worker::ImageModel) -> Self {
+        Self(Loaded::Image(model))
     }
 }
 
@@ -341,12 +345,13 @@ impl ModelServer {
             Loaded::Inference(state) if kind == ModelKind::Embedding => {
                 embeddings_route::handle_body(request, state, &body)
             }
-            Loaded::Image(cfg) if kind == ModelKind::Image => crate::image::handle_body(
+            Loaded::Image(model) if kind == ModelKind::Image => crate::image::handle_body_with(
                 request,
-                cfg,
+                &model.cfg,
                 &body,
                 &content_type,
                 path == "/v1/images/edits",
+                &|r, out| model.generate(r, out),
             ),
             _ => error(request, 500, "loader returned an incompatible model"),
         }

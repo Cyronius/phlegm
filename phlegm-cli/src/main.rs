@@ -18,7 +18,7 @@ const USAGE: &str = "usage: phlegm <command>
 
 commands:
   run --model-dir DIR [--kernels DIR] [--bridge EXE] --prompt TEXT [--max-tokens N (0 or -1: until the context is full)] [--seed N] [--turbo]
-  serve [--models-dir DIR] [--image-config JSON[,JSON...]] [--keep-alive SECONDS] [--queue-timeout SECONDS]
+  serve [--models-dir DIR] [--image-config JSON[,JSON...]] [--keep-alive SECONDS|-1] [--queue-timeout SECONDS]
   serve --model-dir DIR [--kernels DIR] [--bridge EXE] [--turbo] [--host 127.0.0.1] [--port 52625]
   serve --embed-model DIR [--embed-python PYTHON] [--embed-source DIR] [--embed-model-name NAME]
   serve --mock [--host H] [--port N]

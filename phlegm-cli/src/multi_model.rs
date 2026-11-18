@@ -56,7 +56,7 @@ pub(super) fn start(
             .transpose()
     };
     let timeout = seconds("--queue-timeout")?.unwrap_or(Duration::from_secs(600));
-    let keep_alive = seconds("--keep-alive")?;
+    let keep_alive = phlegm_core::image_worker::keep_alive_option(opts.get("--keep-alive").map(String::as_str))?;
     cfg.backend_name = "multi-model".into();
     cfg.model_dir = None;
     let base = cfg.clone();
@@ -91,7 +91,9 @@ pub(super) fn start(
                 )?;
                 Ok(LoadedModel::embedding(Box::new(embedder), cfg))
             }
-            ModelKind::Image => Ok(LoadedModel::image(ImageConfig::load(&model.path)?)),
+            ModelKind::Image => Ok(LoadedModel::image_model(
+                phlegm_core::image_worker::ImageModel::load(ImageConfig::load(&model.path)?)?,
+            )),
         }
     })?;
     println!(

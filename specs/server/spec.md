@@ -174,8 +174,14 @@ models, with the OpenAI fields and the extensions `capabilities: ["chat"]`,
 `["embedding"]` or `["image"]`, `loaded: bool`, and
 `status: "unloaded" | "loading" | "loaded"`. `created: 0` means the installation
 time is unknown. A failed load leaves its entry installed and unloaded; it is
-retryable. For images, loaded means the pipeline config is selected; the existing
-sampler creates and releases device resources for each generation/edit.
+retryable. For FLUX.2 klein, loaded means a resident worker
+(`flux2_native_generate --serve`, one JSON request and reply per line) holds the
+weights, the NPU lock and the NPU; same-model requests reuse it, and a change of
+size, step count or edit rebuilds its sampler inside the same worker. Other image
+models keep one sampler process per generation/edit. A worker failure returns 500
+and the next request starts a new worker. Unloading closes the worker's input, waits
+up to 15 s for it to exit, then kills it; on Windows the worker runs in a
+kill-on-close Job Object, so it also ends when the server ends.
 
 **Request lifetime.** The request's `model` selects an installed ID. It is required
 in discovery mode, except that a catalog containing just one image model accepts
@@ -197,13 +203,16 @@ handlers (including body readers); excess requests return 503. GET discovery and
 health remain available while a worker loads or generates. Queue order is the
 order handlers enter the lease queue, not TCP connection order.
 
-`--keep-alive SECONDS` optionally unloads a resident model after that much idle
-time since its last handler completed; omitted means keep it until a switch or
-normal server teardown. A 250 ms sweep checks idle time. Zero releases it on the
-next sweep unless a request is active/queued. Single-model modes retain their
+`--keep-alive SECONDS` unloads a resident model after that much idle time since
+its last handler completed. Omitted means 600 s (since 2026-11-18; before, omitted
+meant never). `-1` means never unload when idle: only a switch or normal server
+teardown unloads. A 250 ms sweep checks idle time. Zero releases it on the next
+sweep unless a request is active/queued. Values below -1 or not whole numbers are a
+startup error. Single-model modes retain their
 existing lifetime; they reject these discovery-only options. Image samplers use
 the same `NpuLock` around generation as the resident backends, wait for their child
-to exit before replying, and set the existing parent-death behavior on the child.
+to exit before replying, and set the existing parent-death behavior on the child
+(the resident FLUX.2 worker instead holds the lock from load to unload).
 Images retain their existing size, edit-capability and response-format validation;
 JSON/base64 and multipart edits reuse the same parser as the image-only server.
 
@@ -237,6 +246,20 @@ five tests; seven prerequisite-dependent tests ignored. The CLI smoke listed
 passed four rejection routes plus health without invoking a loader. Exact
 commands, results and corrected setup failures:
 [u7-validation.json](u7-validation.json). No new crate or download was needed.
+
+**Resident FLUX.2 worker, hardware, 2026-11-18.** Strix Point, Windows 11, Q8_0 GGUF
+config without dibs, debug `phlegm serve-images --keep-alive 20`, `dibs run --measure`
+CLEAN before and after. HTTP wall time per t2i request, 4 steps: first 512 (worker
+start and load) 8.52 s; next three 512 4.09 / 4.06 / 4.06 s; first 1024 (sampler
+rebuild) 19.89 s; second 1024 12.17 s; back to 512 (rebuild) 10.74 s. One worker
+process for all seven requests. Idle unload ended it 21.7 s after the last reply and
+freed the lock; the next 512 started a new worker (8.42 s). Killing the server ended
+the worker (Job Object), but left the server's lock file: `dead_owner` reads `/proc`,
+so on Windows a crashed server's lock is only cleared by the 40-minute age rule.
+The same run with the dibs-wrapped config passed the same checks (not measured).
+Not tested on hardware: a switch to a different model (it uses the same unload path
+as idle expiry), edits through the resident worker, Linux.
+Evidence: `C:\dev\klein-eval\resident-20261118\` (not in Git).
 
 **Untested hardware gate.** After integration into the main checkout, run this
 in one terminal (no such NPU command was run for U7):

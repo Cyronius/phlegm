@@ -864,7 +864,7 @@ fn generate_flux2(cfg: &Flux2ImageConfig, request: &ImageRequest,
 }
 
 /// The environment a PowerShell env script leaves behind (Windows has no `bash -c "source"`).
-fn powershell_env(script: &Path) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn powershell_env(script: &Path) -> Result<Vec<(String, String)>, String> {
     let quoted = script.to_string_lossy().replace('\'', "''");
     let dump = format!(". '{quoted}' *> $null; Get-ChildItem env: | ForEach-Object {{ \"$($_.Name)=$($_.Value)\" }}");
     let output = Command::new("powershell.exe")
@@ -882,12 +882,31 @@ fn powershell_env(script: &Path) -> Result<Vec<(String, String)>, String> {
 fn flux2_command(cfg: &Flux2ImageConfig, request: &ImageRequest,
                  out: &Path, resolution: u32) -> Result<Command, String> {
     let steps = request.steps.unwrap_or(4);
+    let eta = (steps * if resolution > 512 { 2 } else { 1 } + 15).min(120);
+    let mut process = flux2_base_command(cfg, "Phlegm native FLUX.2 klein generation", eta)?;
+    process.arg("--prompt").arg(&request.prompt)
+        .arg("--size").arg(resolution.to_string())
+        .arg("--steps").arg(steps.to_string())
+        .arg("--seed").arg(request.seed.to_string())
+        .arg("--out").arg(out);
+    if let Some(image) = &request.image {
+        process.arg("--image").arg(image);
+    }
+    if let Some(path) = &request.projected_conditioning {
+        process.arg("--projected-conditioning").arg(path);
+    }
+    Ok(process)
+}
+
+/// The sampler process with its environment, dibs wrapper and model options; callers add
+/// either one request's options or `--serve`.
+pub(crate) fn flux2_base_command(cfg: &Flux2ImageConfig, label: &str, eta_minutes: u32)
+                                 -> Result<Command, String> {
     let windows = cfg!(windows);
     let mut process = if let Some(dibs) = &cfg.dibs {
         let mut wrapped = Command::new(dibs);
-        wrapped.args(["run", "npu", "cpu", "--label", "Phlegm native FLUX.2 klein generation",
-                      "--eta"])
-            .arg(format!("{}m", (steps * if resolution > 512 { 2 } else { 1 } + 15).min(120)))
+        wrapped.args(["run", "npu", "cpu", "--label", label, "--eta"])
+            .arg(format!("{eta_minutes}m"))
             .arg("--");
         if windows { wrapped.arg(&cfg.python); } else { wrapped.arg("bash"); }
         wrapped
@@ -908,20 +927,9 @@ fn flux2_command(cfg: &Flux2ImageConfig, request: &ImageRequest,
             .arg(&cfg.python);
     }
     process.arg("-m").arg("open_kernels.flux2_native_generate")
-        .arg("--prompt").arg(&request.prompt)
         .arg("--model").arg(&cfg.model)
         .arg("--kernels").arg(&cfg.kernels)
-        .arg("--size").arg(resolution.to_string())
-        .arg("--steps").arg(steps.to_string())
-        .arg("--seed").arg(request.seed.to_string())
-        .arg("--out").arg(out)
         .current_dir(cfg.repo_root.join("open-kernels"));
-    if let Some(image) = &request.image {
-        process.arg("--image").arg(image);
-    }
-    if let Some(path) = &request.projected_conditioning {
-        process.arg("--projected-conditioning").arg(path);
-    }
     if let Some(gguf) = &cfg.transformer_gguf {
         process.arg("--transformer-gguf").arg(gguf)
             .arg("--gguf-modulation").arg(cfg.gguf_modulation.as_deref().unwrap_or("auto"));
@@ -995,6 +1003,12 @@ pub(crate) fn request_model(content_type: &str, body: &[u8]) -> Result<Option<St
 }
 
 pub(crate) fn handle_body(request: Request, cfg: &ImageConfig, body: &[u8], content_type: &str, edit: bool) {
+    handle_body_with(request, cfg, body, content_type, edit, &|r, out| generate(cfg, r, out));
+}
+
+/// `handle_body` with the sampler supplied by the caller (a resident worker or one process per request).
+pub(crate) fn handle_body_with(request: Request, cfg: &ImageConfig, body: &[u8], content_type: &str,
+                               edit: bool, sample: &dyn Fn(&ImageRequest, &Path) -> Result<PathBuf, String>) {
     let serial = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let prefix = match cfg { ImageConfig::Moss(_) => "moss", ImageConfig::Flux3(_) => "flux3",
         ImageConfig::Qwen21(_) => "qwen21", ImageConfig::Flux2(_) => "flux2" };
@@ -1016,7 +1030,7 @@ pub(crate) fn handle_body(request: Request, cfg: &ImageConfig, body: &[u8], cont
         }
     };
     let out = cfg.output_root().join(&name);
-    match generate(cfg, &image_request, &out).and_then(|path| fs::read(&path)
+    match sample(&image_request, &out).and_then(|path| fs::read(&path)
          .map_err(|e| format!("reading generated image: {e}"))) {
         Ok(png) => respond(request, 200, json!({"created":now_unix(),
             "data":[{"b64_json":encode(png)}]})),
