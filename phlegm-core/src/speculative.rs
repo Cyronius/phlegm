@@ -193,5 +193,6 @@ mod tests {
         assert_eq!(p.max_draft(20, 20), 1);
         p.observe(1, 1);
         assert_eq!(p.max_draft(20, 20), 2);
+        assert_eq!(SpecPolicy::new(16).max_draft(100, 100), 15);
     }
 }

@@ -602,8 +602,8 @@ bridges and bridges without verification always use ordinary decode, for all
 modes. An accepted mode is not evidence of runtime MTP support.
 
 Between cycles Rust holds one emitted token outside the committed context.
-It verifies that token plus at most three drafts, bounded by the advertised
-width, remaining output budget and context capacity. With no lookup match,
+It verifies that token plus at most fifteen drafts, bounded by the advertised
+width (Rust caps it at 16), remaining output budget and context capacity. With no lookup match,
 the pass has one row. After a rejection the draft budget halves; a completely
 rejected draft triggers two width-one cycles before another probe. A fully
 accepted cycle grows the budget by one, up to the advertised width.
@@ -623,6 +623,22 @@ Protocol 2 retains protocol 1's prefill, reset, rewind and decode commands:
 - `accept {"n":m}` commits only the first m pending rows and discards the rest.
   This client explicitly accepts after each cycle, so its next verify command
   carries `accept:0`. Reset, rewind, prefill and decode require no pending pass.
+
+The in-tree bridge (`benchmarks/reference/bridge.cpp`) speaks protocol 2. It runs
+each verify row as an ordinary decode step (`verify_ref: true`), so its rows are
+decode's logits by construction, and `accept` seeks back over the rest. It
+advertises width 16 for a model without recurrent layers, 0 otherwise, and no
+drafter. Rust accepts a logit payload of up to 16 rows of a 512Ki-token
+vocabulary (32 MiB); gpt-oss's 16 rows are 12.8 MB.
+
+Hardware check (2026-11-18; Strix Point, Windows 11; gpt-oss-20b on the
+open-kernels in-tree engine): a 16-row pass equalled 16 `decode_logits` replies
+byte for byte. After `accept 5`, a pass of the next token plus 7 wrong drafts,
+and `accept 1`, the next 10-row pass also equalled decode byte for byte. The
+reference verifier costs one decode step a row, so it gives no speedup.
+End to end, `phlegm run` at temperature 0 with 120 tokens gave the same output
+with `--speculative off` and `lookup` in two rounds. Wall time was 50.9/44.3 s
+off and 52.2/51.4 s lookup: rejected drafts cost real decode steps.
 
 Rust samples only valid rows, once each, in order, using the request's sampler,
 history, penalties, ramps, RNG and structured-output mask. A masked-out draft

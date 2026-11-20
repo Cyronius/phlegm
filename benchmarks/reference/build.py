@@ -190,7 +190,7 @@ def main():
     commands.append(command)
     if inputs() != before or git_state(root) != state:
         raise RuntimeError("Build inputs changed during compilation; rebuild required")
-    build = dict(protocol=1, engine="openflowlm-cpp-reference",
+    build = dict(protocol=2, engine="openflowlm-cpp-reference",
                  source_commit=state[0], source_dirty=state[1],
                  engine_tree_sha256=tree, release_tag=release_tag,
                  xrt_rpath=rpath,

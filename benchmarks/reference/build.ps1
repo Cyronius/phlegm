@@ -89,7 +89,7 @@ try {
 } finally { Pop-Location }
 if ((ManifestHash (SourceFiles)) -ne $sourceHash) { throw 'Build inputs changed during compilation; rebuild required' }
 $build = [ordered]@{
-    protocol = 1
+    protocol = 2
     engine = 'openflowlm-cpp-reference'
     source_commit = $commit.Trim()
     source_dirty = $dirty

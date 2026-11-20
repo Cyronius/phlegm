@@ -108,6 +108,21 @@ static int prefill(Core& core, const std::vector<int>& ids, const std::string& r
     run_prefill(core, ids, route);
     return greedy(core);
 }
+// Protocol 2 (SERVER-SPECULATIVE): rows run as decode steps, so they are decode's logits; seeking back discards the rest.
+constexpr size_t kVerifyWidth = 16;
+struct Pending {
+    bool active = false;
+    size_t start = 0;
+    size_t rows = 0;
+};
+static void accept_rows(Core& core, Pending& pending, size_t n) {
+    if (!pending.active) throw std::runtime_error("accept without a pending verify pass");
+    if (n > pending.rows) throw std::runtime_error("accept past the pending rows");
+    const size_t pos = pending.start + n;
+    if (pos != static_cast<size_t>(core.position())) core.seek(static_cast<int>(pos));
+    pending.active = false;
+}
+
 // Logits follow their reply line as raw binary32 bytes ("logits_f32_le_bytes" of them, little
 // endian: the bridge builds only for x86-64), not as 1.3 MB of text inside the JSON.
 static void reply_logits(json value, const Core& core) {
@@ -125,6 +140,31 @@ static void reply_logits(json value, const Core& core) {
     std::cout.write(reinterpret_cast<const char*>(logits.data()), static_cast<std::streamsize>(n * sizeof(float)));
     std::cout.flush();
 }
+static void verify(Core& core, Pending& pending, const json& request) {
+    const auto tokens = request.at("tokens").get<std::vector<int>>();
+    if (request.value("draft", 0) != 0) throw std::runtime_error("this bridge has no drafter");
+    if (recurrent_layers(core)) throw std::runtime_error("verify needs a model without recurrent layers");
+    if (tokens.empty() || tokens.size() > kVerifyWidth) throw std::runtime_error("verify takes 1 to 16 tokens");
+    for (int id : tokens) if (id < 0 || static_cast<size_t>(id) >= core.real_vocab())
+        throw std::runtime_error("verify token outside the model vocabulary");
+    const size_t start = static_cast<size_t>(core.position()), n = core.real_vocab();
+    if (start + tokens.size() > core.max_ctx()) throw std::runtime_error("verify exceeds context capacity");
+    std::vector<float> rows(tokens.size() * n);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        core.step(tokens[i], true);
+        const auto& logits = core.logits();
+        if (logits.size() < n) throw std::runtime_error("incomplete logits");
+        for (size_t v = 0; v < n; ++v)
+            if (!std::isfinite(logits[v])) throw std::runtime_error("nonfinite logits");
+        std::copy(logits.begin(), logits.begin() + n, rows.begin() + i * n);
+    }
+    pending = {true, start, tokens.size()};
+    json value = {{"ok", true}, {"rows", tokens.size()}, {"tokens", tokens}, {"position", start},
+                  {"logits_f32_le_bytes", rows.size() * sizeof(float)}};
+    std::cout << value.dump() << '\n';
+    std::cout.write(reinterpret_cast<const char*>(rows.data()), static_cast<std::streamsize>(rows.size() * sizeof(float)));
+    std::cout.flush();
+}
 
 int main() {
     // Rust owns this process and its device lock. Exit without XRT destruction:
@@ -134,10 +174,11 @@ int main() {
     std::unique_ptr<Core> core;
     std::string route;
     Mark mark;
+    Pending pending;
 #ifdef _WIN32
     _setmode(_fileno(stdout), _O_BINARY);  // the logits are raw bytes
 #endif
-    reply({{"protocol", 1}, {"engine", "openflowlm-cpp-reference"}});
+    reply({{"protocol", 2}, {"engine", "openflowlm-cpp-reference"}});
     try {
         std::string line;
         while (std::getline(std::cin, line)) {
@@ -174,10 +215,24 @@ int main() {
                     {"context_capacity", core->max_ctx()}, {"layers", core->num_layers()},
                     {"real_vocab", core->real_vocab()}, {"prefill_route", route},
                     {"weights_file", core->is_gguf() ? "model.gguf" : "model.q4nx"},
-                    {"recurrent_layers", recurrent_layers(*core)}});
+                    {"recurrent_layers", recurrent_layers(*core)},
+                    {"verify_width", recurrent_layers(*core) ? 0 : kVerifyWidth}, {"verify_ref", true},
+                    {"draft", nullptr}});
                 continue;
             }
             if (!core) throw std::runtime_error("init is required before inference");
+            if (command == "verify_logits") {
+                if (pending.active) accept_rows(*core, pending, request.at("accept").get<size_t>());
+                else if (request.at("accept").get<size_t>() != 0) throw std::runtime_error("accept without a pending verify pass");
+                verify(*core, pending, request);
+                continue;
+            }
+            if (command == "accept") {
+                accept_rows(*core, pending, request.at("n").get<size_t>());
+                reply({{"position", core->position()}});
+                continue;
+            }
+            if (pending.active) throw std::runtime_error("a verify pass is pending; accept it first");
             if (command == "reset") { core->reset(); mark.valid = false; reply({}); }
             else if (command == "rewind") {
                 // Back to `pos` <= the position: the mark's own position (its states restored), or
