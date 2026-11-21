@@ -30,6 +30,9 @@ pub struct ReleaseInfo {
     pub target: String,
     pub rustc: String,
     pub features: Vec<String>,
+    // A development run: no release tag, possibly a modified tree; never a publishable result.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub development: bool,
 }
 
 impl ReleaseInfo {
@@ -47,16 +50,17 @@ impl ReleaseInfo {
             } else {
                 vec![]
             },
+            development: false,
         }
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.version.is_empty() || self.tag != format!("v{}", self.version) {
+        if !self.development && (self.version.is_empty() || self.tag != format!("v{}", self.version)) {
             return Err(
                 "benchmarks require a build from the exact v<Cargo version> release tag".into(),
             );
         }
-        if self.dirty {
+        if self.dirty && !self.development {
             return Err("benchmarks require an unmodified release build".into());
         }
         if self.opt_level != "3" {
@@ -527,9 +531,19 @@ impl BenchReport {
     }
 
     pub fn table(&self) -> String {
+        let build = if self.phlegm.development {
+            format!(
+                "{} DEVELOPMENT (not a release) {}{}",
+                self.phlegm.version,
+                &self.phlegm.commit[..12.min(self.phlegm.commit.len())],
+                if self.phlegm.dirty { "-dirty" } else { "" }
+            )
+        } else {
+            self.phlegm.tag.clone()
+        };
         let mut out = format!(
             "Phlegm {} | {} | {} | {}\ninput tokens   prefill tok/s   decode tok/s   first token ms\n",
-            self.phlegm.tag, self.runtime.backend, self.model.id, self.runtime.device
+            build, self.runtime.backend, self.model.id, self.runtime.device
         );
         for case in &self.cases {
             out.push_str(&format!(
@@ -558,7 +572,23 @@ mod tests {
             target: "test-target".into(),
             rustc: "test".into(),
             features: vec![],
+            development: false,
         }
+    }
+
+    #[test]
+    fn development_runs_need_no_tag_but_stay_optimized_and_labeled() {
+        let mut dev = release();
+        dev.development = true;
+        dev.tag.clear();
+        dev.dirty = true;
+        assert!(dev.validate().is_ok());
+        dev.opt_level = "0".into();
+        assert!(dev.validate().is_err());
+        let json = serde_json::to_string(&release()).unwrap();
+        assert!(!json.contains("development"));
+        let back: ReleaseInfo = serde_json::from_str(&json).unwrap();
+        assert!(!back.development);
     }
 
     fn machine() -> MachineInfo {
