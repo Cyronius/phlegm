@@ -134,6 +134,16 @@ fn number(flags: &BTreeMap<String, String>, name: &str, default: usize) -> Resul
     }
 }
 
+// canonicalize() gives \\?\C:\... on Windows, where the engine's "dir/file" joins stop resolving
+fn absolute(path: &str) -> Result<PathBuf, String> {
+    let full = Path::new(path).canonicalize().map_err(|e| e.to_string())?;
+    let text = full.to_string_lossy();
+    Ok(match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => full,
+    })
+}
+
 fn run_reference(args: &[String]) -> Result<(), String> {
     let development = args.iter().any(|a| a == "--development");
     let rest: Vec<String> = args.iter().filter(|a| *a != "--development").cloned().collect();
@@ -221,15 +231,9 @@ fn run_reference(args: &[String]) -> Result<(), String> {
             }
         });
     let options = ReferenceOptions {
-        bridge: Path::new(required(&flags, "--reference-engine")?)
-            .canonicalize()
-            .map_err(|e| e.to_string())?,
-        model_dir: Path::new(required(&flags, "--model-dir")?)
-            .canonicalize()
-            .map_err(|e| e.to_string())?,
-        kernel_dir: Path::new(required(&flags, "--kernels")?)
-            .canonicalize()
-            .map_err(|e| e.to_string())?,
+        bridge: absolute(required(&flags, "--reference-engine")?)?,
+        model_dir: absolute(required(&flags, "--model-dir")?)?,
+        kernel_dir: absolute(required(&flags, "--kernels")?)?,
         model_id: required(&flags, "--model-id")?.into(),
         model_revision: required(&flags, "--model-revision")?.into(),
         quantization: required(&flags, "--quantization")?.into(),
@@ -289,6 +293,8 @@ mod tests {
         assert!(parse(&args(&["--runs", "--output"])).is_err());
         assert!(parse(&args(&["--allow-untagged", "true"])).is_err());
         assert!(parse(&args(&["--development", "true"])).is_err()); // a bare switch, taken out before parse
+        let here = absolute(".").unwrap();
+        assert!(here.is_absolute() && !here.to_string_lossy().starts_with(r"\\?\"));
         let flags = parse(&args(&["--model-dir", "C:/models/a model", "--runs", "3"])).unwrap();
         assert_eq!(
             required(&flags, "--model-dir").unwrap(),
