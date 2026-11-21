@@ -22,6 +22,10 @@ use std::{
 pub const BACKEND_NAME: &str = "openflowlm-cpp-reference";
 const BRIDGE_SOURCE: &[u8] = include_bytes!("../../../benchmarks/reference/bridge.cpp");
 pub const ENGINE_TREE_SHA256: &str = env!("PHLEGM_ENGINE_TREE_SHA256");
+/// Rows a protocol 2 verify pass may carry: the emitted token plus up to 15 drafts.
+pub const MAX_VERIFY_WIDTH: u64 = 16;
+/// A reply's logits: up to MAX_VERIFY_WIDTH rows of a vocabulary of up to 512Ki tokens.
+const MAX_LOGIT_BYTES: u64 = MAX_VERIFY_WIDTH * 512 * 1024 * 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -325,8 +329,8 @@ impl Process {
                         .map_err(|e| format!("invalid reference reply: {e}"))
                         .and_then(|value| {
                             let n = value.get("logits_f32_le_bytes").and_then(Value::as_u64).unwrap_or(0);
-                            if n > 8_000_000 {
-                                return Err("reference logits exceed 8 MB".to_string());
+                            if n > MAX_LOGIT_BYTES {
+                                return Err(format!("reference logits exceed {MAX_LOGIT_BYTES} bytes"));
                             }
                             let mut payload = vec![0u8; n as usize];
                             reader
@@ -864,7 +868,7 @@ impl NpuBackend {
             .map(|n| n > 0);
         Ok(Self {
             verify_width: if process.protocol == 2 {
-                hello.get("verify_width").and_then(Value::as_u64).unwrap_or(0).min(4) as usize
+                hello.get("verify_width").and_then(Value::as_u64).unwrap_or(0).min(MAX_VERIFY_WIDTH) as usize
             } else { 0 },
             draft_max: if hello["draft"]["method"] == "mtp" {
                 hello["draft"]["max"].as_u64().unwrap_or(0).min(3) as usize

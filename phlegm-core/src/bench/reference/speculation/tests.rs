@@ -25,7 +25,7 @@ for line in sys.stdin:
         cap = r['max_ctx']
         out = {'context_capacity':cap, 'real_vocab':8, 'recurrent_layers':1}
         if protocol == 2:
-            out.update(verify_width=4, verify_ref=True, draft={'method':'mtp','max':3})
+            out.update(verify_width=config.get('width', 4), verify_ref=True, draft={'method':'mtp','max':3})
     elif cmd == 'reset':
         assert pending is None
         committed, mark = [], None
@@ -46,7 +46,7 @@ for line in sys.stdin:
         pending = list(r['tokens'])
         # Deterministic bridge-owned drafts; their quality cannot affect output.
         pending.extend([1]*r['draft'])
-        assert 1 <= len(pending) <= 4 and len(committed)+len(pending) <= cap
+        assert 1 <= len(pending) <= min(config.get('width', 4), 16) and len(committed)+len(pending) <= cap
         temp = list(committed); rows = []
         for t in pending:
             temp.append(t); rows.extend(logits(temp))
@@ -374,6 +374,26 @@ fn invalid_protocol_two_replies_invalidate_all_reuse() {
         assert!(!err.is_empty(), "{fault}");
         assert!(backend.context.is_empty(), "{fault}");
         assert!(backend.mark.is_none(), "{fault}");
+    }
+}
+
+#[test]
+fn width_sixteen_carries_fifteen_drafts_and_wider_bridges_are_clamped() {
+    for (advertised, used) in [(16, 16), (64, 16)] {
+        let f = Fixture::new(json!({"width": advertised}));
+        let mut backend = f.load(64);
+        assert_eq!(backend.verify_width, used);
+        let prompt = [1, 2, 1, 2];
+        let mut plain = params(0, 40, false);
+        plain.stop_ids.clear();
+        let expected = generate(&mut backend, &prompt, &mut plain, None, usize::MAX);
+        let mut p = params(0, 40, false);
+        p.stop_ids.clear();
+        let drafter = Box::new(Adversary { kind: 0, oracle: expected.clone(), prompt_len: prompt.len() });
+        assert_eq!(generate(&mut backend, &prompt, &mut p, Some(drafter), usize::MAX), expected);
+        f.assert_committed(&backend);
+        assert!(f.log().iter().any(|v| v["request"]["command"] == "verify_logits"
+            && v["request"]["tokens"].as_array().unwrap().len() == used));
     }
 }
 

@@ -31,8 +31,9 @@ def main():
         raise RuntimeError(f'bridge failed ({result.returncode}): {result.stdout}\n{result.stderr}')
     replies = [json.loads(line) for line in result.stdout.splitlines()]
     assert len(replies) == len(requests) + 1 and all(r.get('ok') for r in replies), replies
-    assert replies[0]['protocol'] == 1
+    assert replies[0]['protocol'] == 2
     assert replies[0]['engine'] == 'openflowlm-cpp-reference'
+    assert replies[1]['verify_width'] in (0, 16) and replies[1]['verify_ref'] is True
     assert replies[3]['token'] == replies[6]['token'], 'reset did not reproduce the first greedy token'
     trial = replies[4]
     assert trial['prompt_tokens'] == len(ids) and trial['output_tokens'] == 8 and trial['decode_steps'] == 7

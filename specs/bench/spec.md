@@ -116,9 +116,18 @@ memory would be useful future measurements; v1 does not estimate them.
 Build provenance is embedded when compiling `phlegm-core`. A benchmark requires
 the exact tag `v<Cargo package version>` pointing at the build commit, no tracked
 modifications, no untracked engine/CLI source files, and optimization level 3
-(`cargo build --release`). Missing Git metadata fails closed. No override flag
-allows development or mock reports. Unrelated untracked research directories do
+(`cargo build --release`). Missing Git metadata fails closed. Mock reports are
+never allowed. Unrelated untracked research directories do
 not make a build dirty. Tag and Git state changes invalidate Cargo's build cache.
+
+**Development runs.** `phlegm bench --development ...` runs the same protocol on
+any optimized build: no release tag is needed and a modified tree is allowed.
+The report's `phlegm.development` is `true`, its commit and dirty flag are kept,
+and `validate` and the table label it `DEVELOPMENT (not a release)` with the
+commit. Optimization level 3 and full provenance are still required. A
+development report is for comparing development builds and recording model
+work; it is never a published release result. Reports without the field are
+release reports, as before.
 
 This detects local build provenance; it does not cryptographically prove an
 official GitHub Release exists or prevent someone editing a JSON report. Publish

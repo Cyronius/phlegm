@@ -17,7 +17,9 @@ const HELP: &str = "usage: phlegm bench [machine | validate <results.json> | --h
 Phlegm Bench v1: 512, 1024, 2048, 4096 input tokens; batch/concurrency 1.
 Defaults: 1 warmup + 3 measured runs per length; 128 output tokens; greedy.
 Records separate synchronous prefill/decode timings, raw samples and metadata.
-Only clean optimized builds from an exact v<Cargo version> tag are eligible.
+Only clean optimized builds from an exact v<Cargo version> tag are eligible,
+unless --development is given: then any optimized build runs, and the report and
+its table are labeled DEVELOPMENT with the commit and dirty flag (never publish it).
 
   machine                 print public machine metadata as JSON
   validate <results.json> validate a saved report and print its median speeds
@@ -132,8 +134,20 @@ fn number(flags: &BTreeMap<String, String>, name: &str, default: usize) -> Resul
     }
 }
 
+// canonicalize() gives \\?\C:\... on Windows, where the engine's "dir/file" joins stop resolving
+fn absolute(path: &str) -> Result<PathBuf, String> {
+    let full = Path::new(path).canonicalize().map_err(|e| e.to_string())?;
+    let text = full.to_string_lossy();
+    Ok(match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => full,
+    })
+}
+
 fn run_reference(args: &[String]) -> Result<(), String> {
-    let flags = parse(args)?;
+    let development = args.iter().any(|a| a == "--development");
+    let rest: Vec<String> = args.iter().filter(|a| *a != "--development").cloned().collect();
+    let flags = parse(&rest)?;
     // Validate all required arguments before running hardware or creating files.
     for name in [
         "--reference-engine",
@@ -152,8 +166,16 @@ fn run_reference(args: &[String]) -> Result<(), String> {
         output_tokens: number(&flags, "--output-tokens", 128)?,
     };
     config.validate()?;
-    let release = ReleaseInfo::current();
-    release.validate()?; // No development-build bypass; metadata/validator remain usable.
+    let mut release = ReleaseInfo::current();
+    release.development = development;
+    release.validate()?;
+    if development {
+        eprintln!(
+            "DEVELOPMENT run (commit {}{}): not a release benchmark; do not publish it.",
+            release.commit,
+            if release.dirty { ", modified tree" } else { "" }
+        );
+    }
     let output = PathBuf::from(required(&flags, "--output")?);
     if output.exists() {
         return Err(format!(
@@ -209,15 +231,9 @@ fn run_reference(args: &[String]) -> Result<(), String> {
             }
         });
     let options = ReferenceOptions {
-        bridge: Path::new(required(&flags, "--reference-engine")?)
-            .canonicalize()
-            .map_err(|e| e.to_string())?,
-        model_dir: Path::new(required(&flags, "--model-dir")?)
-            .canonicalize()
-            .map_err(|e| e.to_string())?,
-        kernel_dir: Path::new(required(&flags, "--kernels")?)
-            .canonicalize()
-            .map_err(|e| e.to_string())?,
+        bridge: absolute(required(&flags, "--reference-engine")?)?,
+        model_dir: absolute(required(&flags, "--model-dir")?)?,
+        kernel_dir: absolute(required(&flags, "--kernels")?)?,
         model_id: required(&flags, "--model-id")?.into(),
         model_revision: required(&flags, "--model-revision")?.into(),
         quantization: required(&flags, "--quantization")?.into(),
@@ -276,6 +292,9 @@ mod tests {
         assert!(parse(&args(&["--runs"])).is_err());
         assert!(parse(&args(&["--runs", "--output"])).is_err());
         assert!(parse(&args(&["--allow-untagged", "true"])).is_err());
+        assert!(parse(&args(&["--development", "true"])).is_err()); // a bare switch, taken out before parse
+        let here = absolute(".").unwrap();
+        assert!(here.is_absolute() && !here.to_string_lossy().starts_with(r"\\?\"));
         let flags = parse(&args(&["--model-dir", "C:/models/a model", "--runs", "3"])).unwrap();
         assert_eq!(
             required(&flags, "--model-dir").unwrap(),
