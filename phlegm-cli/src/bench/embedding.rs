@@ -2,7 +2,7 @@ use super::{absolute, machine, number, parse_flags, required, MachineInfo, Relea
 use crate::embedding_pack;
 use phlegm_core::{
     bench::reference::hash_file,
-    embeddings::{EmbeddingBackend, EmbeddingInput, ResidentEmbeddingBackend},
+    embeddings::{EmbeddingInput, EmbeddingTimings, ResidentEmbeddingBackend},
 };
 use serde_json::{json, Value};
 use std::{
@@ -50,7 +50,12 @@ struct Case {
     input: EmbeddingInput,
     tokens_per_input: usize,
     prompt: Option<String>,
-    samples: Vec<f64>,
+    samples: Vec<Sample>,
+}
+
+struct Sample {
+    worker_ms: f64,
+    encoder: Option<EmbeddingTimings>,
 }
 
 fn cases(data: &[u8]) -> Result<Vec<Case>, String> {
@@ -151,11 +156,11 @@ fn projection(design: &Path) -> Result<(usize, BTreeMap<String, String>), String
     Ok((context, projector))
 }
 
-fn measure(backend: &mut dyn EmbeddingBackend, case: &Case) -> Result<f64, String> {
+fn measure(backend: &mut ResidentEmbeddingBackend, case: &Case) -> Result<Sample, String> {
     let input = case.input.clone();
     let start = Instant::now();
-    let result = backend
-        .embed_with_options(input, case.prompt.as_deref(), None, false)
+    let (result, encoder) = backend
+        .embed_profiled(input, case.prompt.as_deref())
         .map_err(|e| format!("{e:?}"))?;
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
     let expected = case.tokens_per_input * case.input.len();
@@ -168,7 +173,10 @@ fn measure(backend: &mut dyn EmbeddingBackend, case: &Case) -> Result<f64, Strin
     if elapsed <= 0.0 {
         return Err("timer could not resolve the embedding duration".into());
     }
-    Ok(elapsed)
+    Ok(Sample {
+        worker_ms: elapsed,
+        encoder,
+    })
 }
 
 pub(super) fn run(args: &[String]) -> Result<(), String> {
@@ -290,7 +298,13 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         .iter()
         .map(|case| {
             let batch = case.input.len();
-            let mut sorted = case.samples.clone();
+            let worker_ms: Vec<_> = case.samples.iter().map(|sample| sample.worker_ms).collect();
+            let encoder: Vec<_> = case
+                .samples
+                .iter()
+                .map(|sample| sample.encoder.as_ref())
+                .collect();
+            let mut sorted = worker_ms.clone();
             sorted.sort_by(f64::total_cmp);
             let median = (sorted[(runs - 1) / 2] + sorted[runs / 2]) / 2.0;
             json!({
@@ -301,7 +315,8 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
                     EmbeddingInput::TokenIds(_) => "token_ids",
                 },
                 "prompt_name": case.prompt,
-                "samples_ms": case.samples,
+                "samples_ms": worker_ms,
+                "encoder_timings": encoder,
                 "median_ms": median,
                 "tokens_per_second": 1000.0 * (case.tokens_per_input * batch) as f64 / median,
             })

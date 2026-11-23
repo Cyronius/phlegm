@@ -1,6 +1,7 @@
 //! Model-independent embeddings contract and resident worker adapters.
 use crate::npu_lock::NpuLock;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -35,6 +36,27 @@ pub struct EmbeddingOutput {
 pub struct SparseEmbedding {
     pub indices: Vec<u32>,
     pub values: Vec<f32>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct EmbeddingTimings {
+    pub context_tokens: usize,
+    pub projection_dispatches: usize,
+    pub encode_ms: f64,
+    pub stages_ms: BTreeMap<String, f64>,
+}
+
+impl EmbeddingTimings {
+    fn valid(&self) -> bool {
+        self.context_tokens > 0
+            && self.encode_ms.is_finite()
+            && self.encode_ms > 0.0
+            && !self.stages_ms.is_empty()
+            && self
+                .stages_ms
+                .values()
+                .all(|ms| ms.is_finite() && *ms >= 0.0)
+    }
 }
 
 #[derive(Debug)]
@@ -330,6 +352,28 @@ impl EmbeddingBackend for ResidentEmbeddingBackend {
         dimensions: Option<u32>,
         return_sparse: bool,
     ) -> Result<EmbeddingOutput, EmbeddingError> {
+        self.embed_request(input, prompt_name, dimensions, return_sparse, false)
+            .map(|(output, _)| output)
+    }
+}
+
+impl ResidentEmbeddingBackend {
+    pub fn embed_profiled(
+        &mut self,
+        input: EmbeddingInput,
+        prompt_name: Option<&str>,
+    ) -> Result<(EmbeddingOutput, Option<EmbeddingTimings>), EmbeddingError> {
+        self.embed_request(input, prompt_name, None, false, true)
+    }
+
+    fn embed_request(
+        &mut self,
+        input: EmbeddingInput,
+        prompt_name: Option<&str>,
+        dimensions: Option<u32>,
+        return_sparse: bool,
+        profile: bool,
+    ) -> Result<(EmbeddingOutput, Option<EmbeddingTimings>), EmbeddingError> {
         if return_sparse && !self.sparse {
             return Err(EmbeddingError::Invalid(
                 "this model has no sparse output".into(),
@@ -367,6 +411,9 @@ impl EmbeddingBackend for ResidentEmbeddingBackend {
             if return_sparse {
                 request["return_sparse"] = json!(true);
             }
+            if profile {
+                request["profile"] = json!(true);
+            }
         }
         let reply = match self.request(request) {
             Ok(reply) => reply,
@@ -394,7 +441,7 @@ impl EmbeddingBackend for ResidentEmbeddingBackend {
                 },
             );
         }
-        let parsed = (|| -> Result<EmbeddingOutput, String> {
+        let parsed = (|| -> Result<_, String> {
             let vectors: Vec<Vec<f32>> =
                 serde_json::from_value(reply.get("vectors").cloned().unwrap_or(Value::Null))
                     .map_err(|e| format!("invalid embedding vectors: {e}"))?;
@@ -428,11 +475,29 @@ impl EmbeddingBackend for ResidentEmbeddingBackend {
             } else {
                 None
             };
-            Ok(EmbeddingOutput {
-                vectors,
-                tokens,
-                sparse_vectors,
-            })
+            let timing = if profile {
+                reply
+                    .get("stage_timings")
+                    .map(|raw| {
+                        let timing: EmbeddingTimings = serde_json::from_value(raw.clone())
+                            .map_err(|e| format!("invalid embedding stage timings: {e}"))?;
+                        if !timing.valid() {
+                            return Err("invalid embedding stage timings".to_string());
+                        }
+                        Ok(timing)
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            Ok((
+                EmbeddingOutput {
+                    vectors,
+                    tokens,
+                    sparse_vectors,
+                },
+                timing,
+            ))
         })();
         parsed.map_err(|e| {
             self.stop();

@@ -192,6 +192,14 @@ rounds and stores per-case samples, median latency and input token throughput.
 Timing includes the worker protocol and encoder. HTTP latency is measured
 through the serving endpoint separately.
 
+Current NPUE workers also return an encoder timing record for each measured
+sample. It includes the selected context, projection dispatch count and
+encode wall time. Stage counters cover input preparation, pooling, rotary
+work, projections, attention, normalization and activation. The host timing
+starts inside the worker before encoding. Compare it with the outer worker
+round trip when measuring IPC overhead. An older worker can return a null
+stage timing record.
+
 The `phlegm-embedding-bench-v1` JSON includes the machine, Phlegm build, model
 revision, quant and hashes for the NPUE pack, worker, fixtures and design
 payloads. Use `--development` for local bring-up runs. Establish hardware
