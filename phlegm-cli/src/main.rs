@@ -22,6 +22,7 @@ commands:
   serve --model-dir DIR [--kernels DIR] [--bridge EXE] [--turbo] [--host 127.0.0.1] [--port 52625]
   serve --embed-model DIR [--embed-python PYTHON] [--embed-source DIR] [--embed-model-name NAME]
   serve --embed-model PACK --embed-worker EXE --embed-design DIR [--embed-attention DIR] [--embed-model-name NAME]
+    [--embed-short-design DIR [--embed-short-attention DIR]]
   serve --mock [--host H] [--port N]
   every serve: [--api-key KEY] [--allowed-origins ORIGINS]   (--host / --port override PHLEGM_HOST / PHLEGM_PORT)
   config show [--model-dir DIR | --config-model TAG] [--json]   the settings in effect, and where each comes from
@@ -232,17 +233,25 @@ fn serve(args: &[String]) -> Result<(), String> {
                 return Err("--embed-worker cannot be combined with Trit embedding options".into());
             }
             let design = opts.get("--embed-design").ok_or("--embed-worker requires --embed-design")?;
-            let embedder = phlegm_core::embeddings::ResidentEmbeddingBackend::load_npue(
+            let short_design = opts.get("--embed-short-design").map(std::path::Path::new);
+            let short_attention = opts.get("--embed-short-attention").map(std::path::Path::new);
+            if short_attention.is_some() && short_design.is_none() {
+                return Err("--embed-short-attention requires --embed-short-design".into());
+            }
+            let embedder = phlegm_core::embeddings::ResidentEmbeddingBackend::load_npue_routed(
                 model_id,
                 std::path::Path::new(worker),
                 &model_dir,
                 std::path::Path::new(design),
                 opts.get("--embed-attention").map(std::path::Path::new),
+                short_design.map(|dir| (dir, short_attention)),
             )?;
             return server::serve_embeddings(Box::new(embedder), cfg);
         }
-        if opts.contains_key("--embed-design") || opts.contains_key("--embed-attention") {
-            return Err("--embed-design and --embed-attention require --embed-worker".into());
+        if ["--embed-design", "--embed-attention", "--embed-short-design", "--embed-short-attention"]
+            .iter().any(|name| opts.contains_key(*name))
+        {
+            return Err("NPUE design options require --embed-worker".into());
         }
         let python = opts.get("--embed-python").cloned().or_else(|| std::env::var("PHLEGM_EMBED_PYTHON").ok()).unwrap_or_else(|| "python3".into());
         let source = opts.get("--embed-source").map(PathBuf::from).or_else(|| std::env::var_os("PHLEGM_EMBED_SOURCE").map(PathBuf::from))
@@ -250,7 +259,7 @@ fn serve(args: &[String]) -> Result<(), String> {
         let embedder = phlegm_core::embeddings::TritEmbeddingBackend::load(model_id, std::path::Path::new(&python), &source, &model_dir)?;
         return server::serve_embeddings(Box::new(embedder), cfg);
     }
-    if ["--embed-worker", "--embed-design", "--embed-attention"]
+    if ["--embed-worker", "--embed-design", "--embed-attention", "--embed-short-design", "--embed-short-attention"]
         .iter().any(|name| opts.contains_key(*name))
     {
         return Err("NPUE embedding options require --embed-model".into());

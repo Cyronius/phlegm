@@ -176,6 +176,9 @@ Supply the packed model, worker, projection design and optional attention
 directory. The fixture file is a JSON array of cases. Each case declares
 `tokens_per_input` and either `texts` or `token_ids`. Use an optional
 `prompt_name` for text fixtures that require a task prefix.
+Use `--embed-short-design` to exercise the serving router with a smaller
+projection design. The report records the capacities and artifact hashes
+for both routes.
 
 The model stays resident. The benchmark checks the processed token counts in
 every warmup and timed call. It alternates the order of cases across measured

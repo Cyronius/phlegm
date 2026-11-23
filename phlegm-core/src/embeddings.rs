@@ -77,6 +77,21 @@ struct Worker {
 }
 
 impl Worker {
+    fn start_npue(
+        executable: &Path,
+        pack: &Path,
+        design: &Path,
+        attention: Option<&Path>,
+    ) -> Result<(Self, Value), String> {
+        let mut command = Command::new(executable);
+        command.arg(pack).arg(design).args(attention);
+        let (worker, hello) = Self::start(command)?;
+        if hello.get("npu_attention").and_then(Value::as_bool) != Some(attention.is_some()) {
+            return Err("embedding worker did not confirm the requested attention route".into());
+        }
+        Ok((worker, hello))
+    }
+
     fn spawn(python: &Path, source_dir: &Path, model_dir: &Path) -> Result<Self, String> {
         let mut command = Command::new(python);
         command
@@ -164,11 +179,17 @@ impl Drop for Worker {
 
 pub struct ResidentEmbeddingBackend {
     worker: Option<Worker>,
+    short: Option<ShortRoute>,
     id: String,
     lock: Option<NpuLock>,
     width: usize,
     native: bool,
     sparse: bool,
+}
+
+struct ShortRoute {
+    worker: Worker,
+    context: usize,
 }
 pub type TritEmbeddingBackend = ResidentEmbeddingBackend;
 
@@ -183,6 +204,7 @@ impl ResidentEmbeddingBackend {
         let worker = Worker::spawn(python, source_dir, model_dir)?;
         Ok(Self {
             worker: Some(worker),
+            short: None,
             id,
             lock: Some(lock),
             width: 384,
@@ -198,27 +220,93 @@ impl ResidentEmbeddingBackend {
         design: &Path,
         attention: Option<&Path>,
     ) -> Result<Self, String> {
+        Self::load_npue_routed(id, executable, pack, design, attention, None)
+    }
+
+    pub fn load_npue_routed(
+        id: String,
+        executable: &Path,
+        pack: &Path,
+        design: &Path,
+        attention: Option<&Path>,
+        short: Option<(&Path, Option<&Path>)>,
+    ) -> Result<Self, String> {
         let lock = NpuLock::acquire("phlegm NPUE embeddings")?;
-        let mut command = Command::new(executable);
-        command.arg(pack).arg(design).args(attention);
-        let (worker, hello) = Worker::start(command)?;
+        let (worker, hello) = Worker::start_npue(executable, pack, design, attention)?;
         let width = hello
             .get("dimensions")
             .and_then(Value::as_u64)
             .and_then(|n| usize::try_from(n).ok())
             .filter(|&n| n > 0)
             .ok_or("embedding worker omitted its vector width")?;
-        if hello.get("npu_attention").and_then(Value::as_bool) != Some(attention.is_some()) {
-            return Err("embedding worker did not confirm the requested attention route".into());
-        }
+        let short =
+            short
+                .map(|(design, attention)| {
+                    let (worker, probe) = Worker::start_npue(executable, pack, design, attention)?;
+                    let full_context = hello
+                        .get("context")
+                        .and_then(Value::as_u64)
+                        .ok_or("full embedding worker omitted its context capacity")?;
+                    let context = probe.get("context").and_then(Value::as_u64)
+                .filter(|&n| n > 0 && n < full_context)
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or("short embedding design must have a smaller context than the full design")?;
+                    if probe.get("length_probe").and_then(Value::as_bool) != Some(true)
+                        || ["dimensions", "prompt_names", "sparse"]
+                            .iter()
+                            .any(|key| probe.get(key) != hello.get(key))
+                    {
+                        return Err(
+                            "short embedding worker is incompatible with the full worker"
+                                .to_string(),
+                        );
+                    }
+                    Ok(ShortRoute { worker, context })
+                })
+                .transpose()?;
+        lock.ensure_held()?;
         Ok(Self {
             worker: Some(worker),
+            short,
             id,
             lock: Some(lock),
             width,
             native: true,
             sparse: hello.get("sparse").and_then(Value::as_bool) == Some(true),
         })
+    }
+
+    fn stop(&mut self) {
+        self.short.take();
+        self.worker.take();
+        self.lock.take();
+    }
+
+    fn request(&mut self, request: Value) -> Result<Value, String> {
+        if let Some(route) = &mut self.short {
+            let fits = if let Some(rows) = request.get("token_ids").and_then(Value::as_array) {
+                rows.iter()
+                    .all(|row| row.as_array().is_some_and(|ids| ids.len() <= route.context))
+            } else {
+                let mut probe = request.clone();
+                probe["length_only"] = json!(true);
+                let reply = route.worker.request(probe)?;
+                if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+                    return Ok(reply);
+                }
+                reply
+                    .get("fits")
+                    .and_then(Value::as_bool)
+                    .ok_or("short embedding worker omitted the input length decision")?
+            };
+            if fits {
+                return route.worker.request(request);
+            }
+        }
+        self.worker
+            .as_mut()
+            .ok_or("embedding worker is no longer available")?
+            .request(request)
     }
 }
 impl EmbeddingBackend for ResidentEmbeddingBackend {
@@ -260,8 +348,7 @@ impl EmbeddingBackend for ResidentEmbeddingBackend {
             })?
             .ensure_held();
         if let Err(e) = held {
-            self.worker.take();
-            self.lock.take();
+            self.stop();
             return Err(EmbeddingError::Backend(e));
         }
         let expected_count = input.len();
@@ -281,24 +368,15 @@ impl EmbeddingBackend for ResidentEmbeddingBackend {
                 request["return_sparse"] = json!(true);
             }
         }
-        let reply = match self
-            .worker
-            .as_mut()
-            .ok_or_else(|| {
-                EmbeddingError::Backend("embedding worker is no longer available".into())
-            })?
-            .request(request)
-        {
+        let reply = match self.request(request) {
             Ok(reply) => reply,
             Err(e) => {
-                self.worker.take();
-                self.lock.take();
+                self.stop();
                 return Err(EmbeddingError::Backend(e));
             }
         };
         if let Err(e) = self.lock.as_ref().unwrap().ensure_held() {
-            self.worker.take();
-            self.lock.take();
+            self.stop();
             return Err(EmbeddingError::Backend(e));
         }
         if reply.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -311,8 +389,7 @@ impl EmbeddingBackend for ResidentEmbeddingBackend {
                 if reply.get("invalid").and_then(Value::as_bool) == Some(true) {
                     EmbeddingError::Invalid(error)
                 } else {
-                    self.worker.take();
-                    self.lock.take();
+                    self.stop();
                     EmbeddingError::Backend(error)
                 },
             );
@@ -358,8 +435,7 @@ impl EmbeddingBackend for ResidentEmbeddingBackend {
             })
         })();
         parsed.map_err(|e| {
-            self.worker.take();
-            self.lock.take();
+            self.stop();
             EmbeddingError::Backend(e)
         })
     }
@@ -403,6 +479,7 @@ for line in sys.stdin:
             std::env::temp_dir().join(format!("phlegm-npue-test-{}.lock", std::process::id()));
         let mut backend = ResidentEmbeddingBackend {
             worker: Some(worker),
+            short: None,
             id: "nomic-test".into(),
             lock: Some(NpuLock::for_test(lock_path)),
             width: 2,

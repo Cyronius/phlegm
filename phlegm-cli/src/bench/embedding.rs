@@ -15,6 +15,7 @@ use std::{
 const HELP: &str = "usage: phlegm bench embed --embed-model <pack.npue> --embed-worker <exe>
   --embed-design <dir> [--embed-attention <dir>] --model-id <id> --model-revision <rev>
   --quantization <quant> --fixtures <cases.json> --output <report.json>
+  [--embed-short-design <dir> [--embed-short-attention <dir>]]
   [--warmups N] [--runs N] [--machine-info FILE] [--notes TEXT] [--development]
 
 The fixture file is an array of cases with tokens_per_input and either texts
@@ -27,6 +28,8 @@ const FLAGS: &[&str] = &[
     "--embed-worker",
     "--embed-design",
     "--embed-attention",
+    "--embed-short-design",
+    "--embed-short-attention",
     "--model-id",
     "--model-revision",
     "--quantization",
@@ -125,6 +128,24 @@ fn artifact_hashes(directory: &Path) -> Result<BTreeMap<String, String>, String>
     Ok(hashes)
 }
 
+fn projection(design: &Path) -> Result<(usize, BTreeMap<String, String>), String> {
+    let projector = artifact_hashes(&design.join("gemm_rtp"))?;
+    if !projector.contains_key("design.json") || !projector.contains_key("final.xclbin") {
+        return Err("embedding benchmark requires an exported GEMM RTP design".into());
+    }
+    let geometry: Value = serde_json::from_slice(
+        &fs::read(design.join("gemm_rtp/design.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let context = geometry
+        .get("seq")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n > 0)
+        .ok_or("projection design omitted its sequence capacity")?;
+    Ok((context, projector))
+}
+
 fn measure(backend: &mut dyn EmbeddingBackend, case: &Case) -> Result<f64, String> {
     let input = case.input.clone();
     let start = Instant::now();
@@ -179,6 +200,17 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         .get("--embed-attention")
         .map(|p| absolute(p))
         .transpose()?;
+    let short_design = flags
+        .get("--embed-short-design")
+        .map(|p| absolute(p))
+        .transpose()?;
+    let short_attention = flags
+        .get("--embed-short-attention")
+        .map(|p| absolute(p))
+        .transpose()?;
+    if short_attention.is_some() && short_design.is_none() {
+        return Err("--embed-short-attention requires --embed-short-design".into());
+    }
     let fixture = Path::new(value("--fixtures")?);
     let mut cases = cases(&fs::read(fixture).map_err(|e| e.to_string())?)?;
     let machine: MachineInfo = match flags.get("--machine-info") {
@@ -186,20 +218,7 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
             .map_err(|e| e.to_string())?,
         None => machine::collect()?,
     };
-    let projector = artifact_hashes(&design.join("gemm_rtp"))?;
-    if !projector.contains_key("design.json") || !projector.contains_key("final.xclbin") {
-        return Err("embedding benchmark requires an exported GEMM RTP design".into());
-    }
-    let geometry: Value = serde_json::from_slice(
-        &fs::read(design.join("gemm_rtp/design.json")).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    let context_capacity = geometry
-        .get("seq")
-        .and_then(Value::as_u64)
-        .and_then(|n| usize::try_from(n).ok())
-        .filter(|&n| n > 0)
-        .ok_or("projection design omitted its sequence capacity")?;
+    let (context_capacity, projector) = projection(&design)?;
     if cases
         .iter()
         .any(|case| case.tokens_per_input > context_capacity)
@@ -215,12 +234,30 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         "projection_sha256": projector,
         "attention_sha256": attention.as_deref().map(artifact_hashes).transpose()?,
     });
-    let mut backend = ResidentEmbeddingBackend::load_npue(
+    let mut short_context = None;
+    let mut short_artifacts = None;
+    if let Some(dir) = &short_design {
+        let (context, hashes) = projection(dir)?;
+        if context >= context_capacity {
+            return Err(
+                "short embedding design must have a smaller context than the full design".into(),
+            );
+        }
+        short_context = Some(context);
+        short_artifacts = Some(json!({
+            "projection_sha256": hashes,
+            "attention_sha256": short_attention.as_deref().map(artifact_hashes).transpose()?,
+        }));
+    }
+    let mut backend = ResidentEmbeddingBackend::load_npue_routed(
         model.into(),
         &worker,
         &pack,
         &design,
         attention.as_deref(),
+        short_design
+            .as_deref()
+            .map(|dir| (dir, short_attention.as_deref())),
     )?;
     for case in &cases {
         for _ in 0..warmups {
@@ -267,8 +304,10 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         "model": {"id": model, "revision": revision, "quantization": quantization},
         "backend": "npue",
         "context_capacity": context_capacity,
+        "short_context_capacity": short_context,
         "npu_attention": attention.is_some(),
         "artifacts": artifacts,
+        "short_artifacts": short_artifacts,
         "notes": flags.get("--notes"),
         "warmups": warmups,
         "runs": runs,
