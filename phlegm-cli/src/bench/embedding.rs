@@ -156,7 +156,11 @@ fn projection(design: &Path) -> Result<(usize, BTreeMap<String, String>), String
     Ok((context, projector))
 }
 
-fn measure(backend: &mut ResidentEmbeddingBackend, case: &Case) -> Result<Sample, String> {
+fn measure(
+    backend: &mut ResidentEmbeddingBackend,
+    case: &Case,
+    expected_context: usize,
+) -> Result<Sample, String> {
     let input = case.input.clone();
     let start = Instant::now();
     let (result, encoder) = backend
@@ -169,6 +173,14 @@ fn measure(backend: &mut ResidentEmbeddingBackend, case: &Case) -> Result<Sample
             "fixture expected {expected} tokens, worker processed {}",
             result.tokens
         ));
+    }
+    if let Some(timing) = &encoder {
+        if timing.context_tokens != expected_context {
+            return Err(format!(
+                "{}-token fixture expected a {expected_context}-token design, worker used {}",
+                case.tokens_per_input, timing.context_tokens
+            ));
+        }
     }
     if elapsed <= 0.0 {
         return Err("timer could not resolve the embedding duration".into());
@@ -277,9 +289,14 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
             .as_deref()
             .map(|dir| (dir, short_attention.as_deref())),
     )?;
+    let expected_context = |case: &Case| {
+        short_context
+            .filter(|&context| case.tokens_per_input <= context)
+            .unwrap_or(context_capacity)
+    };
     for case in &cases {
         for _ in 0..warmups {
-            measure(&mut backend, case)?;
+            measure(&mut backend, case, expected_context(case))?;
         }
     }
     for round in 0..runs {
@@ -289,7 +306,7 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         }
         for index in order {
             let case = &mut cases[index];
-            let sample = measure(&mut backend, case)?;
+            let sample = measure(&mut backend, case, expected_context(case))?;
             case.samples.push(sample);
         }
     }

@@ -194,7 +194,9 @@ through the serving endpoint separately.
 
 Current NPUE workers also return an encoder timing record for each measured
 sample. It includes the selected context, projection dispatch count and
-encode wall time. Stage counters cover input preparation, pooling, rotary
+encode wall time. The benchmark rejects a reported context that differs
+from the route expected for the fixture's declared length. Stage counters
+cover input preparation, pooling, rotary
 work, projections, attention, normalization and activation. The host timing
 starts inside the worker before encoding. Compare it with the outer worker
 round trip when measuring IPC overhead. An older worker can return a null
