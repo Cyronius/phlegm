@@ -14,7 +14,7 @@ fn invalid(request: Request, status: u16, msg: &str) {
 fn parse_input(value: Option<&Value>) -> Result<EmbeddingInput, &'static str> {
     let input = value.ok_or("input is required")?;
     let ids = |a: &[Value]| -> Option<Vec<u32>> {
-        if a.is_empty() || a.len() > 128 {
+        if a.is_empty() {
             return None;
         }
         a.iter()
@@ -23,15 +23,17 @@ fn parse_input(value: Option<&Value>) -> Result<EmbeddingInput, &'static str> {
     };
     match input {
         Value::String(s) => Ok(EmbeddingInput::Texts(vec![s.clone()])),
-        Value::Array(a) if !a.is_empty() && a.len() <= 2048 => {
-            if a.iter().all(Value::is_string) {
-                Ok(EmbeddingInput::Texts(
-                    a.iter().map(|v| v.as_str().unwrap().to_owned()).collect(),
-                ))
-            } else if a.iter().all(Value::is_number) {
+        Value::Array(a) if !a.is_empty() => {
+            if a.iter().all(Value::is_number) {
                 Ok(EmbeddingInput::TokenIds(vec![
                     ids(a).ok_or("invalid token sequence")?
                 ]))
+            } else if a.len() > 2048 {
+                Err("input must contain at most 2048 sequences")
+            } else if a.iter().all(Value::is_string) {
+                Ok(EmbeddingInput::Texts(
+                    a.iter().map(|v| v.as_str().unwrap().to_owned()).collect(),
+                ))
             } else if a.iter().all(Value::is_array) {
                 let rows = a
                     .iter()
@@ -43,6 +45,26 @@ fn parse_input(value: Option<&Value>) -> Result<EmbeddingInput, &'static str> {
             }
         }
         _ => Err("input must be a string or a non-empty array of at most 2048 inputs"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_sequence_length_is_enforced_by_the_embedding_backend() {
+        let ids = vec![42_u32; 8192];
+        assert_eq!(
+            parse_input(Some(&json!(ids))),
+            Ok(EmbeddingInput::TokenIds(vec![ids.clone()]))
+        );
+        assert_eq!(
+            parse_input(Some(&json!([ids, vec![42]]))),
+            Ok(EmbeddingInput::TokenIds(vec![ids, vec![42]]))
+        );
+        assert!(parse_input(Some(&json!([[1], [-1]]))).is_err());
+        assert!(parse_input(Some(&json!(vec!["text"; 2049]))).is_err());
     }
 }
 
