@@ -243,6 +243,7 @@ impl EmbeddingBackend for ResidentEmbeddingBackend {
             return Err(EmbeddingError::Backend(e));
         }
         let expected_count = input.len();
+        let expected_width = dimensions.map_or(self.width, |n| n as usize);
         let mut request = match input {
             EmbeddingInput::Texts(texts) => json!({"texts": texts}),
             EmbeddingInput::TokenIds(ids) => json!({"token_ids": ids}),
@@ -303,7 +304,7 @@ impl EmbeddingBackend for ResidentEmbeddingBackend {
             if vectors.len() != expected_count
                 || vectors
                     .iter()
-                    .any(|v| v.len() != self.width || v.iter().any(|n| !n.is_finite()))
+                    .any(|v| v.len() != expected_width || v.iter().any(|n| !n.is_finite()))
             {
                 return Err("embedding worker returned invalid vectors".into());
             }
@@ -340,8 +341,8 @@ for line in sys.stdin:
     if request.get('prompt_name') != 'search_document':
         print(json.dumps(dict(ok=False, invalid=True, error='prompt_name is required')))
     else:
-        assert request['dimensions'] == 2 and request['texts'] == ['one', 'two']
-        print(json.dumps(dict(ok=True, tokens=4, vectors=[[1, 0], [0, 1]])))
+        assert request['dimensions'] == 1 and request['texts'] == ['one', 'two']
+        print(json.dumps(dict(ok=True, tokens=4, vectors=[[1], [-1]])))
 "#,
         ]);
         let (worker, _) = Worker::start(command).unwrap();
@@ -360,10 +361,10 @@ for line in sys.stdin:
             Err(EmbeddingError::Invalid(_))
         ));
         let result = backend
-            .embed_with_options(input, Some("search_document"), Some(2))
+            .embed_with_options(input, Some("search_document"), Some(1))
             .unwrap();
         assert_eq!(result.tokens, 4);
-        assert_eq!(result.vectors, [vec![1., 0.], vec![0., 1.]]);
+        assert_eq!(result.vectors, [vec![1.], vec![-1.]]);
     }
 
     #[test]
