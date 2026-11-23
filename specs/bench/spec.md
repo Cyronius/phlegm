@@ -169,6 +169,25 @@ The Phlegm release guard still applies. Development bridge edits are identified
 by the dirty flag and content hashes; published reports need the clean release
 build described above. Hardware equivalence remains a separate gate.
 
+## Embedding benchmark
+
+`phlegm bench embed` uses the same resident NPUE adapter as `phlegm serve`.
+Supply the packed model, worker, projection design and optional attention
+directory. The fixture file is a JSON array of cases. Each case declares
+`tokens_per_input` and either `texts` or `token_ids`. Use an optional
+`prompt_name` for text fixtures that require a task prefix.
+
+The model stays resident. The benchmark checks the processed token counts in
+every warmup and timed call. It alternates the order of cases across measured
+rounds and stores per-case samples, median latency and input token throughput.
+Timing includes the worker protocol and encoder. HTTP latency is measured
+through the serving endpoint separately.
+
+The `phlegm-embedding-bench-v1` JSON includes the machine, Phlegm build, model
+revision, quant and hashes for the NPUE pack, worker, fixtures and design
+payloads. Use `--development` for local bring-up runs. Establish hardware
+parity and collect the NPU power mode and complete stack before publishing.
+
 ## Publishing
 
 Commit validated reports under `benchmarks/results/` after a complete run. Keep

@@ -9,10 +9,13 @@ use std::{
     time::Duration,
 };
 
+mod embedding;
+
 const HELP: &str = "usage: phlegm bench [machine | validate <results.json> | --help]
        phlegm bench --reference-engine <bridge.exe> --model-dir <dir>
          --kernels <dir> --model-id <id> --model-revision <revision>
          --quantization <name> --output <results.json> [options]
+       phlegm bench embed --help
 
 Phlegm Bench v1: 512, 1024, 2048, 4096 input tokens; batch/concurrency 1.
 Defaults: 1 warmup + 3 measured runs per length; 128 output tokens; greedy.
@@ -47,6 +50,9 @@ OMP_WAIT_POLICY=PASSIVE is enforced; inherited OFLM/OMP tuning is cleared.
 See benchmarks/reference/README.md and specs/bench/spec.md.";
 
 pub fn command(args: &[String]) -> Result<(), String> {
+    if let Some(("embed", rest)) = args.split_first().map(|(first, rest)| (first.as_str(), rest)) {
+        return embedding::run(rest);
+    }
     match args
         .iter()
         .map(String::as_str)
@@ -99,10 +105,14 @@ const FLAGS: &[&str] = &[
 ];
 
 fn parse(args: &[String]) -> Result<BTreeMap<String, String>, String> {
+    parse_flags(args, FLAGS)
+}
+
+fn parse_flags(args: &[String], allowed: &[&str]) -> Result<BTreeMap<String, String>, String> {
     let mut flags = BTreeMap::new();
     let mut pairs = args.chunks_exact(2);
     for pair in &mut pairs {
-        if !FLAGS.contains(&pair[0].as_str()) {
+        if !allowed.contains(&pair[0].as_str()) {
             return Err(format!("unknown benchmark option {}", pair[0]));
         }
         if pair[1].trim().is_empty() || pair[1].starts_with("--") {
