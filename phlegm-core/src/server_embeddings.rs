@@ -113,16 +113,22 @@ pub(super) fn handle_body(request: Request, state: &ServerState, body: &[u8]) {
         Some(Value::String(s)) if s == "float" || s == "base64" => s.as_str(),
         _ => return invalid(request, 400, "encoding_format must be float or base64"),
     };
+    let return_sparse = match req.get("return_sparse") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        _ => return invalid(request, 400, "return_sparse must be a boolean"),
+    };
     let input = match parse_input(req.get("input")) {
         Ok(v) => v,
         Err(e) => return invalid(request, 400, e),
     };
     let count = input.len();
-    let output = match embedder
-        .lock()
-        .unwrap()
-        .embed_with_options(input, prompt_name, dimensions)
-    {
+    let output = match embedder.lock().unwrap().embed_with_options(
+        input,
+        prompt_name,
+        dimensions,
+        return_sparse,
+    ) {
         Ok(v) => v,
         Err(EmbeddingError::Invalid(e)) => return invalid(request, 400, &e),
         Err(EmbeddingError::Backend(e)) => {
@@ -134,6 +140,7 @@ pub(super) fn handle_body(request: Request, state: &ServerState, body: &[u8]) {
         }
     };
     if output.vectors.len() != count
+        || (return_sparse && output.sparse_vectors.as_ref().map(Vec::len) != Some(count))
         || output
             .vectors
             .iter()
@@ -156,7 +163,11 @@ pub(super) fn handle_body(request: Request, state: &ServerState, body: &[u8]) {
             } else {
                 json!(vector)
             };
-            json!({"object": "embedding", "index": index, "embedding": embedding})
+            let mut item = json!({"object": "embedding", "index": index, "embedding": embedding});
+            if return_sparse {
+                item["sparse_embedding"] = json!(output.sparse_vectors.as_ref().unwrap()[index]);
+            }
+            item
         })
         .collect();
     respond_json(

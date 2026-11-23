@@ -28,6 +28,13 @@ impl EmbeddingInput {
 pub struct EmbeddingOutput {
     pub vectors: Vec<Vec<f32>>,
     pub tokens: usize,
+    pub sparse_vectors: Option<Vec<SparseEmbedding>>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct SparseEmbedding {
+    pub indices: Vec<u32>,
+    pub values: Vec<f32>,
 }
 
 #[derive(Debug)]
@@ -47,7 +54,13 @@ pub trait EmbeddingBackend: Send {
         input: EmbeddingInput,
         _prompt_name: Option<&str>,
         dimensions: Option<u32>,
+        return_sparse: bool,
     ) -> Result<EmbeddingOutput, EmbeddingError> {
+        if return_sparse {
+            return Err(EmbeddingError::Invalid(
+                "this model has no sparse output".into(),
+            ));
+        }
         if dimensions.is_some() {
             return Err(EmbeddingError::Invalid(
                 "this embedding model does not support dimensions".into(),
@@ -155,6 +168,7 @@ pub struct ResidentEmbeddingBackend {
     lock: Option<NpuLock>,
     width: usize,
     native: bool,
+    sparse: bool,
 }
 pub type TritEmbeddingBackend = ResidentEmbeddingBackend;
 
@@ -173,6 +187,7 @@ impl ResidentEmbeddingBackend {
             lock: Some(lock),
             width: 384,
             native: false,
+            sparse: false,
         })
     }
 
@@ -202,6 +217,7 @@ impl ResidentEmbeddingBackend {
             lock: Some(lock),
             width,
             native: true,
+            sparse: hello.get("sparse").and_then(Value::as_bool) == Some(true),
         })
     }
 }
@@ -217,14 +233,20 @@ impl EmbeddingBackend for ResidentEmbeddingBackend {
         }
     }
     fn embed(&mut self, input: EmbeddingInput) -> Result<EmbeddingOutput, EmbeddingError> {
-        self.embed_with_options(input, None, None)
+        self.embed_with_options(input, None, None, false)
     }
     fn embed_with_options(
         &mut self,
         input: EmbeddingInput,
         prompt_name: Option<&str>,
         dimensions: Option<u32>,
+        return_sparse: bool,
     ) -> Result<EmbeddingOutput, EmbeddingError> {
+        if return_sparse && !self.sparse {
+            return Err(EmbeddingError::Invalid(
+                "this model has no sparse output".into(),
+            ));
+        }
         if !self.native && dimensions.is_some() {
             return Err(EmbeddingError::Invalid(
                 "this embedding model does not support dimensions".into(),
@@ -254,6 +276,9 @@ impl EmbeddingBackend for ResidentEmbeddingBackend {
             }
             if let Some(dimensions) = dimensions {
                 request["dimensions"] = json!(dimensions);
+            }
+            if return_sparse {
+                request["return_sparse"] = json!(true);
             }
         }
         let reply = match self
@@ -308,7 +333,29 @@ impl EmbeddingBackend for ResidentEmbeddingBackend {
             {
                 return Err("embedding worker returned invalid vectors".into());
             }
-            Ok(EmbeddingOutput { vectors, tokens })
+            let sparse_vectors = if return_sparse {
+                let sparse: Vec<SparseEmbedding> = serde_json::from_value(
+                    reply.get("sparse_vectors").cloned().unwrap_or(Value::Null),
+                )
+                .map_err(|e| format!("invalid sparse embedding vectors: {e}"))?;
+                if sparse.len() != expected_count
+                    || sparse.iter().any(|row| {
+                        row.indices.len() != row.values.len()
+                            || row.indices.windows(2).any(|pair| pair[0] >= pair[1])
+                            || row.values.iter().any(|v| !v.is_finite() || *v <= 0.0)
+                    })
+                {
+                    return Err("embedding worker returned invalid sparse vectors".into());
+                }
+                Some(sparse)
+            } else {
+                None
+            };
+            Ok(EmbeddingOutput {
+                vectors,
+                tokens,
+                sparse_vectors,
+            })
         })();
         parsed.map_err(|e| {
             self.worker.take();
@@ -342,7 +389,13 @@ for line in sys.stdin:
         print(json.dumps(dict(ok=False, invalid=True, error='prompt_name is required')))
     else:
         assert request['dimensions'] == 1 and request['texts'] == ['one', 'two']
-        print(json.dumps(dict(ok=True, tokens=4, vectors=[[1], [-1]])))
+        result = dict(ok=True, tokens=4, vectors=[[1], [-1]])
+        if request.get('return_sparse'):
+            result['sparse_vectors'] = [
+                dict(indices=[1, 5], values=[0.25, 0.5]),
+                dict(indices=[], values=[]),
+            ]
+        print(json.dumps(result))
 "#,
         ]);
         let (worker, _) = Worker::start(command).unwrap();
@@ -354,6 +407,7 @@ for line in sys.stdin:
             lock: Some(NpuLock::for_test(lock_path)),
             width: 2,
             native: true,
+            sparse: true,
         };
         let input = EmbeddingInput::Texts(vec!["one".into(), "two".into()]);
         assert!(matches!(
@@ -361,10 +415,14 @@ for line in sys.stdin:
             Err(EmbeddingError::Invalid(_))
         ));
         let result = backend
-            .embed_with_options(input, Some("search_document"), Some(1))
+            .embed_with_options(input, Some("search_document"), Some(1), true)
             .unwrap();
         assert_eq!(result.tokens, 4);
         assert_eq!(result.vectors, [vec![1.], vec![-1.]]);
+        let sparse = result.sparse_vectors.unwrap();
+        assert_eq!(sparse[0].indices, [1, 5]);
+        assert_eq!(sparse[0].values, [0.25, 0.5]);
+        assert!(sparse[1].values.is_empty());
     }
 
     #[test]

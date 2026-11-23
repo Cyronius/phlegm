@@ -1288,7 +1288,7 @@ mod tests {
                 EmbeddingInput::Texts(v) => v.iter().map(|s| s.len()).collect(),
                 EmbeddingInput::TokenIds(v) => v.iter().map(Vec::len).collect(),
             };
-            Ok(EmbeddingOutput { tokens: lengths.iter().sum(), vectors: lengths.iter().map(|n| vec![*n as f32, -1.0]).collect() })
+            Ok(EmbeddingOutput { tokens: lengths.iter().sum(), vectors: lengths.iter().map(|n| vec![*n as f32, -1.0]).collect(), sparse_vectors: None })
         }
     }
 
@@ -1368,7 +1368,7 @@ print(json.dumps({'vectors': model.encode(texts).tolist(), 'tokens': sum(map(len
             let result = process.wait_with_output().unwrap();
             assert!(result.status.success(), "CPU reference failed");
             let v: Value = serde_json::from_slice(&result.stdout).unwrap();
-            EmbeddingOutput { vectors: serde_json::from_value(v["vectors"].clone()).unwrap(), tokens: v["tokens"].as_u64().unwrap() as usize }
+            EmbeddingOutput { vectors: serde_json::from_value(v["vectors"].clone()).unwrap(), tokens: v["tokens"].as_u64().unwrap() as usize, sparse_vectors: None }
         }
         struct Cpu;
         impl EmbeddingBackend for Cpu {

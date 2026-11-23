@@ -86,6 +86,7 @@ impl EmbeddingBackend for Embed {
         Ok(EmbeddingOutput {
             vectors: vec![vec![0.25, 0.75]; input.len()],
             tokens: input.len(),
+            sparse_vectors: None,
         })
     }
 }
