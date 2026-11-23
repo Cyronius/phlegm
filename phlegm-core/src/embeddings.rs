@@ -1,4 +1,4 @@
-//! Model-independent embeddings contract and the resident TritNpu adapter.
+//! Model-independent embeddings contract and resident worker adapters.
 use crate::npu_lock::NpuLock;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -39,6 +39,22 @@ pub enum EmbeddingError {
 pub trait EmbeddingBackend: Send {
     fn model_id(&self) -> &str;
     fn embed(&mut self, input: EmbeddingInput) -> Result<EmbeddingOutput, EmbeddingError>;
+    fn backend_name(&self) -> &str {
+        "trit-embed"
+    }
+    fn embed_with_options(
+        &mut self,
+        input: EmbeddingInput,
+        _prompt_name: Option<&str>,
+        dimensions: Option<u32>,
+    ) -> Result<EmbeddingOutput, EmbeddingError> {
+        if dimensions.is_some() {
+            return Err(EmbeddingError::Invalid(
+                "this embedding model does not support dimensions".into(),
+            ));
+        }
+        self.embed(input)
+    }
 }
 
 struct Worker {
@@ -53,7 +69,12 @@ impl Worker {
         command
             .args(["-I", "-u", "-c", include_str!("embeddings_worker.py")])
             .arg(source_dir)
-            .arg(model_dir)
+            .arg(model_dir);
+        Self::start(command).map(|(worker, _)| worker)
+    }
+
+    fn start(mut command: Command) -> Result<(Self, Value), String> {
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -105,7 +126,7 @@ impl Worker {
                     .unwrap_or("unsupported protocol")
             ));
         }
-        Ok(worker)
+        Ok((worker, hello))
     }
     fn receive(&self) -> Result<Value, String> {
         self.replies
@@ -128,12 +149,16 @@ impl Drop for Worker {
     }
 }
 
-pub struct TritEmbeddingBackend {
+pub struct ResidentEmbeddingBackend {
     worker: Option<Worker>,
     id: String,
     lock: Option<NpuLock>,
+    width: usize,
+    native: bool,
 }
-impl TritEmbeddingBackend {
+pub type TritEmbeddingBackend = ResidentEmbeddingBackend;
+
+impl ResidentEmbeddingBackend {
     pub fn load(
         id: String,
         python: &Path,
@@ -146,14 +171,65 @@ impl TritEmbeddingBackend {
             worker: Some(worker),
             id,
             lock: Some(lock),
+            width: 384,
+            native: false,
+        })
+    }
+
+    pub fn load_npue(
+        id: String,
+        executable: &Path,
+        pack: &Path,
+        design: &Path,
+        attention: Option<&Path>,
+    ) -> Result<Self, String> {
+        let lock = NpuLock::acquire("phlegm NPUE embeddings")?;
+        let mut command = Command::new(executable);
+        command.arg(pack).arg(design).args(attention);
+        let (worker, hello) = Worker::start(command)?;
+        let width = hello
+            .get("dimensions")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+            .ok_or("embedding worker omitted its vector width")?;
+        if hello.get("npu_attention").and_then(Value::as_bool) != Some(attention.is_some()) {
+            return Err("embedding worker did not confirm the requested attention route".into());
+        }
+        Ok(Self {
+            worker: Some(worker),
+            id,
+            lock: Some(lock),
+            width,
+            native: true,
         })
     }
 }
-impl EmbeddingBackend for TritEmbeddingBackend {
+impl EmbeddingBackend for ResidentEmbeddingBackend {
     fn model_id(&self) -> &str {
         &self.id
     }
+    fn backend_name(&self) -> &str {
+        if self.native {
+            "npue"
+        } else {
+            "trit-embed"
+        }
+    }
     fn embed(&mut self, input: EmbeddingInput) -> Result<EmbeddingOutput, EmbeddingError> {
+        self.embed_with_options(input, None, None)
+    }
+    fn embed_with_options(
+        &mut self,
+        input: EmbeddingInput,
+        prompt_name: Option<&str>,
+        dimensions: Option<u32>,
+    ) -> Result<EmbeddingOutput, EmbeddingError> {
+        if !self.native && dimensions.is_some() {
+            return Err(EmbeddingError::Invalid(
+                "this embedding model does not support dimensions".into(),
+            ));
+        }
         let held = self
             .lock
             .as_ref()
@@ -167,10 +243,18 @@ impl EmbeddingBackend for TritEmbeddingBackend {
             return Err(EmbeddingError::Backend(e));
         }
         let expected_count = input.len();
-        let request = match input {
+        let mut request = match input {
             EmbeddingInput::Texts(texts) => json!({"texts": texts}),
             EmbeddingInput::TokenIds(ids) => json!({"token_ids": ids}),
         };
+        if self.native {
+            if let Some(prompt) = prompt_name {
+                request["prompt_name"] = json!(prompt);
+            }
+            if let Some(dimensions) = dimensions {
+                request["dimensions"] = json!(dimensions);
+            }
+        }
         let reply = match self
             .worker
             .as_mut()
@@ -219,7 +303,7 @@ impl EmbeddingBackend for TritEmbeddingBackend {
             if vectors.len() != expected_count
                 || vectors
                     .iter()
-                    .any(|v| v.len() != 384 || v.iter().any(|n| !n.is_finite()))
+                    .any(|v| v.len() != self.width || v.iter().any(|n| !n.is_finite()))
             {
                 return Err("embedding worker returned invalid vectors".into());
             }
@@ -236,6 +320,52 @@ impl EmbeddingBackend for TritEmbeddingBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn python() -> &'static Path {
+        Path::new(if cfg!(windows) { "python" } else { "python3" })
+    }
+
+    #[test]
+    fn npue_protocol_passes_request_options_and_recovers_from_invalid_input() {
+        let mut command = Command::new(python());
+        command.args([
+            "-I",
+            "-u",
+            "-c",
+            r#"
+import json, sys
+print(json.dumps(dict(ok=True, protocol=1, dimensions=2, npu_attention=True)))
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get('prompt_name') != 'search_document':
+        print(json.dumps(dict(ok=False, invalid=True, error='prompt_name is required')))
+    else:
+        assert request['dimensions'] == 2 and request['texts'] == ['one', 'two']
+        print(json.dumps(dict(ok=True, tokens=4, vectors=[[1, 0], [0, 1]])))
+"#,
+        ]);
+        let (worker, _) = Worker::start(command).unwrap();
+        let lock_path =
+            std::env::temp_dir().join(format!("phlegm-npue-test-{}.lock", std::process::id()));
+        let mut backend = ResidentEmbeddingBackend {
+            worker: Some(worker),
+            id: "nomic-test".into(),
+            lock: Some(NpuLock::for_test(lock_path)),
+            width: 2,
+            native: true,
+        };
+        let input = EmbeddingInput::Texts(vec!["one".into(), "two".into()]);
+        assert!(matches!(
+            backend.embed(input.clone()),
+            Err(EmbeddingError::Invalid(_))
+        ));
+        let result = backend
+            .embed_with_options(input, Some("search_document"), Some(2))
+            .unwrap();
+        assert_eq!(result.tokens, 4);
+        assert_eq!(result.vectors, [vec![1., 0.], vec![0., 1.]]);
+    }
+
     #[test]
     fn resident_worker_protocol_handles_batches_and_invalid_ids() {
         let dir = std::env::temp_dir().join(format!("phlegm-embed-worker-{}", std::process::id()));
@@ -257,7 +387,7 @@ class TritNpu:
 "#,
         )
         .unwrap();
-        let mut worker = Worker::spawn(Path::new("python3"), &dir, &dir).unwrap();
+        let mut worker = Worker::spawn(python(), &dir, &dir).unwrap();
         let response = worker.request(json!({"texts": ["ab", "c"]})).unwrap();
         assert_eq!(response["tokens"], 3);
         assert_eq!(response["vectors"][0].as_array().unwrap().len(), 384);

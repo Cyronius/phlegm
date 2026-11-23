@@ -415,7 +415,7 @@ fn run_inner(
 pub fn serve_embeddings(embedder: Box<dyn crate::embeddings::EmbeddingBackend>, mut cfg: ServerConfig) -> Result<(), String> {
     cfg.model_dir = None;
     let server = bind(&cfg)?;
-    cfg.backend_name = "trit-embed".into();
+    cfg.backend_name = embedder.backend_name().into();
     run_inner(server, Box::new(crate::mock_backend::MockBackend::new()), cfg, Some(embedder), true)
 }
 

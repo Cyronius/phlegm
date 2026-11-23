@@ -21,6 +21,7 @@ commands:
   serve [--models-dir DIR] [--image-config JSON[,JSON...]] [--keep-alive SECONDS] [--queue-timeout SECONDS]
   serve --model-dir DIR [--kernels DIR] [--bridge EXE] [--turbo] [--host 127.0.0.1] [--port 52625]
   serve --embed-model DIR [--embed-python PYTHON] [--embed-source DIR] [--embed-model-name NAME]
+  serve --embed-model PACK --embed-worker EXE --embed-design DIR [--embed-attention DIR] [--embed-model-name NAME]
   serve --mock [--host H] [--port N]
   every serve: [--api-key KEY] [--allowed-origins ORIGINS]   (--host / --port override PHLEGM_HOST / PHLEGM_PORT)
   config show [--model-dir DIR | --config-model TAG] [--json]   the settings in effect, and where each comes from
@@ -220,13 +221,39 @@ fn serve(args: &[String]) -> Result<(), String> {
             return Err("--embed-model serves an embedding model alone; do not combine with chat backend options".into());
         }
         let model_dir = PathBuf::from(dir);
-        let model_id = opts.get("--embed-model-name").cloned().or_else(|| model_dir.file_name().and_then(|v| v.to_str()).map(str::to_owned)).ok_or("invalid embedding model name")?;
+        let worker = opts.get("--embed-worker");
+        let default_name = if worker.is_some() { model_dir.file_stem() } else { model_dir.file_name() };
+        let model_id = opts.get("--embed-model-name").cloned()
+            .or_else(|| default_name.and_then(|v| v.to_str()).map(str::to_owned))
+            .ok_or("invalid embedding model name")?;
         if model_id.is_empty() { return Err("embedding model name must not be empty".into()); }
+        if let Some(worker) = worker {
+            if opts.contains_key("--embed-python") || opts.contains_key("--embed-source") {
+                return Err("--embed-worker cannot be combined with Trit embedding options".into());
+            }
+            let design = opts.get("--embed-design").ok_or("--embed-worker requires --embed-design")?;
+            let embedder = phlegm_core::embeddings::ResidentEmbeddingBackend::load_npue(
+                model_id,
+                std::path::Path::new(worker),
+                &model_dir,
+                std::path::Path::new(design),
+                opts.get("--embed-attention").map(std::path::Path::new),
+            )?;
+            return server::serve_embeddings(Box::new(embedder), cfg);
+        }
+        if opts.contains_key("--embed-design") || opts.contains_key("--embed-attention") {
+            return Err("--embed-design and --embed-attention require --embed-worker".into());
+        }
         let python = opts.get("--embed-python").cloned().or_else(|| std::env::var("PHLEGM_EMBED_PYTHON").ok()).unwrap_or_else(|| "python3".into());
         let source = opts.get("--embed-source").map(PathBuf::from).or_else(|| std::env::var_os("PHLEGM_EMBED_SOURCE").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../open-kernels/open_kernels/designs/trit_embed"));
         let embedder = phlegm_core::embeddings::TritEmbeddingBackend::load(model_id, std::path::Path::new(&python), &source, &model_dir)?;
         return server::serve_embeddings(Box::new(embedder), cfg);
+    }
+    if ["--embed-worker", "--embed-design", "--embed-attention"]
+        .iter().any(|name| opts.contains_key(*name))
+    {
+        return Err("NPUE embedding options require --embed-model".into());
     }
     if !opts.contains_key("--mock") && !opts.contains_key("--model-dir")
         && (cfg.model_dir.is_none() || opts.contains_key("--models-dir") || opts.contains_key("--image-config")) {

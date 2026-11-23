@@ -74,13 +74,18 @@ pub(super) fn handle_body(request: Request, state: &ServerState, body: &[u8]) {
     if Some(model) != state.embedding_model.as_deref() {
         return invalid(request, 404, "embedding model not found");
     }
-    if req.get("dimensions").is_some_and(|v| !v.is_null()) {
-        return invalid(
-            request,
-            400,
-            "this embedding model does not support dimensions",
-        );
-    }
+    let dimensions = match req.get("dimensions") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_u64().and_then(|n| u32::try_from(n).ok()) {
+            Some(n) if n > 0 => Some(n),
+            _ => return invalid(request, 400, "dimensions must be a positive integer"),
+        },
+    };
+    let prompt_name = match req.get("prompt_name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(name.as_str()),
+        _ => return invalid(request, 400, "prompt_name must be a string"),
+    };
     let format = match req.get("encoding_format") {
         None | Some(Value::Null) => "float",
         Some(Value::String(s)) if s == "float" || s == "base64" => s.as_str(),
@@ -91,7 +96,11 @@ pub(super) fn handle_body(request: Request, state: &ServerState, body: &[u8]) {
         Err(e) => return invalid(request, 400, e),
     };
     let count = input.len();
-    let output = match embedder.lock().unwrap().embed(input) {
+    let output = match embedder
+        .lock()
+        .unwrap()
+        .embed_with_options(input, prompt_name, dimensions)
+    {
         Ok(v) => v,
         Err(EmbeddingError::Invalid(e)) => return invalid(request, 400, &e),
         Err(EmbeddingError::Backend(e)) => {
