@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 mod bench;
+mod embedding_pack;
 mod multi_model;
 
 const USAGE: &str = "usage: phlegm <command>
@@ -23,6 +24,8 @@ commands:
   serve --embed-model DIR [--embed-python PYTHON] [--embed-source DIR] [--embed-model-name NAME]
   serve --embed-model PACK --embed-worker EXE --embed-design DIR [--embed-attention DIR] [--embed-model-name NAME]
     [--embed-short-design DIR [--embed-short-attention DIR]]
+    GGUF input uses --embed-packer EXE --embed-gguf-sha256 HASH
+    [--embed-pack-cache DIR] [--embed-pack-script FILE] [--embed-python PYTHON]
   serve --mock [--host H] [--port N]
   every serve: [--api-key KEY] [--allowed-origins ORIGINS]   (--host / --port override PHLEGM_HOST / PHLEGM_PORT)
   config show [--model-dir DIR | --config-model TAG] [--json]   the settings in effect, and where each comes from
@@ -229,7 +232,7 @@ fn serve(args: &[String]) -> Result<(), String> {
             .ok_or("invalid embedding model name")?;
         if model_id.is_empty() { return Err("embedding model name must not be empty".into()); }
         if let Some(worker) = worker {
-            if opts.contains_key("--embed-python") || opts.contains_key("--embed-source") {
+            if opts.contains_key("--embed-source") {
                 return Err("--embed-worker cannot be combined with Trit embedding options".into());
             }
             let design = opts.get("--embed-design").ok_or("--embed-worker requires --embed-design")?;
@@ -238,20 +241,23 @@ fn serve(args: &[String]) -> Result<(), String> {
             if short_attention.is_some() && short_design.is_none() {
                 return Err("--embed-short-attention requires --embed-short-design".into());
             }
+            let design = std::path::Path::new(design);
+            let pack = embedding_pack::prepare(&model_dir, design, |name| opts.get(name).map(String::as_str))?;
             let embedder = phlegm_core::embeddings::ResidentEmbeddingBackend::load_npue_routed(
                 model_id,
                 std::path::Path::new(worker),
-                &model_dir,
-                std::path::Path::new(design),
+                &pack.path,
+                design,
                 opts.get("--embed-attention").map(std::path::Path::new),
                 short_design.map(|dir| (dir, short_attention)),
             )?;
             return server::serve_embeddings(Box::new(embedder), cfg);
         }
-        if ["--embed-design", "--embed-attention", "--embed-short-design", "--embed-short-attention"]
-            .iter().any(|name| opts.contains_key(*name))
+        if embedding_pack::is_gguf(&model_dir)
+            || ["--embed-design", "--embed-attention", "--embed-short-design", "--embed-short-attention"]
+                .iter().chain(embedding_pack::FLAGS).any(|name| opts.contains_key(*name))
         {
-            return Err("NPUE design options require --embed-worker".into());
+            return Err("GGUF models and NPUE options require --embed-worker".into());
         }
         let python = opts.get("--embed-python").cloned().or_else(|| std::env::var("PHLEGM_EMBED_PYTHON").ok()).unwrap_or_else(|| "python3".into());
         let source = opts.get("--embed-source").map(PathBuf::from).or_else(|| std::env::var_os("PHLEGM_EMBED_SOURCE").map(PathBuf::from))
@@ -260,7 +266,7 @@ fn serve(args: &[String]) -> Result<(), String> {
         return server::serve_embeddings(Box::new(embedder), cfg);
     }
     if ["--embed-worker", "--embed-design", "--embed-attention", "--embed-short-design", "--embed-short-attention"]
-        .iter().any(|name| opts.contains_key(*name))
+        .iter().chain(embedding_pack::FLAGS).any(|name| opts.contains_key(*name))
     {
         return Err("NPUE embedding options require --embed-model".into());
     }

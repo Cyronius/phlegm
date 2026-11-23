@@ -1,4 +1,5 @@
 use super::{absolute, machine, number, parse_flags, required, MachineInfo, ReleaseInfo};
+use crate::embedding_pack;
 use phlegm_core::{
     bench::reference::hash_file,
     embeddings::{EmbeddingBackend, EmbeddingInput, ResidentEmbeddingBackend},
@@ -12,10 +13,13 @@ use std::{
     time::Instant,
 };
 
-const HELP: &str = "usage: phlegm bench embed --embed-model <pack.npue> --embed-worker <exe>
+const HELP: &str =
+    "usage: phlegm bench embed --embed-model <pack.npue|model.gguf> --embed-worker <exe>
   --embed-design <dir> [--embed-attention <dir>] --model-id <id> --model-revision <rev>
   --quantization <quant> --fixtures <cases.json> --output <report.json>
   [--embed-short-design <dir> [--embed-short-attention <dir>]]
+  [--embed-packer EXE --embed-gguf-sha256 HASH] [--embed-pack-cache DIR]
+  [--embed-pack-script FILE] [--embed-python PYTHON]
   [--warmups N] [--runs N] [--machine-info FILE] [--notes TEXT] [--development]
 
 The fixture file is an array of cases with tokens_per_input and either texts
@@ -26,6 +30,7 @@ artifact hashes. The measurement includes Phlegm worker IPC and excludes HTTP.";
 const FLAGS: &[&str] = &[
     "--embed-model",
     "--embed-worker",
+    "--embed-python",
     "--embed-design",
     "--embed-attention",
     "--embed-short-design",
@@ -178,7 +183,8 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         .filter(|a| *a != "--development")
         .cloned()
         .collect();
-    let flags = parse_flags(&args, FLAGS)?;
+    let allowed: Vec<_> = FLAGS.iter().chain(embedding_pack::FLAGS).copied().collect();
+    let flags = parse_flags(&args, &allowed)?;
     let value = |name| required(&flags, name);
     let model = value("--model-id")?;
     let revision = value("--model-revision")?;
@@ -193,7 +199,7 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         return Err("expected 1..10 warmups and 1..20 measured runs".into());
     }
     release.validate()?;
-    let pack = absolute(value("--embed-model")?)?;
+    let model_path = absolute(value("--embed-model")?)?;
     let worker = absolute(value("--embed-worker")?)?;
     let design = absolute(value("--embed-design")?)?;
     let attention = flags
@@ -227,8 +233,12 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
             "benchmark fixtures exceed the {context_capacity}-token design"
         ));
     }
+    let pack = embedding_pack::prepare(&model_path, &design, |name| {
+        flags.get(name).map(String::as_str)
+    })?;
     let artifacts = json!({
-        "npue_sha256": hash_file(&pack)?,
+        "npue_sha256": hash_file(&pack.path)?,
+        "gguf_sha256": pack.source_sha256,
         "worker_sha256": hash_file(&worker)?,
         "fixtures_sha256": hash_file(fixture)?,
         "projection_sha256": projector,
@@ -252,7 +262,7 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
     let mut backend = ResidentEmbeddingBackend::load_npue_routed(
         model.into(),
         &worker,
-        &pack,
+        &pack.path,
         &design,
         attention.as_deref(),
         short_design

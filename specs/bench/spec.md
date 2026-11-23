@@ -180,6 +180,12 @@ Use `--embed-short-design` to exercise the serving router with a smaller
 projection design. The report records the capacities and artifact hashes
 for both routes.
 
+For a GGUF input, pass `--embed-packer` and `--embed-gguf-sha256` with
+`--embed-model`. The CLI caches the derived NPUE before timing and records
+the GGUF and NPUE hashes. Serving uses the same cache. You can select its
+directory with `--embed-pack-cache` and the packing script with
+`--embed-pack-script`.
+
 The model stays resident. The benchmark checks the processed token counts in
 every warmup and timed call. It alternates the order of cases across measured
 rounds and stores per-case samples, median latency and input token throughput.
