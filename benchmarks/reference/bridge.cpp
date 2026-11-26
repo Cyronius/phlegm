@@ -369,7 +369,8 @@ int main() {
     try {
         std::string line;
         while (std::getline(std::cin, line)) {
-            if (line.size() > 1'000'000) throw std::runtime_error("request exceeds 1 MB");
+            // a prompt line: up to about 8 bytes a token id, so 16 MB holds a 2M-token context
+            if (line.size() > 16'000'000) throw std::runtime_error("request exceeds 16 MB");
             const json request = json::parse(line);
             const std::string command = request.at("command").get<std::string>();
             static const bool trace = [] { const char* e = std::getenv("QWEN36_BRIDGE_TRACE"); return e && *e; }();
