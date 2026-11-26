@@ -6,6 +6,7 @@ pub(crate) mod speculation;
 use super::{is_hex, BenchBackend, ModelInfo, RuntimeInfo, Sample};
 use crate::backend::{Backend, GenParams};
 use crate::npu_lock::NpuLock;
+use crate::vision::{image_runs, ImageRun, VisionConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -387,11 +388,21 @@ impl Process {
     }
 
     fn request_with_payload(&mut self, value: Value) -> Result<(Value, Vec<u8>), String> {
+        self.request_with_bytes(value, &[])
+    }
+
+    /// A request line followed by raw bytes (SERVER-IMAGE-INPUT: `pixels_bytes` of RGB8 images),
+    /// then the reply with its payload.
+    fn request_with_bytes(&mut self, value: Value, bytes: &[&[u8]]) -> Result<(Value, Vec<u8>), String> {
         serde_json::to_writer(&mut self.input, &value).map_err(|e| e.to_string())?;
-        self.input
-            .write_all(b"\n")
-            .and_then(|_| self.input.flush())
-            .map_err(|e| format!("writing reference request: {e}"))?;
+        let mut write = || -> std::io::Result<()> {
+            self.input.write_all(b"\n")?;
+            for b in bytes {
+                self.input.write_all(b)?;
+            }
+            self.input.flush()
+        };
+        write().map_err(|e| format!("writing reference request: {e}"))?;
         self.receive_with_payload()
     }
 }
@@ -770,6 +781,10 @@ pub struct NpuBackend {
     context: Vec<u32>,
     mark: Option<usize>,
     reused: usize,
+    /// SERVER-IMAGE-INPUT: the bridge's image input (None: the model takes no images), and the
+    /// image runs in `context` (reuse keeps an image's rows only for the same pixels).
+    vision: Option<VisionConfig>,
+    context_images: Vec<ImageRun>,
 }
 
 /// How a request's prompt starts on the bridge (SERVER-PROMPT-REUSE).
@@ -782,17 +797,43 @@ enum Start {
     Rewind(usize),
 }
 
-/// The longest reuse of `context` (the bridge's tokens) for `prompt`, leaving at least one token
-/// to prefill (the logits come from it). Returns the start and how to get there.
-fn reuse_start(context: &[u32], mark: Option<usize>, recurrent: Option<bool>, prompt: &[u32]) -> (usize, Start) {
+/// Back to the start of the image run `pos` splits, if any (SERVER-IMAGE-INPUT).
+fn outside_runs(runs: &[ImageRun], pos: usize) -> usize {
+    runs.iter().find(|r| r.splits(pos)).map_or(pos, |r| r.start)
+}
+
+/// The longest reuse of `context` (the bridge's tokens, with its image runs) for `prompt` (with
+/// its image runs), leaving at least one token to prefill (the logits come from it). Returns the
+/// start and how to get there. Image tokens are all alike, so the shared prefix also ends at the
+/// first image run that differs (other pixels, or absent on one side), and no start splits a run.
+fn reuse_start(
+    context: &[u32],
+    context_runs: &[ImageRun],
+    mark: Option<usize>,
+    recurrent: Option<bool>,
+    prompt: &[u32],
+    prompt_runs: &[ImageRun],
+) -> (usize, Start) {
     let Some(recurrent) = recurrent else { return (0, Start::Reset) };
-    let shared = context.iter().zip(prompt).take_while(|(a, b)| a == b).count();
-    let limit = shared.min(prompt.len().saturating_sub(1));
+    let mut shared = context.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+    let same = |a: Option<&ImageRun>, b: Option<&ImageRun>| {
+        matches!((a, b), (Some(a), Some(b)) if a.len == b.len && a.sha256 == b.sha256)
+    };
+    let starts = context_runs.iter().chain(prompt_runs).map(|r| r.start).filter(|&s| s < shared);
+    if let Some(s) = starts
+        .filter(|&s| !same(context_runs.iter().find(|r| r.start == s), prompt_runs.iter().find(|r| r.start == s)))
+        .min()
+    {
+        shared = s;
+    }
+    shared = outside_runs(prompt_runs, outside_runs(context_runs, shared));
+    let limit = outside_runs(prompt_runs, shared.min(prompt.len().saturating_sub(1)));
     let mut best = (0, Start::Reset);
     if shared == context.len() && shared == limit && shared > 0 {
         best = (shared, Start::Append);
     }
-    if let Some(m) = mark.filter(|&m| m <= limit && m > best.0) {
+    // A mark inside an image run cannot be used: the image is sent whole or not at all.
+    if let Some(m) = mark.filter(|&m| m <= limit && m > best.0 && !prompt_runs.iter().any(|r| r.splits(m))) {
         best = (m, Start::Rewind(m));
     }
     if !recurrent && limit > best.0 {
@@ -883,6 +924,8 @@ impl NpuBackend {
             context: Vec::new(),
             mark: None,
             reused: 0,
+            vision: VisionConfig::from_init(hello.get("vision"))?,
+            context_images: Vec::new(),
         })
     }
 
@@ -931,12 +974,14 @@ impl NpuBackend {
         {
             return Err("prompt or output count exceeds the NPU model's context/vocabulary".into());
         }
+        let runs = image_runs(prompt_ids, &params.images, self.vision.as_ref())?;
         // Until this request's prefill succeeds the bridge's context is unknown: a failed
         // request leaves nothing to reuse.
         let context = std::mem::take(&mut self.context);
+        let context_images = std::mem::take(&mut self.context_images);
         let old_mark = self.mark.take();
         self.reused = 0;
-        let (start, how) = reuse_start(&context, old_mark, self.recurrent, prompt_ids);
+        let (start, how) = reuse_start(&context, &context_images, old_mark, self.recurrent, prompt_ids, &runs);
         let kept_mark = match how {
             Start::Reset => {
                 self.process.request(json!({"command":"reset"}))?;
@@ -951,13 +996,23 @@ impl NpuBackend {
         let mut prefill = json!({"command":"prefill_logits", "prompt":&prompt_ids[start..]});
         // A model with recurrent layers saves their state at the conversation's end (or the
         // prompt's), where the next turn's prompt will part from this one.
+        // The mark never splits an image run (SERVER-IMAGE-INPUT).
         let want_mark = (self.recurrent == Some(true)).then(|| {
-            params.reuse_mark.filter(|&k| k > start && k <= prompt_ids.len()).unwrap_or(prompt_ids.len())
+            params.reuse_mark.map(|k| outside_runs(&runs, k))
+                .filter(|&k| k > start && k <= prompt_ids.len()).unwrap_or(prompt_ids.len())
         });
         if let Some(k) = want_mark {
             prefill["mark"] = json!(k);
         }
-        let (reply, bytes) = self.process.request_with_payload(prefill)?;
+        // Images whose runs are in the reused part are already on the bridge.
+        let sent: Vec<&crate::vision::PromptImage> =
+            runs.iter().filter(|r| r.start >= start).map(|r| &params.images[r.image]).collect();
+        if !sent.is_empty() {
+            prefill["images"] = json!(sent.iter().map(|i| json!({"width":i.width, "height":i.height})).collect::<Vec<_>>());
+            prefill["pixels_bytes"] = json!(sent.iter().map(|i| i.rgb.len()).sum::<usize>());
+        }
+        let pixels: Vec<&[u8]> = sent.iter().map(|i| i.rgb.as_slice()).collect();
+        let (reply, bytes) = self.process.request_with_bytes(prefill, &pixels)?;
         let mut logits = self.logits_of(&bytes)?;
         self.mark = match want_mark {
             Some(_) => Some(
@@ -971,6 +1026,7 @@ impl NpuBackend {
             None => kept_mark,
         };
         self.context = prompt_ids.to_vec();
+        self.context_images = runs;
         self.reused = start;
         if self.recurrent.is_some() {
             eprintln!("phlegm: prompt {} tokens, {} reused", prompt_ids.len(), start);
@@ -1014,6 +1070,10 @@ impl Backend for NpuBackend {
 
     fn cached_tokens(&self) -> usize {
         self.reused
+    }
+
+    fn vision(&self) -> Option<VisionConfig> {
+        self.vision.clone()
     }
 }
 
@@ -1094,7 +1154,7 @@ for line in sys.stdin:
                 max_tokens: 4,
                 sampler: crate::sampler::Sampler::new(0.0, 0, 1.0, 1.0, None),
                 stop_ids: [4u32].into_iter().collect(),
-                reuse_mark: None,
+                reuse_mark: None, images: Vec::new(),
             };
             let mut output = Vec::new();
             backend
@@ -1185,7 +1245,7 @@ for line in sys.stdin:
                 max_tokens: 3,
                 sampler: crate::sampler::Sampler::new(0.0, 0, 1.0, 1.0, None),
                 stop_ids: std::collections::HashSet::new(),
-                reuse_mark: Some(mark),
+                reuse_mark: Some(mark), images: Vec::new(),
             };
             let mut output = Vec::new();
             backend.generate(prompt, &mut params, &mut |event| { output.push(event.id); std::ops::ControlFlow::Continue(()) }).unwrap();
@@ -1235,7 +1295,7 @@ for line in sys.stdin:
             speculative: Default::default(),
             max_tokens: 8,
             sampler: crate::sampler::Sampler::new(0.0, 0, 1.0, 1.0, None),
-            stop_ids: Default::default(), reuse_mark: Some(6),
+            stop_ids: Default::default(), reuse_mark: Some(6), images: Vec::new(),
         };
         let mut seen = 0;
         backend.generate(&early, &mut params, &mut |event| {
@@ -1268,17 +1328,175 @@ for line in sys.stdin:
     fn reuse_start_takes_the_longest_valid_start() {
         let ctx = [1, 2, 3, 4, 5, 6];
         // without reuse, always a reset
-        assert_eq!(reuse_start(&ctx, Some(4), None, &[1, 2, 3, 4, 5, 6, 7]), (0, Start::Reset));
+        assert_eq!(reuse_start(&ctx, &[], Some(4), None, &[1, 2, 3, 4, 5, 6, 7], &[]), (0, Start::Reset));
         // extends the context: append, even past the mark
-        assert_eq!(reuse_start(&ctx, Some(4), Some(true), &[1, 2, 3, 4, 5, 6, 7]), (6, Start::Append));
+        assert_eq!(reuse_start(&ctx, &[], Some(4), Some(true), &[1, 2, 3, 4, 5, 6, 7], &[]), (6, Start::Append));
         // parts after the mark: back to it; before it: nothing to reuse on a recurrent model
-        assert_eq!(reuse_start(&ctx, Some(4), Some(true), &[1, 2, 3, 4, 5, 9]), (4, Start::Rewind(4)));
-        assert_eq!(reuse_start(&ctx, Some(4), Some(true), &[1, 2, 3, 9]), (0, Start::Reset));
+        assert_eq!(reuse_start(&ctx, &[], Some(4), Some(true), &[1, 2, 3, 4, 5, 9], &[]), (4, Start::Rewind(4)));
+        assert_eq!(reuse_start(&ctx, &[], Some(4), Some(true), &[1, 2, 3, 9], &[]), (0, Start::Reset));
         // attention only: back to wherever the prompts part
-        assert_eq!(reuse_start(&ctx, None, Some(false), &[1, 2, 3, 9]), (3, Start::Rewind(3)));
+        assert_eq!(reuse_start(&ctx, &[], None, Some(false), &[1, 2, 3, 9], &[]), (3, Start::Rewind(3)));
         // the same prompt again keeps one token to prefill
-        assert_eq!(reuse_start(&ctx, None, Some(false), &ctx), (5, Start::Rewind(5)));
-        assert_eq!(reuse_start(&ctx, Some(6), Some(true), &ctx), (0, Start::Reset));
-        assert_eq!(reuse_start(&ctx, Some(4), Some(true), &ctx), (4, Start::Rewind(4)));
+        assert_eq!(reuse_start(&ctx, &[], None, Some(false), &ctx, &[]), (5, Start::Rewind(5)));
+        assert_eq!(reuse_start(&ctx, &[], Some(6), Some(true), &ctx, &[]), (0, Start::Reset));
+        assert_eq!(reuse_start(&ctx, &[], Some(4), Some(true), &ctx, &[]), (4, Start::Rewind(4)));
+    }
+
+    #[test]
+    fn reuse_start_keeps_images_apart() {
+        let run = |start, sha: u8| ImageRun { start, len: 4, sha256: [sha; 32], image: 0 };
+        // 1 2 [9 9 9 9] 3 4 5: an image at 2..6.
+        let ctx = [1, 2, 9, 9, 9, 9, 3, 4, 5];
+        let same = [run(2, 7)];
+        let longer = [&ctx[..], &[6, 7]].concat();
+        // The same image: reuse as before.
+        assert_eq!(reuse_start(&ctx, &same, None, Some(true), &longer, &same), (9, Start::Append));
+        assert_eq!(reuse_start(&ctx, &same, None, Some(false), &[1, 2, 9, 9, 9, 9, 3, 8], &same), (7, Start::Rewind(7)));
+        // Other pixels, same ids: the shared prefix ends where the image starts.
+        let other = [run(2, 8)];
+        assert_eq!(reuse_start(&ctx, &same, None, Some(true), &longer, &other), (0, Start::Reset));
+        assert_eq!(reuse_start(&ctx, &same, None, Some(false), &longer, &other), (2, Start::Rewind(2)));
+        assert_eq!(reuse_start(&ctx, &same, Some(2), Some(true), &longer, &other), (2, Start::Rewind(2)));
+        // Absent on one side (a user who typed the image token ids): the same.
+        assert_eq!(reuse_start(&ctx, &[], None, Some(false), &longer, &same), (2, Start::Rewind(2)));
+        assert_eq!(reuse_start(&ctx, &same, None, Some(false), &longer, &[]), (2, Start::Rewind(2)));
+        // Prompts parting inside a run: back to its start.
+        assert_eq!(reuse_start(&ctx, &same, None, Some(false), &[1, 2, 9, 9, 8, 8], &[]), (2, Start::Rewind(2)));
+        // A mark inside a run is never used.
+        assert_eq!(reuse_start(&ctx, &same, Some(4), Some(true), &[1, 2, 9, 9, 9, 9, 3, 8], &same), (0, Start::Reset));
+        assert_eq!(reuse_start(&ctx, &same, Some(6), Some(true), &[1, 2, 9, 9, 9, 9, 3, 8], &same), (6, Start::Rewind(6)));
+        // An image at the very end of the prompt still keeps one token to prefill, outside it.
+        let tail = [run(5, 7)];
+        let ends = [1, 2, 3, 4, 5, 9, 9, 9, 9];
+        assert_eq!(reuse_start(&ends, &tail, None, Some(false), &ends, &tail), (5, Start::Rewind(5)));
+    }
+
+    /// The bridge receives the images per the contract: `images` + `pixels_bytes` then the RGB8
+    /// bytes, only for runs after the reuse start, and a mark moved out of an image run.
+    #[test]
+    fn resident_bridge_sends_images_after_the_request_line() {
+        let dir = std::env::temp_dir().join(format!("phlegm-image-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bridge = dir.join("fake-bridge");
+        let log = dir.join("log.jsonl");
+        fs::write(
+            &bridge,
+            format!(
+                r#"#!/usr/bin/env python3
+import hashlib, json, struct, sys
+print(json.dumps({{'ok': True, 'protocol': 1, 'engine': 'openflowlm-cpp-reference'}}), flush=True)
+log = open({log:?}, 'a')
+pos, mark = 0, None
+LOGITS = struct.pack('<6f', 0, 0, 0, 0, 0, 10)
+VISION = {{'image_token_id': 4, 'patch': 16, 'merge': 2, 'min_pixels': 1024, 'max_pixels': 1003520,
+          'mean': [0.5, 0.5, 0.5], 'std': [0.5, 0.5, 0.5], 'placeholder': '<|vision_start|><|image_pad|><|vision_end|>'}}
+while True:
+    line = sys.stdin.buffer.readline()
+    if not line:
+        break
+    logits = b''
+    r = json.loads(line)
+    cmd = r['command']
+    if 'pixels_bytes' in r:
+        px = sys.stdin.buffer.read(r['pixels_bytes'])
+        assert len(px) == r['pixels_bytes'] == sum(i['width'] * i['height'] * 3 for i in r['images'])
+        r['pixels_sha256'] = hashlib.sha256(px).hexdigest()
+    log.write(json.dumps({{k: v for k, v in r.items() if k != 'model_dir' and k != 'kernel_dir'}}) + '\n'); log.flush()
+    if cmd == 'init':
+        out = {{'context_capacity': r['max_ctx'], 'real_vocab': 6, 'recurrent_layers': 1, 'vision': VISION}}
+    elif cmd == 'reset':
+        pos, mark, out = 0, None, {{}}
+    elif cmd == 'rewind':
+        assert r['pos'] == mark, (r, mark)
+        pos, out = mark, {{'position': mark}}
+    elif cmd == 'prefill_logits':
+        mark = r['mark']
+        pos += len(r['prompt'])
+        out, logits = {{'mark': mark}}, LOGITS
+    elif cmd == 'decode_logits':
+        pos += 1
+        out, logits = {{}}, LOGITS
+    else:
+        raise RuntimeError(cmd)
+    out['ok'] = True
+    if logits:
+        out['logits_f32_le_bytes'] = len(logits)
+    sys.stdout.write(json.dumps(out) + '\n'); sys.stdout.flush()
+    sys.stdout.buffer.write(logits); sys.stdout.buffer.flush()
+"#
+            ),
+        )
+        .unwrap();
+        let mut mode = fs::metadata(&bridge).unwrap().permissions();
+        mode.set_mode(0o700);
+        fs::set_permissions(&bridge, mode).unwrap();
+        let adapter_sha = format!("{:x}", Sha256::digest(BRIDGE_SOURCE));
+        let files = BTreeMap::from([("bridge/bridge.cpp".into(), adapter_sha.clone())]);
+        let sidecar = json!({"protocol":1, "engine":BACKEND_NAME, "source_commit":"0".repeat(40),
+            "source_dirty":false, "source_tree_sha256":manifest_hash(&files), "engine_tree_sha256":ENGINE_TREE_SHA256,
+            "adapter_sha256":adapter_sha, "binary_sha256":hash_file(&bridge).unwrap(),
+            "compiler_flags":"fake test bridge", "source_files":files});
+        fs::write(bridge.with_extension("build.json"), sidecar.to_string()).unwrap();
+        let opts = NpuOptions {
+            bridge,
+            model_dir: dir.clone(),
+            kernel_dir: dir.clone(),
+            turbo: false,
+            context_capacity: 64,
+            prefill_route: "auto".into(),
+            prefill_mode: "fast".into(),
+            threads: 1,
+            request_timeout: Duration::from_secs(5),
+            dispatch_timeout_ms: 1000,
+            speculative: Default::default(),
+        };
+        let mut backend = NpuBackend::load(opts).unwrap();
+        let vision = backend.vision().unwrap();
+        assert_eq!((vision.image_token_id, vision.factor()), (4, 32));
+        // A 64x32 image: (64/16)*(32/16)/4 = 2 tokens.
+        let image = |v: u8| crate::vision::PromptImage::new(64, 32, vec![v; 64 * 32 * 3]);
+        let mut turn = |prompt: &[u32], images: Vec<crate::vision::PromptImage>, mark: usize| {
+            let mut params = GenParams {
+                speculative: Default::default(),
+                max_tokens: 1,
+                sampler: crate::sampler::Sampler::new(0.0, 0, 1.0, 1.0, None),
+                stop_ids: Default::default(),
+                reuse_mark: Some(mark),
+                images,
+            };
+            backend.generate(prompt, &mut params, &mut |_| std::ops::ControlFlow::Continue(())).unwrap();
+            backend.cached_tokens()
+        };
+        let first = [1, 4, 4, 2, 3];
+        assert_eq!(turn(&first, vec![image(1)], 2), 0); // mark 2 splits the run: sent as 1
+        // The same image and a second one: back to the mark before the first, both sent.
+        let second = [1, 4, 4, 2, 5, 4, 4, 3];
+        assert_eq!(turn(&second, vec![image(1), image(2)], 5), 1);
+        // Other pixels in the first image, same token ids: the mark at 5 is past it, so a reset.
+        assert_eq!(turn(&second, vec![image(3), image(2)], 5), 0);
+        // Extending that prompt: both runs are in the reused part and are not sent again.
+        let third = [&second[..], &[2, 3]].concat();
+        assert_eq!(turn(&third, vec![image(3), image(2)], 9), 8);
+        let sha = |v: u8, n: usize| format!("{:x}", Sha256::digest(vec![v; 64 * 32 * 3 * n]));
+        let both = format!("{:x}", Sha256::digest([vec![3u8; 64 * 32 * 3], vec![2u8; 64 * 32 * 3]].concat()));
+        let commands: Vec<Value> = fs::read_to_string(&log).unwrap().lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|v| v["command"] != "init")
+            .collect();
+        assert_eq!(commands, vec![
+            json!({"command":"reset"}),
+            json!({"command":"prefill_logits", "prompt":first, "mark":1, "images":[{"width":64,"height":32}],
+                   "pixels_bytes":6144, "pixels_sha256":sha(1, 1)}),
+            json!({"command":"rewind", "pos":1}),
+            json!({"command":"prefill_logits", "prompt":[4, 4, 2, 5, 4, 4, 3], "mark":5,
+                   "images":[{"width":64,"height":32}, {"width":64,"height":32}], "pixels_bytes":12288,
+                   "pixels_sha256":format!("{:x}", Sha256::digest([vec![1u8; 6144], vec![2u8; 6144]].concat()))}),
+            json!({"command":"reset"}),
+            json!({"command":"prefill_logits", "prompt":second, "mark":5,
+                   "images":[{"width":64,"height":32}, {"width":64,"height":32}], "pixels_bytes":12288, "pixels_sha256":both}),
+            json!({"command":"prefill_logits", "prompt":[2, 3], "mark":9}),
+        ]);
+        drop(backend);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

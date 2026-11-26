@@ -1,6 +1,7 @@
 // Temporary process adapter over the externally supplied OpenFlowLM C++ Core.
 // No copy of that engine is vendored here. See README.md for build provenance.
 #include "open_qwen36/core.hpp"
+#include "open_qwen36/vision/prompt.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -52,7 +53,7 @@ static void run_prefill(Core& core, const std::vector<int>& ids, const std::stri
     if (ids.empty()) return;
     if (route == "layer-major") {
         core.step_gemm_prompt(ids, want_logits);
-    } else if (route == "gemm-block") {
+    } else if (route == "gemm-block" && !core.mrope_active()) {   // the block-major route has no M-RoPE positions
         const size_t block_size = core.gemm_block_t();
         if (!block_size) throw std::runtime_error("kernel set has no block prefill route");
         for (size_t at = 0; at < ids.size();) {
@@ -65,6 +66,83 @@ static void run_prefill(Core& core, const std::vector<int>& ids, const std::stri
     } else {
         for (size_t i = 0; i < ids.size(); ++i) core.step(ids[i], want_logits && i + 1 == ids.size());
     }
+}
+
+// Image input (SERVER-IMAGE-INPUT, OPEN-VISION-BLOCK): phlegm resizes each image and expands its placeholder into
+// the image's token run; the request lists the images and their RGB8 bytes follow the JSON line on stdin. The
+// vision tower runs on the host and the prompt's rows go to the block route at their M-RoPE positions.
+namespace vis = open_qwen36::vision;
+struct Vision {
+    bool on = false;
+    vis::VitConfig cfg;
+    std::string weights;                       // the tower's file, loaded at the first image
+    std::unique_ptr<vis::VitWeights> w;
+    long long min_pixels = 65536, max_pixels = 1003520;
+};
+static Vision vision;
+static json vision_info(const Core& core, const std::string& model_dir) {
+    vision = Vision{};
+    if (!core.has_mrope() || core.image_token_id() < 0) return nullptr;
+    const std::string file = vis::vision_weights_path(model_dir);
+    if (!std::filesystem::is_regular_file(std::filesystem::path(model_dir) / file)) return nullptr;
+    vision.cfg = vis::VitConfig::for_model_dir(model_dir);
+    vision.weights = model_dir + "/" + file;
+    vision.on = true;
+    return {{"image_token_id", core.image_token_id()}, {"patch", vision.cfg.patch}, {"merge", vision.cfg.merge},
+            {"min_pixels", vision.min_pixels}, {"max_pixels", vision.max_pixels},
+            {"mean", {0.5, 0.5, 0.5}}, {"std", {0.5, 0.5, 0.5}},
+            {"placeholder", "<|vision_start|><|image_pad|><|vision_end|>"}};
+}
+// The request's images: their RGB8 bytes follow the JSON line ("pixels_bytes" of them).
+static std::vector<vis::PromptImage> read_images(const json& request) {
+    std::vector<vis::PromptImage> out;
+    if (!request.contains("images")) return out;
+    if (!vision.on) throw std::runtime_error("this model does not accept images");
+    const auto& list = request.at("images");
+    const size_t total = request.at("pixels_bytes").get<size_t>();
+    size_t want = 0;
+    for (const auto& im : list) want += im.at("width").get<size_t>() * im.at("height").get<size_t>() * 3;
+    if (want != total || list.empty() || list.size() > 64) throw std::runtime_error("images and pixels_bytes disagree");
+    std::vector<uint8_t> bytes(total);
+    std::cin.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(total));
+    if (static_cast<size_t>(std::cin.gcount()) != total) throw std::runtime_error("short image payload");
+    const float mean[3] = {0.5f, 0.5f, 0.5f}, stdv[3] = {0.5f, 0.5f, 0.5f};
+    size_t off = 0;
+    for (const auto& im : list) {
+        vis::RgbImage rgb;
+        rgb.width = im.at("width").get<int>();
+        rgb.height = im.at("height").get<int>();
+        const long long px = static_cast<long long>(rgb.width) * rgb.height;
+        if (px > 4 * vision.max_pixels) throw std::runtime_error("image larger than the bridge's pixel bound");
+        rgb.rgb.assign(bytes.begin() + off, bytes.begin() + off + static_cast<size_t>(px) * 3);
+        off += static_cast<size_t>(px) * 3;
+        out.push_back(vis::patchify(vision.cfg, rgb, mean, stdv));
+    }
+    return out;
+}
+// The image runs of ids: [start, end) of each run of image_token_id, in order.
+static std::vector<std::pair<size_t, size_t>> image_runs(const Core& core, const std::vector<int>& ids) {
+    std::vector<std::pair<size_t, size_t>> runs;
+    for (size_t i = 0; i < ids.size();) {
+        if (ids[i] != core.image_token_id()) { ++i; continue; }
+        size_t j = i;
+        while (j < ids.size() && ids[j] == core.image_token_id()) ++j;
+        runs.emplace_back(i, j);
+        i = j;
+    }
+    return runs;
+}
+static void prefill_with_images(Core& core, const std::vector<int>& ids, const std::vector<vis::PromptImage>& images,
+                                const std::string& route, bool want_logits) {
+    if (ids.empty()) return;
+    if (!vision.w) {
+        const auto t = Clock::now();
+        vision.w = std::make_unique<vis::VitWeights>(vis::load_vit(vision.weights, vision.cfg));
+        std::cerr << "bridge: vision tower resident in " << elapsed(t) << " ms\n";
+    }
+    const auto st = vis::prefill_images(core, vision.cfg, *vision.w, ids, images, route == "layer-major", want_logits);
+    std::cerr << "bridge: " << images.size() << " image(s), " << st.image_tokens << " image tokens of " << ids.size()
+              << ": vision tower " << st.vit_ms << " ms, prefill " << st.prefill_ms << " ms\n";
 }
 
 // Prompt reuse (SERVER-PROMPT-REUSE). Phlegm keeps the bridge's context between requests and
@@ -101,6 +179,33 @@ static size_t prefill_marked(Core& core, const std::vector<int>& ids, const std:
         run_prefill(core, std::vector<int>(ids.begin(), ids.begin() + at), route, false);
         set_mark(core, mark);
         run_prefill(core, std::vector<int>(ids.begin() + at, ids.end()), route);
+    }
+    return pos0 + at;
+}
+// prefill_marked with images: the mark never splits an image's run (it moves to the run's start), and each part
+// takes the images whose runs it holds.
+static size_t prefill_marked_images(Core& core, const std::vector<int>& ids, const std::vector<vis::PromptImage>& images,
+                                    const std::string& route, size_t want, Mark& mark) {
+    const size_t pos0 = static_cast<size_t>(core.position());
+    if (want < pos0 || want > pos0 + ids.size()) throw std::runtime_error("mark outside the prefill");
+    const size_t want_at = want - pos0;
+    size_t at = want_at;
+    if (route != "sequential" && core.gemm_block_t()) at -= at % core.gemm_block_t();
+    const auto runs = image_runs(core, ids);
+    if (runs.size() != images.size()) throw std::runtime_error("the prompt's image runs and the images disagree");
+    size_t before = 0;
+    for (const auto& [a, b] : runs) {
+        if (a < at && at < b) at = b <= want_at ? b : a;   // past the image when the mark allows, else before it
+        if (b <= at) ++before;
+    }
+    const std::vector<vis::PromptImage> head(images.begin(), images.begin() + before), tail(images.begin() + before, images.end());
+    if (at == ids.size()) {
+        prefill_with_images(core, ids, images, route, true);
+        set_mark(core, mark);
+    } else {
+        prefill_with_images(core, std::vector<int>(ids.begin(), ids.begin() + at), head, route, false);
+        set_mark(core, mark);
+        prefill_with_images(core, std::vector<int>(ids.begin() + at, ids.end()), tail, route, true);
     }
     return pos0 + at;
 }
@@ -258,6 +363,7 @@ int main() {
     Pending pending;
 #ifdef _WIN32
     _setmode(_fileno(stdout), _O_BINARY);  // the logits are raw bytes
+    _setmode(_fileno(stdin), _O_BINARY);   // so are the images' pixels
 #endif
     reply({{"protocol", 2}, {"engine", "openflowlm-cpp-reference"}});
     try {
@@ -266,6 +372,12 @@ int main() {
             if (line.size() > 1'000'000) throw std::runtime_error("request exceeds 1 MB");
             const json request = json::parse(line);
             const std::string command = request.at("command").get<std::string>();
+            static const bool trace = [] { const char* e = std::getenv("QWEN36_BRIDGE_TRACE"); return e && *e; }();
+            if (trace) {
+                json t = request;
+                if (t.contains("prompt")) t["prompt"] = t["prompt"].size();
+                std::cerr << "bridge <- " << t.dump() << " at " << (core ? core->position() : -1) << std::endl;
+            }
             if (command == "quit") { stats.flush(); reply({}); std::_Exit(0); }
             if (command == "reset" || command == "rewind" || command == "prefill_logits") stats.flush();
             if (command == "init") {
@@ -306,7 +418,8 @@ int main() {
                     {"weights_file", core->is_gguf() ? "model.gguf" : "model.q4nx"},
                     {"recurrent_layers", recurrent_layers(*core)},
                     {"verify_width", verify_width(*core)}, {"verify_ref", true},
-                    {"draft", core->mtp_ready() && verify_width(*core) == 2 ? json{{"method", "mtp"}, {"max", 1}} : json(nullptr)}});
+                    {"draft", core->mtp_ready() && verify_width(*core) == 2 ? json{{"method", "mtp"}, {"max", 1}} : json(nullptr)},
+                    {"vision", vision_info(*core, config.model_dir)}});
                 continue;
             }
             if (!core) throw std::runtime_error("init is required before inference");
@@ -350,9 +463,22 @@ int main() {
                 // Continues from the current position (a fresh request resets first). With `mark`,
                 // also saves the recurrent state there (prefill_marked) and replies with its position.
                 const auto ids = prompt_ids(request, *core);
+                const auto images = read_images(request);   // the payload is read even if the prefill fails below
                 if (mark.valid && static_cast<size_t>(core->position()) < static_cast<size_t>(mark.snap.pos))
                     mark.valid = false;
-                if (request.contains("mark")) {
+                if (!images.empty() || image_runs(*core, ids).size()) {
+                    if (images.size() != image_runs(*core, ids).size())
+                        throw std::runtime_error("the prompt's image runs and the request's images disagree");
+                    if (request.contains("mark")) {
+                        const size_t at = prefill_marked_images(*core, ids, images, route, request.at("mark").get<size_t>(), mark);
+                        mtp_after_step(*core);
+                        reply_logits({{"mark", at}}, *core);
+                    } else {
+                        prefill_with_images(*core, ids, images, route, true);
+                        mtp_after_step(*core);
+                        reply_logits(json::object(), *core);
+                    }
+                } else if (request.contains("mark")) {
                     const size_t at = prefill_marked(*core, ids, route, request.at("mark").get<size_t>(), mark);
                     mtp_after_step(*core);
                     reply_logits({{"mark", at}}, *core);

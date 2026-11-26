@@ -184,7 +184,7 @@ fn params(setting: usize, max: usize, constrained: bool) -> GenParams {
         max_tokens: max,
         sampler,
         stop_ids: [7].into_iter().collect(),
-        reuse_mark: Some(2),
+        reuse_mark: Some(2), images: Vec::new(),
     }
 }
 

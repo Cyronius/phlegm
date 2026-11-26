@@ -301,6 +301,7 @@ fn scripted_request(text: &str, req: Value, reasoning: Option<Reasoning>) -> (St
         cfg,
         embedder: None,
         embedding_model: None,
+        vision: None,
         embedding_only: false,
     });
     let client_req = req.clone();
@@ -317,7 +318,7 @@ fn scripted_request(text: &str, req: Value, reasoning: Option<Reasoning>) -> (St
                     max_tokens: 1000,
                     sampler: Sampler::new(0., 0, 1., 1., None),
                     stop_ids: Default::default(),
-                    reuse_mark: None,
+                    reuse_mark: None, images: Vec::new(),
                 },
                 "fixture".into(),
                 Some(r),
@@ -621,6 +622,7 @@ fn real_token_logprobs_preserve_partial_utf8_bytes_and_intra_token_stop() {
                 cfg,
                 embedder: None,
                 embedding_model: None,
+                vision: None,
                 embedding_only: false,
             });
             let worker = std::thread::spawn(move || handle_request(server.recv().unwrap(), &state));
@@ -736,6 +738,7 @@ fn six_cpu_protocol_fixtures_stream_with_reasoning_and_validated_calls() {
             cfg,
             embedder: None,
             embedding_model: None,
+            vision: None,
             embedding_only: false,
         });
         let worker = std::thread::spawn(move || {
@@ -748,7 +751,7 @@ fn six_cpu_protocol_fixtures_stream_with_reasoning_and_validated_calls() {
                     max_tokens: 1000,
                     sampler: Sampler::new(0., 0, 1., 1., None),
                     stop_ids: Default::default(),
-                    reuse_mark: None,
+                    reuse_mark: None, images: Vec::new(),
                 },
                 "fixture".into(),
                 reasoning,
@@ -811,6 +814,7 @@ fn legacy_unicode_offsets_and_bytes_preserve_split_characters() {
             cfg,
             embedder: None,
             embedding_model: None,
+            vision: None,
             embedding_only: false,
         });
         let worker = std::thread::spawn(move || handle_request(server.recv().unwrap(), &state));

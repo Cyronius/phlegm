@@ -32,6 +32,9 @@ impl Backend for MockBackend {
         params: &mut GenParams,
         on_token: &mut dyn FnMut(crate::backend::TokenEvent<'_>) -> std::ops::ControlFlow<()>,
     ) -> Result<(), String> {
+        if !params.images.is_empty() {
+            return Err("the mock backend does not accept images".into());
+        }
         if params.sampler.is_constrained() {
             // Hardware-free serving still exercises the actual sampler mask. Prefer closing a
             // value and EOS over extending it, so arbitrary supported schemas finish promptly.
@@ -131,7 +134,7 @@ mod tests {
             max_tokens: 5,
             sampler: Sampler::new(0.0, 0, 1.0, 1.0, Some(1)),
             stop_ids: HashSet::new(),
-            reuse_mark: None,
+            reuse_mark: None, images: Vec::new(),
         };
         let mut out = Vec::new();
         backend
@@ -157,7 +160,7 @@ mod tests {
             max_tokens: 100,
             sampler: Sampler::new(0.0, 0, 1.0, 1.0, Some(1)),
             stop_ids,
-            reuse_mark: None,
+            reuse_mark: None, images: Vec::new(),
         };
         let mut out = Vec::new();
         backend

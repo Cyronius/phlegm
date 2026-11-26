@@ -584,6 +584,46 @@ Their bridge selection checks `--bridge`, `PHLEGM_REFERENCE_BRIDGE`, an adjacent
 using the kernel manifest family, then the build-time developer checkout's bridge tree.
 Explicit paths must exist. `phlegm bench` continues to require `--reference-engine`.
 
+## SERVER-IMAGE-INPUT: Images in chat messages
+
+A model whose bridge describes a vision tower (`init` reply `vision`: `image_token_id`, `patch`,
+`merge`, `min_pixels`, `max_pixels`, `mean`, `std`, `placeholder`; null otherwise) answers questions
+about images in `/v1/chat/completions` (`phlegm-core` `vision.rs`). Every number is the bridge's.
+
+- **Request:** a message's `content` array may hold OpenAI image parts,
+  `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}` (or `"image_url":"<url>"`).
+  `data:` URLs (base64 png, jpeg, webp, gif's first frame); `phlegm run --image FILE` (repeatable,
+  before the prompt text) also takes absolute `file://` paths. http(s) URLs are HTTP 400: phlegm
+  fetches nothing. At most 8 images per request, each at most 50 MP decoded. A model without vision
+  answers an image with HTTP 400 `this model does not accept images`; an undecodable image is 400.
+- **Text:** each image part becomes the bridge's `placeholder` at its place in the message's text.
+- **Pixels:** Qwen2-VL `smart_resize` with `factor = patch * merge` (round half away from zero;
+  aspect ratio over 200 is an error), Catmull-Rom, RGB8 (alpha over white).
+- **Tokens:** after the template renders and tokenizes, each placeholder's single `image_token_id`
+  becomes a run of `(W/patch)*(H/patch)/merge^2` copies. The prompt must hold exactly one image token
+  per image (a user typing the placeholder text is HTTP 400). Context checks, `usage.prompt_tokens`
+  and the reuse mark count the expanded prompt.
+- **Bridge:** `prefill_logits` carries `"images":[{"width":W,"height":H},...]` and
+  `"pixels_bytes":N` for the images whose runs are in the request's `prompt`, and the request line is
+  followed by exactly N bytes: each image's RGB8 pixels, row-major, concatenated in order. Without an
+  image run in `prompt` neither field is sent. The reply and every other command are unchanged.
+- **Reuse (SERVER-PROMPT-REUSE):** all of an image's tokens are alike, so the backend keeps each
+  context image's run start and pixel SHA-256: the shared prefix ends at the first image run whose
+  pixels differ or that is absent on one side; no reuse start, and no mark sent, splits an image
+  run (a start moves back to the run's start; a kept mark inside a run is not used).
+- Speculative decoding stays on; the bridge keeps positions right after an image.
+
+### Acceptance criteria
+
+- `vision.rs`: `smart_resize_follows_qwen2_vl` (640x480, 4000x3000, 50x50, 1920x1080, 300x2, 1x300
+  rejected), `content_parts_become_placeholders_and_images`, `expansion_and_runs`.
+- `server.rs` `chat_image_parts_expand_to_runs`: a data-URL PNG in a chat request reaches the backend
+  as the expanded prompt and its image; http(s), a typed image token, a broken image and a model
+  without vision are HTTP 400.
+- `bench/reference.rs` `reuse_start_keeps_images_apart` and
+  `resident_bridge_sends_images_after_the_request_line` (a fake bridge reads and hashes the pixels).
+- Hardware: untested in phlegm until the bridge side lands.
+
 ## SERVER-SPECULATIVE: Verified speculative decoding
 
 `phlegm run` and `phlegm serve` accept `--speculative off|auto|lookup|mtp`.
