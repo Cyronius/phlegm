@@ -115,6 +115,7 @@ impl Fixture {
                 threads: 1,
                 request_timeout: Duration::from_secs(5),
                 dispatch_timeout_ms: 1000,
+                speculative: crate::speculative::SpeculativeMode::Auto,
             },
             || Ok(NpuLock::for_test(self.dir.join("fake.lock"))),
         )
@@ -183,7 +184,7 @@ fn params(setting: usize, max: usize, constrained: bool) -> GenParams {
         max_tokens: max,
         sampler,
         stop_ids: [7].into_iter().collect(),
-        reuse_mark: Some(2),
+        reuse_mark: Some(2), images: Vec::new(),
     }
 }
 

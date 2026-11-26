@@ -129,7 +129,7 @@ def main():
     specs = link_specs(compiler, compiler_version)
     sources = [engine / name for name in (
         "core.cpp", "block_host.cpp", "pools.cpp", "manifest.cpp",
-        "q4nx_file.cpp", "gguf_file.cpp")]
+        "q4nx_file.cpp", "gguf_file.cpp", "vision/vit.cpp", "vision/prompt.cpp")]
     helper = kernels / "open_kernels/harness/stream_patch.hpp"
     for path in [adapter, *sources, helper, xrt_lib,
                  xrt_include / "xrt/xrt_device.h",

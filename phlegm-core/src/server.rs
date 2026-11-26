@@ -341,6 +341,8 @@ struct ServerState {
     backend: Mutex<Box<dyn Backend + Send>>,
     /// The backend's fixed context, read once at start (None for a backend without one).
     context_capacity: Option<usize>,
+    /// The backend's image input (SERVER-IMAGE-INPUT), read once at start.
+    vision: Option<crate::vision::VisionConfig>,
     tokenizer: ServerTokenizer,
     cfg: ServerConfig,
     embedder: Option<Mutex<Box<dyn crate::embeddings::EmbeddingBackend>>>,
@@ -377,10 +379,12 @@ fn run_inner(
     let backend_name = cfg.backend_name.clone();
     let model_id = embedder.as_ref().filter(|_| embedding_only).map(|e| e.model_id().to_owned()).unwrap_or_else(|| cfg.model_id.clone());
     let context_capacity = backend.context_capacity();
+    let vision = backend.vision();
     let embedding_model = embedder.as_ref().map(|e| e.model_id().to_owned());
     let state = Arc::new(ServerState {
         backend: Mutex::new(backend),
         context_capacity,
+        vision,
         tokenizer,
         cfg,
         embedder: embedder.map(Mutex::new),
@@ -566,9 +570,16 @@ fn handle_chat_body(request: Request, state: &Arc<ServerState>, legacy: bool, bo
         Ok(v) => v,
         Err(e) => { respond_json(request, 400, &json!({"error":{"message":e,"type":"invalid_request_error"}})); return; }
     };
+    // SERVER-IMAGE-INPUT: image parts become the bridge's placeholder; their images, in order.
+    let mut images = Vec::new();
     let messages: Vec<ChatMessage> = if legacy { vec![] } else {
         match req_json.get("messages").and_then(Value::as_array) {
-            Some(arr) if !arr.is_empty() => arr.iter().map(parse_message).collect(),
+            Some(arr) if !arr.is_empty() => {
+                match arr.iter().map(|m| parse_message(m, state.vision.as_ref(), &mut images)).collect() {
+                    Ok(v) => v,
+                    Err(e) => { respond_json(request, 400, &json!({"error":{"message":e,"type":"invalid_request_error"}})); return; }
+                }
+            }
             _ => { respond_json(request, 400, &json!({"error":{"message":"'messages' must be a non-empty array","type":"invalid_request_error"}})); return; }
         }
     };
@@ -766,6 +777,16 @@ fn handle_chat_body(request: Request, state: &Arc<ServerState>, legacy: bool, bo
             Err(e) => { respond_json(request, 400, &json!({"error":{"message":e,"type":"invalid_request_error"}})); return; }
         }
     } else { state.tokenizer.encode(&prompt) };
+    let reuse_mark = if legacy { None } else { state.tokenizer.conversation_end(&messages, &kwargs, &prompt_ids) };
+    // Each image's token becomes its run; lengths and the mark count the expanded prompt.
+    let (prompt_ids, reuse_mark) = match state.vision.as_ref().map(|v| crate::vision::expand(&prompt_ids, &images, v)) {
+        None => (prompt_ids, reuse_mark),
+        Some(Ok(e)) => {
+            let mark = reuse_mark.map(|m| e.map(m));
+            (e.ids, mark)
+        }
+        Some(Err(e)) => { respond_json(request, 400, &json!({"error":{"message":e,"type":"invalid_request_error"}})); return; }
+    };
     let max_tokens = match output_budget(
         requested_max_tokens,
         &state.cfg,
@@ -818,28 +839,26 @@ fn handle_chat_body(request: Request, state: &Arc<ServerState>, legacy: bool, bo
         max_tokens,
         sampler,
         stop_ids,
-        reuse_mark: if legacy { None } else { state.tokenizer.conversation_end(&messages, &kwargs, &prompt_ids) },
+        reuse_mark,
+        images,
     };
 
     generation::respond(request, state, prompt_ids, params, model, reasoning,
         tool_format.map(|f| (f, tools)), options);
 }
 
-fn parse_message(m: &Value) -> ChatMessage {
+fn parse_message(
+    m: &Value,
+    vision: Option<&crate::vision::VisionConfig>,
+    images: &mut Vec<crate::vision::PromptImage>,
+) -> Result<ChatMessage, String> {
     let role = m
         .get("role")
         .and_then(Value::as_str)
         .unwrap_or("user")
         .to_string();
-    let content = match m.get("content") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    };
+    // Text parts in order; image parts (SERVER-IMAGE-INPUT) as the placeholder. No file:// here.
+    let content = crate::vision::message_content(m.get("content"), vision, false, images)?;
     let extra = m
         .as_object()
         .map(|o| {
@@ -849,11 +868,11 @@ fn parse_message(m: &Value) -> ChatMessage {
                 .collect()
         })
         .unwrap_or_default();
-    ChatMessage {
+    Ok(ChatMessage {
         role,
         content,
         extra,
-    }
+    })
 }
 
 /// Parse calls before splitting reasoning: harmony's recipient lives in the header, not its final channel.
@@ -1069,6 +1088,7 @@ mod tests {
                 cfg,
                 embedder: None,
                 embedding_model: None,
+                vision: None,
                 embedding_only: false,
             });
             let thread = std::thread::spawn(move || handle_request(server.recv().unwrap(), &state));
@@ -1480,6 +1500,63 @@ print(json.dumps({'vectors': model.encode(texts).tolist(), 'tokens': sum(map(len
             assert_eq!(status, 200, "{response}");
         }
         assert_eq!(*seen.lock().unwrap(), vec![(0.1, 50, 0.9, 1.1), (0.7, 5, 0.5, 1.3), (0.1, 50, 0.9, 1.2)]);
+    }
+
+    #[test]
+    fn chat_image_parts_expand_to_runs() {
+        use crate::vision::tests::{fake_config, png_data_url};
+        type Seen = Vec<(Vec<u32>, Vec<(u32, u32, [u8; 32])>)>;
+        struct Vision(Arc<Mutex<Seen>>);
+        impl Backend for Vision {
+            fn generate(&mut self, ids: &[u32], p: &mut GenParams, emit: &mut dyn FnMut(crate::backend::TokenEvent<'_>) -> std::ops::ControlFlow<()>)
+                -> Result<(), String> {
+                self.0.lock().unwrap().push((ids.to_vec(), p.images.iter().map(|i| (i.width, i.height, i.sha256)).collect()));
+                let _ = emit(crate::backend::TokenEvent { id: b'k' as u32, logits: None });
+                Ok(())
+            }
+            // The placeholder tokenizer is byte-level: the placeholder is one byte, 7.
+            fn vision(&self) -> Option<crate::vision::VisionConfig> { Some(fake_config(7, "\u{7}")) }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut cfg = ServerConfig::from_env();
+        cfg.port = 0;
+        cfg.model_dir = None;
+        cfg.backend_name = "mock".into();
+        let server = bind(&cfg).unwrap();
+        let addr = server.server_addr().to_ip().unwrap().to_string();
+        let model = cfg.model_id.clone();
+        std::thread::spawn({ let seen = seen.clone(); move || run(server, Box::new(Vision(seen)), cfg) });
+        let url = png_data_url(640, 480);
+        let body = json!({"model": model, "messages": [{"role": "user", "content": [{"type": "text", "text": "a "},
+            {"type": "image_url", "image_url": {"url": url}}, {"type": "text", "text": " b"}]}]}).to_string();
+        let (status, _, response) = http_request(&addr, "POST", "/v1/chat/completions", Some(&body));
+        assert_eq!(status, 200, "{response}");
+        let mut expected: Vec<u32> = b"user: a ".iter().map(|&b| b as u32).collect();
+        expected.extend([7; 300]); // 640x480 stays 640x480: 40x30 patches / 4
+        expected.extend(b" b\nassistant:".iter().map(|&b| b as u32));
+        let (prompt, images) = seen.lock().unwrap()[0].clone();
+        assert_eq!(prompt, expected);
+        let mut decoded = Vec::new();
+        let part = json!([{"type": "image_url", "image_url": url}]);
+        crate::vision::message_content(Some(&part), Some(&fake_config(7, "\u{7}")), false, &mut decoded).unwrap();
+        assert_eq!(images, vec![(640, 480, decoded[0].sha256)]);
+        let v: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["usage"]["prompt_tokens"], expected.len());
+        // Fetching, a typed image token without an image, and a broken image are client errors.
+        for content in [json!([{"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]),
+                        json!("typed \u{7} token"),
+                        json!([{"type": "image_url", "image_url": "data:image/png;base64,AAAA"}])] {
+            let body = json!({"messages": [{"role": "user", "content": content}]}).to_string();
+            let (status, _, response) = http_request(&addr, "POST", "/v1/chat/completions", Some(&body));
+            assert_eq!(status, 400, "{response}");
+        }
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        // A model without vision.
+        let addr = spawn_test_server(|_| {});
+        let body = json!({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": png_data_url(32, 32)}}]}]}).to_string();
+        let (status, _, response) = http_request(&addr, "POST", "/v1/chat/completions", Some(&body));
+        assert_eq!(status, 400);
+        assert!(response.contains("this model does not accept images"), "{response}");
     }
 
     #[test]
