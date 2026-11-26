@@ -123,6 +123,12 @@ pub struct SpecPolicy {
     cooldown: usize,
     rate: f32,
     floor: f32,
+    // SERVER-SPEC-COST: the measured price of a cycle. Drafting pays only while a drafted cycle's tokens per
+    // millisecond beat a plain step's; below that the policy runs plain steps and probes again later.
+    draft_ms: Option<f64>,
+    draft_tokens: f64,
+    plain_ms: Option<f64>,
+    drafted_cycles: usize,
 }
 impl SpecPolicy {
     pub fn new(width: usize) -> Self {
@@ -133,6 +139,35 @@ impl SpecPolicy {
             cooldown: 0,
             rate: 1.0,
             floor: f32::INFINITY,
+            draft_ms: None,
+            draft_tokens: 0.0,
+            plain_ms: None,
+            drafted_cycles: 0,
+        }
+    }
+    /// Plain steps to run before drafting is tried again once it measured slower than plain decode.
+    const PROBE_AFTER: usize = 16;
+    /// A cycle's wall time: `drafted` draft rows, `emitted` tokens it produced (SERVER-SPEC-COST).
+    pub fn observe_time(&mut self, drafted: usize, emitted: usize, ms: f64) {
+        let ema = |old: Option<f64>, x: f64| Some(old.map_or(x, |o| 0.8 * o + 0.2 * x));
+        if drafted == 0 {
+            self.plain_ms = ema(self.plain_ms, ms);
+            return;
+        }
+        self.drafted_cycles += 1;
+        self.draft_ms = ema(self.draft_ms, ms);
+        self.draft_tokens = if self.drafted_cycles == 1 { emitted as f64 } else { 0.8 * self.draft_tokens + 0.2 * emitted as f64 };
+        let Some(plain) = self.plain_ms else {
+            // nothing to compare with yet: one plain step after a few drafted cycles measures it
+            if self.drafted_cycles == 4 {
+                self.cooldown = self.cooldown.max(1);
+            }
+            return;
+        };
+        let draft = self.draft_ms.unwrap();
+        if self.drafted_cycles >= 4 && self.draft_tokens / draft < 1.0 / plain {
+            self.cooldown = self.cooldown.max(Self::PROBE_AFTER);
+            self.drafted_cycles = 2;     // a probe gets two cycles to show it pays before backing off again
         }
     }
     /// A drafted cycle costs about 1.5 plain steps (Qwen3.6-35B-A3B MTP, XDNA2), so it loses below half accepted.
@@ -215,6 +250,33 @@ mod tests {
         assert_eq!(p.max_draft(20, 20), 2);
         assert_eq!(SpecPolicy::new(16).max_draft(100, 100), 15);
     }
+    #[test]
+    fn drafting_backs_off_when_a_drafted_cycle_costs_more_than_its_tokens() {
+        // plain step 73 ms; a drafted cycle 138 ms for 1.8 tokens is 76.7 ms a token: slower, so plain steps follow
+        let mut p = SpecPolicy::for_model_drafts(2);
+        for _ in 0..4 {
+            assert_eq!(p.max_draft(100, 100), 1);
+            p.observe_time(1, 2, 138.0);
+        }
+        assert_eq!(p.max_draft(100, 100), 0, "one plain step to measure plain decode");
+        p.observe_time(0, 1, 73.0);
+        assert_eq!(p.max_draft(100, 100), 1);
+        p.observe_time(1, 1, 138.0);
+        assert_eq!(p.max_draft(100, 100), 0, "slower than plain: back off");
+        for _ in 0..SpecPolicy::PROBE_AFTER - 1 {
+            assert_eq!(p.max_draft(100, 100), 0);
+            p.observe_time(0, 1, 73.0);
+        }
+        assert_eq!(p.max_draft(100, 100), 1, "probe again");
+        // a cheap cycle that pays keeps drafting
+        let mut q = SpecPolicy::for_model_drafts(2);
+        q.observe_time(0, 1, 73.0);
+        for _ in 0..10 {
+            assert_eq!(q.max_draft(100, 100), 1);
+            q.observe_time(1, 2, 120.0);
+        }
+    }
+
     #[test]
     fn model_drafts_keep_drafting_until_acceptance_falls_below_half() {
         let mut p = SpecPolicy::for_model_drafts(2);

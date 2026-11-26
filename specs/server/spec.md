@@ -706,6 +706,18 @@ checks SSE/non-stream text, a stop string ending inside a cycle, rollback and
 subsequent HTTP prefix reuse with the protocol-2 fake. These tests load no
 hardware and do not validate C++ verification or MTP implementations.
 
+### SERVER-SPEC-COST: drafting only while it pays
+
+A speculative request shall time each cycle: a drafted cycle (the verify pass, draft included) against the tokens it
+emitted, and a plain step. While a drafted cycle's tokens per millisecond fall below a plain step's, the policy runs
+plain steps and tries drafting again after 16 of them; before a plain step has been timed it takes one after the
+fourth drafted cycle. Output is unchanged: only which cycles draft. This holds for every drafter (MTP, prompt
+lookup, `auto`), on top of the acceptance-based backoff.
+
+Result 2026-11-26 (Qwen3.6-35B-A3B, Strix Halo, one-context decode and verify images: plain step 73 ms, verify pass
+122 ms): rewrite 13.25 tok/s off, MTP 13.92 (1.05x), lookup 13.99; explain 13.40 off, MTP 13.00 (0.97x, 0.95x without
+this policy), lookup 13.10; every output byte-identical to `off`.
+
 ## SERVER-SETTINGS: Per-model runtime defaults
 
 `phlegm run` and `phlegm serve` take their sampling, template, context and prefill defaults from

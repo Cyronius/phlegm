@@ -78,6 +78,7 @@ impl NpuBackend {
             // never leave a reusable prefix or mark pointing at uncertain state.
             let context = std::mem::take(&mut self.context);
             let mark = self.mark.take();
+            let cycle_start = std::time::Instant::now();
             let (reply, bytes) = self.process.request_with_payload(json!({
                 "command":"verify_logits", "accept":0, "tokens":tokens, "draft":bridge_drafts
             }))?;
@@ -153,6 +154,7 @@ impl NpuBackend {
                 return Err(e);
             }
             policy.observe(drafted, accepted);
+            policy.observe_time(drafted, walked, cycle_start.elapsed().as_secs_f64() * 1e3);
             if done {
                 break;
             }
