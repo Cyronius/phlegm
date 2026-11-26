@@ -34,6 +34,9 @@ pub enum Draft {
 pub trait Drafter {
     /// History includes the emitted token that has not yet been run.
     fn draft(&mut self, history: &[u32], max: usize) -> Draft;
+    fn policy(&self, width: usize) -> SpecPolicy {
+        SpecPolicy::new(width)
+    }
 }
 
 pub struct NoneDrafter;
@@ -49,6 +52,10 @@ pub struct Bridge {
 impl Drafter for Bridge {
     fn draft(&mut self, _: &[u32], max: usize) -> Draft {
         Draft::Bridge(max.min(self.max))
+    }
+    // A model draft's miss says little about the next draft, unlike a lookup miss.
+    fn policy(&self, width: usize) -> SpecPolicy {
+        SpecPolicy::for_model_drafts(width)
     }
 }
 
@@ -109,10 +116,13 @@ impl Lookup {
 
 /// Bounded per-request backoff: halve the budget after a rejection; after a
 /// completely rejected draft, run two width-one cycles before probing again.
+/// Model drafts skip those cycles while the running acceptance stays at or above `floor`.
 pub struct SpecPolicy {
     ceiling: usize,
     budget: usize,
     cooldown: usize,
+    rate: f32,
+    floor: f32,
 }
 impl SpecPolicy {
     pub fn new(width: usize) -> Self {
@@ -121,6 +131,15 @@ impl SpecPolicy {
             ceiling,
             budget: ceiling,
             cooldown: 0,
+            rate: 1.0,
+            floor: f32::INFINITY,
+        }
+    }
+    /// A drafted cycle costs about 1.5 plain steps (Qwen3.6-35B-A3B MTP, XDNA2), so it loses below half accepted.
+    pub fn for_model_drafts(width: usize) -> Self {
+        Self {
+            floor: 0.5,
+            ..Self::new(width)
         }
     }
     pub fn max_draft(&mut self, remaining: usize, room: usize) -> usize {
@@ -136,9 +155,10 @@ impl SpecPolicy {
         if drafted == 0 {
             return;
         }
+        self.rate = 0.875 * self.rate + 0.125 * accepted as f32 / drafted as f32;
         if accepted < drafted {
             self.budget = (self.budget / 2).max(1).min(self.ceiling);
-            if accepted == 0 {
+            if accepted == 0 && self.rate < self.floor {
                 self.cooldown = 2;
             }
         } else {
@@ -194,5 +214,20 @@ mod tests {
         p.observe(1, 1);
         assert_eq!(p.max_draft(20, 20), 2);
         assert_eq!(SpecPolicy::new(16).max_draft(100, 100), 15);
+    }
+    #[test]
+    fn model_drafts_keep_drafting_until_acceptance_falls_below_half() {
+        let mut p = SpecPolicy::for_model_drafts(2);
+        p.observe(1, 0);
+        assert_eq!(p.max_draft(20, 20), 1);
+        for _ in 0..4 {
+            p.observe(1, 0);
+        }
+        // rate 0.875^5 = 0.51: still drafting; the sixth miss takes it to 0.45
+        assert_eq!(p.max_draft(20, 20), 1);
+        p.observe(1, 0);
+        assert_eq!(p.max_draft(20, 20), 0);
+        assert_eq!(p.max_draft(20, 20), 0);
+        assert_eq!(p.max_draft(20, 20), 1);
     }
 }

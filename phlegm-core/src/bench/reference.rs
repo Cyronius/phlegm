@@ -452,7 +452,7 @@ impl ReferenceBackend {
         let hello = process.request(json!({"command":"init", "model_dir":options.model_dir,
             "kernel_dir":options.kernel_dir, "max_ctx":options.context_capacity,
             "dispatch_timeout_ms":options.dispatch_timeout_ms, "prefill_route":options.prefill_route,
-            "prefill_mode":options.prefill_mode}))?;
+            "prefill_mode":options.prefill_mode, "speculative":"off"}))?;
         if hello.get("weights_file").and_then(Value::as_str) != Some(weight_name)
             || hello.get("context_capacity").and_then(Value::as_u64)
                 != Some(options.context_capacity as u64)
@@ -812,6 +812,8 @@ pub struct NpuOptions {
     pub threads: usize,
     pub request_timeout: Duration,
     pub dispatch_timeout_ms: u32,
+    /// Sent in `init` so the bridge loads only the speculation parts this mode can use.
+    pub speculative: crate::speculative::SpeculativeMode,
 }
 
 impl NpuBackend {
@@ -843,7 +845,7 @@ impl NpuBackend {
         let hello = process.request(json!({"command":"init", "model_dir":options.model_dir,
             "kernel_dir":options.kernel_dir, "max_ctx":options.context_capacity,
             "dispatch_timeout_ms":options.dispatch_timeout_ms, "prefill_route":options.prefill_route,
-            "prefill_mode":options.prefill_mode}))?;
+            "prefill_mode":options.prefill_mode, "speculative":options.speculative}))?;
         if options.turbo {
             turbo::validate_loaded_route(hello.get("prefill_route").and_then(Value::as_str))?;
         }
@@ -1083,6 +1085,7 @@ for line in sys.stdin:
             threads: 1,
             request_timeout: Duration::from_secs(5),
             dispatch_timeout_ms: 1000,
+            speculative: Default::default(),
         };
         let mut backend = NpuBackend::load(opts).unwrap();
         for _ in 0..2 {
@@ -1173,6 +1176,7 @@ for line in sys.stdin:
             threads: 1,
             request_timeout: Duration::from_secs(5),
             dispatch_timeout_ms: 1000,
+            speculative: Default::default(),
         };
         let mut backend = NpuBackend::load(opts).unwrap();
         let mut turn = |prompt: &[u32], mark: usize| {

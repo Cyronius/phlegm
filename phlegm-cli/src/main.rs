@@ -113,6 +113,7 @@ fn npu_options(map: &HashMap<String, String>, settings: &Resolved) -> Result<Npu
         request_timeout: Duration::from_secs(number("--timeout", 600)? as u64),
         dispatch_timeout_ms: u32::try_from(number("--dispatch-timeout-ms", 120_000)?)
             .map_err(|_| "invalid --dispatch-timeout-ms".to_string())?,
+        speculative: settings.speculative()?,
     })
 }
 

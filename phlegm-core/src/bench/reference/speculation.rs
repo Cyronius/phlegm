@@ -1,7 +1,7 @@
 //! Protocol 2 client and verified row walk. The bridge owns all tentative state.
 use super::*;
 use crate::backend::TokenEvent;
-use crate::speculative::{Bridge, Draft, Drafter, Lookup, SpecPolicy, SpeculativeMode};
+use crate::speculative::{Bridge, Draft, Drafter, Lookup, SpeculativeMode};
 use std::ops::ControlFlow;
 
 impl NpuBackend {
@@ -54,7 +54,7 @@ impl NpuBackend {
         history.push(first);
         sample_history.push(i64::from(first));
         let mut emitted = 1;
-        let mut policy = SpecPolicy::new(self.verify_width);
+        let mut policy = drafter.policy(self.verify_width);
         while emitted < params.max_tokens {
             let remaining = params.max_tokens - emitted;
             let room = self.context_capacity - self.context.len();

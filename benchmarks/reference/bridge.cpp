@@ -114,13 +114,61 @@ struct Pending {
     bool active = false;
     size_t start = 0;
     size_t rows = 0;
+    bool verify = false;   // the rows came from Core::step_verify: accepting commits a state slot
+    std::vector<int> inputs;
 };
+// OPEN-SPEC-MTP-QWEN36MOE: the engine's MTP layer drafts from h, the main model's output for the row that produced
+// the next input; each accepted row writes its MTP cache row, so the cache stays current.
+struct Mtp {
+    bool have_h = false;
+    std::vector<float> h, row0, row1;
+};
+static Mtp mtp;
+// QWEN36_BRIDGE_STATS=1: one stderr line per request with the speculation cycles and their costs
+struct SpecStats {
+    int passes = 0, accepted = 0, plain = 0;
+    double draft_ms = 0, pass_ms = 0, commit_ms = 0, plain_ms = 0;
+    void flush() {
+        static const bool on = [] { const char* e = std::getenv("QWEN36_BRIDGE_STATS"); return e && std::string(e) == "1"; }();
+        if (on && (passes || plain))
+            std::cerr << "bridge stats: passes " << passes << " (both rows " << accepted << "), plain " << plain
+                      << "; ms draft " << draft_ms << ", pass " << pass_ms << ", commit " << commit_ms
+                      << ", plain " << plain_ms << '\n';
+        *this = {};
+    }
+};
+static SpecStats stats;
+static double ms_since(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+}
+static void mtp_after_step(Core& core) {
+    if (!core.mtp_ready()) return;
+    mtp.h = core.hidden_row(false, 0);
+    mtp.have_h = true;
+}
+// A recurrent model verifies through the engine's verify pass (OPEN-VERIFY-ROWS-QWEN36MOE), whose width is fixed.
+static size_t verify_width(const Core& core) { return recurrent_layers(core) ? core.verify_rows() : kVerifyWidth; }
 static void accept_rows(Core& core, Pending& pending, size_t n) {
     if (!pending.active) throw std::runtime_error("accept without a pending verify pass");
     if (n > pending.rows) throw std::runtime_error("accept past the pending rows");
-    const size_t pos = pending.start + n;
-    if (pos != static_cast<size_t>(core.position())) core.seek(static_cast<int>(pos));
     pending.active = false;
+    if (pending.verify) {
+        const auto t = std::chrono::steady_clock::now();
+        if (n) core.verify_commit(n);              // n == 0: the committed state was never touched
+        if (core.mtp_ready() && n) {
+            // row n - 1 gave the next input; with two rows, row 0's MTP cache row is written now
+            if (n == 2) core.mtp_step(pending.inputs[1], mtp.row0.data(), static_cast<int>(pending.start), false);
+            mtp.h = n == 2 ? mtp.row1 : mtp.row0;
+            mtp.have_h = true;
+        }
+        stats.accepted += n == 2;
+        stats.commit_ms += ms_since(t);
+        return;
+    }
+    const size_t pos = pending.start + n;
+    if (pos != static_cast<size_t>(core.position()) && recurrent_layers(core))
+        throw std::runtime_error("a recurrent model's plain step cannot be taken back");
+    if (pos != static_cast<size_t>(core.position())) core.seek(static_cast<int>(pos));
 }
 
 // Logits follow their reply line as raw binary32 bytes ("logits_f32_le_bytes" of them, little
@@ -141,24 +189,57 @@ static void reply_logits(json value, const Core& core) {
     std::cout.flush();
 }
 static void verify(Core& core, Pending& pending, const json& request) {
-    const auto tokens = request.at("tokens").get<std::vector<int>>();
-    if (request.value("draft", 0) != 0) throw std::runtime_error("this bridge has no drafter");
-    if (recurrent_layers(core)) throw std::runtime_error("verify needs a model without recurrent layers");
-    if (tokens.empty() || tokens.size() > kVerifyWidth) throw std::runtime_error("verify takes 1 to 16 tokens");
+    auto tokens = request.at("tokens").get<std::vector<int>>();
+    const int ndraft = request.value("draft", 0);
+    if (ndraft) {
+        if (!core.mtp_ready() || ndraft != 1 || tokens.size() != 1 || verify_width(core) != 2)
+            throw std::runtime_error("this bridge drafts one MTP token after one input (OFLM_OPEN_MTP=1)");
+        if (!mtp.have_h) throw std::runtime_error("an MTP draft needs a prefill or decode first");
+        if (tokens[0] < 0 || static_cast<size_t>(tokens[0]) >= core.real_vocab())
+            throw std::runtime_error("verify token outside the model vocabulary");
+        const auto t = std::chrono::steady_clock::now();
+        tokens.push_back(core.mtp_step(tokens[0], mtp.h.data(), core.position() - 1, true));
+        stats.draft_ms += ms_since(t);
+    }
+    const size_t width = verify_width(core);
+    if (!width) throw std::runtime_error("verify needs a model without recurrent layers, or the engine's verify pass (OFLM_OPEN_VERIFY=1)");
+    if (tokens.empty() || tokens.size() > width)
+        throw std::runtime_error("verify takes 1 to " + std::to_string(width) + " tokens");
     for (int id : tokens) if (id < 0 || static_cast<size_t>(id) >= core.real_vocab())
         throw std::runtime_error("verify token outside the model vocabulary");
     const size_t start = static_cast<size_t>(core.position()), n = core.real_vocab();
     if (start + tokens.size() > core.max_ctx()) throw std::runtime_error("verify exceeds context capacity");
     std::vector<float> rows(tokens.size() * n);
+    // one input on a recurrent model is a plain step: the verify pass would cost two rows for it
+    const bool recurrent = recurrent_layers(core) > 0, pass = recurrent && tokens.size() > 1;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (recurrent && !pass && core.mtp_ready() && mtp.have_h)
+        core.mtp_step(tokens[0], mtp.h.data(), static_cast<int>(start) - 1, false);   // keeps the MTP cache current
+    if (pass) {
+        // a short request fills the pass's rows with its last token; those rows are never accepted
+        std::vector<int> ids(width, tokens.back()), am(width);
+        std::copy(tokens.begin(), tokens.end(), ids.begin());
+        core.step_verify(ids.data(), am.data(), true);
+        if (core.mtp_ready()) {
+            mtp.row0 = core.hidden_row(true, 0);
+            mtp.row1 = core.hidden_row(true, 1);
+        }
+    }
     for (size_t i = 0; i < tokens.size(); ++i) {
-        core.step(tokens[i], true);
-        const auto& logits = core.logits();
+        if (!pass) {
+            core.step(tokens[i], true);
+            if (recurrent) mtp_after_step(core);
+        }
+        const float* lp = pass ? core.verify_logits(i) : core.logits().data();
+        const std::vector<float> logits(lp, lp + n);
         if (logits.size() < n) throw std::runtime_error("incomplete logits");
         for (size_t v = 0; v < n; ++v)
             if (!std::isfinite(logits[v])) throw std::runtime_error("nonfinite logits");
         std::copy(logits.begin(), logits.begin() + n, rows.begin() + i * n);
     }
-    pending = {true, start, tokens.size()};
+    (pass ? stats.pass_ms : stats.plain_ms) += ms_since(t0);
+    ++(pass ? stats.passes : stats.plain);
+    pending = {true, start, tokens.size(), pass, tokens};
     json value = {{"ok", true}, {"rows", tokens.size()}, {"tokens", tokens}, {"position", start},
                   {"logits_f32_le_bytes", rows.size() * sizeof(float)}};
     std::cout << value.dump() << '\n';
@@ -185,7 +266,8 @@ int main() {
             if (line.size() > 1'000'000) throw std::runtime_error("request exceeds 1 MB");
             const json request = json::parse(line);
             const std::string command = request.at("command").get<std::string>();
-            if (command == "quit") { reply({}); std::_Exit(0); }
+            if (command == "quit") { stats.flush(); reply({}); std::_Exit(0); }
+            if (command == "reset" || command == "rewind" || command == "prefill_logits") stats.flush();
             if (command == "init") {
                 if (core) throw std::runtime_error("engine already loaded");
                 CoreConfig config;
@@ -195,7 +277,14 @@ int main() {
                 config.timeout_ms = request.at("dispatch_timeout_ms").get<unsigned>();
                 config.prefill_mode = request.at("prefill_mode").get<std::string>();
                 config.verbose = false;
-                if (config.max_ctx < 2 || config.max_ctx > 131072 || !config.timeout_ms)
+                // an older phlegm sends no mode: load whatever the kernels and GGUF allow
+                const std::string spec = request.value("speculative", std::string("auto"));
+                if (spec != "off" && spec != "lookup" && spec != "mtp" && spec != "auto")
+                    throw std::runtime_error("unknown speculative mode " + spec);
+                config.verify = spec != "off";
+                config.mtp = spec == "mtp" || spec == "auto";
+                // no upper cap: models reach 1M tokens, and the engine's allocations fail on a context too large
+                if (config.max_ctx < 2 || !config.timeout_ms)
                     throw std::runtime_error("invalid context capacity or dispatch timeout");
                 if (!std::filesystem::is_regular_file(std::filesystem::path(config.kernel_dir) / "manifest.json"))
                     throw std::runtime_error("missing kernel manifest.json");
@@ -216,8 +305,8 @@ int main() {
                     {"real_vocab", core->real_vocab()}, {"prefill_route", route},
                     {"weights_file", core->is_gguf() ? "model.gguf" : "model.q4nx"},
                     {"recurrent_layers", recurrent_layers(*core)},
-                    {"verify_width", recurrent_layers(*core) ? 0 : kVerifyWidth}, {"verify_ref", true},
-                    {"draft", nullptr}});
+                    {"verify_width", verify_width(*core)}, {"verify_ref", true},
+                    {"draft", core->mtp_ready() && verify_width(*core) == 2 ? json{{"method", "mtp"}, {"max", 1}} : json(nullptr)}});
                 continue;
             }
             if (!core) throw std::runtime_error("init is required before inference");
@@ -233,8 +322,9 @@ int main() {
                 continue;
             }
             if (pending.active) throw std::runtime_error("a verify pass is pending; accept it first");
-            if (command == "reset") { core->reset(); mark.valid = false; reply({}); }
+            if (command == "reset") { core->reset(); mark.valid = false; mtp.have_h = false; reply({}); }
             else if (command == "rewind") {
+                mtp.have_h = false;
                 // Back to `pos` <= the position: the mark's own position (its states restored), or
                 // anywhere on a model without recurrent layers. Rows past `pos` are rewritten later.
                 const size_t pos = request.at("pos").get<size_t>();
@@ -247,11 +337,14 @@ int main() {
                 reply({{"position", core->position()}});
             } else if (command == "prefill") {
                 const auto ids = prompt_ids(request, *core);
-                reply({{"token", prefill(*core, ids, route)}});
+                const int tok = prefill(*core, ids, route);
+                mtp_after_step(*core);
+                reply({{"token", tok}});
             } else if (command == "decode") {
                 const int token = request.at("token").get<int>();
                 if (token < 0 || static_cast<size_t>(token) >= core->real_vocab()) throw std::runtime_error("invalid decode token");
                 core->step(token, true);
+                mtp_after_step(*core);
                 reply({{"token", greedy(*core)}});
             } else if (command == "prefill_logits") {
                 // Continues from the current position (a fresh request resets first). With `mark`,
@@ -261,15 +354,18 @@ int main() {
                     mark.valid = false;
                 if (request.contains("mark")) {
                     const size_t at = prefill_marked(*core, ids, route, request.at("mark").get<size_t>(), mark);
+                    mtp_after_step(*core);
                     reply_logits({{"mark", at}}, *core);
                 } else {
                     run_prefill(*core, ids, route);
+                    mtp_after_step(*core);
                     reply_logits(json::object(), *core);
                 }
             } else if (command == "decode_logits") {
                 const int token = request.at("token").get<int>();
                 if (token < 0 || static_cast<size_t>(token) >= core->real_vocab()) throw std::runtime_error("invalid decode token");
                 core->step(token, true);
+                mtp_after_step(*core);
                 reply_logits(json::object(), *core);
             } else if (command == "trial" || command == "survey_trial") {
                 const auto ids = prompt_ids(request, *core);

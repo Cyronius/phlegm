@@ -22,6 +22,27 @@ pub const OBJECT_REF_END: u32 = 248048;
 /// Any of these ends generation (tokenizer_config.json: eos_token_id).
 pub const EOS_TOKEN_IDS: [u32; 3] = [ENDOFTEXT, IM_END, OBJECT_REF_END];
 
+/// transformers' `{% generation %}` / `{% endgeneration %}` (the assistant-mask tags, Qwen3.6) as a
+/// plain `if true` block: they render their body unchanged, and minijinja has no such statement.
+pub(crate) fn hf_generation_tags(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(open) = rest.find("{%") {
+        let Some(len) = rest[open..].find("%}") else { break };
+        let tag = &rest[open..open + len + 2];
+        let inner = tag[2..tag.len() - 2].trim_matches(|c: char| c == '-' || c == '+' || c.is_whitespace());
+        out.push_str(&rest[..open]);
+        match inner {
+            "generation" => out.push_str(&tag.replacen("generation", "if true", 1)),
+            "endgeneration" => out.push_str(&tag.replacen("endgeneration", "endif", 1)),
+            _ => out.push_str(tag),
+        }
+        rest = &rest[open + len + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// `strftime` over a UTC time for the chat templates (`strftime_now`): %Y %m %d %H %M %S %b %B
 /// %a %A %y %j %e %%; anything else is copied through as written.
 pub(crate) fn strftime_utc(fmt: &str, unix_secs: i64) -> String {
@@ -459,6 +480,17 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn generation_tags_render_their_body() {
+        let src = "a{%- generation %}b{{ x }}{%- endgeneration %}c{% if y %}d{% endif %}";
+        let fixed = hf_generation_tags(src);
+        assert_eq!(fixed, "a{%- if true %}b{{ x }}{%- endif %}c{% if y %}d{% endif %}");
+        let mut env = Environment::new();
+        env.add_template("t", &fixed).unwrap();
+        let out = env.get_template("t").unwrap().render(minijinja::context! { x => 1, y => false }).unwrap();
+        assert_eq!(out, "ab1c");
+    }
+
+    #[test]
     fn native_stream_buffers_split_utf8_and_keeps_exact_complete_decode() {
         let (dir, tokenizer) = fixture(false, true);
         let mut stream = tokenizer.decode_stream();
@@ -631,7 +663,7 @@ impl Tokenizer {
         };
         let tool_format = crate::tool_calls::Format::of(&template_src);
         let template_vars = TemplateVars::of(&template_src);
-        env.add_template_owned("chat", template_src)
+        env.add_template_owned("chat", hf_generation_tags(&template_src))
             .map_err(|e| format!("compiling chat_template.jinja: {e}"))?;
 
         // generation_config.json's eos_token_id is what transformers stops on. Where a model ships
