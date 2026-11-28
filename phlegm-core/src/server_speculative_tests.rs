@@ -46,6 +46,7 @@ fn speculative_bridge_stream_stop_and_reuse_match_plain_http() {
             cfg,
             embedder: None,
             embedding_model: None,
+            vision: None,
             embedding_only: false,
         });
         let worker = std::thread::spawn(move || {

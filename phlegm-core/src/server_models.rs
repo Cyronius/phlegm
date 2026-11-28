@@ -194,8 +194,10 @@ impl LoadedModel {
     pub fn chat(backend: Box<dyn Backend + Send>, cfg: ServerConfig) -> Result<Self, String> {
         let tokenizer = ServerTokenizer::build(&cfg)?;
         let context_capacity = backend.context_capacity();
+        let vision = backend.vision();
         Ok(Self(Loaded::Inference(Arc::new(ServerState {
             backend: Mutex::new(backend),
+            vision,
             tokenizer,
             context_capacity,
             cfg,
@@ -213,6 +215,7 @@ impl LoadedModel {
             backend: Mutex::new(Box::new(crate::mock_backend::MockBackend::new())),
             tokenizer: ServerTokenizer::Placeholder(PlaceholderTokenizer::new()),
             context_capacity: None,
+            vision: None,
             cfg,
             embedder: Some(Mutex::new(embedder)),
             embedding_model,

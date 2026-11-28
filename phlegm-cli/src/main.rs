@@ -18,7 +18,7 @@ mod multi_model;
 const USAGE: &str = "usage: phlegm <command>
 
 commands:
-  run --model-dir DIR [--kernels DIR] [--bridge EXE] --prompt TEXT [--max-tokens N (0 or -1: until the context is full)] [--seed N] [--turbo]
+  run --model-dir DIR [--kernels DIR] [--bridge EXE] --prompt TEXT [--image FILE ...] [--max-tokens N (0 or -1: until the context is full)] [--seed N] [--turbo]
   serve [--models-dir DIR] [--image-config JSON[,JSON...]] [--keep-alive SECONDS] [--queue-timeout SECONDS]
   serve --model-dir DIR [--kernels DIR] [--bridge EXE] [--turbo] [--host 127.0.0.1] [--port 52625]
   serve --embed-model DIR [--embed-python PYTHON] [--embed-source DIR] [--embed-model-name NAME]
@@ -118,13 +118,45 @@ fn npu_options(map: &HashMap<String, String>, settings: &Resolved) -> Result<Npu
         request_timeout: Duration::from_secs(number("--timeout", 600)? as u64),
         dispatch_timeout_ms: u32::try_from(number("--dispatch-timeout-ms", 120_000)?)
             .map_err(|_| "invalid --dispatch-timeout-ms".to_string())?,
+        speculative: settings.speculative()?,
     })
 }
 
 // Like llama.cpp (`-n -1`, its default): generate until a stop token or the end of the context.
 // A positive --max-tokens bounds the reply, clamped to the room the context has left.
+/// Split off every `--image VALUE` pair (repeatable), leaving the other arguments.
+fn take_images(args: &[String]) -> Result<(Vec<String>, Vec<String>), String> {
+    let (mut rest, mut images) = (Vec::new(), Vec::new());
+    let mut at = 0;
+    while at < args.len() {
+        if args[at] == "--image" {
+            let value = args.get(at + 1).filter(|v| !v.starts_with("--")).ok_or("expected a value after --image")?;
+            images.push(value.clone());
+            at += 2;
+        } else {
+            rest.push(args[at].clone());
+            at += 1;
+        }
+    }
+    Ok((rest, images))
+}
+
+/// `--image` files as the user message's image parts (SERVER-IMAGE-INPUT), before the text.
+fn image_parts(paths: &[String], prompt: &str) -> Result<serde_json::Value, String> {
+    let mut parts = Vec::new();
+    for p in paths {
+        let path = std::fs::canonicalize(p).map_err(|e| format!("--image {p}: {e}"))?;
+        let path = path.to_str().ok_or_else(|| format!("--image {p}: path is not UTF-8"))?;
+        let url = format!("file://{}", path.replace('%', "%25"));
+        parts.push(serde_json::json!({"type": "image_url", "image_url": {"url": url}}));
+    }
+    parts.push(serde_json::json!({"type": "text", "text": prompt}));
+    Ok(serde_json::Value::Array(parts))
+}
+
 fn run(args: &[String]) -> Result<(), String> {
-    let mut opts = flags(args)?;
+    let (args, image_paths) = take_images(args)?;
+    let mut opts = flags(&args)?;
     // -1 (llama.cpp's spelling) and 0 both mean until a stop token or the end of the context.
     if opts.get("--max-tokens").is_some_and(|v| v == "-1") {
         opts.insert("--max-tokens".into(), "0".into());
@@ -140,18 +172,33 @@ fn run(args: &[String]) -> Result<(), String> {
     let tokenizer = Tokenizer::load(&npu.model_dir)?;
     let defaults = GenDefaults::from_settings(&settings)?;
     let kwargs = template_kwargs(&defaults.thinking, tokenizer.template_vars(), defaults.effort_levels.as_ref());
+    // With images the bridge's vision description (its `init` reply) is needed first.
+    let capacity = npu.context_capacity;
+    let mut npu = Some(npu);
+    let mut loaded = None;
+    let mut images = Vec::new();
+    let content = if image_paths.is_empty() {
+        prompt
+    } else {
+        let backend = NpuBackend::load(npu.take().unwrap())?;
+        let vision = backend.vision();
+        loaded = Some(backend);
+        phlegm_core::vision::message_content(Some(&image_parts(&image_paths, &prompt)?), vision.as_ref(), true, &mut images)?
+    };
     let text = tokenizer.render_chat(
         &[ChatMessage {
             role: "user".into(),
-            content: prompt,
+            content,
             ..Default::default()
         }],
         true,
         &kwargs,
     )?;
-    let ids = tokenizer.encode(&text)?;
+    let mut ids = tokenizer.encode(&text)?;
+    if let Some(vision) = loaded.as_ref().and_then(|b| b.vision()) {
+        ids = phlegm_core::vision::expand(&ids, &images, &vision)?.ids;
+    }
     // The backend holds prompt + max_tokens - 1 tokens (the last one is never fed back).
-    let capacity = npu.context_capacity;
     if ids.len() > capacity {
         return Err(format!(
             "prompt is {} tokens; --max-ctx {capacity} holds fewer",
@@ -160,7 +207,10 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     let room = capacity + 1 - ids.len();
     let max_tokens = if requested == 0 { room } else { requested.min(room) };
-    let mut backend = NpuBackend::load(npu)?;
+    let mut backend = match loaded {
+        Some(b) => b,
+        None => NpuBackend::load(npu.take().unwrap())?,
+    };
     let mut output = Vec::new();
     let mut params = GenParams {
         speculative: settings.speculative()?,
@@ -179,6 +229,7 @@ fn run(args: &[String]) -> Result<(), String> {
         )),
         stop_ids: tokenizer.stop_ids(),
         reuse_mark: None,
+        images,
     };
     backend.generate(&ids, &mut params, &mut |event| { output.push(event.id); std::ops::ControlFlow::Continue(()) })?;
     let reply = tokenizer.decode(&output)?;

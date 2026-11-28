@@ -44,6 +44,7 @@ fn schema_mask_drives_fake_logits_backend_and_rejects_unsupported_features() {
             cfg,
             embedder: None,
             embedding_model: None,
+            vision: None,
             embedding_only: false,
         });
         let thread = std::thread::spawn(move || {
@@ -160,6 +161,7 @@ fn tool_loop_streaming_and_full_and_malformed() {
                     cfg,
                     embedder: None,
                     embedding_model: None,
+                    vision: None,
                     embedding_only: false,
                 });
                 let thread = std::thread::spawn(move || {

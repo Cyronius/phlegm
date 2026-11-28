@@ -15,6 +15,9 @@ pub struct GenParams {
     /// (SERVER-PROMPT-REUSE): the next turn's prompt shares the tokens before it, so a backend
     /// that keeps its context saves its recurrent state there. None: the prompt's end.
     pub reuse_mark: Option<usize>,
+    /// The prompt's images (SERVER-IMAGE-INPUT), in order: each is a run of the vision config's
+    /// `image_token_id` in the prompt. A backend without vision rejects a request that has any.
+    pub images: Vec<crate::vision::PromptImage>,
 }
 
 /// A verified output token. Logits are the raw, untransformed model distribution
@@ -60,5 +63,10 @@ pub trait Backend {
     /// prefilling them (OpenAI's `usage.prompt_tokens_details.cached_tokens`).
     fn cached_tokens(&self) -> usize {
         0
+    }
+
+    /// The model's image input (SERVER-IMAGE-INPUT), when it takes images.
+    fn vision(&self) -> Option<crate::vision::VisionConfig> {
+        None
     }
 }
