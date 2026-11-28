@@ -201,7 +201,7 @@ impl Drop for Worker {
 
 pub struct ResidentEmbeddingBackend {
     worker: Option<Worker>,
-    short: Option<ShortRoute>,
+    short: Vec<ShortRoute>,
     id: String,
     lock: Option<NpuLock>,
     width: usize,
@@ -226,7 +226,7 @@ impl ResidentEmbeddingBackend {
         let worker = Worker::spawn(python, source_dir, model_dir)?;
         Ok(Self {
             worker: Some(worker),
-            short: None,
+            short: Vec::new(),
             id,
             lock: Some(lock),
             width: 384,
@@ -242,7 +242,7 @@ impl ResidentEmbeddingBackend {
         design: &Path,
         attention: Option<&Path>,
     ) -> Result<Self, String> {
-        Self::load_npue_routed(id, executable, pack, design, attention, None)
+        Self::load_npue_routed(id, executable, pack, design, attention, &[])
     }
 
     pub fn load_npue_routed(
@@ -251,7 +251,7 @@ impl ResidentEmbeddingBackend {
         pack: &Path,
         design: &Path,
         attention: Option<&Path>,
-        short: Option<(&Path, Option<&Path>)>,
+        short: &[(&Path, Option<&Path>)],
     ) -> Result<Self, String> {
         let lock = NpuLock::acquire("phlegm NPUE embeddings")?;
         let (worker, hello) = Worker::start_npue(executable, pack, design, attention)?;
@@ -261,9 +261,9 @@ impl ResidentEmbeddingBackend {
             .and_then(|n| usize::try_from(n).ok())
             .filter(|&n| n > 0)
             .ok_or("embedding worker omitted its vector width")?;
-        let short =
-            short
-                .map(|(design, attention)| {
+        let mut short = short
+                .iter()
+                .map(|&(design, attention)| {
                     let (worker, probe) = Worker::start_npue(executable, pack, design, attention)?;
                     let full_context = hello
                         .get("context")
@@ -285,7 +285,11 @@ impl ResidentEmbeddingBackend {
                     }
                     Ok(ShortRoute { worker, context })
                 })
-                .transpose()?;
+                .collect::<Result<Vec<_>, String>>()?;
+        short.sort_by_key(|route| route.context);
+        if short.windows(2).any(|pair| pair[0].context == pair[1].context) {
+            return Err("short embedding designs must have distinct contexts".into());
+        }
         lock.ensure_held()?;
         Ok(Self {
             worker: Some(worker),
@@ -299,13 +303,13 @@ impl ResidentEmbeddingBackend {
     }
 
     fn stop(&mut self) {
-        self.short.take();
+        self.short.clear();
         self.worker.take();
         self.lock.take();
     }
 
     fn request(&mut self, request: Value) -> Result<Value, String> {
-        if let Some(route) = &mut self.short {
+        for route in &mut self.short {
             let fits = if let Some(rows) = request.get("token_ids").and_then(Value::as_array) {
                 rows.iter()
                     .all(|row| row.as_array().is_some_and(|ids| ids.len() <= route.context))
@@ -544,7 +548,7 @@ for line in sys.stdin:
             std::env::temp_dir().join(format!("phlegm-npue-test-{}.lock", std::process::id()));
         let mut backend = ResidentEmbeddingBackend {
             worker: Some(worker),
-            short: None,
+            short: Vec::new(),
             id: "nomic-test".into(),
             lock: Some(NpuLock::for_test(lock_path)),
             width: 2,

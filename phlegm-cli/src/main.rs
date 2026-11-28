@@ -24,6 +24,7 @@ commands:
   serve --embed-model DIR [--embed-python PYTHON] [--embed-source DIR] [--embed-model-name NAME]
   serve --embed-model PACK --embed-worker EXE --embed-design DIR [--embed-attention DIR] [--embed-model-name NAME]
     [--embed-short-design DIR [--embed-short-attention DIR]]
+    [--embed-mid-design DIR [--embed-mid-attention DIR]]
     GGUF input uses --embed-packer EXE --embed-gguf-sha256 HASH
     [--embed-pack-cache DIR] [--embed-pack-script FILE] [--embed-python PYTHON]
   serve --mock [--host H] [--port N]
@@ -287,10 +288,15 @@ fn serve(args: &[String]) -> Result<(), String> {
                 return Err("--embed-worker cannot be combined with Trit embedding options".into());
             }
             let design = opts.get("--embed-design").ok_or("--embed-worker requires --embed-design")?;
-            let short_design = opts.get("--embed-short-design").map(std::path::Path::new);
-            let short_attention = opts.get("--embed-short-attention").map(std::path::Path::new);
-            if short_attention.is_some() && short_design.is_none() {
-                return Err("--embed-short-attention requires --embed-short-design".into());
+            let mut routes = Vec::new();
+            for tier in ["short", "mid"] {
+                let design = opts.get(&format!("--embed-{tier}-design")).map(std::path::Path::new);
+                let attention = opts.get(&format!("--embed-{tier}-attention")).map(std::path::Path::new);
+                match (design, attention) {
+                    (Some(design), attention) => routes.push((design, attention)),
+                    (None, Some(_)) => return Err(format!("--embed-{tier}-attention requires --embed-{tier}-design")),
+                    (None, None) => {}
+                }
             }
             let design = std::path::Path::new(design);
             let pack = embedding_pack::prepare(&model_dir, design, |name| opts.get(name).map(String::as_str))?;
@@ -300,12 +306,12 @@ fn serve(args: &[String]) -> Result<(), String> {
                 &pack.path,
                 design,
                 opts.get("--embed-attention").map(std::path::Path::new),
-                short_design.map(|dir| (dir, short_attention)),
+                &routes,
             )?;
             return server::serve_embeddings(Box::new(embedder), cfg);
         }
         if embedding_pack::is_gguf(&model_dir)
-            || ["--embed-design", "--embed-attention", "--embed-short-design", "--embed-short-attention"]
+            || ["--embed-design", "--embed-attention", "--embed-short-design", "--embed-short-attention", "--embed-mid-design", "--embed-mid-attention"]
                 .iter().chain(embedding_pack::FLAGS).any(|name| opts.contains_key(*name))
         {
             return Err("GGUF models and NPUE options require --embed-worker".into());
@@ -316,7 +322,7 @@ fn serve(args: &[String]) -> Result<(), String> {
         let embedder = phlegm_core::embeddings::TritEmbeddingBackend::load(model_id, std::path::Path::new(&python), &source, &model_dir)?;
         return server::serve_embeddings(Box::new(embedder), cfg);
     }
-    if ["--embed-worker", "--embed-design", "--embed-attention", "--embed-short-design", "--embed-short-attention"]
+    if ["--embed-worker", "--embed-design", "--embed-attention", "--embed-short-design", "--embed-short-attention", "--embed-mid-design", "--embed-mid-attention"]
         .iter().chain(embedding_pack::FLAGS).any(|name| opts.contains_key(*name))
     {
         return Err("NPUE embedding options require --embed-model".into());

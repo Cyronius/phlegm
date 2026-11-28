@@ -18,6 +18,7 @@ const HELP: &str =
   --embed-design <dir> [--embed-attention <dir>] --model-id <id> --model-revision <rev>
   --quantization <quant> --fixtures <cases.json> --output <report.json>
   [--embed-short-design <dir> [--embed-short-attention <dir>]]
+  [--embed-mid-design <dir> [--embed-mid-attention <dir>]]
   [--embed-packer EXE --embed-gguf-sha256 HASH] [--embed-pack-cache DIR]
   [--embed-pack-script FILE] [--embed-python PYTHON]
   [--warmups N] [--runs N] [--machine-info FILE] [--notes TEXT] [--development]
@@ -35,6 +36,8 @@ const FLAGS: &[&str] = &[
     "--embed-attention",
     "--embed-short-design",
     "--embed-short-attention",
+    "--embed-mid-design",
+    "--embed-mid-attention",
     "--model-id",
     "--model-revision",
     "--quantization",
@@ -226,16 +229,15 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         .get("--embed-attention")
         .map(|p| absolute(p))
         .transpose()?;
-    let short_design = flags
-        .get("--embed-short-design")
-        .map(|p| absolute(p))
-        .transpose()?;
-    let short_attention = flags
-        .get("--embed-short-attention")
-        .map(|p| absolute(p))
-        .transpose()?;
-    if short_attention.is_some() && short_design.is_none() {
-        return Err("--embed-short-attention requires --embed-short-design".into());
+    let mut tiers = Vec::new();
+    for tier in ["short", "mid"] {
+        let design = flags.get(&format!("--embed-{tier}-design")).map(|p| absolute(p)).transpose()?;
+        let attention = flags.get(&format!("--embed-{tier}-attention")).map(|p| absolute(p)).transpose()?;
+        match (design, attention) {
+            (Some(design), attention) => tiers.push((design, attention)),
+            (None, Some(_)) => return Err(format!("--embed-{tier}-attention requires --embed-{tier}-design")),
+            (None, None) => {}
+        }
     }
     let fixture = Path::new(value("--fixtures")?);
     let mut cases = cases(&fs::read(fixture).map_err(|e| e.to_string())?)?;
@@ -264,34 +266,43 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         "projection_sha256": projector,
         "attention_sha256": attention.as_deref().map(artifact_hashes).transpose()?,
     });
-    let mut short_context = None;
-    let mut short_artifacts = None;
-    if let Some(dir) = &short_design {
+    let mut route_contexts = Vec::new();
+    let mut route_artifacts = Vec::new();
+    for (dir, attention) in &tiers {
         let (context, hashes) = projection(dir)?;
         if context >= context_capacity {
             return Err(
                 "short embedding design must have a smaller context than the full design".into(),
             );
         }
-        short_context = Some(context);
-        short_artifacts = Some(json!({
+        route_contexts.push(context);
+        route_artifacts.push(json!({
+            "context_capacity": context,
             "projection_sha256": hashes,
-            "attention_sha256": short_attention.as_deref().map(artifact_hashes).transpose()?,
+            "attention_sha256": attention.as_deref().map(artifact_hashes).transpose()?,
         }));
     }
+    route_contexts.sort_unstable();
+    let short_context = route_contexts.first().copied();
+    let short_artifacts = match route_artifacts.len() {
+        0 => Value::Null,
+        1 => route_artifacts.pop().unwrap(),
+        _ => Value::Array(route_artifacts),
+    };
+    let routes: Vec<_> = tiers.iter().map(|(dir, attention)| (dir.as_path(), attention.as_deref())).collect();
     let mut backend = ResidentEmbeddingBackend::load_npue_routed(
         model.into(),
         &worker,
         &pack.path,
         &design,
         attention.as_deref(),
-        short_design
-            .as_deref()
-            .map(|dir| (dir, short_attention.as_deref())),
+        &routes,
     )?;
     let expected_context = |case: &Case| {
-        short_context
-            .filter(|&context| case.tokens_per_input <= context)
+        route_contexts
+            .iter()
+            .copied()
+            .find(|&context| case.tokens_per_input <= context)
             .unwrap_or(context_capacity)
     };
     for case in &cases {
@@ -347,6 +358,7 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         "backend": "npue",
         "context_capacity": context_capacity,
         "short_context_capacity": short_context,
+        "route_context_capacities": route_contexts,
         "npu_attention": attention.is_some(),
         "artifacts": artifacts,
         "short_artifacts": short_artifacts,
